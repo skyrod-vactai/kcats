@@ -33,6 +33,9 @@
                                   :y ::number
                                   :others (s/* ::stack-item)))
 
+(s/def ::predicate (s/cat :x ::stack-item
+                          :others (s/* ::stack-item)))
+
 (s/def ::quoted-word (s/coll-of ::word
                                 :count 1
                                 :kind vector?))
@@ -93,14 +96,34 @@
         [(for [sym ['+ '- '/ '* '< '<= '> '>= 'min 'max]]
            [sym
             {:spec ::binary-arithmetic
-             :fn (partial update-stack
-                          (partial s-apply-one 2 (resolve sym)))}])
+             :fn (f-stack 2 (resolve sym))}])
          (for [sym ['inc 'dec]]
            [sym
             {:spec (s/cat :x ::number
                           :others (s/* ::stack-item))
-             :fn (partial update-stack
-                          (partial s-apply-one 1 (resolve sym)))}])]))
+             :fn (f-stack 1 (resolve sym))}])]))
+
+(def predicates
+  (into {} cat
+        [(for [sym ['odd? 'even? 'sequential? 'zero? 'pos? 'neg?
+                    'number? 'int? 'true? 'false? 'nil? 'some?
+                    'string? 'empty?]]
+           [sym {:spec ::predicate
+                 :fn (f-stack 1 (resolve sym))}])
+         (for [sym ['starts-with? 'ends-with?]]
+           [sym {:spec ::stack-min-depth-2
+                 :fn (f-stack 2 (resolve sym))}])]))
+
+(defn leaves-true?
+  "Runs program on an env, returns true if true was on the top of the
+  stack afterward."
+  [env p]
+  (-> env (eval p) :stack first true?))
+
+(defn with-stack
+  "Returns env with stack set to `stack`"
+  [env stack]
+  (assoc env :stack stack))
 
 (defn debug [env item]
   (println item (:stack env)))
@@ -109,6 +132,7 @@
 (def builtin-words
   (merge
    arithmetic-words
+   predicates
    {'pop {:spec ::stack-min-depth-1
           :fn (partial update-stack pop)}
     'dup {:spec ::stack-min-depth-1
@@ -123,15 +147,15 @@
                      :others (s/* ::stack-item))
         :fn (fn [env]
               (let [[a & others] (:stack env)]
-                (eval (assoc env :stack others) a)))}
+                (eval (with-stack env others) a)))}
     'dip {:spec (s/cat :program ::aggregate
                        :x ::stack-item
                        :others (s/* ::stack-item))
           :fn (fn [env]
                 (let [[p x & others] (:stack env)]
-                  (eval-one (assoc env :stack
-                                   (conj others
-                                         (conj p x))) :i)))}
+                  (eval-one (with-stack env
+                              (conj others
+                                    (conj p x))) :i)))}
     'inscribe {:spec (s/cat :definition ::definition
                             :others (s/* ::stack-item))
                :fn #'inscribe}
@@ -154,7 +178,7 @@
                           :others (s/* ::stack-item))
              :fn (fn [{:keys [stack] :as env}]
                    (let [[b t f & others] stack]
-                     (eval (assoc env :stack others)
+                     (eval (with-stack env others)
                            (if b t f))))}
     '= {:spec (s/cat :x ::stack-item
                      :y ::stack-item
@@ -168,45 +192,51 @@
                         :program ::aggregate
                         :others (s/* ::stack-item))
            :fn (fn [env]
-                 (update env :stack
-                         (fn [[a p & others :as stack]]
-                           )))}
+                 (update-stack
+                  (fn [[a p & others :as stack]]
+                    )))}
     'first {:spec (s/cat :aggregate ::aggregate, :other (s/* ::stack-item))
             :fn (f-stack 1 first)}
     'map {:spec (s/cat :aggregate ::aggregate
                        :program ::aggregate
                        :others (s/* ::stack-item))
+          ;; runs a parallel simulation - if the map function
+          ;; tries to add or remove more stack elements those
+          ;; changes will be lost - only top stack element is
+          ;; collected from each parallel run of p
           :fn (fn [env]
-                ;; runs a parallel simulation - if the map function
-                ;; tries to add or remove more stack elements those
-                ;; changes will be lost - only top stack element is
-                ;; collected from each parallel run of p
-                (update env :stack
-                        (fn [[a p & others :as stack]]
-                          (conj others
-                                (->> (for [item a]
-                                       (eval (assoc env :stack (conj others item)) p))
-                                     (map (comp first :stack))
-                                     (into []))))))}
+                (update-stack (fn [[a p & others :as stack]]
+                                (conj others
+                                      (->> (for [item a]
+                                             (eval (with-stack env (conj others item)) p))
+                                           (map (comp first :stack))
+                                           (into []))))
+                              env))}
     'filter {:spec (s/cat :aggregate ::aggregate
                           :program ::aggregate
                           :others (s/* ::stack-item))
+             ;; runs a parallel simulation - if the filter function
+             ;; tries to add or remove more stack elements those
+             ;; changes will be lost - only top stack element is
+             ;; collected from each parallel run of p
              :fn (fn [env]
-                   ;; runs a parallel simulation - if the filter function
-                   ;; tries to add or remove more stack elements those
-                   ;; changes will be lost - only top stack element is
-                   ;; collected from each parallel run of p
-                   (update env :stack
-                           (fn [[a p & others :as stack]]
-                             (->>
-                              (for [item a
-                                    :when (-> (eval (assoc env :stack
-                                                           (conj others item))
-                                                    p)
-                                              :stack first true?)]
-                                item)
-                              (into [])
-                              (conj others)))))}
+                   (update-stack (fn [[a p & others :as stack]]
+                                   (->> a
+                                        (filter #(leaves-true? (with-stack env (conj others %)) p))
+                                        (into [])
+                                        (conj others)
+                                        (into [])))
+                                 env))}
+
+    'every? {:spec (s/cat :aggregate ::aggregate
+                          :program ::aggregate
+                          :others (s/* ::stack-item))
+             :fn (fn [env]
+                   (update-stack (fn [[a p & others :as stack]]
+                                   (->> a
+                                        (every? #(leaves-true? (with-stack env (conj others %)) p))
+                                        (conj others)))
+                                 env))}
     'and  {:spec (s/cat :x ::stack-item, :y ::stack-item,
                         :others (s/* ::stack-item))
            :fn (f-stack 2 #(and %1 %2))}
@@ -230,7 +260,7 @@
                             (let [r (eval-one env item)]
                               (debug r item)
                               r))
-                          (assoc env :stack others)
+                          (with-stack others)
                           p))}}))
 
 (def core
@@ -287,5 +317,5 @@
   (->> p (eval (default-env)) :stack))
 
 #_(defn threshold
-  [scripts threshold](let [scripts [:a :b :c]](filter (fn []))))
+    [scripts threshold](let [scripts [:a :b :c]](filter (fn []))))
 
