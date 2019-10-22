@@ -146,8 +146,8 @@
     'i {:spec (s/cat :program ::aggregate
                      :others (s/* ::stack-item))
         :fn (fn [env]
-              (let [[a & others] (:stack env)]
-                (eval (with-stack env others) a)))}
+              (let [[p & others] (:stack env)]
+                (eval (with-stack env others) p)))}
     'dip {:spec (s/cat :program ::aggregate
                        :x ::stack-item
                        :others (s/* ::stack-item))
@@ -188,39 +188,39 @@
                         :aggregate ::aggregate
                         :others (s/* ::stack-item))
            :fn (f-stack 2 (comp vec cons))}
-    'some {:spec (s/cat :aggregate ::aggregate ;; TODO finish this
-                        :program ::aggregate
+    'some {:spec (s/cat :program ::aggregate
+                        :aggregate ::aggregate ;; TODO finish this
                         :others (s/* ::stack-item))
            :fn (fn [env]
                  (update-stack
-                  (fn [[a p & others :as stack]]
+                  (fn [[p a & others :as stack]]
                     )))}
     'first {:spec (s/cat :aggregate ::aggregate, :other (s/* ::stack-item))
             :fn (f-stack 1 first)}
-    'map {:spec (s/cat :aggregate ::aggregate
-                       :program ::aggregate
+    'map {:spec (s/cat :program ::aggregate
+                       :aggregate ::aggregate
                        :others (s/* ::stack-item))
           ;; runs a parallel simulation - if the map function
           ;; tries to add or remove more stack elements those
           ;; changes will be lost - only top stack element is
           ;; collected from each parallel run of p
           :fn (fn [env]
-                (update-stack (fn [[a p & others :as stack]]
+                (update-stack (fn [[p a & others :as stack]]
                                 (conj others
                                       (->> (for [item a]
                                              (eval (with-stack env (conj others item)) p))
                                            (map (comp first :stack))
                                            (into []))))
                               env))}
-    'filter {:spec (s/cat :aggregate ::aggregate
-                          :program ::aggregate
+    'filter {:spec (s/cat :program ::aggregate
+                          :aggregate ::aggregate
                           :others (s/* ::stack-item))
              ;; runs a parallel simulation - if the filter function
              ;; tries to add or remove more stack elements those
              ;; changes will be lost - only top stack element is
              ;; collected from each parallel run of p
              :fn (fn [env]
-                   (update-stack (fn [[a p & others :as stack]]
+                   (update-stack (fn [[p a & others :as stack]]
                                    (->> a
                                         (filter #(leaves-true? (with-stack env (conj others %)) p))
                                         (into [])
@@ -228,11 +228,11 @@
                                         (into [])))
                                  env))}
 
-    'every? {:spec (s/cat :aggregate ::aggregate
-                          :program ::aggregate
+    'every? {:spec (s/cat :program ::aggregate
+                          :aggregate ::aggregate
                           :others (s/* ::stack-item))
              :fn (fn [env]
-                   (update-stack (fn [[a p & others :as stack]]
+                   (update-stack (fn [[p a & others :as stack]]
                                    (->> a
                                         (every? #(leaves-true? (with-stack env (conj others %)) p))
                                         (conj others)))
