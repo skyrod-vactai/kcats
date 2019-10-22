@@ -12,7 +12,7 @@
 (s/def ::string string?)
 (s/def ::bytes bytes?)
 (expound/def ::non-empty (complement seq) "not-empty?")
-(expound/def ::word keyword? "word?")
+(expound/def ::word symbol? "word?")
 (expound/def ::stack-item (s/or :aggregate ::aggregate
                                 :boolean ::boolean
                                 :number ::number
@@ -91,12 +91,12 @@
 (def arithmetic-words
   (into {} cat
         [(for [sym ['+ '- '/ '* '< '<= '> '>= 'min 'max]]
-           [(keyword (name sym))
+           [sym
             {:spec ::binary-arithmetic
              :fn (partial update-stack
                           (partial s-apply-one 2 (resolve sym)))}])
          (for [sym ['inc 'dec]]
-           [(keyword (name sym))
+           [sym
             {:spec (s/cat :x ::number
                           :others (s/* ::stack-item))
              :fn (partial update-stack
@@ -109,22 +109,22 @@
 (def builtin-words
   (merge
    arithmetic-words
-   {:pop {:spec ::stack-min-depth-1
+   {'pop {:spec ::stack-min-depth-1
           :fn (partial update-stack pop)}
-    :dup {:spec ::stack-min-depth-1
+    'dup {:spec ::stack-min-depth-1
           :fn (partial update-stack (fn [s]
                                       (conj s (first s))))}
-    :swap {:spec ::stack-min-depth-2
+    'swap {:spec ::stack-min-depth-2
            :fn (partial update-stack (fn [[a b & others]]
                                        (-> others
                                            (conj a)
                                            (conj b))))}
-    :i {:spec (s/cat :program ::aggregate
+    'i {:spec (s/cat :program ::aggregate
                      :others (s/* ::stack-item))
         :fn (fn [env]
               (let [[a & others] (:stack env)]
                 (eval (assoc env :stack others) a)))}
-    :dip {:spec (s/cat :program ::aggregate
+    'dip {:spec (s/cat :program ::aggregate
                        :x ::stack-item
                        :others (s/* ::stack-item))
           :fn (fn [env]
@@ -132,10 +132,10 @@
                   (eval-one (assoc env :stack
                                    (conj others
                                          (conj p x))) :i)))}
-    :inscribe {:spec (s/cat :definition ::definition
+    'inscribe {:spec (s/cat :definition ::definition
                             :others (s/* ::stack-item))
                :fn #'inscribe}
-    :describe {:spec (s/cat :word ::quoted-word
+    'describe {:spec (s/cat :word ::quoted-word
                             :others (s/* ::stack-item))
                :fn (fn [{:keys [stack dict] :as env}]
                      (let [[[word] & others] stack
@@ -148,7 +148,7 @@
                              (format word)
                              Exception.
                              throw))))}
-    :branch {:spec (s/cat :condition ::boolean
+    'branch {:spec (s/cat :condition ::boolean
                           :true-branch ::aggregate
                           :false-branch ::aggregate
                           :others (s/* ::stack-item))
@@ -156,24 +156,24 @@
                    (let [[b t f & others] stack]
                      (eval (assoc env :stack others)
                            (if b t f))))}
-    := {:spec (s/cat :x ::stack-item
+    '= {:spec (s/cat :x ::stack-item
                      :y ::stack-item
                      :other (s/* ::stack-item))
         :fn (f-stack 2 =)}
-    :cons {:spec (s/cat :x ::stack-item
+    'cons {:spec (s/cat :x ::stack-item
                         :aggregate ::aggregate
                         :others (s/* ::stack-item))
-           :fn (f-stack 2 cons)}
-    :some {:spec (s/cat :aggregate ::aggregate ;; TODO finish this
+           :fn (f-stack 2 (comp vec cons))}
+    'some {:spec (s/cat :aggregate ::aggregate ;; TODO finish this
                         :program ::aggregate
                         :others (s/* ::stack-item))
            :fn (fn [env]
                  (update env :stack
                          (fn [[a p & others :as stack]]
                            )))}
-    :first {:spec (s/cat :aggregate ::aggregate, :other (s/* ::stack-item))
+    'first {:spec (s/cat :aggregate ::aggregate, :other (s/* ::stack-item))
             :fn (f-stack 1 first)}
-    :map {:spec (s/cat :aggregate ::aggregate
+    'map {:spec (s/cat :aggregate ::aggregate
                        :program ::aggregate
                        :others (s/* ::stack-item))
           :fn (fn [env]
@@ -188,7 +188,7 @@
                                        (eval (assoc env :stack (conj others item)) p))
                                      (map (comp first :stack))
                                      (into []))))))}
-    :filter {:spec (s/cat :aggregate ::aggregate
+    'filter {:spec (s/cat :aggregate ::aggregate
                           :program ::aggregate
                           :others (s/* ::stack-item))
              :fn (fn [env]
@@ -202,28 +202,28 @@
                               (for [item a
                                     :when (-> (eval (assoc env :stack
                                                            (conj others item))
-                                                      p)
+                                                    p)
                                               :stack first true?)]
                                 item)
                               (into [])
                               (conj others)))))}
-    :and  {:spec (s/cat :x ::stack-item, :y ::stack-item,
+    'and  {:spec (s/cat :x ::stack-item, :y ::stack-item,
                         :others (s/* ::stack-item))
            :fn (f-stack 2 #(and %1 %2))}
-    :or  {:spec (s/cat :x ::stack-item, :y ::stack-item,
+    'or  {:spec (s/cat :x ::stack-item, :y ::stack-item,
                        :others (s/* ::stack-item))
           :fn (f-stack 2 #(or %1 %2))}
-    :in  {:spec (s/cat :aggregate ::aggregate, :item ::stack-item
+    'in  {:spec (s/cat :aggregate ::aggregate, :item ::stack-item
                        :other (s/* ::stack-item))
           :fn (f-stack 2 contains?)}
-    :intersection {:spec (s/cat :aggregate-x ::aggregate, :aggregate-y ::aggregate,
+    'intersection {:spec (s/cat :aggregate-x ::aggregate, :aggregate-y ::aggregate,
                                 :others (s/* ::stack-item))
                    :fn (f-stack 2 (fn [x y]
                                     (into []
                                           (clojure.set/intersection
                                            (into #{} x)
                                            (into #{} y)))))}
-    :trace {:spec (s/cat :program ::aggregate
+    'trace {:spec (s/cat :program ::aggregate
                          :others (s/* ::stack-item))
             :fn (fn [{[p & others] :stack :as env}]
                   (reduce (fn [env item]
@@ -234,11 +234,11 @@
                           p))}}))
 
 (def core
-  (let [words [[:swapd [:swap :dip]]
-               [:dupd [:dup :dip]]
-               [:popd [:pop :dip]]
-               [:swons [:swap :cons]]]]
-    (->> :inscribe repeat (interleave words) (into []))))
+  (let [words '[[swapd [swap dip]]
+                [dupd [dup dip]]
+                [popd [pop dip]]
+                [swons [swap cons]]]]
+    (->> 'inscribe repeat (interleave words) (into []))))
 
 (defmethod eval-one Number [env item]
   (push env item))
@@ -255,7 +255,7 @@
 (defmethod eval-one (Class/forName "[B") [env item]
   (push env item))
 
-(defmethod eval-one clojure.lang.Keyword [env word]
+(defmethod eval-one clojure.lang.Symbol [env word]
   (let [{f :fn spec :spec} (-> env :dict word)]
     (when spec
       (s/assert spec (:stack env)))
