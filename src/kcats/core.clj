@@ -314,7 +314,7 @@
 (defn k
   "Evaluates program in a fresh env, returns the resulting stack"
   [p]
-  (->> p (eval (default-env)) :stack))
+  (->> p (eval (default-env)) :stack vec))
 
 #_(defn threshold
     [scripts threshold](let [scripts [:a :b :c]](filter (fn []))))
