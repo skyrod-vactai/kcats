@@ -31,7 +31,7 @@ The language should use as few concepts as possible. It may include
 + Functions
 + Channels
 
-It will explicitly *not* use 
+It will explicitly *not* use
 
 + Variables
 + User-defined Types (static or dynamic)
@@ -51,7 +51,7 @@ processing.
 Items inside square brackets [] are quotations.
 
 #+BEGIN_EXAMPLE
-true ☯ 💭 false 
+true ☯ 💭 false
 #+END_EXAMPLE
 
 
@@ -154,14 +154,22 @@ there is no difference).
 We'll also need words that perform actions- this maps well to
 clojure's symbols which are used similarly. Then we will want to be
 able to define new words in our new language so let's spec out what a
-word's definition looks like - it's a program. Finally we want to be
-able to keep track of all words we've defined, so we'll spec a
-dictionary that allows us to look up a word's definition.
+word's definition looks like - it's a program.
+
+Finally we want to be able to keep track of all words we've defined,
+so we'll spec a dictionary that allows us to look up a word's
+definition. In a dictionary we're also going to have inscrutable
+definitions are only implemented in clojure, not as other kcats words,
+so we have to allow for those also. We'll call those axiom words.
 
 #+BEGIN_SRC clojure :tangle src/kcats/core.clj
   (expound/def ::word symbol? "word?")
-  
-  (spec/def ::dictionary (spec/map-of ::word ::program))
+
+  (spec/def ::axiom-definition (spec/keys :req [::fn ::spec]))
+  (spec/def ::program-definition (spec/keys :req [::fn ::definition]))
+
+  (spec/def ::dictionary (spec/map-of ::word (s/or ::axiom-definition
+                                                   ::program-definition)))
 #+END_SRC
 
 Next we'll spec a stack. We want it to easily implement a FIFO
@@ -181,4 +189,70 @@ dictionary and a stack put together. Later we might allow multiple stacks.
 
 #+BEGIN_SRC clojure :tangle src/kcats/core.clj
   (spec/def ::environment (spec/keys :req [::stack ::dictionary]))
+#+END_SRC
+** Evaluation
+Next we're going to define how the kcats language executes (or
+evaluates) a [[#definitions][program]]. First we can say that to evaluate a program, we
+will evaluate each item in the program in turn, and update the
+environment each time.
+
+#+BEGIN_SRC clojure :tangle src/kcats/core.clj
+  (declare eval-item) ;; we'll define this later
+
+  (def eval (partial reduce #'eval-item))
+#+END_SRC
+
+Now, we need to define =eval-item=. To evaluate an item, we will take
+an environment and item as input, do some operation on the
+environment, and return an updated environment.
+
+To decide what operation to do, we'll first look at the item's
+type. For example, basic types like numbers, byte arrays and strings
+will simply be pushed onto the stack and there's nothing further to do
+to evaluate that item.
+
+We'll also define what we mean by "push" - add the item to the top of
+the stack.
+
+#+BEGIN_SRC clojure :tangle src/kcats/core.clj
+  (defmulti eval-item
+    "Evaluate one item in the given environment. A single step in a
+    program's execution."
+    (fn [env item]
+      (type item)))
+
+  (defn- push [env item]
+    (update env :stack conj item))
+
+  (defmethod eval-item Number [env item]
+    (push env item))
+
+  (defmethod eval-item String [env item]
+    (push env item))
+
+  (defmethod eval-item Boolean [env item]
+    (push env item))
+
+  ;; PersistentVector is the clojure type for an aggregate
+  (defmethod eval-item clojure.lang.PersistentVector [env item]
+    (push env item))
+
+  (defmethod eval-item (Class/forName "[B") [env item]
+    (push env item))
+#+END_SRC
+
+Where the real action happens is when we evaluate a word. Each defined
+word has a clojure function that will run when that word is
+evaluated. If it's not defined, then the word will act like everything
+else and just be put on the stack.
+
+#+BEGIN_SRC clojure :tangle src/kcats/core.clj
+  ;; Symbol is the underlying clojure type for words
+  (defmethod eval-item clojure.lang.Symbol [env word]
+    (let [{f :fn spec :spec} (-> env :dict word)]
+      (when spec
+        (spec/assert spec (:stack env)))
+      (if f
+        (f env)
+        (push env word))))
 #+END_SRC
