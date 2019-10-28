@@ -78,11 +78,14 @@ languages like python and ruby, but we won't consider this a goal.
           items from the top of the stack and using them to create new
           stack items. Some words may do nothing but put themselves on
           the stack.
-
-- definition :: what exactly a word is supposed to do, exists either
-                as inscrutable implementation in the base language,
-                or in terms of other existing words.
+- axiom word :: A word that is defined in the base language, not in
+                terms of other words.
+- definition :: what exactly a word is supposed to do, represented
+                either in the base language for axiom words, or as a
+                program.
 - dictionary :: a list of words and their definitions.
+- expression :: The part of the program being evaluated, which needs
+                to be broken down into axiom words and executed.
 - environment :: the entire state of the program, which generally
                  consists of a dictionary and one or more stacks.
 - predicate :: a word that consumes stack items and leaves either true
@@ -163,13 +166,14 @@ definitions are only implemented in clojure, not as other kcats words,
 so we have to allow for those also. We'll call those axiom words.
 
 #+BEGIN_SRC clojure :tangle src/kcats/core.clj
-  (expound/def ::word symbol? "word?")
+  (def word? symbol?)
+  (spec/def ::word word?)
 
   (spec/def ::axiom-definition (spec/keys :req [::fn ::spec]))
   (spec/def ::program-definition (spec/keys :req [::fn ::definition]))
 
-  (spec/def ::dictionary (spec/map-of ::word (s/or ::axiom-definition
-                                                   ::program-definition)))
+  (spec/def ::dictionary (spec/map-of ::word (spec/or ::axiom-definition
+                                                      ::program-definition)))
 #+END_SRC
 
 Next we'll spec a stack. We want it to easily implement a FIFO
@@ -177,68 +181,76 @@ stack, (meaning the last item you put in is accessible in constant
 time), and clojure's built-in list type does this.
 
 Since a stack is a list of items, we need to also define what a "stack
-item" is - it's any of the types we've specced up until now.
-#+BEGIN_SRC clojure :tangle src/kcats/core.clj
+item" is - it's any of the types we've specced up until now. 
 
-  (spec/def ::stack (spec/coll-of ::stack-item
+An expression is also a list of items that are being broken down into
+their axiomatic parts.
+#+BEGIN_SRC clojure :tangle src/kcats/core.clj
+  (spec/def ::stack (spec/coll-of ::item
                                   :kind list?))
+
+  (spec/def ::expression (spec/coll-of ::item
+                                       :kind list?))
 #+END_SRC
 
 Next we'll spec what an Environment is - it's currently just a
-dictionary and a stack put together. Later we might allow multiple stacks.
+dictionary, stack, and expression put together. Later we might allow
+multiple stacks.
 
 #+BEGIN_SRC clojure :tangle src/kcats/core.clj
-  (spec/def ::environment (spec/keys :req [::stack ::dictionary]))
+  (spec/def ::environment (spec/keys :req [::stack ::dictionary ::expression]))
 #+END_SRC
 ** Evaluation
 Next we're going to define how the kcats language executes (or
 evaluates) a [[#definitions][program]]. First we can say that to evaluate a program, we
-will evaluate each item in the program in turn, and update the
-environment each time.
+will keep stepping through evaluation as long as the expression isn't
+empty. Once it's empty, there's nothing left to do and we return the
+last environment.
 
 #+BEGIN_SRC clojure :tangle src/kcats/core.clj
-  (declare eval-item) ;; we'll define this later
+  (declare eval-step) ;; we'll define this later
 
-  (def eval (partial reduce #'eval-item))
+  (defn eval
+    [env]
+    (->> env
+         (iterate eval-step)
+         (drop-while #(-> % ::expression seq))
+         first))
 #+END_SRC
 
-Now, we need to define =eval-item=. To evaluate an item, we will take
-an environment and item as input, do some operation on the
-environment, and return an updated environment.
-
-To decide what operation to do, we'll first look at the item's
-type. For example, basic types like numbers, byte arrays and strings
-will simply be pushed onto the stack and there's nothing further to do
-to evaluate that item.
-
-We'll also define what we mean by "push" - add the item to the top of
-the stack.
+Now, we define =onto-stack=, which says what we do to put an item onto
+the stack. Simple items like numbers, strings and undefined words,
+just go straight onto the stack with no changes. 
 
 #+BEGIN_SRC clojure :tangle src/kcats/core.clj
-  (defmulti eval-item
+  (defmulti onto-stack
     "Evaluate one item in the given environment. A single step in a
     program's execution."
-    (fn [env item]
+    (fn [{[item] ::expression}]
       (type item)))
 
-  (defn- push [env item]
-    (update env :stack conj item))
+  (defn- push
+    "Push an item from the expression into the stack"
+    [{[item & others] ::expression :as env}]
+    (-> env
+        (assoc ::expression others)
+        (update ::stack conj item)))
 
-  (defmethod eval-item Number [env item]
-    (push env item))
+  (defmethod onto-stack Number [env]
+    (push env))
 
-  (defmethod eval-item String [env item]
-    (push env item))
+  (defmethod onto-stack String [env]
+    (push env))
 
-  (defmethod eval-item Boolean [env item]
-    (push env item))
+  (defmethod onto-stack Boolean [env]
+    (push env))
 
   ;; PersistentVector is the clojure type for an aggregate
-  (defmethod eval-item clojure.lang.PersistentVector [env item]
-    (push env item))
+  (defmethod onto-stack clojure.lang.PersistentVector [env]
+    (push env))
 
-  (defmethod eval-item (Class/forName "[B") [env item]
-    (push env item))
+  (defmethod onto-stack (Class/forName "[B") [env]
+    (push env))
 #+END_SRC
 
 Where the real action happens is when we evaluate a word. Each defined
@@ -246,13 +258,90 @@ word has a clojure function that will run when that word is
 evaluated. If it's not defined, then the word will act like everything
 else and just be put on the stack.
 
+We'll also specify here what a step of evaluation is - it looks at the
+next item in the expression. If it has a definition, it's replaced
+with its definition. Otherwise it's put onto the stack.
+
+Recall what =eval= does, it just keeps iterating =eval-step= until
+there's nothing left in the expression.
 #+BEGIN_SRC clojure :tangle src/kcats/core.clj
-  ;; Symbol is the underlying clojure type for words
-  (defmethod eval-item clojure.lang.Symbol [env word]
-    (let [{f :fn spec :spec} (-> env :dict word)]
+  (defmethod onto-stack clojure.lang.Symbol [{[word & others] ::expression
+                                              ::keys [dictionary stack]
+                                              :as env}]
+    (let [{f ::fn spec ::spec} (dictionary word)]
       (when spec
-        (spec/assert spec (:stack env)))
+        (spec/assert spec stack))
       (if f
-        (f env)
-        (push env word))))
+        (f (update env ::expression pop))
+        (push env))))
+
+  (defn definition
+    "Returns the definition of an item, if it's a word defined in terms
+    of other words"
+    [{::keys [dictionary] :as env} item]
+    (some-> dictionary (get item) ::definition))
+
+  (defn eval-step
+    "Evaluate one step in the environment."
+    [{[next-item & items] ::expression ::keys [stack dictionary] :as env}]
+    (println (dissoc env ::dictionary))
+    (if-let [d (definition env next-item)]
+      (assoc env ::expression (into items d)) ;; replace item with definition
+      ;; eval the thing onto the stack
+      (onto-stack env)))
 #+END_SRC
+** Built-in words
+Eventually we'll want to define words in terms of other words. But
+right now we don't have any words! So we'll have to define some, not
+in terms of other words but as clojure functions. Then we can build
+new words on top of those.
+
+We'll need some utility functions that help us define these axiom
+words.
+
+#+BEGIN_SRC clojure :tangle src/kcats/core.clj
+  (defn update-stack [f env]
+    (update env ::stack f))
+
+  (defn s-apply
+    "Take nitems off the stack, apply them to f. f should return a list
+     to put back onto the stack."
+    [nitems f stack]
+    (let [[a b] (split-at nitems stack)]
+      (into b (apply f a))))
+
+  (defn s-apply-one
+    "Like s-apply, but useful for functions where you only want to put
+     one item back on the stack and f doesn't return a
+     list. Automatically creates a list of one item."
+    [nitems f stack]
+    (s-apply nitems (comp list f) stack))
+
+  (defn f-stack
+    "Apply nitems from stack to f, put result back on stack"
+    [nitems f]
+    (partial update-stack (partial s-apply-one nitems f)))
+
+  (defn inscribe
+  "Define a new word. Takes an aggregate off the stack which should be of the
+   form:
+   [new-word [program-item1 [program-item2 ...]]"
+    [{[[word word-def] & others] ::stack
+      ::keys [expression dictionary]}]
+    {::stack others
+     ::expression (pop expression)
+     ::dictionary (assoc dictionary word {::definition word-def})})
+#+END_SRC
+
+Here are some tests for what we have so far. This test will inscribe a
+new word, =plus= and then use it.
+#+BEGIN_SRC clojure 
+  (eval {::expression '[1 2 [plus [+]] inscribe plus]
+         ::dictionary {'+ {::fn (f-stack 2 #'+)}
+                       'inscribe {::fn #'inscribe}}
+         ::stack '()})
+  ;; should yield (3)
+
+#+END_SRC
+
+Now we can go ahead and start filling out axiom words in our default dictionary.
