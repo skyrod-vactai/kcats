@@ -345,3 +345,181 @@ new word, =plus= and then use it.
 #+END_SRC
 
 Now we can go ahead and start filling out axiom words in our default dictionary.
+
+#+BEGIN_SRC clojure :tangle src/kcats/core.clj
+
+  (spec/def ::stack-min-depth-1 (spec/coll-of ::item
+                                              :kind list?
+                                              :min-count 1))
+  (spec/def ::stack-min-depth-2 (spec/coll-of ::item
+                                              :kind list?
+                                              :min-count 2))
+
+  (spec/def ::binary-arithmetic (spec/cat :x ::number
+                                          :y ::number
+                                          :others (spec/* ::item)))
+
+  (spec/def ::predicate (spec/cat :x ::item
+                                  :others (spec/* ::item)))
+
+  (spec/def ::quoted-word (spec/coll-of ::word
+                                        :count 1
+                                        :kind vector?))
+  (def arithmetic-words
+    (into {} cat
+          [(for [sym ['+ '- '/ '* '< '<= '> '>= 'min 'max]]
+             [sym
+              {::spec ::binary-arithmetic
+               ::fn (f-stack 2 (resolve sym))}])
+           (for [sym ['inc 'dec]]
+             [sym
+              {::spec (spec/cat :x ::number
+                                :others (spec/* ::item))
+               ::fn (f-stack 1 (resolve sym))}])]))
+
+  (def predicates
+    (into {} cat
+          [(for [sym ['odd? 'even? 'sequential? 'zero? 'pos? 'neg?
+                      'number? 'int? 'true? 'false? 'nil? 'some?
+                      'string? 'empty?]]
+             [sym {::spec ::predicate
+                   ::fn (f-stack 1 (resolve sym))}])
+           (for [sym ['starts-with? 'ends-with?]]
+             [sym {::spec ::stack-min-depth-2
+                   ::fn (f-stack 2 (resolve sym))}])]))
+
+  (def builtin-words
+    (merge
+     arithmetic-words
+     predicates
+     {'pop {::spec ::stack-min-depth-1
+            ::fn (partial update-stack pop)}
+      'dup {::spec ::stack-min-depth-1
+            ::fn (partial update-stack (fn [s]
+                                         (conj s (first s))))}
+      'swap {::spec ::stack-min-depth-2
+             ::fn (partial update-stack (fn [[a b & others]]
+                                          (-> others
+                                              (conj a)
+                                              (conj b))))}
+      'i {::spec (spec/cat :program ::aggregate
+                           :others (spec/* ::item))
+          ::fn (fn [{[p & others] ::stack ::keys [dictionary expression]}]
+                 {::stack others
+                  ::expression (into expression p)
+                  ::dictionary dictionary})}
+      'dip {::spec (spec/cat :program ::aggregate
+                             :x ::item
+                             :others (spec/* ::item))
+            ::fn (fn [{[p x & others] ::stack ::keys [dictionary expression]}]
+                   {::stack others
+                    ::expression (into expression (conj p x))
+                    ::dictionary dictionary})}
+      'inscribe {::spec (spec/cat :definition (spec/tuple ::word ::aggregate)
+                                  :others (spec/* ::item))
+                 ::fn #'inscribe}
+      'describe {::spec (spec/cat :word (spec/tuple ::word)
+                                  :others (spec/* ::item))
+                 ::fn (fn [{[[word] & others] ::stack dict ::dictionary :as env}]
+                        (let [dfn (-> dict (get word) ::definition)]
+                          (if dfn
+                            (assoc env ::stack (conj others dfn))
+                            (-> "Word %s is not defined"
+                                (format word)
+                                Exception.
+                                throw))))}
+      'branch {::spec (spec/cat :condition ::boolean
+                                :true-branch ::aggregate
+                                :false-branch ::aggregate
+                                :others (spec/* ::item))
+               ::fn (fn [{[b t f & others] ::stack expression ::expression :as env}]
+                      (-> env
+                          (assoc ::stack others)
+                          (update ::expression into (conj (if b t f)))))}
+      '= {::spec (spec/cat :x ::item
+                           :y ::item
+                           :other (spec/* ::item))
+          ::fn (f-stack 2 =)}
+      'cons {::spec (spec/cat :x ::item
+                              :aggregate ::aggregate
+                              :others (spec/* ::item))
+             ::fn (f-stack 2 (comp vec cons))}
+      'some {::spec (spec/cat :program ::aggregate
+                              :aggregate ::aggregate ;; TODO finish this
+                              :others (spec/* ::item))
+             ::fn (fn [env]
+                    (update-stack
+                     (fn [[p a & others :as stack]]
+                       )))}
+      'first {::spec (spec/cat :aggregate ::aggregate, :other (spec/* ::item))
+              ::fn (f-stack 1 first)}
+      'map {::spec (spec/cat :program ::aggregate
+                             :aggregate ::aggregate
+                             :others (spec/* ::item))
+            ;; runs a parallel simulation - if the map function
+            ;; tries to add or remove more stack elements those
+            ;; changes will be lost - only top stack element is
+            ;; collected from each parallel run of p
+            ::fn (fn [env]
+                   #_(update-stack (fn [[p a & others :as stack]]
+                                     (conj others
+                                           (->> (for [item a]
+                                                  (eval (with-stack env (conj others item)) p))
+                                                (map (comp first :stack))
+                                                (into []))))
+                                   env))}
+      'filter {::spec (spec/cat :program ::aggregate
+                                :aggregate ::aggregate
+                                :others (spec/* ::item))
+               ;; runs a parallel simulation - if the filter function
+               ;; tries to add or remove more stack elements those
+               ;; changes will be lost - only top stack element is
+               ;; collected from each parallel run of p
+               ::fn (fn [env]
+                      #_(update-stack (fn [[p a & others :as stack]]
+                                        (->> a
+                                             (filter #(leaves-true? (with-stack env (conj others %)) p))
+                                             (into [])
+                                             (conj others)
+                                             (into [])))
+                                      env))}
+
+      'every? {::spec (spec/cat :program ::aggregate
+                                :aggregate ::aggregate
+                                :others (spec/* ::item))
+               ::fn (fn [env]
+                      #_(update-stack (fn [[p a & others :as stack]]
+                                        (->> a
+                                             (every? #(leaves-true? (with-stack env (conj others %)) p))
+                                             (conj others)))
+                                      env))}
+      'and  {::spec (spec/cat :x ::item, :y ::item,
+                              :others (spec/* ::item))
+             ::fn (f-stack 2 #(and %1 %2))}
+      'or  {::spec (spec/cat :x ::item, :y ::item,
+                             :others (spec/* ::item))
+            ::fn (f-stack 2 #(or %1 %2))}
+      'in  {::spec (spec/cat :aggregate ::aggregate, :item ::item
+                             :other (spec/* ::item))
+            ::fn (f-stack 2 contains?)}
+      'intersection {::spec (spec/cat :aggregate-x ::aggregate, :aggregate-y ::aggregate,
+                                      :others (spec/* ::item))
+                     ::fn (f-stack 2 (fn [x y]
+                                       (into []
+                                             (clojure.set/intersection
+                                              (into #{} x)
+                                              (into #{} y)))))}
+      'trace {::spec (spec/cat :program ::aggregate
+                               :others (spec/* ::item))
+              ::fn (fn [{[p & others] :stack :as env}]
+                     #_(reduce (fn [env item]
+                                 (let [r (eval-one env item)]
+                                   (debug r item)
+                                   r))
+                               (with-stack others)
+                               p))}}))(spec/def ::binary-arithmetic (spec/cat :x ::number
+                                                                              :y ::number
+                                                                              :others (spec/* ::item)))
+
+
+#+END_SRC
