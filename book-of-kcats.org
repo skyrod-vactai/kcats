@@ -29,7 +29,7 @@ The language should use as few concepts as possible. It may include
 + Primitive datatypes (numbers, booleans, strings, bytes)
 + Nested datatypes (lists, maps)
 + Functions
-+ Channels
++ Pipes
 
 It will explicitly *not* use
 
@@ -53,8 +53,6 @@ Items inside square brackets [] are quotations.
 #+BEGIN_EXAMPLE
 true ☯ 💭 false
 #+END_EXAMPLE
-
-
 ** Easy to implement
 ** Useful for general programming
 ** Make tool development as easy as possible
@@ -90,8 +88,9 @@ languages like python and ruby, but we won't consider this a goal.
                  consists of a dictionary and one or more stacks.
 - predicate :: a word that consumes stack items and leaves either true
                or false on the stack.
-- channel :: A method to communicate between stacks. Values are put
-             into channels on one stack, and emerge in another.
+- pipe :: A method to communicate between stacks and to the outside
+          world. Values are put into pipes and emerge elsewhere (in
+          the stack, another environment, a file, a socket, etc).
 * Prototype implementation
 ** Status
 The first implementation is entirely experimental. Everything in it is
@@ -220,9 +219,19 @@ last environment.
          first))
 #+END_SRC
 
-Now, we define =onto-stack=, which says what we do to put an item onto
-the stack. Simple items like numbers, strings and undefined words,
-just go straight onto the stack with no changes. 
+
+Next we're going to need some utility functions that operate on
+environments to do common things like moving items between the stack
+and the expression.
+
+#+BEGIN_SRC clojure :tangle src/kcats/core.clj
+
+#+END_SRC
+
+Now, we define =onto-stack=,
+which says what we do to put an item onto the stack. Simple items like
+numbers, strings and undefined words, just go straight onto the stack
+with no changes.
 
 #+BEGIN_SRC clojure :tangle src/kcats/core.clj
   (defmulti onto-stack
@@ -335,14 +344,51 @@ words.
      ::dictionary (assoc dictionary word {::definition word-def})})
 #+END_SRC
 
-Here are some tests for what we have so far. This test will inscribe a
-new word, =plus= and then use it.
+We're going to need to do repeated operations, like the =map= of
+functional programming, which means we need a mechanism to clone the
+stack and do operations essentially in parallel. Discussion: how do we
+do this in a composable way?
+
+We need to support things like map and filter and every?, so it's not
+necessarily just "run this program on each stack and collate the
+result". For example, every? short circuits to produce =false= when
+the first item fails the predicate.
+
+We need an extra mechanism to control how/when those extra programs
+are run.
+
+What if we had a stack of stacks? 
+
+
+#+BEGIN_EXAMPLE
+1 inc  ;; map
+2 inc
+3 inc
+
+1 odd?  ;; filter, every?
+2 odd?
+3 odd?
+#+END_EXAMPLE
+
+I'm not sure that's the right path, when joy/thun are using =cleave=
+as a parallelism primitive. We might be able to build something
+sufficiently flexible using that - basically doing a transduce using
+cleave? I don't know if cleave is quite the right construct because it
+only splits in two, and I could only see it being used in a reduce.
+
+There are several things that need to happen:
++ copy stack
++ push item from original list onto stack
++ run program on copy 
++ possibly do something with the resulting to element(s)
++ possibly stop before traversing the entire original list
+
+The undeveloped area seems to be the last two items, how to capture
+that in a function or program.
+
 #+BEGIN_SRC clojure 
-  (eval {::expression '[1 2 [plus [+]] inscribe plus]
-         ::dictionary {'+ {::fn (f-stack 2 #'+)}
-                       'inscribe {::fn #'inscribe}}
-         ::stack '()})
-  ;; should yield (3)
+  (defn parallel
+    "Run program(s) by making a stack (list?) of environments. The first program ")
 
 #+END_SRC
 
@@ -486,7 +532,9 @@ Now we can go ahead and start filling out axiom words in our default dictionary.
      predicates
      cardinality
      {'discard {::spec ::stack-min-depth-1
-                ::fn (partial update-stack #'discard* )}
+                ::fn (partial update-stack #'discard*)}
+      'pop {::spec ::stack-min-depth-1
+            ::definition '[1 discard]}
       'clone {::spec ::stack-min-depth-1
               ::fn (partial update-stack #'clone*)}
       'swap {::spec ::stack-min-depth-2
@@ -551,6 +599,10 @@ Now we can go ahead and start filling out axiom words in our default dictionary.
                                :false-branch ::program
                                :others (spec/* ::item))
               ::fn #'recur*}
+      'spread {::spec (spec/cat :gather ::program
+                                :spread ::program
+                                :others (spec/* ::item))
+               ::fn #'spread*} 
       '= {::spec (spec/cat :x ::item
                            :y ::item
                            :other (spec/* ::item))
@@ -654,9 +706,7 @@ Now we can go ahead and start filling out axiom words in our default dictionary.
                                    (debug r item)
                                    r))
                                (with-stack others)
-                               p))}}))(spec/def ::binary-arithmetic (spec/cat :x ::number
-                                                                              :y ::number
-                                                                              :others (spec/* ::item)))
+                               p))}}))
 
   (defn k
     "Run a program with the default env and return the result"
@@ -665,3 +715,203 @@ Now we can go ahead and start filling out axiom words in our default dictionary.
                     ::dictionary builtin-words
                     ::expression (list* p)})))
 #+END_SRC
+* Notes
+** Instruction set
+It might be prudent to define some low level words, and then define
+the higher level words in terms of those words. Essentially trading
+some performance for portability. Here's a stab at what some of the
+low level words would be. We could refer to positions on the stack and
+expression with an integer (positive = on stack, negative = on
+expression)
+
+- shift* items from the expression to the stack, or vice versa (neg),
+  int argument. Oops the problem here is if you shift stuff from
+  stack->expr whatever you shifted will get eval'd next, instead of
+  what you probably wanted
+
+- move* better than swap as you can specify what you're moving AND how
+  far. This has the problem of needing to know how long the section of
+  program is that you need to move things past. I'm not sure this is
+  useful either, as moving things into the expression is not very useful
+  
+- exchange* items at the given locations (eg -1 1 swap would swap the
+  top of the stack and top of the expression)
+
+- swap* shorthand for 1 2 exchange* (swap the top two items)
+
+- conj* the item on top of the stack into the agg just below it
+
+- concat* the top n (or 2?) items (lists)
+
+- execute* unwrap agg on ToS, move it into expr (to be eval'd)
+
+- discard* get rid of items on the stack
+
+- clone* duplicate items on the stack
+
+- cleave* the env into two, execute the program on ToS on one of
+  them, put result on other. drop the mutated env. -  see below
+
+- booleans and* or* not*
+
+- =* 
+
+- branch*
+
+- unwrap* - unwraps the aggregate at position n
+
+- inscribe*
+
+- describe* 
+
+Using this we can define =dip= like this (nope, does not work due to
+neg shift being worthless)
+
+#+BEGIN_EXAMPLE
+  1 2 swap* -1 shift* conj*
+
+  3 1 2 [* +] . dip
+  3 1 [* +] 2 . -1 shift* conj*
+  3 1 [* +] . 2 conj*
+  3 1 [* + 2]  
+#+END_EXAMPLE
+
+
+ok how about this
+
+#+BEGIN_EXAMPLE
+  swap* conj* execute*
+
+  3 4 2 5 [* +] . dip
+  3 4 2 5 [* +] . swap* conj* execute*
+  3 4 2 [* +] 5 . conj* execute*
+  3 4 2 [* + 5] . execute*
+  3 4 2 . * + 5
+  3 8 . + 5
+  11 . 5
+  11 5
+#+END_EXAMPLE
+
+ re cleave*, seems like there is some overlapping functionality
+ between parallelism and preserving the stack for things like
+ =nullary=. In both cases we're cloning the environment (or part of
+ it) so that multiple modifications don't conflict with each other.
+
+ The only difference is how we join the cloned stacks back together.
+
+ With nullary, we clone the env, run the program on the clone, take
+ the top of the stack and put it back on the original. throw the clone
+ env away.
+
+ With map, we clone the env (one for each item in the list), run the
+ program in parallel on each env, gather up the top items in each env,
+ and put it as a list on top of the original stack.
+
+ The question is, can we leverage kcats itself to manage the intra-env
+ computations? Seems like theoretically we could - make a new stack
+ consisting of the other stacks as list items in the new one. Then you
+ can process that arbitrarily and whatever remains can be used. Seems
+ like maybe channels should be a dependency here, since that would
+ easily pipe the right value back to the right env.
+
+So, what's needed here is another combinator (like genrec etc) that
+takes two programs:
+
++ one that takes (a clone of) the current stack
+and leaves on top a list of lists (where each item will represent a
+stack in a new env).
+
++ one that takes a list of items that were on top of the various
+stacks, and turns them back into items to be put back on the original
+stack. (in the case of map, noop).
+
+Let's try an example
+
+7 [1 2 3] [swap pop inc] map
+
+In this example, the =pop= would drop the =7= off the stack, so we're
+testing that it gets resurrected for each item in the list =[1 2 3]=.
+
+Let's define =f= as something that would take the input stack and leave
+
+7 [[1 swap pop inc] [2 swap pop inc] [3 swap pop inc]] (concat'ing the
+mapping function program onto each piece of data)
+
+Then that list-of-lists is what's used to make new environments (in
+the implementation of cleave*), each top-level item is a program to
+run.
+
+Then you'd have 3 environments, after the program had run, stacks look like this:
+
+2
+3
+4
+
+Then we'd need to specify how map gathers up the top items from this
+stack and adds them to the original:
+
+1 3 exchange pop pop
+
+  #+BEGIN_EXAMPLE
+So, what's needed here is another combinator (like genrec etc) that
+takes two programs:
+
+  ,* one that takes (a clone of) the current stack
+  and leaves on top a list of lists (where each item will represent a
+  stack in a new env).
+
+  ,* one that takes a list of items that were on top of the various
+  stacks, and turns them back into items to be put back on the original
+  stack. (in the case of map, noop).
+
+  Let's try an example
+
+  7 [1 2 3] [swap pop inc] map
+
+  In this example, the pop
+
+  map
+
+  7 [1 2 3] [inc] . map
+
+  env1
+  7 1 . inc
+  7 2
+
+  env2
+  7 2 . inc
+  7 3
+
+  env3
+  7 3 . inc
+  7 4
+
+
+  ,* distribute items f(stack) -> new env(s) expression (in the case of map, enstacken or whatever takes the agg on ToS as the items to be added)
+  ,* run all the envs (one per item in the list below ToS) 
+  ,* reduce all the ToSs (in the case of map we're already done)
+
+  Let's try nullary
+
+  2 3 [+] nullary
+
+  ,* enstacken
+  ,* run all (one)
+  ,* conj o
+** Dispatch
+#+BEGIN_EXAMPLE
+  [from where] [thing] get => the thing
+
+  network {url "http://foo.com"} get => (a pipe to read data from)
+  network {url "http://foo.com"} get bytes => (byte array)
+
+  [foo bar baz quux] mapping foo get => bar
+#+END_EXAMPLE
+
+Defining a multifn
+
+#+BEGIN_EXAMPLE
+  [type get] multi foo inscribe
+
+  [url [sdf asdf]] foo addmethod
+#+END_EXAMPLE
