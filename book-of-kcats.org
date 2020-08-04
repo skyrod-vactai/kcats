@@ -27,18 +27,16 @@ The language should use as few concepts as possible. It may include
 
 + Stacks
 + Primitive datatypes (numbers, booleans, strings, bytes)
-+ Nested datatypes (lists, maps)
++ lists
 + Functions
 + Pipes
 
 It will explicitly *not* use
 
 + Variables
-+ User-defined Types (static or dynamic)
 + Classes
-+ Loops
 + Lexical or dynamic scope rules
-+ Macros
++ Precompiled libraries
 *** Easy to understand documentation
 **** Documentation by example
 By documenting by example only, no translation into other languages is
@@ -64,9 +62,9 @@ should be able to send anything to a remote interpreter, even one that
 is not the same implementation, and have it understand the value it
 received.
 
-There will be no compiled binary code, at least, not a standard one
-that users can rely on. All code will be source and run via the
-interpreter.
+There will be no compiled binary code, at least, not a portable
+one. If there is compilation it will be local only (all libs built
+locally from source). 
 * Non-goals
 ** Fast performance
 It would be nice if kcats were at least as fast as slower scripting
@@ -228,15 +226,6 @@ last environment.
          first))
 #+END_SRC
 
-
-Next we're going to need some utility functions that operate on
-environments to do common things like moving items between the stack
-and the expression.
-
-#+BEGIN_SRC clojure :tangle src/kcats/core.clj
-
-#+END_SRC
-
 Now, we define =onto-stack=,
 which says what we do to put an item onto the stack. Simple items like
 numbers, strings and undefined words, just go straight onto the stack
@@ -345,7 +334,7 @@ words.
   (defn inscribe
   "Define a new word. Takes an aggregate off the stack which should be of the
    form:
-   [new-word [program-item1 [program-item2 ...]]"
+   [new-word program]"
     [{[[word word-def] & others] ::stack
       ::keys [expression dictionary]}]
     {::stack others
@@ -566,6 +555,10 @@ Now we can go ahead and start filling out axiom words in our default dictionary.
                              :program ::aggregate
                              :others (spec/* ::item))
             ::fn #'dip*}
+      'quote {::spec (spec/cat :item ::item
+                               :others (spec/* ::item))
+              ::fn (partial update-stack (fn [[item & others]]
+                                           (concat others [[item]])))}
       'inscribe {::spec (spec/cat :definition (spec/tuple ::word ::aggregate)
                                   :others (spec/* ::item))
                  ::fn #'inscribe}
@@ -715,7 +708,10 @@ Now we can go ahead and start filling out axiom words in our default dictionary.
                                    (debug r item)
                                    r))
                                (with-stack others)
-                               p))}}))
+                               p))}
+      'multi {::spec (spec/cat :dispatch ::program
+                               :others (spec/* ::item))
+              ::definition '[quote [execute [] swap get execute] concat]}}))
 
   (defn k
     "Run a program with the default env and return the result"
@@ -723,6 +719,33 @@ Now we can go ahead and start filling out axiom words in our default dictionary.
     (::stack (eval {::stack '()
                     ::dictionary builtin-words
                     ::expression (list* p)})))
+#+END_SRC
+** Maps/associations
+A simple implementation that works well for small lists: specify
+associations as lists of pairs.
+
+#+BEGIN_SRC clojure :tangle src/kcats/core.clj
+  (spec/def ::pair (spec/coll-of ::item :kind vector? :count 2))
+
+  (spec/def ::association-list (spec/coll-of ::pair
+                                             :kind vector?))
+
+  (def builtin-words
+    (update builtin-words merge
+            {'assoc {::spec (spec/cat :item ::pair, :alist ::association-list
+                                      :others (spec/* ::item))
+                     ::fn (partial update-stack (fn [[item alist & others]]
+                                                  (->> alist
+                                                       (into {})
+                                                       (apply assoc)
+                                                       (into [])
+                                                       (conj others))))}}))
+#+END_SRC
+** Multimethods
+These are words that have different behavior depending on what is on
+the stack. 
+#+BEGIN_SRC clojure :tangle src/kcats/core.clj
+
 #+END_SRC
 * Notes
 ** Instruction set
@@ -907,6 +930,7 @@ takes two programs:
   ,* enstacken
   ,* run all (one)
   ,* conj o
+#+END_EXAMPLE
 ** Dispatch
 #+BEGIN_EXAMPLE
   [from where] [thing] get => the thing
@@ -924,3 +948,136 @@ Defining a multifn
 
   [url [sdf asdf]] foo addmethod
 #+END_EXAMPLE
+
+How do we implement? Somewhere we need a dictionary mapping from
+dispatch value to a program.
+
+We *could* make these standard-shape programs and just manipulate
+them.
+
+#+BEGIN_EXAMPLE
+  [[odd?] execute [[true [inc]] [false []]] swap get execute]
+
+  ;; so the pattern here is [dispatch-fn execute methods swap get execute]
+
+  ;; if we want to add a method, we can just insert it with add
+ 
+  ;; we can create an empty multi from a dispatch:
+
+  [[odd?] list [execute [] swap get execute] concat ;; or some such
+ 
+  ;; then to update an already inscribed method
+  [[foo] dup describe ... (updating) ... 
+#+END_EXAMPLE
+** Pipes
+This is a general coordination construct. A pipe is a one way
+communication channel, you put values in at one end, and take them off
+at the other. Where the data actually goes (in memory, over network,
+to a file, etc) is up to the implementation.
+
+There are a few words that a pipe needs to respond to:
++ put - put a value into the pipe (may block)
++ take - take a value out of the pipe (may block)
++ close - close the input end of the pipe (no more puts)
+
+And then some higher level words that let you do more complex things:
++ choose - given a list of pipes, block until one has a value ready,
+  then return [val pipe].
++ copy - given two pipes, the values that emerge from the first will
+  also emerge from the 2nd.
++ dump - given a pipe and an aggregate, put all the items of the
+  aggregate into the pipe.
+
+Unlike go/coreasync, there are no non-blocking operations, as envs are
+equivalent to go blocks, so everything is in a go block.
+#+BEGIN_EXAMPLE
+  ;; create a pipe 
+
+  
+#+END_EXAMPLE
+** Hash maps
+*** Use a map literal or not?
+Do we add a new literal type for maps? ={a 1 b 2}= ?
+
+Or do we just use a list literal and specify that we want to look at
+it like a map? =[a 1 b 2] hashmap=?
+
+Data's just data, should it also carry around how it's supposed to be
+looked at? A hashmap is just a list with some optimizations (the data
+is grouped by hash so that you can find an item in O(1) time - but you
+can always construct a hashmap from a list as the list has all the
+data).
+
+All data can be represented as lists (possibly nested), eg a graph
+=1->2<-3= is =[[1 2] [3 2]]=
+
+Do we just not bother to turn a list into something else until we
+reach a word that expects a certain semantic? for example:
+
+=[a 1 b 2] b get= we're clearly using =get= as a hashmap get, not
+trying to get a vector item at an index b. (however if you allowed
+integer keys, it would become ambiguous - but let's ignore that for
+now). So maybe the language impl can see that we intend to use this
+list as a map, and create a hashmap under the covers. (note I no
+longer think this is necessary esp for smaller maps. elisp just uses
+association lists (O(n) lookup) and for small maps it's actually going
+to be faster than hashmap lookup. The vast, vast majority is going to
+fall into that category. Hashmaps should be available for larger data
+but not the default for literals.
+*** Hashmap/ case statement equivalence
+There's no difference between a hashmap with get, and a case statement
+in this language. So maybe we shouldn't bother with hashmap types? We
+could just have a program that we pass around and can modify?
+ 
+=[a 1 b 2] b case=
+*** Environments as first class objects
+If we can operate on envs on a stack, that might open up some simpler
+implementations and/or better abstraction.
+#+BEGIN_SRC clojure
+  (defn stackify
+    "Take the stacks of the given envs and add them to the stack of
+    top-level-env"
+    [{::keys [stack] :as top-level-env} envs]
+    (update top-level-env :stack concat (mapv ::stack envs)))
+
+
+#+END_SRC
+** Types
+How do we express types? We're definitely going to want to dispatch
+methods based on "type" (whatever that may mean). One approach is to
+just treat any map with a =type= field as an object. We'd need some
+kind of inheritance functionality to be able to count, say, a =float=
+type as a =number= type. However a single =type= may not be expressive
+enough. In other languages, a type might be labelled with all the
+interfaces or protocols it implements. I'm not sure that's necessary -
+to find out if a type has a method implementation, we could possibly
+introspect the dictionary and see what methods have a dispatch for
+that type. It seems to me that would only be needed for exploratory
+purposes (to find out what you can do with a given type), not at
+runtime.
+
+#+BEGIN_EXAMPLE
+[type get] multi fetch inscribe ;; return bytes
+[url [prog to get url]] [fetch] method put ;; uh oh, how do we avoid actually calling fetch here?? needs to be quoted
+[[type url] [url "http://google.com"]] fetch
+;; or how about a shorthand
+[url "http://google/com"] hint fetch ;; where hint converts into a map with 2 values
+
+[file [prog to read file]] [fetch] method put
+[file "/tmp/blah.kcats"] hint fetch read eval ;; run a script?
+#+END_EXAMPLE
+
+What about generics? How to express "list of int"?
+
+Could we make use of a predicate(s)? eg [[value 1] [type integer?]]
+** Quoting
+Do we need a special quote syntax other than aggregates? I'm thinking
+of quoting a single word, (using lisp syntax here) is '(foo)
+equivalent to 'foo? Obviously in lisp it isn't. I don't think it will
+be in kcats either. For example the equivalent of assoc, it seems
+reasonable to use a word as a key, but as soon as you put the word on
+the stack, it's executed before we can assoc a value. That's not what
+we intended. One way out is to do =[word] unwrap= which would just
+leave =word= bare on the stack. Doing this might be rare enough that
+it's ok to be that clunky vs making the language more complex to
+support =quote=.
