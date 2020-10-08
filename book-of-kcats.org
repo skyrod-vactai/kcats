@@ -759,6 +759,126 @@ associations as lists of pairs.
                                                        (into [])
                                                        (conj others))))}}))
 #+END_SRC
+** Pipes
+*** Basics
+Pipes are a coordination construct - a way to get values from here to
+there, when "there" is further away than a simple function call. In
+that sense it "breaks" functional programming by introducing state,
+but quite often real programs need to deal with state. That state
+could just be something introduced by, and consumed by, the local
+environment, or it could be received from another machine thousands of
+miles away.
+
+The interface is simple enough - we just need to be able to put values
+into a pipe at one end, and take them off at the other. It's also
+handy to know whether there's anything in the pipe or not, and whether
+the pipe is "full" (nothing more will fit until something at the other
+end is removed).
+
+#+begin_src clojure :tangle src/kcats/pipe.clj
+  (ns kcats.pipe)
+
+  (defprotocol Pipe
+    (put [pipe value] "Puts a value into the pipe, blocks if the pipe is full, returns value on success")
+    (take [pipe] "Takes a value from the pipe, blocks if pipe is empty, returns the value")
+    (empty? [pipe] "Returns whether the pipe has a value ready to take")
+    (full? [pipe] "Returns whether the pipe has space to put a new value"))
+#+end_src
+
+Now we can make some higher level functions that will actually be what
+kcats primitives will be defined in terms of.
+#+begin_src clojure :tangle src/kcats/pipe.clj
+  (def default-pause 10) ;; pause this long when polling empty/full
+
+  (defn take!
+    "Takes from the given pipe and returns a value, blocks if empty."
+    [pipe]
+    (loop []
+      (if (empty? pipe)
+        (do (Thread/sleep default-pause) (recur))
+        (take pipe))))
+
+  (defn put!
+    "Puts a value into the given pipe and returns it, blocks if full."
+    [pipe value]
+    (loop []
+      (if (full? pipe)
+        (do (Thread/sleep default-pause) (recur))
+        (do (put pipe value) value))))
+
+  (defn select
+    "Takes a coll of pipes. Whichever one is non-empty first, return the
+    pipe and the value that was in it."
+    [pipes]
+    (loop [[this-pipe & remaining-pipes] pipes]
+      (if this-pipe
+        (if (empty? this-pipe)
+          (recur remaining-pipes)
+          ;; found it, return the pipe and value as a tuple
+          [this-pipe (take! this-pipe)])
+        ;; everything empty, start over
+        (do (Thread/sleep default-pause)
+            (recur pipes)))))
+#+end_src
+
+Now we can define a few different kinds of pipes, starting with simple
+"local" types.
+*** Atoms
+This is a pipe that when you take, always returns the last value
+put. It's never full, whatever you put just overwrites what was there
+before. It has to be initialized with a value. It's functionally
+equivalent to a clojure atom and is implemented in terms of one.
+#+begin_src clojure :tangle src/kcats/pipe.clj
+  (defrecord Atom [a]
+      Pipe
+    (put [this value] (reset! a value))
+    (take [this] @a)
+    (empty? [this] false)
+    (full? [this] false))
+
+  (defn ->atom
+    "Creates a new atom pipe with initial value v"
+    [v]
+    (->Atom (atom v)))
+#+end_src
+*** Timeout
+This is a pipe that when you take, it will block for a predefined
+period of time (decided when the pipe is created), and then return the
+boolean value =true=. It is always full (cannot accept puts - it will
+just block, doesn't make sense to do it).
+
+The purpose of this kind of pipe is to use with =select= - where you
+have a set of pipes and you want to take from whichever one is
+non-empty first. You can include a timeout pipe in there to guarantee
+that at least one of them will return something eventually.
+
+#+begin_src clojure :tangle src/kcats/pipe.clj
+  (defrecord Timeout [until-timestamp]
+      Pipe
+    (put [this value])
+    (take [this] true)
+    (empty? [this] (< (System/currentTimeMillis) until-timestamp))
+    (full? [this] true))
+
+  (defn ->timeout
+    "Creates a new timeout pipe that waits t milliseconds and then
+    returns a single value (true) from the pipe"
+    [t]
+    (->Timeout (+ (System/currentTimeMillis) t)))
+#+end_src
+*** Notes
+core.async has an out-of-band close message. Do we need that? Seems
+handy but also adds complexity as it becomes an error condition trying
+to put/take into a closed pipe, that would then need to be handled.
+
+Seems acceptable to me that pipes are just there and if you want to
+tell whoever's at the other end that you're done sending, just send
+something that tells them that.
+
+It might be nice for the receiver to be able to let the sender know
+he's "hanging up", but I think that function is better handled at a
+higher level of abstraction (something built on top of bidirectional
+pipes, which is just two pipes with the sender and receiver swapped)
 ** Multimethods
 These are words that have different behavior depending on what is on
 the stack. 
