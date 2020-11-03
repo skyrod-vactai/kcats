@@ -321,7 +321,7 @@
                             :aggregate ::aggregate
                             :others (spec/* ::item))
            ::fn (fn [{[p [agg-item & agg-rest] & others] ::stack
-                      ::keys                             [expression dictionary]}]
+                      ::keys [expression dictionary]}]
                   {::expression (concat (cond-> ['execute]
                                           (seq agg-rest) (concat [(vec agg-rest) p 'step]))
                                         expression)
@@ -333,6 +333,16 @@
                              :false-branch ::program
                              :others (spec/* ::item))
             ::fn #'recur*}
+    'loop {::spec (spec/cat :program ::program
+                            :flag ::item
+                            :others (spec/* ::item))
+           ::fn (fn [{[p f & others] ::stack
+                      ::keys [expression dictionary]}]
+                  {::stack others
+                   ::expression (if f
+                                  (concat (p [p 'loop] expression))
+                                  expression)
+                   ::dictionary dictionary})}
     'spread {::spec (spec/cat :gather ::program
                               :spread ::program
                               :others (spec/* ::item))
