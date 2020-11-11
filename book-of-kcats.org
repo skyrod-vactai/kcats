@@ -62,6 +62,16 @@ false ☯ 💭 true
 In the example without knowing in advance what the ☯ symbol does, you
 can figure out that it's a logical =not= operator.
 ** Easy to implement
+Making a working implementation should involve as few primitives as
+possible, with the bulk of the language being defined in terms of the
+few primitives. This may result in slow performance, but implementors
+can incrementally improve performance by replacing core words with
+primitive versions (written in the platform language).
+
+Ideally the number of minimally required primitive words should be in
+the "few dozen" range, and the LOC would be well under 10,000,
+hopefully closer to 1000.
+
 ** Useful for general programming
 ** Make tool development as easy as possible
 + Debuggers
@@ -85,9 +95,6 @@ This language is meant to . There are a myriad of use cases even when the langua
 the slowest language on earth.
 ** Easy static analysis
 * Definining some terms
-:PROPERTIES:
-:CUSTOM_ID: definitions
-:END:
 - stack :: A first-in, first-out structure. This is mainly where data
            the program needs to manipulate will be stored.
 - aggregate :: A list of items, which can be interpreted either as
@@ -146,7 +153,11 @@ uses them. If it's a clojure boolean, it's a kcats boolean, etc.
   (spec/def ::number number?)
   (spec/def ::string string?)
   (spec/def ::bytes bytes?)
+  (spec/def ::integer integer?)
 #+END_SRC
+
+#+RESULTS:
+: :kcats.core/boolean:kcats.core/number:kcats.core/string:kcats.core/bytes:kcats.core/integer
 
 Now we'll spec some concepts in kcats in terms of clojure
 concepts. We'll need to specify what kinds of things can go in a
@@ -353,9 +364,9 @@ words.
     (partial update-stack (partial s-apply-one nitems f)))
 
   (defn inscribe
-  "Define a new word. Takes an aggregate off the stack which should be of the
-   form:
-   [new-word program]"
+    "Define a new word. Takes an aggregate off the stack which should be of the
+    form:
+    [new-word program]"
     [{[[word word-def] & others] ::stack
       ::keys [expression dictionary]}]
     {::stack others
@@ -442,6 +453,9 @@ Detected 1 error
 
 Now we can go ahead and start filling out axiom words in our default dictionary.
 
+First we'll make some specs so we get a better error message when a
+word doesn't get the stack arguments that it needs.
+
 #+BEGIN_SRC clojure :tangle src/kcats/core.clj
 
   (spec/def ::stack-min-depth-1 (spec/coll-of ::item
@@ -461,9 +475,10 @@ Now we can go ahead and start filling out axiom words in our default dictionary.
   (spec/def ::quoted-word (spec/coll-of ::word
                                         :count 1
                                         :kind vector?))
+
   (def arithmetic-words
     (into {} cat
-          [(for [sym ['+ '- '/ '* '< '<= '> '>= 'min 'max 'quot 'rem]]
+          [(for [sym ['+ '- '/ '* '< '<= '> '>= 'min 'max 'quot 'rem 'mod]]
              [sym
               {::spec ::binary-arithmetic
                ::fn (f-stack 2 (resolve sym))}])
@@ -500,7 +515,7 @@ Now we can go ahead and start filling out axiom words in our default dictionary.
                                          :kind stack?)
                     ::definition [num]}])]))
   (defn roll*
-    [[distance depth & others]]
+    [[depth distance & others]]
     (let [[top rest] (split-at depth others)
           [a b] (split-at (mod (- distance) depth) top)]
       (concat b a rest)))
@@ -563,6 +578,14 @@ Now we can go ahead and start filling out axiom words in our default dictionary.
        ::expression (concat expression gather)
        ::dictionary dictionary}))
 
+  ;; since we'll commonly be defining specs for a stack, we'll nearly
+  ;; always not care about anything below a certain depth, so let's make
+  ;; a macro that encapsulates that.
+  (defmacro stack-spec
+    [& args]
+    `(spec/cat ~@args
+               :others (spec/* ::item)))
+
   (def builtin-words
     (merge
      arithmetic-words
@@ -571,38 +594,41 @@ Now we can go ahead and start filling out axiom words in our default dictionary.
      {'discard {::spec ::stack-min-depth-1
                 ::fn (partial update-stack #'discard*)}
       'pop {::spec ::stack-min-depth-1
-            ::definition '[1 discard]}
+            ::definition '[1 discard]
+            ::examples '[[[1 2 3 pop] [2 1]]
+                        [[1 2 3 [a b c] pop] [3 2 1]]]}
       'clone {::spec ::stack-min-depth-1
-              ::fn (partial update-stack #'clone*)}
+              ::fn (partial update-stack
+                            (fn [[item :as stack]]
+                              (conj stack item)))
+              ::examples '[[[1 2 3 clone] [3 3 2 1]]]}
       'swap {::spec ::stack-min-depth-2
              #_::fn #_(partial update-stack (fn [[a b & others]]
                                               (-> others
                                                   (conj a)
                                                   (conj b))))
-             ::definition '[2 1 roll]}
+             ::definition '[1 2 roll]
+             ::examples '[[[1 2 3 swap] [2 3 1]]]}
       'roll {::spec (spec/coll-of ::item
                                   :kind stack?
                                   :min-count 2) ;; should be dynamic w depth
              ::fn (partial update-stack #'roll*)}
-      'execute {::spec (spec/cat :program ::program
-                                 :others (spec/* ::item))
+      'execute {::spec (stack-spec :program ::program)
                 ::fn (fn [{[p & others] ::stack ::keys [dictionary expression]}]
                        {::stack others
                         ::expression (concat p expression)
-                        ::dictionary dictionary})}
-      'dip {::spec (spec/cat :depth integer?
-                             :program ::aggregate
-                             :others (spec/* ::item))
+                        ::dictionary dictionary})
+                ::examples '[[[2 [+] 4 swap execute] [6]]]}
+      'dip {::spec (stack-spec :depth integer?
+                               :program ::aggregate)
             ::fn #'dip*}
-      'quote {::spec (spec/cat :item ::item
-                               :others (spec/* ::item))
+      'quote {::spec (stack-spec :item ::item)
               ::fn (partial update-stack (fn [[item & others]]
                                            (concat others [[item]])))}
-      'inscribe {::spec (spec/cat :definition (spec/tuple ::word ::aggregate)
-                                  :others (spec/* ::item))
-                 ::fn #'inscribe}
-      'describe {::spec (spec/cat :word (spec/tuple ::word)
-                                  :others (spec/* ::item))
+      'inscribe {::spec (stack-spec :definition (spec/tuple ::word ::aggregate))
+                 ::fn #'inscribe
+                 ::examples '[[[[add3 [3 +]] inscribe 5 add3] [8]]]}
+      'describe {::spec (stack-spec :word (spec/tuple ::word))
                  ::fn (fn [{[[word] & others] ::stack dict ::dictionary :as env}]
                         (let [dfn (-> dict (get word) ::definition)]
                           (if dfn
@@ -611,22 +637,19 @@ Now we can go ahead and start filling out axiom words in our default dictionary.
                                 (format word)
                                 Exception.
                                 throw))))}
-      'branch {::spec (spec/cat :false-branch ::aggregate
-                                :true-branch ::aggregate
-                                :condition ::item
-                                :others (spec/* ::item))
+      'branch {::spec (stack-spec :false-branch ::aggregate
+                                  :true-branch ::aggregate
+                                  :condition ::item)
                ::fn (fn [{[f t b & others] ::stack expression ::expression :as env}]
                       (-> env
                           (assoc ::stack others)
                           (update ::expression concat (if b t f))))}
-      'ifte {::spec (spec/cat :false-branch ::aggregate
-                              :true-branch ::aggregate
-                              :condition ::program
-                              :others (spec/* ::item))
+      'ifte {::spec (stack-spec :false-branch ::aggregate
+                                :true-branch ::aggregate
+                                :condition ::program)
              ::definition '[[execute] second dip branch]}
-      'step {::spec (spec/cat :program ::aggregate
-                              :aggregate ::aggregate
-                              :others (spec/* ::item))
+      'step {::spec (stack-spec :program ::aggregate
+                                :aggregate ::aggregate)
              ::fn (fn [{[p [agg-item & agg-rest] & others] ::stack
                         ::keys [expression dictionary]}]
                     {::expression (concat (cond-> ['execute]
@@ -634,15 +657,13 @@ Now we can go ahead and start filling out axiom words in our default dictionary.
                                           expression)
                      ::stack (conj others agg-item p)
                      ::dictionary dictionary})}
-      'recur {::spec (spec/cat :rec2 ::program
-                               :rec1 ::program
-                               :true-branch ::program
-                               :false-branch ::program
-                               :others (spec/* ::item))
+      'recur {::spec (stack-spec :rec2 ::program
+                                 :rec1 ::program
+                                 :true-branch ::program
+                                 :false-branch ::program)
               ::fn #'recur*}
-      'loop {::spec (spec/cat :program ::program
-                              :flag ::item
-                              :others (spec/* ::item))
+      'loop {::spec (stack-spec :program ::program
+                                :flag ::item)
              ::fn (fn [{[p f & others] ::stack
                         ::keys [expression dictionary]}]
                     {::stack others
@@ -650,52 +671,51 @@ Now we can go ahead and start filling out axiom words in our default dictionary.
                                     (concat p [p 'loop] expression)
                                     expression)
                      ::dictionary dictionary})}
-      'spread {::spec (spec/cat :gather ::program
-                                :spread ::program
-                                :others (spec/* ::item))
+      'spread {::spec (stack-spec :gather ::program
+                                  :spread ::program)
                ::fn #'spread*} 
-      '= {::spec (spec/cat :x ::item
-                           :y ::item
-                           :other (spec/* ::item))
+      '= {::spec (stack-spec :x ::item, :y ::item)
           ::fn (f-stack 2 =)}
-
-      'pack {::spec (spec/cat :x ::item
-                              :aggregate ::aggregate
-                              :others (spec/* ::item))
-             ::fn (f-stack 2 (fn [x a]
-                               (conj (vec a) x)))}
-      'unpack {::spec (spec/cat :aggregate ::aggregate
-                                :others (spec/* ::item))
+      'pack {::spec (stack-spec :x ::item
+                                :aggregate ::aggregate)
+             ::fn (f-stack 2 (fn [a x]
+                               (conj (vec a) x)))
+             ::examples '[[[[] 1 pack] [[1]]]
+                         [[[1 2 3] 4 pack] [[1 2 3 4]]]]}
+      'unpack {::spec (stack-spec :aggregate ::aggregate)
                ::fn (partial update-stack (fn [[[x & rest] & others]]
                                             (apply list x (vec rest) others)))}
-      'join {::spec (spec/cat :agg1 ::aggregate
-                              :agg1 ::aggregate
-                              :others (spec/* ::item))
-             ::fn (f-stack 2 (comp vec #(concat %2 %1)))}
-      'swaack {::spec (spec/cat :list ::aggregate
-                                :others (spec/* ::item))
+      'count {::spec (stack-spec :aggregate ::aggregate)
+              ::fn (partial update-stack (fn [[agg & others]]
+                                           (println agg)
+                                           (conj others (count agg))))}
+      'join {::spec (stack-spec :agg1 ::aggregate
+                                :agg2 ::aggregate)
+             ::fn (f-stack 2 (comp vec concat))}
+      'range {::spec (stack-spec :from ::integer
+                                 :to ::integer)
+              ::fn (f-stack 2 (comp vec range))}
+      'swaack {::spec (stack-spec :list ::aggregate)
                ::doc "Swaps the list on top of the stack and the rest of the stack"
                ::fn (fn [{[a & others] ::stack ::keys [dictionary expression]}]
                       {::stack (apply list (vec others) a)
                        ::expression expression
                        ::dictionary dictionary})}
-      'infra {::spec (spec/cat :program ::program
-                               :list ::aggregate
-                               :others (spec/* ::item))
+      'infra {::spec (stack-spec :program ::program
+                                 :list ::aggregate)
               ::doc "Accept a quoted program and a list on the stack and run the program
                       with the list as its stack.  Does not affect the rest of the stack."
               ::definition '[swap swaack uncons dip swaack]}
-      'some {::spec (spec/cat :program ::aggregate
-                              :aggregate ::aggregate ;; TODO finish this
-                              :others (spec/* ::item))
+      'some {::spec (stack-spec :program ::aggregate
+                                :aggregate ::aggregate ;; TODO finish this
+                                )
              ::fn (fn [env]
                     (update-stack
                      (fn [[p a & others :as stack]])))}
       'getfirst {::spec (spec/cat :aggregate ::aggregate, :other (spec/* ::item))
                  ::fn (f-stack 1 first)}
-      'map {::spec (spec/cat :program ::aggregate
-                             :aggregate ::aggregate
-                             :others (spec/* ::item))
+      'map {::spec (stack-spec :program ::aggregate
+                               :aggregate ::aggregate)
             ;; runs a parallel simulation - if the map function
             ;; tries to add or remove more stack elements those
             ;; changes will be lost - only top stack element is
@@ -708,9 +728,8 @@ Now we can go ahead and start filling out axiom words in our default dictionary.
                                                 (map (comp first :stack))
                                                 (into []))))
                                    env))}
-      'filter {::spec (spec/cat :program ::aggregate
-                                :aggregate ::aggregate
-                                :others (spec/* ::item))
+      'filter {::spec (stack-spec :program ::aggregate
+                                  :aggregate ::aggregate)
                ;; runs a parallel simulation - if the filter function
                ;; tries to add or remove more stack elements those
                ;; changes will be lost - only top stack element is
@@ -724,33 +743,27 @@ Now we can go ahead and start filling out axiom words in our default dictionary.
                                              (into [])))
                                       env))}
 
-      'every? {::spec (spec/cat :program ::aggregate
-                                :aggregate ::aggregate
-                                :others (spec/* ::item))
+      'every? {::spec (stack-spec :program ::aggregate
+                                  :aggregate ::aggregate)
                ::fn (fn [env]
                       #_(update-stack (fn [[p a & others :as stack]]
                                         (->> a
                                              (every? #(leaves-true? (with-stack env (conj others %)) p))
                                              (conj others)))
                                       env))}
-      'and  {::spec (spec/cat :x ::item, :y ::item,
-                              :others (spec/* ::item))
+      'and  {::spec (stack-spec :x ::item, :y ::item,)
              ::fn (f-stack 2 #(and %1 %2))}
-      'or  {::spec (spec/cat :x ::item, :y ::item,
-                             :others (spec/* ::item))
+      'or  {::spec (stack-spec :x ::item, :y ::item,)
             ::fn (f-stack 2 #(or %1 %2))}
-      'in  {::spec (spec/cat :aggregate ::aggregate, :item ::item
-                             :other (spec/* ::item))
+      'in  {::spec (stack-spec :aggregate ::aggregate, :item ::item)
             ::fn (f-stack 2 contains?)}
-      'intersection {::spec (spec/cat :aggregate-x ::aggregate, :aggregate-y ::aggregate,
-                                      :others (spec/* ::item))
+      'intersection {::spec (stack-spec :aggregate-x ::aggregate, :aggregate-y ::aggregate,)
                      ::fn (f-stack 2 (fn [x y]
                                        (into []
                                              (clojure.set/intersection
                                               (into #{} x)
                                               (into #{} y)))))}
-      'trace {::spec (spec/cat :program ::aggregate
-                               :others (spec/* ::item))
+      'trace {::spec (stack-spec :program ::aggregate)
               ::fn (fn [{[p & others] :stack :as env}]
                      #_(reduce (fn [env item]
                                  (let [r (eval-one env item)]
@@ -758,8 +771,7 @@ Now we can go ahead and start filling out axiom words in our default dictionary.
                                    r))
                                (with-stack others)
                                p))}
-      'multi {::spec (spec/cat :dispatch ::program
-                               :others (spec/* ::item))
+      'multi {::spec (stack-spec :dispatch ::program)
               ::definition '[quote [execute [] swap get execute] concat]}}))
 
   (defn k
@@ -768,6 +780,22 @@ Now we can go ahead and start filling out axiom words in our default dictionary.
     (::stack (eval {::stack '()
                     ::dictionary builtin-words
                     ::expression (list* p)})))
+
+  (require '[clojure.test :as test])
+  (defn test
+    "Run through all the examples in the default env and make sure they work"
+    []
+    (doseq [[word {::keys [examples]}] builtin-words]
+      (test/testing (str word)
+        (doseq [[program exp-stack] examples]
+          (->> {::stack '()
+                ::dictionary builtin-words
+                ::expression program}
+               eval
+               ::stack
+               vec
+               (= exp-stack)
+               test/is)))))
 #+END_SRC
 
 #+RESULTS:
@@ -795,16 +823,27 @@ Then include some words that depend on this functionality.
                                                        (apply assoc)
                                                        (into [])
                                                        (conj others))))}
+             'lookup {::spec (spec/cat ::key ::item
+                                       ::map ::association-list)
+                      ::fn (partial update-stack (fn [[key alist & others]]
+                                                   (conj others
+                                                         (get (into {} alist) key []))))}
              'cond {::spec (spec/cat :test-expr-pairs ::association-list
                                      :other (spec/* ::item))
-                    ::fn (fn [{[[[test expr] & other-clauses] & others] ::stack
+                    ::fn (fn [{[[[test expr :as first-clause]
+                                 & other-clauses]
+                                & others] ::stack
                                ::keys [dictionary expression]}]
-                           {::expression (concat [test
-                                                  expr ;; the then
-                                                  [(vec other-clauses) 'cond] ;; the else
-                                                   'ifte]
-                                                 expression)
-                            ::stack others
+                           {::expression (if first-clause
+                                           (concat [test
+                                                    expr ;; the then
+                                                    [(vec other-clauses) 'cond] ;; the else
+                                                    'ifte]
+                                                   expression)
+                                           expression)
+                            ::stack (cond-> others
+                                      ;; if cond is empty result is empty list
+                                      (not first-clause) (conj []))
                             ::dictionary dictionary})}}))
 #+END_SRC
 
@@ -812,7 +851,7 @@ Then include some words that depend on this functionality.
 : :kcats.core/pair:kcats.core/association-list#'kcats.core/builtin-words
 
 
-#+begin_src clojure :tangle src/kcats
+#+begin_src clojure :tangle src/kcats/core.clj
 
 #+end_src
 ** Pipes
@@ -1162,6 +1201,10 @@ Tried and true, but requires the implementation of a type hierarchy to
 do dispatch by type properly
 
 **** Predicate based
+This is where the implementation of multimethods is just =cond=. The
+conditions are data (just like everything else) and to add methods,
+you just insert a condition. 
+
 A series of predicate/method pairs- Iterate over the pairs, and the
 first one where the pred returns true, execute the
 method. Performance-wise, it could be slower if there's lots of
@@ -1172,7 +1215,7 @@ basically always true) you'd have to make sure that's last in the
 list.
 
 There's another performance issue - sometimes predicates are expensive
-to calculate repeausbtedly. Let's say you have a list of a billion
+to calculate repeatedly. Let's say you have a list of a billion
 integers, and you have a method that is dispatched to with =[int?
 every?]=. There's a couple strategies to combat having to examine
 every item in that list, especially multiple times:
