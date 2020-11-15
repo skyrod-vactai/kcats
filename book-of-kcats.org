@@ -378,7 +378,34 @@ words.
     {::stack others
      ::expression expression
      ::dictionary (assoc dictionary word {::definition word-def})})
+
+  ;; we won't allow the value nil/null in kcats. To signify "nothing"
+  ;; we'll use an empty list. Here are some functions to convert between
+  ;; clojure's idea of "nothing" and kcats'
+  (def nothing [])
+
+  (defn nothing?
+    [x]
+    (= nothing x))
+
+  (defn nothing->nil
+    "Returns argument unless it's a kcats 'nothing' (empty list), in
+    which case it returns nil"
+    [x]
+    (if (nothing? x)
+      nil
+      x))
+
+  (defn nil->nothing
+    "Returns argument unless it's nil, in which case it returns empty list"
+    [x]
+    (if (nil? x)
+      nothing
+      x))
 #+END_SRC
+
+#+RESULTS:
+: #'kcats.core/update-stack#'kcats.core/s-apply#'kcats.core/s-apply-one#'kcats.core/f-stack#'kcats.core/inscribe#'kcats.core/nothing#'kcats.core/nothing?#'kcats.core/nothing->nil#'kcats.core/nil->nothing
 
 Now we can go ahead and start filling out axiom words in our default dictionary.
 
@@ -416,10 +443,11 @@ word doesn't get the stack arguments that it needs.
                                 :others (spec/* ::item))
                ::fn (f-stack 1 (resolve sym))}])]))
 
+  ;; need to implement `some` to respect empty list being falsey
   (def predicates
     (into {} cat
           [(for [sym ['odd? 'even? 'sequential? 'zero? 'pos? 'neg?
-                      'number? 'int? 'true? 'false? 'nil? 'some?
+                      'number? 'int? 'true? 'false?
                       'string? 'empty?]]
              [sym {::spec ::predicate
                    ::fn (f-stack 1 (resolve sym))}])
@@ -462,8 +490,6 @@ word doesn't get the stack arguments that it needs.
       {::stack (conj others else)
        ::expression (conj expression 'ifte)
        ::dictionary dictionary}))
-
-
 
   ;; since we'll commonly be defining specs for a stack, we'll nearly
   ;; always not care about anything below a certain depth, so let's make
@@ -520,7 +546,7 @@ word doesn't get the stack arguments that it needs.
                ::fn (fn [{[f t b & others] ::stack expression ::expression :as env}]
                       (-> env
                           (assoc ::stack others)
-                          (update ::expression concat (if b t f))))}
+                          (update ::expression concat (if (nothing->nil b) t f))))}
       'ifte {::spec (stack-spec :false-branch ::aggregate
                                 :true-branch ::aggregate
                                 :condition ::program)
@@ -586,11 +612,12 @@ word doesn't get the stack arguments that it needs.
               ::definition '[swap swaack unpack dip swaack]
               ::examples '[[[1 2 3 [4 5 6] [* +] infra] [[26] 3 2 1]]]}
       'some {::spec (stack-spec :program ::aggregate
-                                :aggregate ::aggregate ;; TODO finish this
-                                )
-             ::fn (fn [env]
-                    (update-stack
-                     (fn [[p a & others :as stack]])))}
+                                :aggregate ::aggregate)
+             ;; implementing this requires infrastructure to restore
+             ;; stacks a la 'map', since the predicate gets run more than once.
+             }
+      'some? {::spec (stack-spec :item ::item)
+              ::fn (f-stack 1 (comp some? nothing->nil))}
       'getfirst {::spec (spec/cat :aggregate ::aggregate, :other (spec/* ::item))
                  ::fn (f-stack 1 first)}
       'map {::spec (stack-spec :program ::aggregate
@@ -599,28 +626,14 @@ word doesn't get the stack arguments that it needs.
             ;; tries to add or remove more stack elements those
             ;; changes will be lost - only top stack element is
             ;; collected from each parallel run of p
-            ::fn (fn [env]
-                   #_(update-stack (fn [[p a & others :as stack]]
-                                     (conj others
-                                           (->> (for [item a]
-                                                  (eval (with-stack env (conj others item)) p))
-                                                (map (comp first :stack))
-                                                (into []))))
-                                   env))}
+            }
       'filter {::spec (stack-spec :program ::aggregate
                                   :aggregate ::aggregate)
                ;; runs a parallel simulation - if the filter function
                ;; tries to add or remove more stack elements those
                ;; changes will be lost - only top stack element is
                ;; collected from each parallel run of p
-               ::fn (fn [env]
-                      #_(update-stack (fn [[p a & others :as stack]]
-                                        (->> a
-                                             (filter #(leaves-true? (with-stack env (conj others %)) p))
-                                             (into [])
-                                             (conj others)
-                                             (into [])))
-                                      env))}
+               }
 
       'every? {::spec (stack-spec :program ::aggregate
                                   :aggregate ::aggregate)
@@ -630,10 +643,6 @@ word doesn't get the stack arguments that it needs.
                                              (every? #(leaves-true? (with-stack env (conj others %)) p))
                                              (conj others)))
                                       env))}
-      'and  {::spec (stack-spec :x ::item, :y ::item,)
-             ::fn (f-stack 2 #(and %1 %2))}
-      'or  {::spec (stack-spec :x ::item, :y ::item,)
-            ::fn (f-stack 2 #(or %1 %2))}
       'in  {::spec (stack-spec :aggregate ::aggregate, :item ::item)
             ::fn (f-stack 2 contains?)}
       'intersection {::spec (stack-spec :aggregate-x ::aggregate, :aggregate-y ::aggregate,)
@@ -641,17 +650,7 @@ word doesn't get the stack arguments that it needs.
                                        (into []
                                              (clojure.set/intersection
                                               (into #{} x)
-                                              (into #{} y)))))}
-      'trace {::spec (stack-spec :program ::aggregate)
-              ::fn (fn [{[p & others] :stack :as env}]
-                     #_(reduce (fn [env item]
-                                 (let [r (eval-one env item)]
-                                   (debug r item)
-                                   r))
-                               (with-stack others)
-                               p))}
-      'multi {::spec (stack-spec :dispatch ::program)
-              ::definition '[quote [execute [] swap get execute] concat]}}))
+                                              (into #{} y)))))}}))
 
   (defn k
     "Run a program with the default env and return the result"
