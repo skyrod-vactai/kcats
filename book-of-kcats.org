@@ -202,11 +202,15 @@ so we have to allow for those also. We'll call those axiom words.
   (expound/def ::word word?)
 
   (expound/def ::axiom-definition (spec/keys :req [::fn ::spec]))
-  (expound/def ::program-definition (spec/keys :req [::fn ::definition]))
+  (expound/def ::program-definition (spec/keys :req [::definition]))
 
-  (expound/def ::dictionary (spec/map-of ::word (spec/or ::axiom-definition
-                                                      ::program-definition)))
+  (expound/def ::dictionary (spec/map-of ::word
+                                         (spec/or :axiom ::axiom-definition
+                                                  :user-defined ::program-definition)))
 #+END_SRC
+
+#+RESULTS:
+: #'kcats.core/word?:kcats.core/word:kcats.core/axiom-definition:kcats.core/program-definition:kcats.core/dictionary
 
 Next we'll spec a stack. We want it to easily implement a FIFO
 stack, (meaning the last item you put in is accessible in constant
@@ -611,30 +615,10 @@ word doesn't get the stack arguments that it needs.
                       with the list as its stack.  Does not affect the rest of the stack."
               ::definition '[swap swaack unpack dip swaack]
               ::examples '[[[1 2 3 [4 5 6] [* +] infra] [[26] 3 2 1]]]}
-      'some {::spec (stack-spec :program ::aggregate
-                                :aggregate ::aggregate)
-             ;; implementing this requires infrastructure to restore
-             ;; stacks a la 'map', since the predicate gets run more than once.
-             }
       'some? {::spec (stack-spec :item ::item)
               ::fn (f-stack 1 (comp some? nothing->nil))}
       'getfirst {::spec (spec/cat :aggregate ::aggregate, :other (spec/* ::item))
                  ::fn (f-stack 1 first)}
-      'map {::spec (stack-spec :program ::aggregate
-                               :aggregate ::aggregate)
-            ;; runs a parallel simulation - if the map function
-            ;; tries to add or remove more stack elements those
-            ;; changes will be lost - only top stack element is
-            ;; collected from each parallel run of p
-            }
-      'filter {::spec (stack-spec :program ::aggregate
-                                  :aggregate ::aggregate)
-               ;; runs a parallel simulation - if the filter function
-               ;; tries to add or remove more stack elements those
-               ;; changes will be lost - only top stack element is
-               ;; collected from each parallel run of p
-               }
-
       'every? {::spec (stack-spec :program ::aggregate
                                   :aggregate ::aggregate)
                ::fn (fn [env]
@@ -678,7 +662,7 @@ word doesn't get the stack arguments that it needs.
 
 #+RESULTS:
 : :kcats.core/stack-min-depth-1:kcats.core/stack-min-depth-2:kcats.core/binary-arithmetic:kcats.core/predicate:kcats.core/quoted-word#'kcats.core/arithmetic-words#'kcats.core/predicates#'kcats.core/cardinality#'kcats.core/roll*#'kcats.core/clone*#'kcats.core/discard*#'kcats.core/dip*#'kcats.core/recur*#'kcats.core/stack-spec#'kcats.core/builtin-words#'kcats.core/knil#'kcats.core/test
-
+** Logical operators
 ** Maps/associations
 A simple implementation that works well for small lists: specify
 associations as lists of pairs.
@@ -743,6 +727,15 @@ within another environment to achieve various features:
   map/filter/some etc (that require us to restore an environment to a
   previous state, and do another calculation with it)
 *** Implementation
+First let's spec what a nested environment looks like
+#+begin_src clojure tangle src/kcats/core.clj
+  (expound/def ::nested-environment
+    (spec/and ::association-list #(->> % ->env (spec/valid? ::environment))))
+#+end_src
+
+#+RESULTS:
+: :kcats.core/nested-environment
+
 We'll need to move back and forth between clojure's idea of an
 environment and the equivalent representation in kcats.
 
@@ -750,9 +743,9 @@ environment and the equivalent representation in kcats.
   (defn ->env
     [e]
     (let [ec (into {} e)]
-      {::stack (-> ec (get 'stack) list*)
-       ::dictionary (-> ec (get 'dictionary) (merge builtin-words))
-       ::expression (list* (get ec 'expression))}))
+      {::stack (-> ec (get 'stack) list* (or '()))
+       ::dictionary (merge builtin-words (into {} (get ec 'dictionary)))
+       ::expression (or (list* (get ec 'expression)) '())}))
 #+end_src
 
 #+RESULTS:
@@ -825,8 +818,9 @@ Now we can define a few different kinds of pipes, starting with simple
 *** Atoms
 This is a pipe that when you take, always returns the last value
 put. It's never full, whatever you put just overwrites what was there
-before. It has to be initialized with a value. It's functionally
-equivalent to a clojure atom and is implemented in terms of one.
+before. It has to be initialized with a value, therefore it's also
+never empty. It's functionally equivalent to a clojure atom and is
+implemented in terms of one.
 #+begin_src clojure :tangle src/kcats/pipe.clj
   (defrecord Atom [a]
       Pipe
