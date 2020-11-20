@@ -371,6 +371,12 @@ words.
     [nitems f]
     (partial update-stack (partial s-apply-one nitems f)))
 
+  (defn f-stack-list
+    "Apply nitems from stack to f, which returns a list to be concat'd
+    onto the stack"
+    [nitems f]
+    (partial update-stack (partial s-apply nitems f)))
+
   (defn inscribe
     "Define a new word. Takes an aggregate off the stack which should be of the
     form:
@@ -415,255 +421,258 @@ First we'll make some specs so we get a better error message when a
 word doesn't get the stack arguments that it needs.
 
 #+BEGIN_SRC clojure
-  (expound/def ::stack-min-depth-1 (spec/coll-of ::item
-                                                 :kind stack?
-                                                 :min-count 1))
-  (expound/def ::stack-min-depth-2 (spec/coll-of ::item
-                                                 :kind stack?
-                                                 :min-count 2))
+(expound/def ::stack-min-depth-1 (spec/coll-of ::item
+                                               :kind stack?
+                                               :min-count 1))
+(expound/def ::stack-min-depth-2 (spec/coll-of ::item
+                                               :kind stack?
+                                               :min-count 2))
+(expound/def ::stack-min-depth-3 (spec/coll-of ::item
+                                               :kind stack?
+                                               :min-count 3))
 
-  (expound/def ::binary-arithmetic (spec/cat :x ::number
-                                             :y ::number
-                                             :others (spec/* ::item)))
+(expound/def ::binary-arithmetic (spec/cat :x ::number
+                                           :y ::number
+                                           :others (spec/* ::item)))
 
-  (expound/def ::predicate (spec/cat :x ::item
-                                     :others (spec/* ::item)))
+(expound/def ::predicate (spec/cat :x ::item
+                                   :others (spec/* ::item)))
 
-  (expound/def ::quoted-word (spec/coll-of ::word
-                                           :count 1
-                                           :kind vector?))
+(expound/def ::quoted-word (spec/coll-of ::word
+                                         :count 1
+                                         :kind vector?))
 
-  (def arithmetic-words
-    (into {} cat
-          [(for [sym ['+ '- '/ '* '< '<= '> '>= 'min 'max 'quot 'rem 'mod]]
-             [sym
-              {::spec ::binary-arithmetic
-               ::fn (f-stack 2 (resolve sym))}])
-           (for [sym ['inc 'dec]]
-             [sym
-              {::spec (spec/cat :x ::number
-                                :others (spec/* ::item))
-               ::fn (f-stack 1 (resolve sym))}])]))
+(def arithmetic-words
+  (into {} cat
+        [(for [sym ['+ '- '/ '* '< '<= '> '>= 'min 'max 'quot 'rem 'mod]]
+           [sym
+            {::spec ::binary-arithmetic
+             ::fn (f-stack 2 (resolve sym))}])
+         (for [sym ['inc 'dec]]
+           [sym
+            {::spec (spec/cat :x ::number
+                              :others (spec/* ::item))
+             ::fn (f-stack 1 (resolve sym))}])]))
 
-  ;; need to implement `some` to respect empty list being falsey
-  (def predicates
-    (into {} cat
-          [(for [sym ['odd? 'even? 'sequential? 'zero? 'pos? 'neg?
-                      'number? 'int? 'true? 'false?
-                      'string? 'empty?]]
-             [sym {::spec ::predicate
-                   ::fn (f-stack 1 (resolve sym))}])
-           (for [sym ['starts-with? 'ends-with?]]
-             [sym {::spec ::stack-min-depth-2
-                   ::fn (f-stack 2 (resolve sym))}])]))
+;; need to implement `some` to respect empty list being falsey
+(def predicates
+  (into {} cat
+        [(for [sym ['odd? 'even? 'sequential? 'zero? 'pos? 'neg?
+                    'number? 'int? 'true? 'false?
+                    'string? 'empty?]]
+           [sym {::spec ::predicate
+                 ::fn (f-stack 1 (resolve sym))}])
+         (for [sym ['starts-with? 'ends-with?]]
+           [sym {::spec ::stack-min-depth-2
+                 ::fn (f-stack 2 (resolve sym))}])]))
 
-  (defn roll*
-    [depth distance stack]
-    (let [[top rest] (split-at depth stack)
-          [a b] (split-at (mod (- distance) depth) top)]
-      (concat b a rest)))
+(defn roll*
+  [depth distance stack]
+  (let [[top rest] (split-at depth stack)
+        [a b] (split-at (mod (- distance) depth) top)]
+    (concat b a rest)))
 
-  (defn clone*
-    [[depth & others]]
-    (let [[top rest] (split-at depth others)]
-      (concat top (conj rest (last top)))))
+(defn clone*
+  [[depth & others]]
+  (let [[top rest] (split-at depth others)]
+    (concat top (conj rest (last top)))))
 
-  (defn discard*
-    [depth stack]
-    (let [[top [_ & rest]] (split-at (dec depth) stack)]
-      (concat top rest)))
+(defn discard*
+  [depth stack]
+  (let [[top [_ & rest]] (split-at (dec depth) stack)]
+    (concat top rest)))
 
-  (defn dip*
-    [depth {[p & others] ::stack
-            expression ::expression
-            dictionary ::dictionary}]
-    (let [[top rest] (split-at depth others)]
-      {::stack rest
-       ::expression (concat p (reverse top) expression)
-       ::dictionary dictionary}))
+(defn dip*
+  [depth {[p & others] ::stack
+          expression ::expression
+          dictionary ::dictionary}]
+  (let [[top rest] (split-at depth others)]
+    {::stack rest
+     ::expression (concat p (reverse top) expression)
+     ::dictionary dictionary}))
 
-  (defn recur*
-    [{[rec2 rec1 & others] ::stack
-      expression ::expression
-      dictionary ::dictionary}]
-    (let [[then pred] others
-          f [pred then rec1 rec2 'genrec]
-          else (vec (concat rec1 [f] rec2))]
-      {::stack (conj others else)
-       ::expression (conj expression 'ifte)
-       ::dictionary dictionary}))
+(defn recur*
+  [{[rec2 rec1 & others] ::stack
+    expression ::expression
+    dictionary ::dictionary}]
+  (let [[then pred] others
+        f [pred then rec1 rec2 'genrec]
+        else (vec (concat rec1 [f] rec2))]
+    {::stack (conj others else)
+     ::expression (conj expression 'ifte)
+     ::dictionary dictionary}))
 
-  ;; since we'll commonly be defining specs for a stack, we'll nearly
-  ;; always not care about anything below a certain depth, so let's make
-  ;; a macro that encapsulates that.
-  (defmacro stack-spec
-    [& args]
-    `(spec/cat ~@args
-               :others (spec/* ::item)))
+;; since we'll commonly be defining specs for a stack, we'll nearly
+;; always not care about anything below a certain depth, so let's make
+;; a macro that encapsulates that.
+(defmacro stack-spec
+  [& args]
+  `(spec/cat ~@args
+             :others (spec/* ::item)))
 
-  (def builtin-words
-    (merge
-     arithmetic-words
-     predicates
-     {'discard {::spec ::stack-min-depth-1
-                ::fn (partial update-stack
-                              (partial #'discard* 1))
-                ::examples '[[[1 2 3 discard] [2 1]]
-                             [[1 2 3 [a b c] discard] [3 2 1]]]}
-      'clone {::spec ::stack-min-depth-1
-              ::fn (partial update-stack
-                            (fn [[item :as stack]]
-                              (conj stack item)))
-              ::examples '[[[1 2 3 clone] [3 3 2 1]]]}
-      'swap {::spec ::stack-min-depth-2
-             ::fn (fn [{[a b & others :as stack] ::stack :as env}]
-                    (assoc env ::stack (-> others (conj a) (conj b))))
-             ::examples '[[[1 2 3 swap] [2 3 1]]]}
-      'execute {::spec (stack-spec :program ::program)
-                ::fn (fn [{[p & others] ::stack ::keys [dictionary expression]}]
-                       {::stack others
-                        ::expression (concat p expression)
-                        ::dictionary dictionary})
-                ::examples '[[[2 [+] 4 swap execute] [6]]]}
-      'dip {::spec (stack-spec :program ::aggregate)
-            ::fn (partial #'dip* 1)}
-      'dipd {::spec (stack-spec :program ::aggregate)
-             ::fn (partial #'dip* 2)}
-      'quote {::spec (stack-spec :item ::item)
-              ::fn (partial update-stack (fn [[item & others]]
-                                           (concat others [[item]])))}
-      'inscribe {::spec (stack-spec :definition (spec/tuple ::word ::aggregate))
-                 ::fn #'inscribe
-                 ::examples '[[[[add3 [3 +]] inscribe 5 add3] [8]]]}
-      'describe {::spec (stack-spec :word (spec/tuple ::word))
-                 ::fn (fn [{[[word] & others] ::stack dict ::dictionary :as env}]
-                        (let [dfn (-> dict (get word) ::definition)]
-                          (if dfn
-                            (assoc env ::stack (conj others dfn))
-                            nothing)))}
-      'branch {::spec (stack-spec :false-branch ::aggregate
-                                  :true-branch ::aggregate
-                                  :condition ::item)
-               ::fn (fn [{[f t b & others] ::stack ::keys [expression dictionary]}]
-                      {::stack others
-                       ::expression (concat (if (nothing->nil b) t f) expression)
-                       ::dictionary dictionary})}
-      'ifte {::spec (stack-spec :false-branch ::aggregate
+(defmacro stack-effect
+  "Takes a stack effect notation and turns it into a call to
+  f-stack-list"
+  [in out]
+  `(f-stack-list ~(count in) (fn ~in ~out)))
+
+(def builtin-words
+  (merge
+   arithmetic-words
+   predicates
+   {'discard {::spec ::stack-min-depth-1
+              ::fn (stack-effect [a] [])
+              ::examples '[[[1 2 3 discard] [2 1]]
+                           [[1 2 3 [a b c] discard] [3 2 1]]]}
+    'clone {::spec ::stack-min-depth-1
+            ::fn (stack-effect [a] [a a])
+            ::examples '[[[1 2 3 clone] [3 3 2 1]]]}
+    'swap {::spec ::stack-min-depth-2
+           ::fn (stack-effect [a b] [b a])
+           ::examples '[[[1 2 3 swap] [2 3 1]]]}
+    'rotate {::spec ::stack-min-depth-3
+             ::fn (stack-effect [a b c] [c a b])}
+    'execute {::spec (stack-spec :program ::program)
+              ::fn (fn [{[p & others] ::stack ::keys [dictionary expression]}]
+                     {::stack others
+                      ::expression (concat p expression)
+                      ::dictionary dictionary})
+              ::examples '[[[2 [+] 4 swap execute] [6]]]}
+    'dip {::spec (stack-spec :program ::aggregate)
+          ::fn (partial #'dip* 1)}
+    'dipd {::spec (stack-spec :program ::aggregate)
+           ::fn (partial #'dip* 2)}
+    'quote {::spec (stack-spec :item ::item)
+            ::fn (stack-effect [a] [[a]])
+            ::examples '[[[1 quote] [[1]]]]}
+    'inscribe {::spec (stack-spec :definition (spec/tuple ::word ::aggregate))
+               ::fn #'inscribe
+               ::examples '[[[[add3 [3 +]] inscribe 5 add3] [8]]]}
+    'describe {::spec (stack-spec :word (spec/tuple ::word))
+               ::fn (fn [{[[word] & others] ::stack dict ::dictionary :as env}]
+                      (let [dfn (-> dict (get word) ::definition)]
+                        (if dfn
+                          (assoc env ::stack (conj others dfn))
+                          nothing)))}
+    'branch {::spec (stack-spec :false-branch ::aggregate
                                 :true-branch ::aggregate
-                                :condition ::program)
-             ::definition '[[execute] dipd branch]}
-      'step {::spec (stack-spec :program ::aggregate
-                                :aggregate ::aggregate)
-             ::fn (fn [{[p [agg-item & agg-rest] & others] ::stack
-                        ::keys [expression dictionary]}]
-                    {::expression (concat (cond-> ['execute]
-                                            (seq agg-rest) (concat [(vec agg-rest) p 'step]))
-                                          expression)
-                     ::stack (conj others agg-item p)
-                     ::dictionary dictionary})}
-      'recur {::spec (stack-spec :rec2 ::program
-                                 :rec1 ::program
-                                 :true-branch ::program
-                                 :false-branch ::program)
-              ::fn #'recur*}
-      'loop {::spec (stack-spec :program ::program
-                                :flag ::item)
-             ::fn (fn [{[p f & others] ::stack
-                        ::keys [expression dictionary]}]
+                                :condition ::item)
+             ::fn (fn [{[f t b & others] ::stack ::keys [expression dictionary]}]
                     {::stack others
-                     ::expression (if (nothing->nil f)
-                                    (concat p [p 'loop] expression)
-                                    expression)
+                     ::expression (concat (if (nothing->nil b) t f) expression)
                      ::dictionary dictionary})}
-      '= {::spec (stack-spec :x ::item, :y ::item)
-          ::fn (f-stack 2 =)}
-      'pack {::spec (stack-spec :x ::item
+    'ifte {::spec (stack-spec :false-branch ::aggregate
+                              :true-branch ::aggregate
+                              :condition ::program)
+           ::definition '[[execute] dipd branch]}
+    'step {::spec (stack-spec :program ::aggregate
+                              :aggregate ::aggregate)
+           ::fn (fn [{[p [agg-item & agg-rest] & others] ::stack
+                      ::keys [expression dictionary]}]
+                  {::expression (concat (cond-> ['execute]
+                                          (seq agg-rest) (concat [(vec agg-rest) p 'step]))
+                                        expression)
+                   ::stack (conj others agg-item p)
+                   ::dictionary dictionary})}
+    'recur {::spec (stack-spec :rec2 ::program
+                               :rec1 ::program
+                               :true-branch ::program
+                               :false-branch ::program)
+            ::fn #'recur*}
+    'loop {::spec (stack-spec :program ::program
+                              :flag ::item)
+           ::fn (fn [{[p f & others] ::stack
+                      ::keys [expression dictionary]}]
+                  {::stack others
+                   ::expression (if (nothing->nil f)
+                                  (concat p [p 'loop] expression)
+                                  expression)
+                   ::dictionary dictionary})}
+    '= {::spec (stack-spec :x ::item, :y ::item)
+        ::fn (f-stack 2 =)}
+    'pack {::spec (stack-spec :x ::item
+                              :aggregate ::aggregate)
+           ::fn (stack-effect [a x] [(conj (vec a) x)])
+           ::examples '[[[[] 1 pack] [[1]]]
+                        [[[1 2 3] 4 pack] [[1 2 3 4]]]]}
+    'unpack {::spec (stack-spec :aggregate ::aggregate)
+             ::fn (stack-effect [[a & others]] [(vec others) a])
+             ::examples '[[[["a" "b" "c"] unpack] ["a" ["b" "c"]]]]}
+    'count {::spec (stack-spec :aggregate ::aggregate)
+            ::fn (stack-effect [a] [(count a)])
+            ::examples '[[[["a" "b" "c"] count] [3]]]}
+    'join {::spec (stack-spec :agg1 ::aggregate
+                              :agg2 ::aggregate)
+           ::fn (f-stack 2 (comp vec concat))
+           ::examples '[[[["a" "b"] ["c" "d"] join] [["a" "b" "c" "d"]]]]}
+    'range {::spec (stack-spec :from ::integer
+                               :to ::integer)
+            ::fn (f-stack 2 (comp vec range))
+            ::examples '[[[1 5 range] [[1 2 3 4]]]]}
+    'swaack {::spec (stack-spec :list ::aggregate)
+             ::doc "Swaps the list on top of the stack and the rest of the stack"
+             ::fn (fn [{[a & others] ::stack ::keys [dictionary expression]}]
+                    {::stack (apply list (vec others) a)
+                     ::expression expression
+                     ::dictionary dictionary})}
+    'infra {::spec (stack-spec :program ::program
+                               :list ::aggregate)
+            ::doc "Accept a quoted program and a list on the stack and run the program
+                    with the list as its stack.  Does not affect the rest of the stack."
+            ::definition '[swap swaack unpack dip swaack]
+            ::examples '[[[1 2 3 [4 5 6] [* +] infra] [[26] 3 2 1]]]}
+    'some? {::spec (stack-spec :item ::item)
+            ::fn (f-stack 1 (comp some? nothing->nil))}
+    'getfirst {::spec (spec/cat :aggregate ::aggregate, :other (spec/* ::item))
+               ::fn (f-stack 1 first)}
+    'every? {::spec (stack-spec :program ::aggregate
                                 :aggregate ::aggregate)
-             ::fn (f-stack 2 (fn [a x]
-                               (conj (vec a) x)))
-             ::examples '[[[[] 1 pack] [[1]]]
-                          [[[1 2 3] 4 pack] [[1 2 3 4]]]]}
-      'unpack {::spec (stack-spec :aggregate ::aggregate)
-               ::fn (partial update-stack (fn [[[x & rest] & others]]
-                                            (apply list x (vec rest) others)))
-               ::examples '[[[["a" "b" "c"] unpack] ["a" ["b" "c"]]]]}
-      'count {::spec (stack-spec :aggregate ::aggregate)
-              ::fn (partial update-stack (fn [[agg & others]]
-                                           (println agg)
-                                           (conj others (count agg))))
-              ::examples '[[[["a" "b" "c"] count] [3]]]}
-      'join {::spec (stack-spec :agg1 ::aggregate
-                                :agg2 ::aggregate)
-             ::fn (f-stack 2 (comp vec concat))
-             ::examples '[[[["a" "b"] ["c" "d"] join] [["a" "b" "c" "d"]]]]}
-      'range {::spec (stack-spec :from ::integer
-                                 :to ::integer)
-              ::fn (f-stack 2 (comp vec range))
-              ::examples '[[[1 5 range] [[1 2 3 4]]]]}
-      'swaack {::spec (stack-spec :list ::aggregate)
-               ::doc "Swaps the list on top of the stack and the rest of the stack"
-               ::fn (fn [{[a & others] ::stack ::keys [dictionary expression]}]
-                      {::stack (apply list (vec others) a)
-                       ::expression expression
-                       ::dictionary dictionary})}
-      'infra {::spec (stack-spec :program ::program
-                                 :list ::aggregate)
-              ::doc "Accept a quoted program and a list on the stack and run the program
-                      with the list as its stack.  Does not affect the rest of the stack."
-              ::definition '[swap swaack unpack dip swaack]
-              ::examples '[[[1 2 3 [4 5 6] [* +] infra] [[26] 3 2 1]]]}
-      'some? {::spec (stack-spec :item ::item)
-              ::fn (f-stack 1 (comp some? nothing->nil))}
-      'getfirst {::spec (spec/cat :aggregate ::aggregate, :other (spec/* ::item))
-                 ::fn (f-stack 1 first)}
-      'every? {::spec (stack-spec :program ::aggregate
-                                  :aggregate ::aggregate)
-               ::fn (fn [env]
-                      #_(update-stack (fn [[p a & others :as stack]]
-                                        (->> a
-                                             (every? #(leaves-true? (with-stack env (conj others %)) p))
-                                             (conj others)))
-                                      env))}
-      'in  {::spec (stack-spec :aggregate ::aggregate, :item ::item)
-            ::fn (f-stack 2 contains?)}
-      'intersection {::spec (stack-spec :aggregate-x ::aggregate, :aggregate-y ::aggregate,)
-                     ::fn (f-stack 2 (fn [x y]
-                                       (into []
-                                             (clojure.set/intersection
-                                              (into #{} x)
-                                              (into #{} y)))))}}))
+             ::fn (fn [env]
+                    #_(update-stack (fn [[p a & others :as stack]]
+                                      (->> a
+                                           (every? #(leaves-true? (with-stack env (conj others %)) p))
+                                           (conj others)))
+                                    env))}
+    'in  {::spec (stack-spec :aggregate ::aggregate, :item ::item)
+          ::fn (f-stack 2 contains?)}
+    'intersection {::spec (stack-spec :aggregate-x ::aggregate, :aggregate-y ::aggregate,)
+                   ::fn (f-stack 2 (fn [x y]
+                                     (into []
+                                           (clojure.set/intersection
+                                            (into #{} x)
+                                            (into #{} y)))))}}))
 
-  (defn k
-    "Run a program with the default env and return the result. Option to
-    stop execution after `max-steps` if still unfinished, to prevent
-    accidental infinite loops (for debugging purposes)"
-    ([p {:keys [max-steps] :as opts}]
-     (let [e {::stack '()
+(defn k
+  "Run a program with the default env and return the result. Option to
+  stop execution after `max-steps` if still unfinished, to prevent
+  accidental infinite loops (for debugging purposes)"
+  ([p {:keys [max-steps] :as opts}]
+   (let [e {::stack '()
+            ::dictionary builtin-words
+            ::expression (list* p)}
+         steps (cond->> (iterate eval-step e)
+                 max-steps (take max-steps))
+         [unfinished finished] (split-with (comp seq ::expression) steps)]
+     (::stack (if (seq finished)
+                (first finished)
+                (last unfinished)))))
+  ([p] (k p {})))
+
+(require '[clojure.test :as test])
+(defn test
+  "Run through all the examples in the default env and make sure they work"
+  []
+  (doseq [[word {::keys [examples]}] builtin-words]
+    (test/testing (str word)
+      (doseq [[program exp-stack] examples]
+        (->> {::stack '()
               ::dictionary builtin-words
-              ::expression (list* p)}
-           steps (cond->> (iterate eval-step e)
-                   max-steps (take max-steps))
-           [unfinished finished] (split-with (comp seq ::expression) steps)]
-       (::stack (if (seq finished)
-                  (first finished)
-                  (last unfinished)))))
-    ([p] (k {})))
-
-  (require '[clojure.test :as test])
-  (defn test
-    "Run through all the examples in the default env and make sure they work"
-    []
-    (doseq [[word {::keys [examples]}] builtin-words]
-      (test/testing (str word)
-        (doseq [[program exp-stack] examples]
-          (->> {::stack '()
-                ::dictionary builtin-words
-                ::expression program}
-               eval
-               ::stack
-               vec
-               (= exp-stack)
-               test/is)))))
+              ::expression program}
+             eval
+             ::stack
+             vec
+             (= exp-stack)
+             test/is)))))
 #+END_SRC
 
 #+RESULTS:
