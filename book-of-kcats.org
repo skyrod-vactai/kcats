@@ -244,14 +244,19 @@ empty. Once it's empty, there's nothing left to do and we return the
 last environment.
 
 #+BEGIN_SRC clojure
-  (declare eval-step) ;; we'll define this later
+(declare eval-step) ;; we'll define this later
 
-  (defn eval
-    [env]
-    (->> env
-         (iterate eval-step)
-         (drop-while (comp seq ::expression))
-         first))
+(defn eval
+  ([{:keys [max-steps]} env]
+   (let [[unfinished finished] (split-with (comp seq ::expression)
+                                           (cond->> (iterate eval-step env)
+                                             max-steps (take max-steps)))]
+     (if (seq finished)
+       (first finished)
+       (last unfinished))))
+  ([env]
+   (eval {} env)))
+
 #+END_SRC
 
 Now, we define =onto-stack=,
@@ -343,77 +348,85 @@ We'll need some utility functions that help us define these axiom
 words.
 
 #+BEGIN_SRC clojure
-  (defn update-stack [f env]
-    (update env ::stack f))
+(defn update-stack [f env]
+  (update env ::stack f))
 
-  (defn s-apply
-    "Take nitems off the stack, apply them to f. f should return a list
-     to put back onto the stack."
-    [nitems f stack]
-    (let [[a b] (split-at nitems stack)]
-      ;; items are reversed so that we can write code with arguments in
-      ;; the same order as we'd use in other langs, eg so that [2 1 >]
-      ;; -> true
-      ;;
-      ;; The top item in the stack would normally be the first
-      ;; arg, but that was the LAST arg written in the code.
-      (into b (apply f (reverse a)))))
+(defn s-apply-one
+  "Like s-apply, but useful for functions where you only want to put
+   one item back on the stack and f doesn't return a
+   list. Automatically creates a list of one item."
+  [nitems f stack]
+  (s-apply nitems (comp list f) stack))
 
-  (defn s-apply-one
-    "Like s-apply, but useful for functions where you only want to put
-     one item back on the stack and f doesn't return a
-     list. Automatically creates a list of one item."
-    [nitems f stack]
-    (s-apply nitems (comp list f) stack))
+(defn f-stack
+  "Apply nitems from stack to f, put result back on stack"
+  [nitems f]
+  (partial update-stack (partial s-apply-one nitems f)))
 
-  (defn f-stack
-    "Apply nitems from stack to f, put result back on stack"
-    [nitems f]
-    (partial update-stack (partial s-apply-one nitems f)))
+(defn env-effect
+  "Calls f with nitems from stack, it should return a pair (items to
+  prepend to the expression, items to replace the nitems with)"
+  [nitems f]
+  (fn [{::keys [stack expression dictionary]}]
+    (let [[a b] (split-at nitems stack)
+          ;; items are reversed so that we can write code with arguments in
+          ;; the same order as we'd use in other langs, eg so that [2 1 >]
+          ;; -> true
+          ;;
+          ;; The top item in the stack would normally be the first
+          ;; arg, but that was the LAST arg written in the code.
+          [new-expression-items new-stack-items] (apply f a)]
+      {::stack (into b new-stack-items)
+       ::expression (concat new-expression-items expression)
+       ::dictionary dictionary})))
 
-  (defn f-stack-list
-    "Apply nitems from stack to f, which returns a list to be concat'd
-    onto the stack"
-    [nitems f]
-    (partial update-stack (partial s-apply nitems f)))
+(defmacro effect
+  [in out-expr out-stack]
+  `(env-effect ~(count in) (fn ~in [~out-expr ~out-stack])))
 
-  (defn inscribe
-    "Define a new word. Takes an aggregate off the stack which should be of the
-    form:
-    [new-word program]"
-    [{[[word word-def] & others] ::stack
-      ::keys [expression dictionary]}]
-    {::stack others
-     ::expression expression
-     ::dictionary (assoc dictionary word {::definition word-def})})
+(defmacro stack-effect
+  "Takes a stack effect notation and turns it into a call to
+  env-effect"
+  [in out]
+  `(env-effect ~(count in) (fn ~in [[] ~out])))
 
-  ;; we won't allow the value nil/null in kcats. To signify "nothing"
-  ;; we'll use an empty list. Here are some functions to convert between
-  ;; clojure's idea of "nothing" and kcats'
-  (def nothing [])
+(defn inscribe
+  "Define a new word. Takes an aggregate off the stack which should be of the
+  form:
+  [new-word program]"
+  [{[[word word-def] & others] ::stack
+    ::keys [expression dictionary]}]
+  {::stack others
+   ::expression expression
+   ::dictionary (assoc dictionary word {::definition word-def})})
 
-  (defn nothing?
-    [x]
-    (= nothing x))
+;; we won't allow the value nil/null in kcats. To signify "nothing"
+;; we'll use an empty list. Here are some functions to convert between
+;; clojure's idea of "nothing" and kcats'
+(def nothing [])
 
-  (defn nothing->nil
-    "Returns argument unless it's a kcats 'nothing' (empty list), in
-    which case it returns nil"
-    [x]
-    (if (nothing? x)
-      nil
-      x))
+(defn nothing?
+  [x]
+  (= nothing x))
 
-  (defn nil->nothing
-    "Returns argument unless it's nil, in which case it returns empty list"
-    [x]
-    (if (nil? x)
-      nothing
-      x))
+(defn nothing->nil
+  "Returns argument unless it's a kcats 'nothing' (empty list), in
+  which case it returns nil"
+  [x]
+  (if (nothing? x)
+    nil
+    x))
+
+(defn nil->nothing
+  "Returns argument unless it's nil, in which case it returns empty list"
+  [x]
+  (if (nil? x)
+    nothing
+    x))
 #+END_SRC
 
 #+RESULTS:
-: #'kcats.core/update-stack#'kcats.core/s-apply#'kcats.core/s-apply-one#'kcats.core/f-stack#'kcats.core/inscribe#'kcats.core/nothing#'kcats.core/nothing?#'kcats.core/nothing->nil#'kcats.core/nil->nothing
+: #'kcats.core/update-stack#'kcats.core/s-apply#'kcats.core/s-apply-one#'kcats.core/f-stack#'kcats.core/f-stack-list#'kcats.core/env-effect#'kcats.core/effect#'kcats.core/stack-effect#'kcats.core/inscribe#'kcats.core/nothing#'kcats.core/nothing?#'kcats.core/nothing->nil#'kcats.core/nil->nothing
 
 Now we can go ahead and start filling out axiom words in our default dictionary.
 
@@ -442,6 +455,14 @@ word doesn't get the stack arguments that it needs.
                                          :count 1
                                          :kind vector?))
 
+;; since we'll commonly be defining specs for a stack, we'll nearly
+;; always not care about anything below a certain depth, so let's make
+;; a macro that encapsulates that.
+(defmacro stack-spec
+  [& args]
+  `(spec/cat ~@args
+             :others (spec/* ::item)))
+
 (def arithmetic-words
   (into {} cat
         [(for [sym ['+ '- '/ '* '< '<= '> '>= 'min 'max 'quot 'rem 'mod]]
@@ -466,31 +487,6 @@ word doesn't get the stack arguments that it needs.
            [sym {::spec ::stack-min-depth-2
                  ::fn (f-stack 2 (resolve sym))}])]))
 
-(defn roll*
-  [depth distance stack]
-  (let [[top rest] (split-at depth stack)
-        [a b] (split-at (mod (- distance) depth) top)]
-    (concat b a rest)))
-
-(defn clone*
-  [[depth & others]]
-  (let [[top rest] (split-at depth others)]
-    (concat top (conj rest (last top)))))
-
-(defn discard*
-  [depth stack]
-  (let [[top [_ & rest]] (split-at (dec depth) stack)]
-    (concat top rest)))
-
-(defn dip*
-  [depth {[p & others] ::stack
-          expression ::expression
-          dictionary ::dictionary}]
-  (let [[top rest] (split-at depth others)]
-    {::stack rest
-     ::expression (concat p (reverse top) expression)
-     ::dictionary dictionary}))
-
 (defn recur*
   [{[rec2 rec1 & others] ::stack
     expression ::expression
@@ -501,20 +497,6 @@ word doesn't get the stack arguments that it needs.
     {::stack (conj others else)
      ::expression (conj expression 'ifte)
      ::dictionary dictionary}))
-
-;; since we'll commonly be defining specs for a stack, we'll nearly
-;; always not care about anything below a certain depth, so let's make
-;; a macro that encapsulates that.
-(defmacro stack-spec
-  [& args]
-  `(spec/cat ~@args
-             :others (spec/* ::item)))
-
-(defmacro stack-effect
-  "Takes a stack effect notation and turns it into a call to
-  f-stack-list"
-  [in out]
-  `(f-stack-list ~(count in) (fn ~in ~out)))
 
 (def builtin-words
   (merge
@@ -533,15 +515,17 @@ word doesn't get the stack arguments that it needs.
     'rotate {::spec ::stack-min-depth-3
              ::fn (stack-effect [a b c] [c a b])}
     'execute {::spec (stack-spec :program ::program)
-              ::fn (fn [{[p & others] ::stack ::keys [dictionary expression]}]
-                     {::stack others
-                      ::expression (concat p expression)
-                      ::dictionary dictionary})
+              ::fn (effect [p] p [])
               ::examples '[[[2 [+] 4 swap execute] [6]]]}
-    'dip {::spec (stack-spec :program ::aggregate)
-          ::fn (partial #'dip* 1)}
-    'dipd {::spec (stack-spec :program ::aggregate)
-           ::fn (partial #'dip* 2)}
+    'dip {::spec (stack-spec :program ::aggregate
+                             :item ::item)
+          ::fn (effect [p a] (conj (vec p) a) [])
+          ::examples '[[[1 2 [inc] dip] [2 2]]]}
+    'dipd {::spec (stack-spec :program ::aggregate
+                              :item1 ::item
+                              :item2 ::item)
+           ::fn (effect [p a b] (conj (vec p) b a) [])
+           ::examples '[[[1 2 3 [inc] dipd] [3 2 2]]]}
     'quote {::spec (stack-spec :item ::item)
             ::fn (stack-effect [a] [[a]])
             ::examples '[[[1 quote] [[1]]]]}
@@ -557,10 +541,8 @@ word doesn't get the stack arguments that it needs.
     'branch {::spec (stack-spec :false-branch ::aggregate
                                 :true-branch ::aggregate
                                 :condition ::item)
-             ::fn (fn [{[f t b & others] ::stack ::keys [expression dictionary]}]
-                    {::stack others
-                     ::expression (concat (if (nothing->nil b) t f) expression)
-                     ::dictionary dictionary})}
+             ::fn (effect [f t b]
+                          (if (nothing->nil b) t f) [])}
     'ifte {::spec (stack-spec :false-branch ::aggregate
                               :true-branch ::aggregate
                               :condition ::program)
@@ -592,7 +574,7 @@ word doesn't get the stack arguments that it needs.
         ::fn (f-stack 2 =)}
     'pack {::spec (stack-spec :x ::item
                               :aggregate ::aggregate)
-           ::fn (stack-effect [a x] [(conj (vec a) x)])
+           ::fn (stack-effect [x a] [(conj (vec a) x)])
            ::examples '[[[[] 1 pack] [[1]]]
                         [[[1 2 3] 4 pack] [[1 2 3 4]]]]}
     'unpack {::spec (stack-spec :aggregate ::aggregate)
@@ -641,22 +623,18 @@ word doesn't get the stack arguments that it needs.
                                            (clojure.set/intersection
                                             (into #{} x)
                                             (into #{} y)))))}}))
+(def default-env
+  {::stack '()
+   ::dictionary builtin-words
+   ::expression '()})
 
 (defn k
   "Run a program with the default env and return the result. Option to
   stop execution after `max-steps` if still unfinished, to prevent
   accidental infinite loops (for debugging purposes)"
-  ([p {:keys [max-steps] :as opts}]
-   (let [e {::stack '()
-            ::dictionary builtin-words
-            ::expression (list* p)}
-         steps (cond->> (iterate eval-step e)
-                 max-steps (take max-steps))
-         [unfinished finished] (split-with (comp seq ::expression) steps)]
-     (::stack (if (seq finished)
-                (first finished)
-                (last unfinished)))))
-  ([p] (k p {})))
+  ([opts p]
+   (::stack (eval opts (assoc default-env ::expression p))))
+  ([p] (k {} p)))
 
 (require '[clojure.test :as test])
 (defn test
@@ -665,18 +643,15 @@ word doesn't get the stack arguments that it needs.
   (doseq [[word {::keys [examples]}] builtin-words]
     (test/testing (str word)
       (doseq [[program exp-stack] examples]
-        (->> {::stack '()
-              ::dictionary builtin-words
-              ::expression program}
-             eval
-             ::stack
+        (->> program
+             (k {:max-steps 500})
              vec
              (= exp-stack)
              test/is)))))
 #+END_SRC
 
 #+RESULTS:
-: :kcats.core/stack-min-depth-1:kcats.core/stack-min-depth-2:kcats.core/binary-arithmetic:kcats.core/predicate:kcats.core/quoted-word#'kcats.core/arithmetic-words#'kcats.core/predicates#'kcats.core/cardinality#'kcats.core/roll*#'kcats.core/clone*#'kcats.core/discard*#'kcats.core/dip*#'kcats.core/recur*#'kcats.core/stack-spec#'kcats.core/builtin-words#'kcats.core/knil#'kcats.core/test
+: :kcats.core/stack-min-depth-1:kcats.core/stack-min-depth-2:kcats.core/stack-min-depth-3:kcats.core/binary-arithmetic:kcats.core/predicate:kcats.core/quoted-word#'kcats.core/stack-spec#'kcats.core/arithmetic-words#'kcats.core/predicates#'kcats.core/roll*#'kcats.core/clone*#'kcats.core/discard*#'kcats.core/dip*#'kcats.core/recur*#'kcats.core/builtin-words#'kcats.core/knil#'kcats.core/test
 ** Logical operators
 #+begin_src clojure
 
