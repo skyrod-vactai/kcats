@@ -318,32 +318,37 @@ with its definition. Otherwise it's put onto the stack.
 Recall what =eval= does, it just keeps iterating =eval-step= until
 there's nothing left in the expression.
 #+BEGIN_SRC clojure
-  (defmethod onto-stack clojure.lang.Symbol [{[word & others] ::expression
-                                              ::keys [dictionary stack]
-                                              :as env}]
-    (let [{f ::fn spec ::spec} (dictionary word)]
-      (when spec
-        (spec/assert spec stack))
-      (if f
-        (f (update env ::expression rest))
-        (push env))))
+(defmethod onto-stack clojure.lang.Symbol [{[word & others] ::expression
+                                            ::keys [dictionary stack]
+                                            :as env}]
+  (let [{f ::fn spec ::spec} (dictionary word)]
+    (when spec
+      (spec/assert spec stack))
+    (if f
+      (f (update env ::expression rest))
+      (push env))))
 
-  (defn definition
-    "Returns the definition of an item, if it's a word defined in terms
-    of other words"
-    [{::keys [dictionary] :as env} item]
-    (some-> dictionary (get item) ::definition))
+(defn definition
+  "Returns the definition of an item, if it's a word defined in terms
+  of other words"
+  [{::keys [dictionary] :as env} item]
+  (some-> dictionary (get item) ::definition))
 
-  (defn eval-step
-    "Evaluate one step in the environment."
-    [{[next-item & items :as expression] ::expression ::keys [stack dictionary] :as env}]
-    (apply pr (reverse expression))
-    (print " . ")
-    (apply prn stack)
-    (if-let [d (definition env next-item)]
-      (assoc env ::expression (concat (list* d) items)) ;; replace item with definition
-      ;; eval the thing onto the stack
-      (onto-stack env)))
+(defn eval-step
+  "Evaluate one step in the environment."
+  [{[next-item & items :as expression] ::expression ::keys [stack dictionary] :as env}]
+  (if-let [d (definition env next-item)]
+    (assoc env ::expression (concat (list* d) items)) ;; replace item with definition
+    ;; eval the thing onto the stack
+    (onto-stack env)))
+ 
+(defn print-env
+  "Prints the expression/stack and then return env"
+  [{::keys [expression stack] :as env}]
+  (apply pr (reverse expression))
+  (print " . ")
+  (apply prn stack)
+  env)
 #+END_SRC
 
 #+RESULTS:
@@ -393,12 +398,6 @@ words.
   [nitems f]
   (fn [{::keys [stack expression dictionary]}]
     (let [[a b] (split-at nitems stack)
-          ;; items are reversed so that we can write code with arguments in
-          ;; the same order as we'd use in other langs, eg so that [2 1 >]
-          ;; -> true
-          ;;
-          ;; The top item in the stack would normally be the first
-          ;; arg, but that was the LAST arg written in the code.
           [new-expression-items new-stack-items] (apply f a)]
           {::stack (concat new-stack-items b)
            ::expression (concat new-expression-items expression)
@@ -418,7 +417,7 @@ words.
   "Define a new word. Takes an aggregate off the stack which should be of the
   form:
   [new-word program]"
-  [{[[word word-def] & others] ::stack
+  [{[word word-def & others] ::stack
     ::keys [expression dictionary]}]
   {::stack others
    ::expression expression
@@ -448,6 +447,9 @@ words.
     nothing
     x))
 #+END_SRC
+
+#+RESULTS:
+: #'kcats.core/update-stack#'kcats.core/s-apply#'kcats.core/s-apply-one#'kcats.core/f-stack#'kcats.core/env-effect#'kcats.core/effect#'kcats.core/stack-effect#'kcats.core/inscribe#'kcats.core/nothing#'kcats.core/nothing?#'kcats.core/nothing->nil#'kcats.core/nil->nothing
 
 #+BEGIN_SRC clojure
 (expound/def ::stack-min-depth-1 (spec/coll-of ::item
@@ -479,6 +481,8 @@ words.
   `(spec/cat ~@args
              :others (spec/* ::item)))
 
+(defonce core-words (atom {}))
+
 (def arithmetic-words
   (into {} cat
         [(for [sym ['+ '- '/ '* '< '<= '> '>= 'min 'max 'quot 'rem 'mod]]
@@ -503,153 +507,163 @@ words.
            [sym {::spec ::stack-min-depth-2
                  ::fn (f-stack 2 (resolve sym))}])]))
 
-(def builtin-words
-  (merge
-   arithmetic-words
-   predicates
-   {'discard {::spec ::stack-min-depth-1
-              ::fn (stack-effect [a] [])
-              ::examples '[[[1 2 3 discard] [2 1]]
-                           [[1 2 3 [a b c] discard] [3 2 1]]]}
-    'clone {::spec ::stack-min-depth-1
-            ::fn (stack-effect [a] [a a])
-            ::examples '[[[1 2 3 clone] [3 3 2 1]]]}
-    'swap {::spec ::stack-min-depth-2
-           ::fn (stack-effect [a b] [b a])
-           ::examples '[[[1 2 3 swap] [2 3 1]]]}
-    'rotate {::spec ::stack-min-depth-3
-             ::fn (stack-effect [a b c] [c a b])}
-    'execute {::spec (stack-spec :program ::program)
-              ::fn (effect [p] p [])
-              ::examples '[[[2 [+] 4 swap execute] [6]]]}
-    'dip {::spec (stack-spec :program ::aggregate
-                             :item ::item)
-          ::fn (effect [p a] (conj (vec p) a) [])
-          ::examples '[[[1 2 [inc] dip] [2 2]]]}
-    'dipd {::spec (stack-spec :program ::aggregate
-                              :item1 ::item
-                              :item2 ::item)
-           ::fn (effect [p a b] (conj (vec p) b a) [])
-           ::examples '[[[1 2 3 [inc] dipd] [3 2 2]]]}
-    'quote {::spec (stack-spec :item ::item)
-            ::fn (stack-effect [a] [[a]])
-            ::examples '[[[1 quote] [[1]]]]}
-    'inscribe {::spec (stack-spec :definition (spec/tuple ::word ::aggregate))
-               ::fn #'inscribe
-               ::examples '[[[[add3 [3 +]] inscribe 5 add3] [8]]]}
-    'describe {::spec (stack-spec :word (spec/tuple ::word))
-               ::fn (fn [{[[word] & others] ::stack dict ::dictionary :as env}]
-                      (let [dfn (-> dict (get word) ::definition)]
-                        (if dfn
-                          (assoc env ::stack (conj others dfn))
-                          nothing)))}
-    'branch {::spec (stack-spec :false-branch ::aggregate
-                                :true-branch ::aggregate
-                                :condition ::item)
-             ::fn (effect [f t b]
-                          (if (nothing->nil b) t f) [])
-             ::examples '[[[5 true [3 *] [4 +] branch] [15]]
-                          [[6 false [3 *] [4 +] branch] [10]]]}
-    'ifte {::spec (stack-spec :false-branch ::aggregate
-                              :true-branch ::aggregate
-                              :condition ::program)
-           ::definition '[[execute] dipd branch]
-           ::examples '[[[5 [clone 5 =] [3 *] [4 +] ifte] [15]]
-                        [[6 [clone 5 =] [3 *] [4 +] ifte] [10]]]}
-    'step {::spec (stack-spec :program ::aggregate
-                              :aggregate ::aggregate)
-           ::fn (effect [p [agg-item & agg-rest]]
-                        (cond-> ['execute]
-                          (seq agg-rest) (concat [(vec agg-rest) p 'step]))
-                        [p agg-item])
-           ::examples '[[[1 [2 3 4] [*] step] [24]]]}
-    'recur {::spec (stack-spec :rec2 ::program
-                               :rec1 ::program
-                               :true-branch ::program
-                               :false-branch ::program)
-            ::fn (effect [rec2 rec1 then pred]
-                         '[ifte]
-                         [(vec (concat rec1 [[pred then rec1 rec2 'recur]] rec2))
-                          then pred])
-            ::examples '[[[3 [clone 1 <=] [] [clone dec] [execute *] recur] [6]]]}
-    'primrec {::spec (stack-spec :rec1 ::program
-                                 :exit ::program
-                                 :data ::number)
-              ::definition '[[execute] swap join ;; add execute to rec1 to be recur's rec2
-                             [[discard] swap join] dip ;; add discard to exit condition
-                             [[clone zero?]] dipd  ;; put the condition on bottom
-                             [[clone dec]] dip ;; add the r1
-                             recur] ;; now it's generic recur
-              ::examples '[[[5 [1] [*] primrec] [120]]]}
-    'loop {::spec (stack-spec :program ::program
-                              :flag ::item)
-           ::fn (effect [p f]
-                        (when (nothing->nil f)
-                          (concat p [p 'loop]))
-                        [])
-           ::examples '[[[10 true [-2 * clone 50 <] loop] [160]]]}
-    '= {::spec (stack-spec :x ::item, :y ::item)
-        ::fn (f-stack 2 =)
-        ::examples '[[[1 1 =] [true]]
-                     [["hi" "hi" =] [true]]
-                     [["hi" "there" =] [false]]
-                     [[[] false =] [false]]]}
-    'pack {::spec (stack-spec :x ::item
-                              :aggregate ::aggregate)
-           ::fn (stack-effect [x a] [(conj (vec a) x)])
-           ::examples '[[[[] 1 pack] [[1]]]
-                        [[[1 2 3] 4 pack] [[1 2 3 4]]]]}
-    'unpack {::spec (stack-spec :aggregate ::aggregate)
-             ::fn (stack-effect [[a & others]] [a (vec others)])
-             ::examples '[[[["a" "b" "c"] unpack] ["a" ["b" "c"]]]]}
-    'count {::spec (stack-spec :aggregate ::aggregate)
-            ::fn (stack-effect [a] [(count a)])
-            ::examples '[[[["a" "b" "c"] count] [3]]]}
-    'join {::spec (stack-spec :agg1 ::aggregate
-                              :agg2 ::aggregate)
-           ::fn (f-stack 2 (comp vec concat))
-           ::examples '[[[["a" "b"] ["c" "d"] join] [["a" "b" "c" "d"]]]]}
-    'range {::spec (stack-spec :from ::integer
-                               :to ::integer)
-            ::fn (f-stack 2 (comp vec range))
-            ::examples '[[[1 5 range] [[1 2 3 4]]]]}
-    'swaack {::spec (stack-spec :list ::aggregate)
-             ::doc "Swaps the list on top of the stack and the rest of the stack"
-             ::fn (fn [{[a & others] ::stack ::keys [dictionary expression]}]
-                    {::stack (apply list (vec others) a)
-                     ::expression expression
-                     ::dictionary dictionary})
-             ::examples '[[[1 2 3 [4 5 6] swaack] [[3 2 1] 4 5 6]]]}
-    'infra {::spec (stack-spec :program ::program
-                               :list ::aggregate)
-            ::doc "Accept a quoted program and a list on the stack and run the program
+(def base-words
+  {'discard {::spec ::stack-min-depth-1
+             ::fn (stack-effect [a] [])
+             ::examples '[[[1 2 3 discard] [2 1]]
+                          [[1 2 3 [a b c] discard] [3 2 1]]]}
+   'clone {::spec ::stack-min-depth-1
+           ::fn (stack-effect [a] [a a])
+           ::examples '[[[1 2 3 clone] [3 3 2 1]]]}
+   'swap {::spec ::stack-min-depth-2
+          ::fn (stack-effect [a b] [b a])
+          ::examples '[[[1 2 3 swap] [2 3 1]]]}
+   'swapd {::spec ::stack-min-depth-3
+          ::fn (stack-effect [a b c] [a c b])
+          ::examples '[[[1 2 3 swapd] [3 1 2]]]}
+   'rotate {::spec ::stack-min-depth-3
+            ::fn (stack-effect [a b c] [c a b])}
+   'execute {::spec (stack-spec :program ::program)
+             ::fn (effect [p] p [])
+             ::examples '[[[[1 2 +] execute] [3]]
+                          [[2 [+] 4 swap execute] [6]]]}
+   'dip {::spec (stack-spec :program ::aggregate
+                            :item ::item)
+         ::fn (effect [p a] (conj (vec p) a) [])
+         ::examples '[[[1 8 [inc] dip] [8 2]]]}
+   'dipd {::spec (stack-spec :program ::aggregate
+                             :item1 ::item
+                             :item2 ::item)
+          ::fn (effect [p a b] (conj (vec p) b a) [])
+          ::examples '[[[1 2 3 [inc] dipd] [3 2 2]]]}
+   'wrap {::spec (stack-spec :item ::item)
+          ::fn (stack-effect [a] [[a]])
+          ::examples '[[[1 wrap] [[1]]]]}
+   'unwrap {::spec (stack-spec :aggregate ::aggregate)
+            ::fn (stack-effect [a] a)
+            ::examples '[[[[1] unwrap] [1]]]}
+   'inscribe {::spec (stack-spec :word ::word
+                                 :definition ::aggregate)
+              ::fn #'inscribe
+              ::examples '[[[[3 +] [add3] unwrap inscribe 5 add3] [8]]]}
+   'describe {::spec (stack-spec :word ::word)
+              ::fn (fn [{[word & others] ::stack dict ::dictionary :as env}]
+                     (let [dfn (-> dict (get word) ::definition)]
+                       (if dfn
+                         (assoc env ::stack (conj others dfn))
+                         nothing)))}
+   'branch {::spec (stack-spec :false-branch ::aggregate
+                               :true-branch ::aggregate
+                               :condition ::item)
+            ::fn (effect [f t b]
+                         (if (nothing->nil b) t f) [])
+            ::examples '[[[5 true [3 *] [4 +] branch] [15]]
+                         [[6 false [3 *] [4 +] branch] [10]]]}
+   'ifte {::spec (stack-spec :false-branch ::aggregate
+                             :true-branch ::aggregate
+                             :condition ::program)
+          ::definition '[[execute] dipd branch]
+          ::examples '[[[5 [clone 5 =] [3 *] [4 +] ifte] [15]]
+                       [[6 [clone 5 =] [3 *] [4 +] ifte] [10]]]}
+   'step {::spec (stack-spec :program ::aggregate
+                             :aggregate ::aggregate)
+          ::fn (effect [p [agg-item & agg-rest]]
+                       (cond-> ['execute]
+                         (seq agg-rest) (concat [(vec agg-rest) p 'step]))
+                       [p agg-item])
+          ::examples '[[[1 [2 3 4] [*] step] [24]]]}
+   'recur {::spec (stack-spec :rec2 ::program
+                              :rec1 ::program
+                              :true-branch ::program
+                              :false-branch ::program)
+           ::fn (effect [rec2 rec1 then pred]
+                        '[ifte]
+                        [(vec (concat rec1 [[pred then rec1 rec2 'recur]] rec2))
+                         then pred])
+           ::examples '[[[3 [clone 1 <=] [] [clone dec] [execute *] recur] [6]]]}
+   'primrec {::spec (stack-spec :rec1 ::program
+                                :exit ::program
+                                :data ::number)
+             ::definition '[[execute] swap join ;; add execute to rec1 to be recur's rec2
+                            [[discard] swap join] dip ;; add discard to exit condition
+                            [[clone zero?]] dipd  ;; put the condition on bottom
+                            [[clone dec]] dip ;; add the r1
+                            recur] ;; now it's generic recur
+             ::examples '[[[5 [1] [*] primrec] [120]]]}
+   'loop {::spec (stack-spec :program ::program
+                             :flag ::item)
+          ::fn (effect [p f]
+                       (when (nothing->nil f)
+                         (concat p [p 'loop]))
+                       [])
+          ::examples '[[[10 true [-2 * clone 50 <] loop] [160]]]}
+   '= {::spec (stack-spec :x ::item, :y ::item)
+       ::fn (f-stack 2 =)
+       ::examples '[[[1 1 =] [true]]
+                    [["hi" "hi" =] [true]]
+                    [["hi" "there" =] [false]]
+                    [[[] false =] [false]]]}
+   'pack {::spec (stack-spec :x ::item
+                             :aggregate ::aggregate)
+          ::fn (stack-effect [x a] [(conj (vec a) x)])
+          ::examples '[[[[] 1 pack] [[1]]]
+                       [[[1 2 3] 4 pack] [[1 2 3 4]]]]}
+   'unpack {::spec (stack-spec :aggregate ::aggregate)
+            ::fn (stack-effect [[a & others]] [a (vec others)])
+            ::examples '[[[["a" "b" "c"] unpack] ["a" ["b" "c"]]]]}
+   'count {::spec (stack-spec :aggregate ::aggregate)
+           ::fn (stack-effect [a] [(count a)])
+           ::examples '[[[["a" "b" "c"] count] [3]]]}
+   'join {::spec (stack-spec :agg1 ::aggregate
+                             :agg2 ::aggregate)
+          ::fn (f-stack 2 (comp vec concat))
+          ::examples '[[[["a" "b"] ["c" "d"] join] [["a" "b" "c" "d"]]]]}
+   'range {::spec (stack-spec :from ::integer
+                              :to ::integer)
+           ::fn (f-stack 2 (comp vec range))
+           ::examples '[[[1 5 range] [[1 2 3 4]]]]}
+   'swaack {::spec (stack-spec :list ::aggregate)
+            ::doc "Swaps the list on top of the stack and the rest of the stack"
+            ::fn (fn [{[a & others] ::stack ::keys [dictionary expression]}]
+                   {::stack (apply list (vec others) a)
+                    ::expression expression
+                    ::dictionary dictionary})
+            ::examples '[[[1 2 3 [4 5 6] swaack] [[3 2 1] 4 5 6]]]}
+   'infra {::spec (stack-spec :program ::program
+                              :list ::aggregate)
+           ::doc "Accept a quoted program and a list on the stack and run the program
                     with the list as its stack.  Does not affect the rest of the stack."
-            ::definition '[swap swaack unpack dip swaack]
-            ::examples '[[[1 2 3 [4 5 6] [* +] infra] [[26] 3 2 1]]]}
-    'some? {::spec (stack-spec :item ::item)
-            ::fn (f-stack 1 (comp some? nothing->nil))}
-    'getfirst {::spec (spec/cat :aggregate ::aggregate, :other (spec/* ::item))
-               ::fn (f-stack 1 first)}
-    'every? {::spec (stack-spec :program ::aggregate
-                                :aggregate ::aggregate)
-             ::fn (fn [env]
-                    #_(update-stack (fn [[p a & others :as stack]]
-                                      (->> a
-                                           (every? #(leaves-true? (with-stack env (conj others %)) p))
-                                           (conj others)))
-                                    env))}
-    'in  {::spec (stack-spec :aggregate ::aggregate, :item ::item)
-          ::fn (f-stack 2 contains?)}
-    'intersection {::spec (stack-spec :aggregate-x ::aggregate
-                                      :aggregate-y ::aggregate)
-                   ::fn (f-stack 2 (fn [x y]
-                                     (into []
-                                           (clojure.set/intersection
-                                            (into #{} x)
-                                            (into #{} y)))))}}))
+           ::definition '[swap swaack unpack dip swaack]
+           ::examples '[[[1 2 3 [4 5 6] [* +] infra] [[26] 3 2 1]]]}
+   'some? {::spec (stack-spec :item ::item)
+           ::fn (f-stack 1 (comp some? nothing->nil))}
+   'first {::spec (spec/cat :aggregate ::aggregate, :other (spec/* ::item))
+           ::fn (f-stack 1 first)}
+   'every? {::spec (stack-spec :program ::aggregate
+                               :aggregate ::aggregate)
+            ::fn (fn [env]
+                   #_(update-stack (fn [[p a & others :as stack]]
+                                     (->> a
+                                          (every? #(leaves-true? (with-stack env (conj others %)) p))
+                                          (conj others)))
+                                   env))}
+   'in  {::spec (stack-spec :aggregate ::aggregate, :item ::item)
+         ::fn (f-stack 2 contains?)}
+   'intersection {::spec (stack-spec :aggregate-x ::aggregate
+                                     :aggregate-y ::aggregate)
+                  ::fn (f-stack 2 (fn [x y]
+                                    (into []
+                                          (clojure.set/intersection
+                                           (into #{} x)
+                                           (into #{} y)))))}})
+(swap! core-words merge
+       base-words
+       arithmetic-words
+       predicates)
+
 (defn default-env []
   {::stack '()
-   ::dictionary builtin-words
+   ::dictionary @core-words
    ::expression '()})
 
 (defn k
@@ -658,7 +672,7 @@ words.
   accidental infinite loops (for debugging purposes)"
   ([opts p]
    (::stack (eval opts (assoc (default-env) ::expression p))))
-  ([p] (k {} p)))
+  ([p] (k {:before-step print-env} p)))
 
 (require '[clojure.test :as test])
 (defn test
@@ -666,8 +680,8 @@ words.
   work. Takes optional list of words to test"
   ([words]
    (doseq [[word {::keys [examples]}] (if words
-                                        (select-keys builtin-words words)
-                                        builtin-words)]
+                                        (select-keys @core-words words)
+                                        @core-words)]
      (test/testing (str word)
        (doseq [[program exp-stack] examples]
          (->> program
@@ -679,14 +693,7 @@ words.
 #+END_SRC
 
 #+RESULTS:
-: :kcats.core/stack-min-depth-1:kcats.core/stack-min-depth-2:kcats.core/stack-min-depth-3:kcats.core/binary-arithmetic:kcats.core/predicate:kcats.core/quoted-word#'kcats.core/stack-spec#'kcats.core/arithmetic-words#'kcats.core/predicatesclass clojure.lang.ExceptionInfoclass java.lang.RuntimeExceptionSyntax error reading source at (REPL:129:69).
-: Unmatched delimiter: ]
-
-#+RESULTS:
-: :kcats.core/stack-min-depth-1:kcats.core/stack-min-depth-2:kcats.core/stack-min-depth-3:kcats.core/binary-arithmetic:kcats.core/predicate:kcats.core/quoted-word#'kcats.core/stack-spec#'kcats.core/arithmetic-words#'kcats.core/predicates#'kcats.core/builtin-words#'kcats.core/default-env#'kcats.core/knil#'kcats.core/test
-
-#+RESULTS:
-: :kcats.core/stack-min-depth-1:kcats.core/stack-min-depth-2:kcats.core/stack-min-depth-3:kcats.core/binary-arithmetic:kcats.core/predicate:kcats.core/quoted-word#'kcats.core/stack-spec#'kcats.core/arithmetic-words#'kcats.core/predicates#'kcats.core/recur*#'kcats.core/builtin-words#'kcats.core/default-env#'kcats.core/knil#'kcats.core/test
+: :kcats.core/stack-min-depth-1:kcats.core/stack-min-depth-2:kcats.core/stack-min-depth-3:kcats.core/binary-arithmetic:kcats.core/predicate:kcats.core/quoted-word#'kcats.core/stack-specnil#'kcats.core/arithmetic-words#'kcats.core/predicates#'kcats.core/base-words{ends-with? #:kcats.core{:spec :kcats.core/stack-min-depth-2, :fn #function[clojure.core/partial/fn--5824]}, every? #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "0761c079-b08e-41a8-bd1f-a2f119d48ac4", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:program :aggregate :others], :forms [:kcats.core/aggregate :kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/fn--17652]}, unwrap #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "86a6eb8b-50b8-455c-bde5-ef1e731ba8d2", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:aggregate :others], :forms [:kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[[1] unwrap] [1]]]}, first #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "05ad3e98-45a8-47d1-86d2-6f0368c2a101", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:aggregate :other], :forms [:kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824]}, branch #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/aggregate :kcats.core/item {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "0cfd58e3-fc07-4ebe-8e49-9d8bb329edb4", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:false-branch :true-branch :condition :others], :forms [:kcats.core/aggregate :kcats.core/aggregate :kcats.core/item (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[5 true [3 *] [4 +] branch] [15]] [[6 false [3 *] [4 +] branch] [10]]]}, = #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/item :kcats.core/item {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "8f87c522-d3b2-413c-9f58-2b1c45de200f", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:x :y :others], :forms [:kcats.core/item :kcats.core/item (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824], :examples [[[1 1 =] [true]] [["hi" "hi" =] [true]] [["hi" "there" =] [false]] [[[] false =] [false]]]}, step #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "c1432998-8c24-4329-930c-7b441819fc09", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:program :aggregate :others], :forms [:kcats.core/aggregate :kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[1 [2 3 4] [*] step] [24]]]}, dec #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/number {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "32fb302c-c1c0-4a98-9ad3-73fce72ae512", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:x :others], :forms [:kcats.core/number (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824]}, < #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, pack #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/item :kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "004fdcbf-59c0-4ac1-9586-983640144578", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:x :aggregate :others], :forms [:kcats.core/item :kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[[] 1 pack] [[1]]] [[[1 2 3] 4 pack] [[1 2 3 4]]]]}, ifte #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/aggregate :kcats.core/program {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "39fb86ff-bca4-4a5e-9173-f1e57963e3a0", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:false-branch :true-branch :condition :others], :forms [:kcats.core/aggregate :kcats.core/aggregate :kcats.core/program (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :definition [[execute] dipd branch], :examples [[[5 [clone 5 =] [3 *] [4 +] ifte] [15]] [[6 [clone 5 =] [3 *] [4 +] ifte] [10]]]}, infra #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/program :kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "77cd71a4-103b-4e8c-b0ed-6ccc986da3ec", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:program :list :others], :forms [:kcats.core/program :kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :doc "Accept a quoted program and a list on the stack and run the program\n                    with the list as its stack.  Does not affect the rest of the stack.", :definition [swap swaack unpack dip swaack], :examples [[[1 2 3 [4 5 6] [* +] infra] [[26] 3 2 1]]]}, some? #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/item {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "8637caca-ce57-40ee-b1f9-5f3a004410f1", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:item :others], :forms [:kcats.core/item (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824]}, join #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "f1fb07b0-43f0-454d-a441-42478eb05f0f", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:agg1 :agg2 :others], :forms [:kcats.core/aggregate :kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824], :examples [[[["a" "b"] ["c" "d"] join] [["a" "b" "c" "d"]]]]}, range #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/integer :kcats.core/integer {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "1a2c771b-5880-4df2-baaa-b97269542e38", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:from :to :others], :forms [:kcats.core/integer :kcats.core/integer (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824], :examples [[[1 5 range] [[1 2 3 4]]]]}, in #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/item {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "7ce65178-4175-40e6-8d6d-05a633018ea4", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:aggregate :item :others], :forms [:kcats.core/aggregate :kcats.core/item (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824]}, pos? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, sequential? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, starts-with? #:kcats.core{:spec :kcats.core/stack-min-depth-2, :fn #function[clojure.core/partial/fn--5824]}, neg? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, <= #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, pushcond #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/pair :kcats.core/association-list {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "54cf99a1-8b65-47c1-8d3f-ba37b6a5844b", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:condition :conditions :others], :forms [:kcats.core/pair :kcats.core/association-list (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :definition [wrap swap join]}, intersection #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "867058e0-9f37-4672-b2a7-dd535ad2e7c7", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:aggregate-x :aggregate-y :others], :forms [:kcats.core/aggregate :kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824]}, * #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, min #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, wrap #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/item {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "64fd6544-5dd4-49b2-b339-cd8553898e9f", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:item :others], :forms [:kcats.core/item (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[1 wrap] [[1]]]]}, swaack #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "3c118da7-e750-4046-90a2-3439abb50a10", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:list :others], :forms [:kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :doc "Swaps the list on top of the stack and the rest of the stack", :fn #function[kcats.core/fn--17646], :examples [[[1 2 3 [4 5 6] swaack] [[3 2 1] 4 5 6]]]}, empty? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, quot #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, string? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, lookup #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/item :kcats.core/association-list], :ret {}, :ks [:kcats.core/key :kcats.core/map], :forms [:kcats.core/item :kcats.core/association-list], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824], :examples [[[[[a b] [c d]] a lookup] [b]] [[[[a b] [c d]] e lookup] [[]]]]}, > #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, int? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, eval-step #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/environment {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "bd4722b6-6957-4b5a-a7ec-73e5e86671bd", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:environment :others], :forms [:kcats.core/environment (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824]}, even? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, dip #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/item {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "324e504a-1462-4330-b315-b762803c99dc", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:program :item :others], :forms [:kcats.core/aggregate :kcats.core/item (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[1 8 [inc] dip] [8 2]]]}, swapd #:kcats.core{:spec :kcats.core/stack-min-depth-3, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[1 2 3 swapd] [3 1 2]]]}, mod #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, primrec #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/program :kcats.core/program :kcats.core/number {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "3d7ec31c-2c96-40d6-bf7f-be1c764b5ebe", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:rec1 :exit :data :others], :forms [:kcats.core/program :kcats.core/program :kcats.core/number (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :definition [[execute] swap join [[discard] swap join] dip [[clone zero?]] dipd [[clone dec]] dip recur], :examples [[[5 [1] [*] primrec] [120]]]}, - #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, unpack #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "b539eb12-27d0-48f0-af9a-2f054be66282", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:aggregate :others], :forms [:kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[["a" "b" "c"] unpack] ["a" ["b" "c"]]]]}, zero? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, inscribe #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/word :kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "fb5e5b3e-fac5-460a-b098-7ece553337d7", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:word :definition :others], :forms [:kcats.core/word :kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #'kcats.core/inscribe, :examples [[[[3 +] [add3] unwrap inscribe 5 add3] [8]]]}, rem #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, execute #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/program {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "87d440a8-cd04-47a0-b277-c44937ecc72c", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:program :others], :forms [:kcats.core/program (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[[1 2 +] execute] [3]] [[2 [+] 4 swap execute] [6]]]}, recur #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/program :kcats.core/program :kcats.core/program :kcats.core/program {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "128caee3-dc81-4ae7-b3e2-51524c9c7734", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:rec2 :rec1 :true-branch :false-branch :others], :forms [:kcats.core/program :kcats.core/program :kcats.core/program :kcats.core/program (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[3 [clone 1 <=] [] [clone dec] [execute *] recur] [6]]]}, type #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/association-list {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "b835728c-2dc3-4c07-8070-972afe250053", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:alist :others], :forms [:kcats.core/association-list (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :definition [[clone count 1 =] [first first] [[type] unwrap lookup] ifte], :examples [[[[[foo 1]] type] [foo]] [[[[type url] [value "http://foo.com"]] type] [url]]]}, dipd #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/item :kcats.core/item {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "05ce3008-dc34-4bed-a198-b72650a0ac97", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:program :item1 :item2 :others], :forms [:kcats.core/aggregate :kcats.core/item :kcats.core/item (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[1 2 3 [inc] dipd] [3 2 2]]]}, true? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, / #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, >= #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, loop #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/program :kcats.core/item {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "dec09535-25e1-4cbf-85c7-49b57b50104f", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:program :flag :others], :forms [:kcats.core/program :kcats.core/item (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[10 true [-2 * clone 50 <] loop] [160]]]}, cond #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/association-list {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "a6e02a6e-4f26-4231-89cd-208f88d062c8", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:test-expr-pairs :other], :forms [:kcats.core/association-list (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/fn--17252]}, odd? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, inc #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/number {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "47a884af-c683-4cf0-bd8c-6ac24b2dc0e3", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:x :others], :forms [:kcats.core/number (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824]}, + #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, false? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, clone #:kcats.core{:spec :kcats.core/stack-min-depth-1, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[1 2 3 clone] [3 3 2 1]]]}, max #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, count #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "6fae0df9-9540-4826-9ff8-ba1c1398ea18", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:aggregate :others], :forms [:kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[["a" "b" "c"] count] [3]]]}, swap #:kcats.core{:spec :kcats.core/stack-min-depth-2, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[1 2 3 swap] [2 3 1]]]}, assoc #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/pair :kcats.core/association-list {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "9f28566d-5d9c-4748-89f3-b7a2f3d334ba", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:item :alist :others], :forms [:kcats.core/pair :kcats.core/association-list (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824], :examples [[[[[a b] [c d]] [a x] assoc] [[[a x] [c d]]]] [[[[a b] [c d]] [e x] assoc] [[[a b] [c d] [e x]]]]]}, describe #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/word {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "fd442887-025f-4f17-bfc0-df90e04531d5", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:word :others], :forms [:kcats.core/word (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/fn--17675]}, discard #:kcats.core{:spec :kcats.core/stack-min-depth-1, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[1 2 3 discard] [2 1]] [[1 2 3 [a b c] discard] [3 2 1]]]}, rotate #:kcats.core{:spec :kcats.core/stack-min-depth-3, :fn #function[kcats.core/env-effect/fn--13662]}, addmethod #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/pair :kcats.core/word {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "00f6457b-0493-4dba-a0ca-c2edc6297dbf", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:condition :word :others], :forms [:kcats.core/pair :kcats.core/word (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :definition [[clone describe] dip pack [rotate pack] infra swap inscribe]}, number? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}}#'kcats.core/default-env#'kcats.core/knil#'kcats.core/test
 
 Now we can go ahead and start filling out axiom words in our default dictionary.
 
@@ -709,54 +716,87 @@ associations as lists of pairs.
 Then include some words that depend on this functionality.
 
 #+BEGIN_SRC clojure
-    (expound/def ::pair (spec/coll-of ::item :kind vector? :count 2))
+(expound/def ::pair (spec/coll-of ::item :kind vector? :count 2))
 
-    (expound/def ::association-list (spec/coll-of ::pair
-                                               :kind vector?))
+(expound/def ::association-list (spec/coll-of ::pair
+                                              :kind vector?))
 
-    (def builtin-words
-      (merge builtin-words
-              {'assoc {::spec (spec/cat :item ::pair, :alist ::association-list
-                                        :others (spec/* ::item))
-                       ::fn (f-stack 2 (fn [alist [k v :as item]]
-                                         (let [i (.indexOf (mapv first alist) k)]
-                                           (if (= -1 i)
-                                             (conj alist item)
-                                             (assoc alist i item)))))
-                       ::examples '[[[[[a b] [c d]] [a x] assoc] #_-> [[[a x] [c d]]]]
-                                    [[[[a b] [c d]] [e x] assoc] #_-> [[[a b] [c d] [e x]]]]]}
-               'lookup {::spec (spec/cat ::key ::item
-                                         ::map ::association-list)
-                        ::fn (f-stack 2 (fn [alist key]
-                                          (get (into {} alist) key [])))
-                        ::examples '[[[[[a b] [c d]] a lookup] [b]]
-                                     [[[[a b] [c d]] e lookup] [[]]]]}
-               'cond {::spec (spec/cat :test-expr-pairs ::association-list
-                                       :other (spec/* ::item))
-                      ::fn (fn [{[[[test expr :as first-clause]
-                                   & other-clauses]
-                                  & others] ::stack
-                                 ::keys [dictionary expression]}]
-                             {::expression (if first-clause
-                                             (concat [test
-                                                      expr ;; the then
-                                                      [(vec other-clauses) 'cond] ;; the else
-                                                      'ifte]
-                                                     expression)
-                                             expression)
-                              ::stack (cond-> others
-                                        ;; if cond is empty result is empty list
-                                        (not first-clause) (conj []))
-                              ::dictionary dictionary})}}))
+(def associative-words
+  {'assoc {::spec (spec/cat :item ::pair, :alist ::association-list
+                            :others (spec/* ::item))
+           ::fn (f-stack 2 (fn [alist [k v :as item]]
+                             (let [i (.indexOf (mapv first alist) k)]
+                               (if (= -1 i)
+                                 (conj alist item)
+                                 (assoc alist i item)))))
+           ::examples '[[[[[a b] [c d]] [a x] assoc] #_-> [[[a x] [c d]]]]
+                        [[[[a b] [c d]] [e x] assoc] #_-> [[[a b] [c d] [e x]]]]]}
+   'lookup {::spec (spec/cat ::key ::item
+                             ::map ::association-list)
+            ::fn (f-stack 2 (fn [alist key]
+                              (get (into {} alist) key [])))
+            ::examples '[[[[[a b] [c d]] a lookup] [b]]
+                         [[[[a b] [c d]] e lookup] [[]]]]}
+   'cond {::spec (spec/cat :test-expr-pairs ::association-list
+                           :other (spec/* ::item))
+          ::fn (fn [{[[[test expr :as first-clause]
+                       & other-clauses]
+                      & others] ::stack
+                     ::keys [dictionary expression]}]
+                 {::expression (if first-clause
+                                 (concat [test
+                                          expr ;; the then
+                                          [(vec other-clauses) 'cond] ;; the else
+                                          'ifte]
+                                         expression)
+                                 expression)
+                  ::stack (cond-> others
+                            ;; if cond is empty result is empty list
+                            (not first-clause) (conj []))
+                  ::dictionary dictionary})}
+   'type {::spec (stack-spec :alist ::association-list)
+          ::definition '[[clone count 1 =] ;; if it's a single item
+                         [first first] ;; the type is the key of that first item
+                         [[type] unwrap lookup] ;; otherwise look up the key 'type'
+                         ifte]
+          ::examples '[[[[[foo 1]] type] [foo]]
+                       [[[[type url] [value "http://foo.com"]] type] [url]]]}})
+
+(swap! core-words merge associative-words)
 #+END_SRC
 
 #+RESULTS:
-: :kcats.core/pair:kcats.core/association-list#'kcats.core/builtin-words
+: :kcats.core/pair:kcats.core/association-list#'kcats.core/associative-words{ends-with? #:kcats.core{:spec :kcats.core/stack-min-depth-2, :fn #function[clojure.core/partial/fn--5824]}, every? #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "fb4eaf08-db5b-4cf5-a6fc-e24a70f8ee57", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:program :aggregate :others], :forms [:kcats.core/aggregate :kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/fn--17135]}, unwrap #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "6bd288a7-c1af-4512-8b26-32ef5275e06f", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:aggregate :others], :forms [:kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[[1] unwrap] [1]]]}, first #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "85037120-01a7-4839-a1fc-dd090bf733ff", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:aggregate :other], :forms [:kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824]}, branch #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/aggregate :kcats.core/item {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "a7cdfd7e-7cb8-4178-a3b5-538ec8e0daa2", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:false-branch :true-branch :condition :others], :forms [:kcats.core/aggregate :kcats.core/aggregate :kcats.core/item (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[5 true [3 *] [4 +] branch] [15]] [[6 false [3 *] [4 +] branch] [10]]]}, = #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/item :kcats.core/item {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "ad872f98-ee7d-4370-9fc2-3cb2b3eb4217", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:x :y :others], :forms [:kcats.core/item :kcats.core/item (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824], :examples [[[1 1 =] [true]] [["hi" "hi" =] [true]] [["hi" "there" =] [false]] [[[] false =] [false]]]}, step #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "e8ee9da1-e285-4308-a92c-93aeefb418f6", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:program :aggregate :others], :forms [:kcats.core/aggregate :kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[1 [2 3 4] [*] step] [24]]]}, dec #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/number {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "c3a27745-d108-437e-9f68-3a4beb863f35", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:x :others], :forms [:kcats.core/number (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824]}, < #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, pack #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/item :kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "8fd2ccde-ee38-4a8e-9db2-cf3ead71fb9c", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:x :aggregate :others], :forms [:kcats.core/item :kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[[] 1 pack] [[1]]] [[[1 2 3] 4 pack] [[1 2 3 4]]]]}, ifte #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/aggregate :kcats.core/program {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "4855918d-2e2b-4c97-8e7a-caa8d1f97a38", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:false-branch :true-branch :condition :others], :forms [:kcats.core/aggregate :kcats.core/aggregate :kcats.core/program (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :definition [[execute] dipd branch], :examples [[[5 [clone 5 =] [3 *] [4 +] ifte] [15]] [[6 [clone 5 =] [3 *] [4 +] ifte] [10]]]}, infra #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/program :kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "5827446c-7319-4fe1-86ea-841fdf926e54", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:program :list :others], :forms [:kcats.core/program :kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :doc "Accept a quoted program and a list on the stack and run the program\n                    with the list as its stack.  Does not affect the rest of the stack.", :definition [swap swaack unpack dip swaack], :examples [[[1 2 3 [4 5 6] [* +] infra] [[26] 3 2 1]]]}, some? #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/item {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "31fd028a-f9e0-4aa3-839f-0fbd7c91e54e", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:item :others], :forms [:kcats.core/item (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824]}, join #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "f8ef9220-f7aa-42f8-b4b2-e7b710163293", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:agg1 :agg2 :others], :forms [:kcats.core/aggregate :kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824], :examples [[[["a" "b"] ["c" "d"] join] [["a" "b" "c" "d"]]]]}, range #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/integer :kcats.core/integer {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "515ccbcd-72da-4ee2-a142-abf5909a5ad8", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:from :to :others], :forms [:kcats.core/integer :kcats.core/integer (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824], :examples [[[1 5 range] [[1 2 3 4]]]]}, in #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/item {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "1698e72f-98eb-498d-b538-7f87fd4da3f5", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:aggregate :item :others], :forms [:kcats.core/aggregate :kcats.core/item (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824]}, pos? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, sequential? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, starts-with? #:kcats.core{:spec :kcats.core/stack-min-depth-2, :fn #function[clojure.core/partial/fn--5824]}, neg? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, <= #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, intersection #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "36fd7058-805b-465d-a5e6-bf41854ffb51", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:aggregate-x :aggregate-y :others], :forms [:kcats.core/aggregate :kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824]}, * #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, min #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, wrap #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/item {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "64efde6f-368a-460d-9406-22d9ade9e2da", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:item :others], :forms [:kcats.core/item (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[1 wrap] [[1]]]]}, swaack #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "a7c493b9-b4a0-4855-9f44-0df8db0d47c0", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:list :others], :forms [:kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :doc "Swaps the list on top of the stack and the rest of the stack", :fn #function[kcats.core/fn--17129], :examples [[[1 2 3 [4 5 6] swaack] [[3 2 1] 4 5 6]]]}, empty? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, quot #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, string? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, lookup #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/item :kcats.core/association-list], :ret {}, :ks [:kcats.core/key :kcats.core/map], :forms [:kcats.core/item :kcats.core/association-list], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824], :examples [[[[[a b] [c d]] a lookup] [b]] [[[[a b] [c d]] e lookup] [[]]]]}, > #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, int? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, even? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, dip #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/item {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "fac05d2c-8f18-4649-b8ae-bc9fecd6a12e", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:program :item :others], :forms [:kcats.core/aggregate :kcats.core/item (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[1 8 [inc] dip] [8 2]]]}, mod #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, primrec #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/program :kcats.core/program :kcats.core/number {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "56fa958c-8c14-4d1e-a390-3901adc5bbce", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:rec1 :exit :data :others], :forms [:kcats.core/program :kcats.core/program :kcats.core/number (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :definition [[execute] swap join [[discard] swap join] dip [[clone zero?]] dipd [[clone dec]] dip recur], :examples [[[5 [1] [*] primrec] [120]]]}, - #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, unpack #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "1224e1e1-cba5-488e-b672-107f1e9e056b", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:aggregate :others], :forms [:kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[["a" "b" "c"] unpack] ["a" ["b" "c"]]]]}, zero? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, inscribe #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/word :kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "5af816be-4dcc-4f80-a725-ff6b955d9610", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:word :definition :others], :forms [:kcats.core/word :kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #'kcats.core/inscribe, :examples [[[[3 +] [add3] unwrap inscribe 5 add3] [8]]]}, rem #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, execute #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/program {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "620caaef-fed0-4c17-8b2f-5d05ff74cf9d", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:program :others], :forms [:kcats.core/program (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[[1 2 +] execute] [3]] [[2 [+] 4 swap execute] [6]]]}, recur #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/program :kcats.core/program :kcats.core/program :kcats.core/program {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "028bd342-a954-4177-94c3-db1c59258ca1", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:rec2 :rec1 :true-branch :false-branch :others], :forms [:kcats.core/program :kcats.core/program :kcats.core/program :kcats.core/program (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[3 [clone 1 <=] [] [clone dec] [execute *] recur] [6]]]}, type #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/association-list {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "b835728c-2dc3-4c07-8070-972afe250053", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:alist :others], :forms [:kcats.core/association-list (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :definition [[clone count 1 =] [first first] [[type] unwrap lookup] ifte], :examples [[[[[foo 1]] type] [foo]] [[[[type url] [value "http://foo.com"]] type] [url]]]}, dipd #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/item :kcats.core/item {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "9da6e2cf-e59f-42a8-91d0-d0aded19104c", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:program :item1 :item2 :others], :forms [:kcats.core/aggregate :kcats.core/item :kcats.core/item (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[1 2 3 [inc] dipd] [3 2 2]]]}, true? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, / #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, >= #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, loop #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/program :kcats.core/item {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "6bf55a1b-f0c6-4eb3-83b9-61f5a4fd7cb3", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:program :flag :others], :forms [:kcats.core/program :kcats.core/item (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[10 true [-2 * clone 50 <] loop] [160]]]}, cond #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/association-list {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "a6e02a6e-4f26-4231-89cd-208f88d062c8", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:test-expr-pairs :other], :forms [:kcats.core/association-list (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/fn--17252]}, odd? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, inc #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/number {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "97fe389c-868b-4d96-8951-d38ffb96f006", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:x :others], :forms [:kcats.core/number (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824]}, + #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, false? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, clone #:kcats.core{:spec :kcats.core/stack-min-depth-1, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[1 2 3 clone] [3 3 2 1]]]}, max #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, count #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "63e36cd2-9ef0-4120-a655-aad823127483", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:aggregate :others], :forms [:kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[["a" "b" "c"] count] [3]]]}, swap #:kcats.core{:spec :kcats.core/stack-min-depth-2, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[1 2 3 swap] [2 3 1]]]}, assoc #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/pair :kcats.core/association-list {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "9f28566d-5d9c-4748-89f3-b7a2f3d334ba", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:item :alist :others], :forms [:kcats.core/pair :kcats.core/association-list (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824], :examples [[[[[a b] [c d]] [a x] assoc] [[[a x] [c d]]]] [[[[a b] [c d]] [e x] assoc] [[[a b] [c d] [e x]]]]]}, describe #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [#object[clojure.spec.alpha$tuple_impl$reify__2098 0x5f07115f "clojure.spec.alpha$tuple_impl$reify__2098@5f07115f"] {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "5fd5f8b3-7111-4f23-9bff-be83c93d75aa", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:word :others], :forms [(clojure.spec.alpha/tuple :kcats.core/word) (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/fn--17156]}, discard #:kcats.core{:spec :kcats.core/stack-min-depth-1, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[1 2 3 discard] [2 1]] [[1 2 3 [a b c] discard] [3 2 1]]]}, rotate #:kcats.core{:spec :kcats.core/stack-min-depth-3, :fn #function[kcats.core/env-effect/fn--13662]}, number? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}}
 
 
 #+begin_src clojure
 
 #+end_src
+** Methods
+#+begin_src clojure
+(swap! core-words merge
+       {'pushcond {::spec (stack-spec :condition ::pair
+                                      :conditions ::association-list)
+                   ::definition '[wrap swap join]}
+        'addmethod {::spec (stack-spec :condition ::pair
+                                       :word ::word)
+                    ::definition '[[clone describe] dip ;; get definition of word beneath
+                                        ; and keep an extra copy for later inscribe
+                                   pack ;; new condition onto end of definition
+                                   [rotate ;; new condition to 1st
+                                           ;; position - TODO: note this
+                                           ;; could fail if the def is
+                                           ;; more than just an alist
+                                           ;; and 'cond'.
+                                    pack] ;; new condition onto end of conditions
+                                   infra 
+                                   swap inscribe ;; redefine word
+                                   ]}})
+#+end_src
+
+#+RESULTS:
+: {ends-with? #:kcats.core{:spec :kcats.core/stack-min-depth-2, :fn #function[clojure.core/partial/fn--5824]}, every? #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "fb4eaf08-db5b-4cf5-a6fc-e24a70f8ee57", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:program :aggregate :others], :forms [:kcats.core/aggregate :kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/fn--17135]}, unwrap #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "6bd288a7-c1af-4512-8b26-32ef5275e06f", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:aggregate :others], :forms [:kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[[1] unwrap] [1]]]}, first #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "85037120-01a7-4839-a1fc-dd090bf733ff", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:aggregate :other], :forms [:kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824]}, branch #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/aggregate :kcats.core/item {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "a7cdfd7e-7cb8-4178-a3b5-538ec8e0daa2", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:false-branch :true-branch :condition :others], :forms [:kcats.core/aggregate :kcats.core/aggregate :kcats.core/item (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[5 true [3 *] [4 +] branch] [15]] [[6 false [3 *] [4 +] branch] [10]]]}, = #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/item :kcats.core/item {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "ad872f98-ee7d-4370-9fc2-3cb2b3eb4217", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:x :y :others], :forms [:kcats.core/item :kcats.core/item (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824], :examples [[[1 1 =] [true]] [["hi" "hi" =] [true]] [["hi" "there" =] [false]] [[[] false =] [false]]]}, step #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "e8ee9da1-e285-4308-a92c-93aeefb418f6", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:program :aggregate :others], :forms [:kcats.core/aggregate :kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[1 [2 3 4] [*] step] [24]]]}, dec #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/number {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "c3a27745-d108-437e-9f68-3a4beb863f35", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:x :others], :forms [:kcats.core/number (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824]}, < #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, pack #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/item :kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "8fd2ccde-ee38-4a8e-9db2-cf3ead71fb9c", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:x :aggregate :others], :forms [:kcats.core/item :kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[[] 1 pack] [[1]]] [[[1 2 3] 4 pack] [[1 2 3 4]]]]}, ifte #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/aggregate :kcats.core/program {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "4855918d-2e2b-4c97-8e7a-caa8d1f97a38", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:false-branch :true-branch :condition :others], :forms [:kcats.core/aggregate :kcats.core/aggregate :kcats.core/program (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :definition [[execute] dipd branch], :examples [[[5 [clone 5 =] [3 *] [4 +] ifte] [15]] [[6 [clone 5 =] [3 *] [4 +] ifte] [10]]]}, infra #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/program :kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "5827446c-7319-4fe1-86ea-841fdf926e54", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:program :list :others], :forms [:kcats.core/program :kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :doc "Accept a quoted program and a list on the stack and run the program\n                    with the list as its stack.  Does not affect the rest of the stack.", :definition [swap swaack unpack dip swaack], :examples [[[1 2 3 [4 5 6] [* +] infra] [[26] 3 2 1]]]}, some? #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/item {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "31fd028a-f9e0-4aa3-839f-0fbd7c91e54e", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:item :others], :forms [:kcats.core/item (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824]}, join #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "f8ef9220-f7aa-42f8-b4b2-e7b710163293", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:agg1 :agg2 :others], :forms [:kcats.core/aggregate :kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824], :examples [[[["a" "b"] ["c" "d"] join] [["a" "b" "c" "d"]]]]}, range #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/integer :kcats.core/integer {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "515ccbcd-72da-4ee2-a142-abf5909a5ad8", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:from :to :others], :forms [:kcats.core/integer :kcats.core/integer (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824], :examples [[[1 5 range] [[1 2 3 4]]]]}, in #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/item {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "1698e72f-98eb-498d-b538-7f87fd4da3f5", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:aggregate :item :others], :forms [:kcats.core/aggregate :kcats.core/item (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824]}, pos? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, sequential? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, starts-with? #:kcats.core{:spec :kcats.core/stack-min-depth-2, :fn #function[clojure.core/partial/fn--5824]}, neg? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, <= #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, pushcond #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "db0fde7f-2050-4a84-9870-25e915a174f9", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:condition :conditions :others], :forms [:kcats.core/aggregate :kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :definition [wrap swap join]}, intersection #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "36fd7058-805b-465d-a5e6-bf41854ffb51", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:aggregate-x :aggregate-y :others], :forms [:kcats.core/aggregate :kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824]}, * #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, min #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, wrap #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/item {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "64efde6f-368a-460d-9406-22d9ade9e2da", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:item :others], :forms [:kcats.core/item (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[1 wrap] [[1]]]]}, swaack #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "a7c493b9-b4a0-4855-9f44-0df8db0d47c0", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:list :others], :forms [:kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :doc "Swaps the list on top of the stack and the rest of the stack", :fn #function[kcats.core/fn--17129], :examples [[[1 2 3 [4 5 6] swaack] [[3 2 1] 4 5 6]]]}, empty? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, quot #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, string? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, lookup #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/item :kcats.core/association-list], :ret {}, :ks [:kcats.core/key :kcats.core/map], :forms [:kcats.core/item :kcats.core/association-list], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824], :examples [[[[[a b] [c d]] a lookup] [b]] [[[[a b] [c d]] e lookup] [[]]]]}, > #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, int? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, even? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, dip #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/item {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "fac05d2c-8f18-4649-b8ae-bc9fecd6a12e", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:program :item :others], :forms [:kcats.core/aggregate :kcats.core/item (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[1 8 [inc] dip] [8 2]]]}, mod #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, primrec #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/program :kcats.core/program :kcats.core/number {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "56fa958c-8c14-4d1e-a390-3901adc5bbce", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:rec1 :exit :data :others], :forms [:kcats.core/program :kcats.core/program :kcats.core/number (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :definition [[execute] swap join [[discard] swap join] dip [[clone zero?]] dipd [[clone dec]] dip recur], :examples [[[5 [1] [*] primrec] [120]]]}, - #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, unpack #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "1224e1e1-cba5-488e-b672-107f1e9e056b", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:aggregate :others], :forms [:kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[["a" "b" "c"] unpack] ["a" ["b" "c"]]]]}, zero? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, inscribe #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/word :kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "5af816be-4dcc-4f80-a725-ff6b955d9610", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:word :definition :others], :forms [:kcats.core/word :kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #'kcats.core/inscribe, :examples [[[[3 +] [add3] unwrap inscribe 5 add3] [8]]]}, rem #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, execute #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/program {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "620caaef-fed0-4c17-8b2f-5d05ff74cf9d", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:program :others], :forms [:kcats.core/program (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[[1 2 +] execute] [3]] [[2 [+] 4 swap execute] [6]]]}, recur #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/program :kcats.core/program :kcats.core/program :kcats.core/program {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "028bd342-a954-4177-94c3-db1c59258ca1", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:rec2 :rec1 :true-branch :false-branch :others], :forms [:kcats.core/program :kcats.core/program :kcats.core/program :kcats.core/program (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[3 [clone 1 <=] [] [clone dec] [execute *] recur] [6]]]}, type #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/association-list {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "b835728c-2dc3-4c07-8070-972afe250053", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:alist :others], :forms [:kcats.core/association-list (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :definition [[clone count 1 =] [first first] [[type] unwrap lookup] ifte], :examples [[[[[foo 1]] type] [foo]] [[[[type url] [value "http://foo.com"]] type] [url]]]}, dipd #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/item :kcats.core/item {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "9da6e2cf-e59f-42a8-91d0-d0aded19104c", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:program :item1 :item2 :others], :forms [:kcats.core/aggregate :kcats.core/item :kcats.core/item (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[1 2 3 [inc] dipd] [3 2 2]]]}, true? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, / #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, >= #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, loop #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/program :kcats.core/item {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "6bf55a1b-f0c6-4eb3-83b9-61f5a4fd7cb3", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:program :flag :others], :forms [:kcats.core/program :kcats.core/item (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[10 true [-2 * clone 50 <] loop] [160]]]}, cond #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/association-list {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "a6e02a6e-4f26-4231-89cd-208f88d062c8", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:test-expr-pairs :other], :forms [:kcats.core/association-list (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/fn--17252]}, odd? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, inc #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/number {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "97fe389c-868b-4d96-8951-d38ffb96f006", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:x :others], :forms [:kcats.core/number (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824]}, + #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, false? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, clone #:kcats.core{:spec :kcats.core/stack-min-depth-1, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[1 2 3 clone] [3 3 2 1]]]}, max #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, count #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "63e36cd2-9ef0-4120-a655-aad823127483", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:aggregate :others], :forms [:kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[["a" "b" "c"] count] [3]]]}, swap #:kcats.core{:spec :kcats.core/stack-min-depth-2, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[1 2 3 swap] [2 3 1]]]}, assoc #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/pair :kcats.core/association-list {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "9f28566d-5d9c-4748-89f3-b7a2f3d334ba", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:item :alist :others], :forms [:kcats.core/pair :kcats.core/association-list (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824], :examples [[[[[a b] [c d]] [a x] assoc] [[[a x] [c d]]]] [[[[a b] [c d]] [e x] assoc] [[[a b] [c d] [e x]]]]]}, describe #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [#object[clojure.spec.alpha$tuple_impl$reify__2098 0x5f07115f "clojure.spec.alpha$tuple_impl$reify__2098@5f07115f"] {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "5fd5f8b3-7111-4f23-9bff-be83c93d75aa", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:word :others], :forms [(clojure.spec.alpha/tuple :kcats.core/word) (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/fn--17156]}, discard #:kcats.core{:spec :kcats.core/stack-min-depth-1, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[1 2 3 discard] [2 1]] [[1 2 3 [a b c] discard] [3 2 1]]]}, rotate #:kcats.core{:spec :kcats.core/stack-min-depth-3, :fn #function[kcats.core/env-effect/fn--13662]}, number? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}}
+
 ** Nested Environments
 *** Basics
 Kcats environments are just data. We can manipulate an environment
@@ -769,7 +809,7 @@ within another environment to achieve various features:
   previous state, and do another calculation with it)
 *** Implementation
 First let's spec what a nested environment looks like
-#+begin_src clojure tangle src/kcats/core.clj
+#+begin_src clojure 
   (declare env->clj)
 
   (expound/def ::nested-environment
@@ -782,7 +822,7 @@ First let's spec what a nested environment looks like
 We'll need to move back and forth between clojure's idea of an
 environment and the equivalent representation in kcats.
 
-#+begin_src clojure tangle src/kcats/core.clj
+#+begin_src clojure
   (defn env->clj
     "Convert an env from kcats format to clj"
     [e]
@@ -811,11 +851,13 @@ Now we can define an axiom word that steps through a nested
 environment's execution.
 
 #+begin_src clojure
-  (def builtin-words
-    (merge builtin-words
-           {'eval-step {::spec (stack-spec :environment ::environment)
-                        ::fn (f-stack 1 (comp env->k eval-step env->clj))}}))
+(swap! core-words merge
+       {'eval-step {::spec (stack-spec :environment ::environment)
+                    ::fn (f-stack 1 (comp env->k eval-step env->clj))}})
 #+end_src
+
+#+RESULTS:
+: {ends-with? #:kcats.core{:spec :kcats.core/stack-min-depth-2, :fn #function[clojure.core/partial/fn--5824]}, every? #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "fb4eaf08-db5b-4cf5-a6fc-e24a70f8ee57", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:program :aggregate :others], :forms [:kcats.core/aggregate :kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/fn--17135]}, unwrap #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "6bd288a7-c1af-4512-8b26-32ef5275e06f", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:aggregate :others], :forms [:kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[[1] unwrap] [1]]]}, first #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "85037120-01a7-4839-a1fc-dd090bf733ff", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:aggregate :other], :forms [:kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824]}, branch #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/aggregate :kcats.core/item {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "a7cdfd7e-7cb8-4178-a3b5-538ec8e0daa2", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:false-branch :true-branch :condition :others], :forms [:kcats.core/aggregate :kcats.core/aggregate :kcats.core/item (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[5 true [3 *] [4 +] branch] [15]] [[6 false [3 *] [4 +] branch] [10]]]}, = #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/item :kcats.core/item {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "ad872f98-ee7d-4370-9fc2-3cb2b3eb4217", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:x :y :others], :forms [:kcats.core/item :kcats.core/item (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824], :examples [[[1 1 =] [true]] [["hi" "hi" =] [true]] [["hi" "there" =] [false]] [[[] false =] [false]]]}, step #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "e8ee9da1-e285-4308-a92c-93aeefb418f6", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:program :aggregate :others], :forms [:kcats.core/aggregate :kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[1 [2 3 4] [*] step] [24]]]}, dec #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/number {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "c3a27745-d108-437e-9f68-3a4beb863f35", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:x :others], :forms [:kcats.core/number (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824]}, < #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, pack #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/item :kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "8fd2ccde-ee38-4a8e-9db2-cf3ead71fb9c", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:x :aggregate :others], :forms [:kcats.core/item :kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[[] 1 pack] [[1]]] [[[1 2 3] 4 pack] [[1 2 3 4]]]]}, ifte #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/aggregate :kcats.core/program {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "4855918d-2e2b-4c97-8e7a-caa8d1f97a38", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:false-branch :true-branch :condition :others], :forms [:kcats.core/aggregate :kcats.core/aggregate :kcats.core/program (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :definition [[execute] dipd branch], :examples [[[5 [clone 5 =] [3 *] [4 +] ifte] [15]] [[6 [clone 5 =] [3 *] [4 +] ifte] [10]]]}, infra #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/program :kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "5827446c-7319-4fe1-86ea-841fdf926e54", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:program :list :others], :forms [:kcats.core/program :kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :doc "Accept a quoted program and a list on the stack and run the program\n                    with the list as its stack.  Does not affect the rest of the stack.", :definition [swap swaack unpack dip swaack], :examples [[[1 2 3 [4 5 6] [* +] infra] [[26] 3 2 1]]]}, some? #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/item {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "31fd028a-f9e0-4aa3-839f-0fbd7c91e54e", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:item :others], :forms [:kcats.core/item (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824]}, join #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "f8ef9220-f7aa-42f8-b4b2-e7b710163293", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:agg1 :agg2 :others], :forms [:kcats.core/aggregate :kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824], :examples [[[["a" "b"] ["c" "d"] join] [["a" "b" "c" "d"]]]]}, range #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/integer :kcats.core/integer {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "515ccbcd-72da-4ee2-a142-abf5909a5ad8", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:from :to :others], :forms [:kcats.core/integer :kcats.core/integer (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824], :examples [[[1 5 range] [[1 2 3 4]]]]}, in #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/item {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "1698e72f-98eb-498d-b538-7f87fd4da3f5", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:aggregate :item :others], :forms [:kcats.core/aggregate :kcats.core/item (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824]}, pos? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, sequential? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, starts-with? #:kcats.core{:spec :kcats.core/stack-min-depth-2, :fn #function[clojure.core/partial/fn--5824]}, neg? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, <= #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, pushcond #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "db0fde7f-2050-4a84-9870-25e915a174f9", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:condition :conditions :others], :forms [:kcats.core/aggregate :kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :definition [wrap swap join]}, intersection #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "36fd7058-805b-465d-a5e6-bf41854ffb51", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:aggregate-x :aggregate-y :others], :forms [:kcats.core/aggregate :kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824]}, * #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, min #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, wrap #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/item {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "64efde6f-368a-460d-9406-22d9ade9e2da", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:item :others], :forms [:kcats.core/item (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[1 wrap] [[1]]]]}, swaack #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "a7c493b9-b4a0-4855-9f44-0df8db0d47c0", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:list :others], :forms [:kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :doc "Swaps the list on top of the stack and the rest of the stack", :fn #function[kcats.core/fn--17129], :examples [[[1 2 3 [4 5 6] swaack] [[3 2 1] 4 5 6]]]}, empty? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, quot #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, string? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, lookup #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/item :kcats.core/association-list], :ret {}, :ks [:kcats.core/key :kcats.core/map], :forms [:kcats.core/item :kcats.core/association-list], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824], :examples [[[[[a b] [c d]] a lookup] [b]] [[[[a b] [c d]] e lookup] [[]]]]}, > #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, int? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, eval-step #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/environment {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "bd4722b6-6957-4b5a-a7ec-73e5e86671bd", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:environment :others], :forms [:kcats.core/environment (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824]}, even? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, dip #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/item {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "fac05d2c-8f18-4649-b8ae-bc9fecd6a12e", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:program :item :others], :forms [:kcats.core/aggregate :kcats.core/item (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[1 8 [inc] dip] [8 2]]]}, mod #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, primrec #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/program :kcats.core/program :kcats.core/number {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "56fa958c-8c14-4d1e-a390-3901adc5bbce", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:rec1 :exit :data :others], :forms [:kcats.core/program :kcats.core/program :kcats.core/number (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :definition [[execute] swap join [[discard] swap join] dip [[clone zero?]] dipd [[clone dec]] dip recur], :examples [[[5 [1] [*] primrec] [120]]]}, - #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, unpack #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "1224e1e1-cba5-488e-b672-107f1e9e056b", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:aggregate :others], :forms [:kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[["a" "b" "c"] unpack] ["a" ["b" "c"]]]]}, zero? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, inscribe #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/word :kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "5af816be-4dcc-4f80-a725-ff6b955d9610", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:word :definition :others], :forms [:kcats.core/word :kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #'kcats.core/inscribe, :examples [[[[3 +] [add3] unwrap inscribe 5 add3] [8]]]}, rem #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, execute #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/program {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "620caaef-fed0-4c17-8b2f-5d05ff74cf9d", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:program :others], :forms [:kcats.core/program (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[[1 2 +] execute] [3]] [[2 [+] 4 swap execute] [6]]]}, recur #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/program :kcats.core/program :kcats.core/program :kcats.core/program {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "028bd342-a954-4177-94c3-db1c59258ca1", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:rec2 :rec1 :true-branch :false-branch :others], :forms [:kcats.core/program :kcats.core/program :kcats.core/program :kcats.core/program (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[3 [clone 1 <=] [] [clone dec] [execute *] recur] [6]]]}, type #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/association-list {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "b835728c-2dc3-4c07-8070-972afe250053", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:alist :others], :forms [:kcats.core/association-list (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :definition [[clone count 1 =] [first first] [[type] unwrap lookup] ifte], :examples [[[[[foo 1]] type] [foo]] [[[[type url] [value "http://foo.com"]] type] [url]]]}, dipd #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate :kcats.core/item :kcats.core/item {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "9da6e2cf-e59f-42a8-91d0-d0aded19104c", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:program :item1 :item2 :others], :forms [:kcats.core/aggregate :kcats.core/item :kcats.core/item (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[1 2 3 [inc] dipd] [3 2 2]]]}, true? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, / #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, >= #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, loop #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/program :kcats.core/item {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "6bf55a1b-f0c6-4eb3-83b9-61f5a4fd7cb3", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:program :flag :others], :forms [:kcats.core/program :kcats.core/item (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[10 true [-2 * clone 50 <] loop] [160]]]}, cond #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/association-list {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "a6e02a6e-4f26-4231-89cd-208f88d062c8", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:test-expr-pairs :other], :forms [:kcats.core/association-list (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/fn--17252]}, odd? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, inc #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/number {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "97fe389c-868b-4d96-8951-d38ffb96f006", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:x :others], :forms [:kcats.core/number (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824]}, + #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, false? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}, clone #:kcats.core{:spec :kcats.core/stack-min-depth-1, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[1 2 3 clone] [3 3 2 1]]]}, max #:kcats.core{:spec :kcats.core/binary-arithmetic, :fn #function[clojure.core/partial/fn--5824]}, count #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/aggregate {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "63e36cd2-9ef0-4120-a655-aad823127483", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:aggregate :others], :forms [:kcats.core/aggregate (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[["a" "b" "c"] count] [3]]]}, swap #:kcats.core{:spec :kcats.core/stack-min-depth-2, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[1 2 3 swap] [2 3 1]]]}, assoc #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [:kcats.core/pair :kcats.core/association-list {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "9f28566d-5d9c-4748-89f3-b7a2f3d334ba", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:item :alist :others], :forms [:kcats.core/pair :kcats.core/association-list (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[clojure.core/partial/fn--5824], :examples [[[[[a b] [c d]] [a x] assoc] [[[a x] [c d]]]] [[[[a b] [c d]] [e x] assoc] [[[a b] [c d] [e x]]]]]}, describe #:kcats.core{:spec {:clojure.spec.alpha/op :clojure.spec.alpha/pcat, :ps [#object[clojure.spec.alpha$tuple_impl$reify__2098 0x5f07115f "clojure.spec.alpha$tuple_impl$reify__2098@5f07115f"] {:clojure.spec.alpha/op :clojure.spec.alpha/rep, :p2 :kcats.core/item, :splice false, :forms :kcats.core/item, :id #uuid "5fd5f8b3-7111-4f23-9bff-be83c93d75aa", :p1 :kcats.core/item, :ret []}], :ret {}, :ks [:word :others], :forms [(clojure.spec.alpha/tuple :kcats.core/word) (clojure.spec.alpha/* :kcats.core/item)], :rep+ nil}, :fn #function[kcats.core/fn--17156]}, discard #:kcats.core{:spec :kcats.core/stack-min-depth-1, :fn #function[kcats.core/env-effect/fn--13662], :examples [[[1 2 3 discard] [2 1]] [[1 2 3 [a b c] discard] [3 2 1]]]}, rotate #:kcats.core{:spec :kcats.core/stack-min-depth-3, :fn #function[kcats.core/env-effect/fn--13662]}, number? #:kcats.core{:spec :kcats.core/predicate, :fn #function[clojure.core/partial/fn--5824]}}
 
 ** Pipes
 *** Basics
@@ -1173,10 +1215,11 @@ A series of predicate/method pairs- Iterate over the pairs, and the
 first one where the pred returns true, execute the
 method. Performance-wise, it could be slower if there's lots of
 methods defined. However there's no dispatch function to execute so in
-some cases it could be faster. Ordering of the methods would become
-important. For example, if you had a predicate like =object?= (that is
-basically always true) you'd have to make sure that's last in the
-list.
+some cases it could be faster. (Note also, that because there's a
+stack here, we could always have a dispatch value available too)
+Ordering of the methods would become important. For example, if you
+had a predicate like =object?= (that is basically always true) you'd
+have to make sure that's last in the list.
 
 There's another performance issue - sometimes predicates are expensive
 to calculate repeatedly. Let's say you have a list of a billion
@@ -1432,33 +1475,82 @@ special quote reading function.
 ***** Pipes
 needs multi's because words like get/put should probably be generic
 and have specific methods for pipes.
-***** 
+
+** Nullary/unary/etc?
+Do we need these? If a program knows that the items it consumes will
+be needed later, it can =clone= them. And if a program is going to run
+another program that it knows will consume items it needs, it can also
+=clone= them first.
+
+So at first glance it would seem that nullary et al aren't needed. 
+
+Even if they were needed, these names are too difficult for the target
+audience to understand. We need better names and I can't think of any
+right now.
+
+** better names?
+- dipd :: dipdown 
+- ifte :: if
+- swaack :: swapstack, switch, pivot
+- primrec :: ?
+- infra :: inject? 
 ** Example programs
 *** Factorial
 **** Recursive definition 
 #+begin_src fundamental
-[10 
+ 10 
  [fact [[clone 0 =]
         [discard 1]
         [clone dec fact *]
         ifte]]
  inscribe
- fact]
+ fact
 #+end_src
 **** Recursive with recur
 #+begin_src fundamental
-[10
+ 5
  [clone 1 <=]
  []
  [clone dec]
  [execute *]
- recur]
+ recur
+
+ 5
+ [1]
+ [*]
+ 
 #+end_src
 **** Using range
 #+begin_src fundamental
-[10
+ 10
  1 +
  2 swap
  range unpack
- [*] step]
+ [*] step
+#+end_src
+**** Plain loop
+#+begin_src fundamental
+10 clone 
+true [dec clone [*] dip clone 1 >] loop
+discard
+#+end_src
+*** Jensen's Device
+ https://rosettacode.org/wiki/Jensen%27s_Device
+ #+begin_src fundamental
+ 100 [0] [[1.0 swap /] dip +] primrec
+ [100 0 swap 1 + 1 swap range [1.0 swap / +] step]
+ #+end_src
+*** Primrec
+#+begin_src fundamental
+(k {:max-steps 2000
+                :foo '[ 5
+                 [clone zero?]
+                 [discard 1]
+                 [clone dec]
+                 [execute *]
+                 recur]}
+               '[5 [1] [*] [execute] swap join ;; add the execute to r2
+                 [[discard] swap join] dip ;; add the discard to r1
+                 [[clone zero?]] dipd] ;; put the condition on bottom
+                )
 #+end_src
