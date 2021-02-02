@@ -264,8 +264,10 @@ Next we'll spec a stack. We want it to easily implement a FIFO
 stack, (meaning the last item you put in is accessible in constant
 time), and clojure's built-in list type does this.
 
-An expression is also a list of items that are being broken down into
-their axiomatic parts.
+An expression is a stack too, but it represents words waiting to be
+executed - parts of the program that haven't run yet. In kcats, the
+program modifies itself heavily, so it is constantly adding pieces to
+the expression.
 #+BEGIN_SRC clojure
 (def stack? (every-pred (complement indexed?) sequential?))
 
@@ -316,10 +318,10 @@ last environment.
 #+RESULTS:
 : #'kcats.core/eval-step#'kcats.core/eval
 
-Now, we define =onto-stack=,
-which says what we do to put an item onto the stack. Simple items like
-numbers, strings and undefined words, just go straight onto the stack
-with no changes.
+Now, we define =onto-stack=, which says what we do to put an item onto
+the stack. Simple values like numbers, strings and undefined words,
+just go straight onto the stack with no changes. This is the default
+and we'll handle everything else as a special case.
 
 #+BEGIN_SRC clojure
 (defmulti onto-stack
@@ -328,15 +330,11 @@ with no changes.
   (fn [{[item] ::expression}]
     (type item)))
 
-(defn- push
-  "Push an item from the expression into the stack"
+(defmethod onto-stack :default
   [{[item & others] ::expression :as env}]
   (-> env
       (assoc ::expression others)
       (update ::stack conj item)))
-
-(defmethod onto-stack :default [env]
-  (push env))
 #+END_SRC
 
 #+RESULTS:
@@ -347,14 +345,21 @@ word has a clojure function that will run when that word is
 evaluated. If it's not defined, then the word will act like everything
 else and just be put on the stack.
 
+We'll include handling for calling down into the platform language
+directly. There will be syntax for calling clojure functions and java
+methods as if they are kcats words.
+
 We'll also specify here what a step of evaluation is - it looks at the
 next item in the expression. If it has a definition, it's replaced
 with its definition. Otherwise it's put onto the stack.
 
 Recall what =eval= does, it just keeps iterating =eval-step= until
 there's nothing left in the expression.
+
 #+BEGIN_SRC clojure
+(in-ns 'kcats.core)
 (require '[clojure.string :as string])
+
 (defn invoke*
   [{[word & others] ::expression
     ::keys [dictionary stack]
@@ -433,7 +438,7 @@ there's nothing left in the expression.
 #+END_SRC
 
 #+RESULTS:
-: nil#'kcats.core/invoke*#multifn[onto-stack 0x1c2b45f8]#'kcats.core/definition#'kcats.core/eval-step#'kcats.core/print-env
+: #namespace[kcats.core]nil#'kcats.core/invoke*#multifn[onto-stack 0x1c2b45f8]#'kcats.core/definition#'kcats.core/eval-step#'kcats.core/print-env
 
 ** Built-in words
 Eventually we'll want to define words in terms of other words. But
@@ -524,7 +529,7 @@ words.
 #+END_SRC
 
 #+RESULTS:
-: #'kcats.core/f-stack#'kcats.core/env-effect#'kcats.core/effect#'kcats.core/stack-effect#'kcats.core/inscribe#'kcats.core/invoke-arity#'kcats.core/nothing#'kcats.core/nothing?#'kcats.core/nothing->nil#'kcats.core/nil->nothing
+: #namespace[kcats.core]#'kcats.core/f-stack#'kcats.core/env-effect#'kcats.core/effect#'kcats.core/stack-effect#'kcats.core/inscribe#'kcats.core/invoke-arity#'kcats.core/nothing#'kcats.core/nothing?#'kcats.core/nothing->nil#'kcats.core/nil->nothing
 
 #+BEGIN_SRC clojure
 (in-ns 'kcats.core)
@@ -653,6 +658,7 @@ words.
                          (seq agg-rest) (concat [(vec agg-rest) p 'step]))
                        [p agg-item])
           ::examples '[[[1 [2 3 4] [*] step] [24]]]}
+   
    'recur {::spec (stack-spec :rec2 ::program
                               :rec1 ::program
                               :true-branch ::program
@@ -752,7 +758,7 @@ words.
    'string? {::spec (stack-spec :item ::item)
              ::definition '[.string?]}
    'getbytes {::spec (stack-spec :string ::string)
-              ::fn (stack-effect [x] [(.getBytes x)])}
+              ::definition '[.getBytes]}
    'bytes {::spec (stack-spec :item ::item)
            ::definition '[[[[clone string?] [getbytes]]
                            [[clone bytes?] []]]
@@ -827,6 +833,8 @@ associations as lists of pairs.
 Then include some words that depend on this functionality.
 
 #+BEGIN_SRC clojure
+(in-ns 'kcats.core)
+
 (expound/def ::pair (spec/coll-of ::item :kind vector? :count 2))
 
 (expound/def ::association-list (spec/coll-of ::pair
