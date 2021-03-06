@@ -267,7 +267,7 @@ to understand error messages.
   (ns kcats.core
     (:require [clojure.spec.alpha :as spec]
               [expound.alpha :as expound])
-    (:refer-clojure :exclude [eval]))
+    (:refer-clojure :exclude [eval test]))
 
   (set! spec/*explain-out* (expound/custom-printer
                             {:show-valid-values? true}))
@@ -289,12 +289,6 @@ stateful things on the stack (like java objects, clojure atoms etc)
 but best practice is that they should only be there temporarily,
 usually during the construction of a pipe[fn:2].
 
-[fn:2] There are some pipes that may be technically values (think of a
-pipe that produces the infinite sequence 1,2,3...). You could send
-that somewhere else, as long as you include what number it last
-produced. But you can't send files or sockets somewhere else (they're
-pointers to real world resources that may be different or nonexistent
-somewhere else). Discerning between the two may be a future feature.
 #+BEGIN_SRC clojure
 (expound/def ::boolean boolean?)
 (expound/def ::number number?)
@@ -306,9 +300,8 @@ somewhere else). Discerning between the two may be a future feature.
 Now we'll spec some concepts in kcats in terms of clojure
 concepts. We'll need to specify what kinds of things can go in a
 program or be put on a stack. We'll call those =items=. Note that
-items can be list, which we haven't specced yet. That's ok,
-recursive specs are allowed. Aggregates contain items, and items
-can also be list.
+items can be list, which we haven't specced yet. That's ok, recursive
+specs are allowed. Lists contain items, and items can be lists.
 
 Values are a particular kind of item, which is what most =words= will
 operate upon. A value list is one where all the contents are
@@ -384,6 +377,26 @@ stack, and expression put together.
 #+BEGIN_SRC clojure
   (expound/def ::environment (spec/keys :req [::stack ::dictionary ::expression]))
 #+END_SRC
+
+Finally, we'll make a bit of syntax for expressing what a particular
+word needs on the stack.
+
+#+begin_src clojure
+;; since we'll commonly be defining specs for a stack, we'll nearly
+;; always not care about anything below a certain depth, so let's make
+;; a macro that encapsulates that.
+(defmacro stack-spec
+  [& args]
+  `(spec/cat ~@args
+             :others (spec/* ::item)))
+#+end_src
+
+[fn:2] There are some pipes that may be technically values (think of a
+pipe that produces the infinite sequence 1,2,3...). You could send
+that somewhere else, as long as you include what number it last
+produced. But you can't send files or sockets somewhere else (they're
+pointers to real world resources that may be different or nonexistent
+somewhere else). Discerning between the two may be a future feature.
 
 ** Evaluation
 Next we're going to define how the kcats language executes (or
@@ -581,10 +594,13 @@ words.
   env-effect"
   [in out]
   `(env-effect ~(count in) (fn ~in [[] ~out])))
+#+END_SRC
 
-;; we won't allow the value nil/null in kcats. To signify "nothing"
-;; we'll use an empty list. Here are some functions to convert between
-;; clojure's idea of "nothing" and kcats'
+Kcats is not going to have a concept of =null= or =nil=. If we want to
+express "nothing" we will use an empty list. We'll need some functions
+to treat empty lists as clojure treats =nil=.
+
+#+begin_src clojure
 (def nothing [])
 
 (defn nothing?
@@ -605,9 +621,10 @@ words.
   (if (nil? x)
     nothing
     x))
-#+END_SRC
+#+end_src
 
-Now we can go ahead and start filling out axiom words in our default dictionary.
+Now we can go ahead and start filling out axiom words in our default
+dictionary.
 
 First we'll make some specs so we get a better error message when a
 word doesn't get the stack arguments that it needs.
@@ -617,14 +634,6 @@ basically as-is in kcats.
 
 #+BEGIN_SRC clojure
 (in-ns 'kcats.core)
-
-;; since we'll commonly be defining specs for a stack, we'll nearly
-;; always not care about anything below a certain depth, so let's make
-;; a macro that encapsulates that.
-(defmacro stack-spec
-  [& args]
-  `(spec/cat ~@args
-             :others (spec/* ::item)))
 
 (defonce core-words (atom {}))
 
@@ -991,7 +1000,7 @@ Then include some words that depend on this functionality.
                           ["five" 5]]
                          [[9 [[[3 =] ["three"]]
                               [[5 =] ["five"]]
-                              [[clone 7 =] ["seven"]]
+                              [[7 =] ["seven"]]
                               [[true] ["something else"]]]
                            decide]
                           ["something else" 9]]
@@ -1096,8 +1105,7 @@ environment's execution.
         'spawn {::spec (stack-spec :expression ::list)
                 ::fn (fn [{::keys [stack] :as env}]
                        ;;(print-env env)
-                       (let [expr (concat (first stack)
-                                          '[1 buffer swap put])]
+                       (let [expr (first stack)]
                          (->> expr
                               default-env
                               (eval {:before-step print-env})
@@ -1306,6 +1314,8 @@ read from a file, so we need to know when to stop waiting for more)
                  ::core/fn (core/stack-effect [s] [(->buffered s)])}
         'timeout {::core/spec (core/stack-spec :timeout-ms ::core/integer)
                  ::core/fn (core/stack-effect [t] [(->timeout t)])}
+        'handoff {::core/spec (core/stack-spec)
+                  ::core/fn (core/stack-effect [] [(->handoff)])} 
         'select {::core/spec (core/stack-spec :pipes (spec/coll-of ::out))
                  ::core/fn (core/stack-effect [pipes]
                                               (let [[p v] (select pipes)]
@@ -1910,11 +1920,41 @@ going to confuse users since it's not magic or exceptional.
 - cond :: choose, decide*
 - assoc :: set, associate, assign*, link
 - map :: ? 
+- pipe-out :: tap? drain?
+- pipe-in :: fill?
+- handoff :: ?
+- spawn :: ?
+- nullary :: ? 
+** Nested env Runtime structure
+How do environments that create new environments control execution?
 
+There could be a top level runtime that controls all the environments
+(runs them in different threads, etc)
+
+Or it could just be fully programmable where the entry-point env is
+responsible for doing whatever it needs. 
+
+The latter seems like the way to go, but what's the control mechanism?
+I think threading a separate concern from how an env is executed (as
+in, in a debugger etc)
+
+A threadpool is probably fine, futures would probably do it, at least
+as a first pass. But there won't be any top level "show me all the
+environments" which would be super handy for use in an IDE. One way to
+handle this would be - for any env that needs to send messages home to
+some IDE, inherit that behavior from its parent and have the top level
+env do that. However then there's the matter of how things like
+breakpoints etc would be communicated down to where they're needed.
+
+It's important to be able to distinguish between envs whose purpose is
+to do the actual job and those that are part of the execution setup
+(envs whose only job is to run other envs, say with logging or
+debugging). It's kind of hard have a library that introduces a
+hierarchy of envs and then still allow the user to debug it.
 ** Example programs
 *** Factorial
 **** Recursive definition 
-#+begin_src fundamental
+#+begin_src clojure
  10 
  [fact [[clone 0 =]
         [discard 1]
@@ -1924,7 +1964,7 @@ going to confuse users since it's not magic or exceptional.
  fact
 #+end_src
 **** Recursive with recur
-#+begin_src fundamental
+#+begin_src clojure
  5
  [clone 1 <=]
  []
@@ -1938,7 +1978,7 @@ going to confuse users since it's not magic or exceptional.
  
 #+end_src
 **** Using range
-#+begin_src fundamental
+#+begin_src clojure
  10
  1 +
  2 swap
@@ -1946,19 +1986,29 @@ going to confuse users since it's not magic or exceptional.
  [*] step
 #+end_src
 **** Plain loop
-#+begin_src fundamental
+#+begin_src clojure
 10 clone 
 true [dec clone [*] dip clone 1 >] loop
 discard
 #+end_src
+*** Spawn child environments and pipe values back
+#+begin_src clojure
+[handoff clone ;; 2 copies of a pipe (one in, one out)
+ wrap [1 1 + put] join ;; build a program containing the pipe and some arthmetic problem, which puts the result in the pipe
+ spawn ;; a new env to run the above program
+ [2 3 +] dip ;; do another calculation in this env
+ take ;; the value from the pipe, which will come from the spawned env 
+ [discard] dip ;; done with the pipe
+ +] ;; add numbers
+#+end_src
 *** Jensen's Device
  https://rosettacode.org/wiki/Jensen%27s_Device
- #+begin_src fundamental
+ #+begin_src clojure
  100 [0] [[1.0 swap /] dip +] primrec
  [100 0 swap 1 + 1 swap range [1.0 swap / +] step]
  #+end_src
 *** Primrec
-#+begin_src fundamental
+#+begin_src clojure
 (k {:max-steps 2000
                 :foo '[ 5
                  [clone zero?]
