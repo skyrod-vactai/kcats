@@ -539,7 +539,33 @@ there's nothing left in the expression.
   (apply prn stack)
   env)
 #+END_SRC
+** Concept of nothing/nil/null
+Kcats is not going to have a concept of =null= or =nil=. If we want to
+express "nothing" we will use an empty list. We'll need some functions
+to treat empty lists as clojure treats =nil=.
 
+#+begin_src clojure
+(def nothing [])
+
+(defn nothing?
+  [x]
+  (= nothing x))
+
+(defn nothing->nil
+  "Returns argument unless it's a kcats 'nothing' (empty list), in
+  which case it returns nil"
+  [x]
+  (if (nothing? x)
+    nil
+    x))
+
+(defn nil->nothing
+  "Returns argument unless it's nil, in which case it returns empty list"
+  [x]
+  (if (nil? x)
+    nothing
+    x))
+#+end_src
 ** Built-in words
 Eventually we'll want to define words in terms of other words. But
 right now we don't have any words! So we'll have to define some, not
@@ -596,33 +622,6 @@ words.
   `(env-effect ~(count in) (fn ~in [[] ~out])))
 #+END_SRC
 
-Kcats is not going to have a concept of =null= or =nil=. If we want to
-express "nothing" we will use an empty list. We'll need some functions
-to treat empty lists as clojure treats =nil=.
-
-#+begin_src clojure
-(def nothing [])
-
-(defn nothing?
-  [x]
-  (= nothing x))
-
-(defn nothing->nil
-  "Returns argument unless it's a kcats 'nothing' (empty list), in
-  which case it returns nil"
-  [x]
-  (if (nothing? x)
-    nil
-    x))
-
-(defn nil->nothing
-  "Returns argument unless it's nil, in which case it returns empty list"
-  [x]
-  (if (nil? x)
-    nothing
-    x))
-#+end_src
-
 Now we can go ahead and start filling out axiom words in our default
 dictionary.
 
@@ -673,6 +672,7 @@ basically as-is in kcats.
    'swap {::spec (stack-spec :a ::item, :b ::item)
           ::fn (stack-effect [a b] [b a])
           ::examples '[[[1 2 3 swap] [2 3 1]]]}
+   ;; TODO: this is just [swap] dip. worth having its own word?
    'swapdown {::spec (stack-spec :a ::item, :b ::item, :c ::item)
               ::fn (stack-effect [a b c] [a c b])
               ::examples '[[[1 2 3 swapdown] [3 1 2]]]}
@@ -686,11 +686,8 @@ basically as-is in kcats.
                             :a ::item)
          ::fn (effect [p a] [(conj (vec p) a) []])
          ::examples '[[[1 8 [inc] dip] [8 2]]]}
-   'dipdown {::spec (stack-spec :p ::program
-                                :a ::item
-                                :b ::item)
-             ::fn (effect [p a b] [(conj (vec p) b a) []])
-             ::examples '[[[1 2 3 [inc] dipdown] [3 2 2]]]}
+   ;; TODO: it's also: wrap [dip] join dip
+   
    'wrap {::spec (stack-spec :a ::item)
           ::fn (stack-effect [a] [[a]])
           ::examples '[[[1 wrap] [[1]]]]}
@@ -852,6 +849,11 @@ axiom words, or calling clojure functions.
         ::definition '[[execute] dipdown branch]
         ::examples '[[[5 [clone 5 =] [3 *] [4 +] if] [15]]
                      [[6 [clone 5 =] [3 *] [4 +] if] [10]]]}
+   'dipdown {::spec (stack-spec :p ::program
+                                :a ::item
+                                :b ::item)
+             ::definition '[wrap [dip] join dip]
+             ::examples '[[[1 2 3 [inc] dipdown] [3 2 2]]]}
    'primrec {::spec (stack-spec :rec1 ::program
                                 :exit ::program
                                 :data ::number)
@@ -888,7 +890,7 @@ axiom words, or calling clojure functions.
               ::examples '[[[1 2 3 snapshot] [[3 2 1] 3 2 1]]
                            [[snapshot] [[]]]]}
    'nullary {::spec (stack-spec :p ::program)
-             ::doc "Runs program keeping stack items produced but
+             ::doc "Runs program keeping top of stack produced but
                     protects existing items from being consumed."
              ::definition '[[snapshot] dip inject first]
              ::examples '[[[1 2 3 [=] nullary] [false 3 2 1]]]}
@@ -935,7 +937,23 @@ axiom words, or calling clojure functions.
                         ]
          ::examples '[[[[1 2 3] [inc] map] [[2 3 4]]]
                       [[1 [1 2 3] [+] map] [[2 3 4] 1]]
-                      [[7 9 [1 2 3] [+ *] map] [[70 77 84] 9 7]]]}})
+                      [[7 9 [1 2 3] [+ *] map] [[70 77 84] 9 7]]]}
+   'filter {::spec (stack-spec :p ::program
+                               :l ::list)
+            ::definition '[[snapshot [] swap]
+                           dipdown
+                           ;; clone the original value so we can save it in results if needed
+                           [[clone] dip clone wrap swapdown]
+                           swap pack
+                           [join inject first 
+                            ;; if passes filter, pack it into results
+                            [[pack]]
+                            ;; othewise discard it
+                            [[discard]]
+                            branch
+                            swapdown
+                            dip]
+                           join step discard]}})
 
 (swap! core-words merge standard-words)
 #+end_src
@@ -1912,7 +1930,7 @@ state from the copy. My current thinking is having this word isn't
 going to confuse users since it's not magic or exceptional.
 
 ** better names?
-- dipd :: dipdown 
+- dipd :: dipdown, protect? 
 - ifte :: if
 - swaack :: swapstack, switch, pivot, evert*
 - primrec :: ?
@@ -1924,7 +1942,7 @@ going to confuse users since it's not magic or exceptional.
 - pipe-in :: fill?
 - handoff :: ?
 - spawn :: ?
-- nullary :: ? 
+- nullary :: protect? prevent? confine? keep? restore? conserve?
 ** Nested env Runtime structure
 How do environments that create new environments control execution?
 
@@ -1993,13 +2011,15 @@ discard
 #+end_src
 *** Spawn child environments and pipe values back
 #+begin_src clojure
-[handoff clone ;; 2 copies of a pipe (one in, one out)
- wrap [1 1 + put] join ;; build a program containing the pipe and some arthmetic problem, which puts the result in the pipe
- spawn ;; a new env to run the above program
- [2 3 +] dip ;; do another calculation in this env
- take ;; the value from the pipe, which will come from the spawned env 
- [discard] dip ;; done with the pipe
- +] ;; add numbers
+handoff clone ;; 2 copies of a pipe (one in, one out)
+wrap [1 1 + put] join ;; build a program containing the pipe and some
+                      ;; arthmetic problem, which puts the result in
+                      ;; the pipe
+spawn ;; a new env to run the above program
+[2 3 +] dip ;; do another calculation in this env
+take ;; the value from the pipe, which will come from the spawned env 
+[discard] dip ;; done with the pipe
++ ;; add numbers
 #+end_src
 *** Jensen's Device
  https://rosettacode.org/wiki/Jensen%27s_Device
