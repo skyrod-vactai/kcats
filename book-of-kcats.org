@@ -1090,23 +1090,38 @@ Then include some words that depend on this functionality.
                                            ;; position - TODO: note this
                                            ;; could fail if the def is
                                            ;; more than just an alist
-                                           ;; and 'cond'.
+                                           ;; and 'decide'.
                                     pack] ;; new condition onto end of conditions
                                    inject ;; the above program to run on the conditions
                                    swap inscribe ;; redefine word
                                    ]}})
 #+end_src
 
-** Nested Environments
+** Programmable Runtime
 *** Basics
-Kcats environments are just data. We can manipulate an environment
-within another environment to achieve various features:
+In kcats, the interpreter is a pure function of the environment data
+it's given (with some caveats). That environment data is representable
+as kcats data structures. That means that the kcats interpreter can
+take that environment data from anywhere, and do whatever arbitrary
+operations on it, including stepping through the execution of the
+environment and producing more environment values. In other words,
+kcats is its own debugger. I'm not sure if any other languages
+implement this feature, certainly it should be straightforward to do
+in many stack-based languages. For those familiar with lisp, you know
+that you can use lisp to manipulate lisp code at compile time. In
+kcats, you similarly have the power to manipulate code before it is
+executed. In addition you have the power to manipulate *how* the code
+is executed.
 
-+ A debugger (each evaluation step checks to see whether it should
-  stop at a breakpoint etc)
-+ Spawning copies of the same environment so that we can do things like
-  map/filter/some etc (that require us to restore an environment to a
-  previous state, and do another calculation with it)
+Of course, most real programs are not purely functional (they refer to
+files on disk or network locations). So that must be taken into
+account as always.
+
+What we'll implement here is nested environments - where the outer
+environment's stack contains data for an inner environment. The outer
+environment can then use words like =eval-step= to step through the
+execution of the inner environment, or do whatever other arbitrary
+operations on it.
 *** Implementation
 First let's spec what a nested environment looks like
 #+begin_src clojure
@@ -1117,8 +1132,18 @@ First let's spec what a nested environment looks like
     (spec/and ::association-list #(->> % env->clj (spec/valid? ::environment))))
 #+end_src
 
-We'll need to move back and forth between clojure's idea of an
-environment and the equivalent representation in kcats.
+We'll need to be able to move back and forth between clojure's idea of
+an environment and the equivalent representation in kcats. Even though
+it's quite inefficient, for this first implementation, we'll convert a
+kcats-format environment to clojure form (converting association lists
+to clojure maps, etc), evaluate, then convert back afterward. This
+allows maximum flexibility to treat a nested environment just like any
+other piece of data.
+
+Note that the =core-words= aren't representable in kcats (they're
+defined in terms of the base language). That's not really a problem,
+as we can make them available during evaluation by merging them in to
+the environment's dictionary.
 
 #+begin_src clojure
 (in-ns 'kcats.core)
@@ -1139,7 +1164,7 @@ environment and the equivalent representation in kcats.
   [['stack (-> e ::stack vec)]
    ['dictionary (into {}
                       (for [[k {::keys [definition]}] (::dictionary e)
-                            :when definition]
+                            :when definition] ;; leave out core-words
                         [k definition]))]
    ['expression (-> e ::expression vec)]])
 #+end_src
@@ -1151,16 +1176,32 @@ environment's execution.
 (in-ns 'kcats.core)
 (swap! core-words merge
        {'eval-step {::spec (stack-spec :environment ::environment)
-                    ::fn (f-stack 1 (comp env->k eval-step env->clj))}
-        'spawn {::spec (stack-spec :expression ::list)
-                ::fn (fn [{::keys [stack] :as env}]
-                       ;;(print-env env)
-                       (let [expr (first stack)]
-                         (->> expr
-                              default-env
-                              (eval {:before-step print-env})
-                              future))
-                       (update env ::stack rest))}})
+                    ::fn (f-stack 1 (comp env->k eval-step env->clj))}})
+#+end_src
+
+Now that we can step, and we have predicates, we can specify in kcats
+itself when execution should stop, and just keep running until either
+that condition is true or the execution is finished. For example:
+
+#+begin_src clojure :tangle no
+[[stack [1 2 3 4 5]]
+ [expression [[+] step]]]
+[clone [stack] unwrap lookup first 8 >] ;; ToS greater than 8
+continue ;; step until above is true or all done
+#+end_src
+
+We can make some handy words to help.
+
+#+begin_src clojure
+(in-ns 'kcats.core)
+(swap! core-words merge
+       {'tos {::spec (stack-spec :environment ::nested-environment)
+              ::definition '[[stack] unwrap lookup first]
+              ::doc "top of stack"
+              ::examples '[[[[[stack [1 2 3 4 5]]
+                              [expression [[+] step]]]
+                             tos]
+                            [1]]]}})
 #+end_src
 ** Pipes
 *** Basics
@@ -1401,7 +1442,16 @@ read from a file, so we need to know when to stop waiting for more)
                                             :target ::core/item)
                ::core/definition '[[pipe-in] dip bytes put close discard]}
         'slurp {::core/spec (core/stack-spec :target ::item)
-                ::core/definition '[]}})
+                ::core/definition '[]}
+        'spawn {::spec (core/stack-spec :expression ::list)
+                ::fn (fn [{::keys [stack] :as env}]
+                       ;;(print-env env)
+                       (let [expr (first stack)]
+                         (->> expr
+                              core/default-env
+                              (eval {:before-step core/print-env})
+                              future))
+                       (update env ::stack rest))}})
 #+end_src
 *** Notes
 core.async has an out-of-band close message. Do we need that? Seems
