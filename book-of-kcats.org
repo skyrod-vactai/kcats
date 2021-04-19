@@ -808,12 +808,34 @@ basically as-is in kcats.
            ::fn (f-stack 1 (comp some? nothing->nil))}
    'every? {::spec (stack-spec :p ::program
                                :l ::list)
-            ::fn (fn [env]
-                   #_(update-stack (fn [[p a & others :as stack]]
-                                     (->> a
-                                          (every? #(leaves-true? (with-stack env (conj others %)) p))
-                                          (conj others)))
-                                   env))}
+            ::definition '[ ;; build the r1
+                           [unary] swap prepend ;; run pred with unary
+                           [unpack swap] swap pack ;; add rest of dip program
+                           [dip swap not] join ;; add the rest of outer dip
+                           wrap [dip or] join ;; add rest of r1
+                           ;; put the other recur clauses under r1
+                           [false
+                            [[[nothing?] shield] dip
+                             swap [or] shielddown] ;; the 'if' 
+                            [not]] ;; then
+                           dip ;; underneath the r1
+                           [execute] recur ;; r2 and recur!
+                           swap discard]} ;; drop leftover list
+   'any? {::spec (stack-spec :p ::program
+                             :l ::list)
+          ::definition '[;; build the r1
+                         [unary] swap prepend ;; run pred with unary
+                         [unpack swap] swap pack ;; add rest of dip program
+                         [dip swap] join ;; add the rest of outer dip
+                         wrap [dip or] join ;; add rest of r1
+                         ;; put the other recur clauses under r1
+                         [false
+                          [[[nothing?] shield] dip
+                           swap [or] shielddown] ;; the 'if' 
+                          []] ;; then
+                         dip ;; underneath the r1
+                         [execute] recur ;; r2 and recur!
+                         swap discard]}
    'and {::spec (stack-spec :a ::item
                             :b ::item)
          ::fn (f-stack 2 (fn [a b]
@@ -822,10 +844,10 @@ basically as-is in kcats.
          ::examples '[[[1 odd? 2 even? and] [true]]]}
    'or {::spec (stack-spec :a ::item
                            :b ::item)
-         ::fn (f-stack 2 (fn [a b]
-                           (or (nothing->nil a)
-                               (nothing->nil b))))
-         ::examples '[[[1 odd? 2 even? and] [true]]]}
+        ::fn (f-stack 2 (fn [a b]
+                          (or (nothing->nil a)
+                              (nothing->nil b))))
+        ::examples '[[[1 odd? 2 even? and] [true]]]}
    'not {::spec (stack-spec :a ::item)
          ::fn (f-stack 1 (fn [a]
                            (not (nothing->nil a))))}
@@ -891,10 +913,19 @@ axiom words, or calling clojure functions.
 ;; be nice to have unit testing be implemented in the language itself?
 (in-ns 'kcats.core)
 (def standard-words
-  {'if {::spec (stack-spec :false-branch ::program
+  {'shield {::spec (stack-spec :p ::program)
+             ::doc "Runs program keeping top of stack produced but
+                    protects existing items from being consumed."
+             ::definition '[[snapshot] dip inject first]
+             ::examples '[[[1 2 3 [=] shield] [false 3 2 1]]]}
+   'shielddown {::spec (stack-spec :p ::program)
+           ::definition '[shield swap discard]}
+   'shielddowndown {::spec (stack-spec :p ::program)
+                    ::definition '[shield [discard discard] dip]}
+   'if {::spec (stack-spec :false-branch ::program
                            :true-branch ::program
                            :condition ::program)
-        ::definition '[[nullary] dipdown branch]
+        ::definition '[[shield] dipdown branch]
         ::examples '[[[5 [5 =] [3 *] [4 +] if] [15]]
                      [[6 [5 =] [3 *] [4 +] if] [10]]]}
    'dipdown {::spec (stack-spec :p ::program
@@ -927,7 +958,7 @@ axiom words, or calling clojure functions.
              ::examples '[[[[1 2] 3 prepend] [[3 1 2]]]]}
    'assert {::spec (stack-spec :p ::program)
             ::definition '[snapshot ;; save stack to print in err message
-                           [nullary] dip swap ;; run the assertion under the saved stack
+                           [shield] dip swap ;; run the assertion under the saved stack
                            [discard] ;; if passes, drop the saved stack, don't need
                            [string ["assertion failed: "] dip join fail] ;; else throw err
                            branch]}
@@ -943,13 +974,6 @@ axiom words, or calling clojure functions.
               ::definition '[[] evert clone evert unwrap]
               ::examples '[[[1 2 3 snapshot] [[3 2 1] 3 2 1]]
                            [[snapshot] [[]]]]}
-   'nullary {::spec (stack-spec :p ::program)
-             ::doc "Runs program keeping top of stack produced but
-                    protects existing items from being consumed."
-             ::definition '[[snapshot] dip inject first]
-             ::examples '[[[1 2 3 [=] nullary] [false 3 2 1]]]}
-   'unary {::spec (stack-spec :p ::program)
-           ::definition '[nullary swap discard]}
    'first {::spec (stack-spec :l ::list)
            ::definition '[.first]
            ::examples '[[[[4 5 6] first] [4]]]}
@@ -1014,12 +1038,18 @@ axiom words, or calling clojure functions.
                             branch
                             swapdown
                             dip]
-                           join step discard]}})
+                           join step discard]}
    'nothing? {::spec (stack-spec :a ::item)
               ::definition '[[] =]}
    'something? {::spec (stack-spec :a ::item)
                 ::definition '[nothing? not]}
-
+   'while {::spec (stack-spec :body ::program
+                              :pred ::program)
+           ::definition '[swap wrap [shield] join ;; add shield to the pred program
+                          clone dipdown ;; run it on the previous ToS 
+                          join loop]
+           ::examples '[[[3 [0 >] [clone dec]] [0 1 2 3]]
+                        ]}})
 (swap! core-words merge standard-words)
 #+end_src
 
@@ -1071,7 +1101,7 @@ Then include some words that depend on this functionality.
                         & others] ::stack
                        ::keys [dictionary expression]}]
                    {::expression (if first-clause
-                                   (concat [[test 'nullary] ;; run test resetting stack
+                                   (concat [[test 'shield] ;; run test resetting stack
                                             expr ;; the then
                                             [(vec other-clauses) 'decide] ;; the else
                                             'if]
@@ -1251,7 +1281,7 @@ We can make some handy words to help.
 #+end_src
 *** Notes
 TODO: the dictionary spec can be replaced with predicate programs,
-that will be run with =nullary= before the actual word and if it
+that will be run with =shield= before the actual word and if it
 returns false, will raise an error. Then this functionality can be
 turned on optionally in the runtime, just as the debugger is
 controlled.
@@ -1609,12 +1639,12 @@ ok how about this
 
 re cleave*, seems like there is some overlapping functionality
 between parallelism and preserving the stack for things like
-=nullary=. In both cases we're cloning the environment (or part of
+=shield=. In both cases we're cloning the environment (or part of
 it) so that multiple modifications don't conflict with each other.
 
 The only difference is how we join the cloned stacks back together.
 
-With nullary, we clone the env, run the program on the clone, take
+With shield, we clone the env, run the program on the clone, take
 the top of the stack and put it back on the original. throw the clone
 env away.
 
@@ -1706,9 +1736,9 @@ env3
 ,* run all the envs (one per item in the list below ToS) 
 ,* reduce all the ToSs (in the case of map we're already done)
 
-Let's try nullary
+Let's try shield
 
-2 3 [+] nullary
+2 3 [+] shield
 
 ,* enstacken
 ,* run all (one)
@@ -2049,20 +2079,20 @@ special quote reading function.
 needs multi's because words like get/put should probably be generic
 and have specific methods for pipes.
 
-** Nullary/unary/etc?
+** Shield/shielddown/etc?
 Do we need these? If a program knows that the items it consumes will
 be needed later, it can =clone= them. And if a program is going to run
 another program that it knows will consume items it needs, it can also
 =clone= them first.
 
-So at first glance it would seem that nullary et al aren't needed. 
+So at first glance it would seem that shield et al aren't needed. 
 
 Even if they were needed, these names are too difficult for the target
 audience to understand. We need better names and I can't think of any
 right now.
 
-Note: I later realized that nullary isn't as voodoo as I originally
-thought. There's no magic in implementing nullary, if you have the
+Note: I later realized that shield isn't as voodoo as I originally
+thought. There's no magic in implementing shield, if you have the
 =stack= (or =evert=) word (capture the stack as a list). Then you can
 just clone it and it's easy to revert the stack back to a previous
 state from the copy. My current thinking is having this word isn't
@@ -2081,7 +2111,8 @@ going to confuse users since it's not magic or exceptional.
 - pipe-in :: fill?
 - handoff :: ?
 - spawn :: ?
-- nullary :: protect? prevent? confine? keep? restore? conserve?
+- shield :: protect? prevent? confine? keep? restore? conserve? shield?
+- shielddown :: shielddown?
 ** Nested env Runtime structure
 How do environments that create new environments control execution?
 
@@ -2117,13 +2148,13 @@ From http://joypy.osdn.io/notebooks/Recursion_Combinators.html#hylomorphism
 #+end_example
 ** Every? impl
 #+begin_example
-
 (k 
- '[[1 23 9 9 9 9 9 9 9 9 9  9]          ; items exceptions? empty? continue?
+ '[2 3 [3 5 7 9 13 11]          ; items exceptions? empty? continue?
    false ;; any exceptions found
-   [[clone nothing?] dip swap [or] unary]
+   [[[nothing?] shield] dip ;; is the list empty? (keep the list intact)
+    swap [or] shielddown]
    [not]
-   [[unpack [odd?] unary not] dip or]
+   [[unpack swap [[+ even?] unary] dip swap not] dip or]
    [execute]
    recur
    ;; drop the remaining items
@@ -2132,14 +2163,9 @@ From http://joypy.osdn.io/notebooks/Recursion_Combinators.html#hylomorphism
 
 #+end_example
 
-the above doesn't work because when the program is executing we can't
-access anything below the list - because the predicate is going the
-find the remaining list below the list item it's currently working
-on. That shouldn't be there from the predicate's point of view.
-
-The only way to make this work is with snapshotting the stack and then
-doing injections. Step also doesn't work here because we need to short
-circuit. 
+The above seems to work (after inserting the 'swapdown' into the
+predicate to get the remaining list out of the way, so that when =dip=
+runs it is on on the stack.
 
 I think what's needed is a recur combinator that does the snapshotting
 and injecting, and lets the caller specify a) what to inject, b) what
@@ -2153,7 +2179,7 @@ The initial stack will be: P L I C
 Example:
 [inc odd?]
 [1 2 3]
-[[clone nothing?] dip swap [or] unary] 
+[[clone nothing?] dip swap [or] shielddown] 
 [first]
 
 During execution the program can expect that each time through the
