@@ -1508,6 +1508,42 @@ read from a file, so we need to know when to stop waiting for more)
   (closed? [os] false))
 #+end_src
 
+*** Reader/Writers
+Unfortunately java Readers (or Readables) don't have any mechanism to
+check whether the EOF has been reached without actually doing a
+read. So there's no direct way to implement =closed?= without keeping
+some extra state, namely of what the status of the last read was. If
+it returned -1, then we know EOF has been reached.
+#+begin_src clojure :tangle src/kcats/pipe.clj
+(in-ns 'kcats.pipe)
+
+(extend-type Readable
+  Out
+  (take [rdr]
+    (let [buf (java.nio.CharBuffer/allocate 1024)
+          chars-read (.read rdr buf)]
+      (if (= -1 chars-read)
+        (throw (Exception. "EOF on reader while reading"))
+        (.toString (let [retbuf (make-array Byte/TYPE chars-read)]
+          (System/arraycopy #^bytes buf 0
+                            #^bytes retbuf 0 ^int (alength retbuf))
+          retbuf)chars-read))))
+  Select
+  (poll [is] (take is))
+  Close
+  (close [is] (.close is))
+  (closed? [is] (try (-> is .available (= 0))
+                     (catch java.io.IOException ioe
+                       true))))
+
+(extend-type java.io.OutputStream
+  In
+  (put [os bs] (doto os (.write bs)))
+  Close
+  (close [os] (doto os (.flush) (.close)))
+  (closed? [os] false))
+#+end_src
+
 *** Words
 #+begin_src clojure :tangle src/kcats/pipe.clj
 (in-ns 'kcats.pipe)
@@ -1539,6 +1575,8 @@ read from a file, so we need to know when to stop waiting for more)
               ::core/fn (core/stack-effect [v p] [(doto p (put v))])}
         'close {::core/spec (core/stack-spec :pipe ::core/pipe)
                 ::core/fn (core/stack-effect [p] (do (close p) [p]))}
+        'closed? {::core/spec (core/stack-spec :pipe ::core/pipe)
+                  ::core/fn (core/stack-effect [p] [(closed? p)])} 
         'pipe-in {::core/spec (core/stack-spec :obj ::item)
                   ::core/definition
                   '[
