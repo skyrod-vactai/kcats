@@ -446,13 +446,24 @@ with its definition. Otherwise it's put onto the stack.
 (in-ns 'kcats.core)
 (require '[clojure.string :as string]
          '[clojure.edn :as edn])
-
+;; Invocation requires several things:
+;; * Indication that it's meant to be invoking platform functionality
+;; * Stack effect (how many args consumed and produced)
+;; * Platform function type (fn, constructor, instance, static, etc)
+;;
+;; +**foo : clojure fn foo, consume 2 args
+;; .Bar. : Java no-arg construct Bar instance (consume zero, add one)
+;; .*Baz. : construct with one arg (consume one, add one)
+;; .!quux : call void instance method quux, (consume one, add none, mutating 2nd item)
+;; .*Foo/bar : call static bar on class Foo. (consume one, add one)
 (defn invoke*
   [{[word & others] ::expression
     ::keys [dictionary stack]
     :as env}]
   {::stack
-   (let [[_ arity fn-name] (->> word str (re-find #"(\.+)(.*)\.?"))
+   (let [[_ fn-type arity fn-name] (->> word
+                                        str
+                                        (re-find #"([\\+\\.])([\\!\\*]*)(.*)\.?"))
          [args others] (split-at (count arity) stack)
          args (reverse args)] ;; due to stacking reversing the args previously
      (conj others
@@ -468,18 +479,24 @@ with its definition. Otherwise it's put onto the stack.
                                    (subs fn-name 0)))
                (into-array Object args))
 
-              (and (.startsWith fn-name "+")
+              (and (= fn-type ".")
                    (.contains fn-name "/")) ;; static method
-              (let [[clazz method] (-> fn-name
-                                       (subs 1)
-                                       (string/split #"/"))]
+              (let [[clazz method] (string/split fn-name #"/")]
                 (clojure.lang.Reflector/invokeStaticMethod clazz method
                                                            (into-array Object args)))
               
-              (.startsWith fn-name "+") ;; instance method
+              (.startsWith arity "!") ;; void instance method (keep object)
+              (let [obj (last args)]
+                (clojure.lang.Reflector/invokeInstanceMethod
+                  obj
+                  fn-name
+                  (into-array Object (butlast args)))
+                obj)
+
+              (= fn-type ".") ;; instance method
               (clojure.lang.Reflector/invokeInstanceMethod
                (last args)
-               (subs fn-name 1)
+               fn-name
                (into-array Object (butlast args)))
 
               ;; clojure function
@@ -635,7 +652,7 @@ basically as-is in kcats.
 
 #+BEGIN_SRC clojure
 (in-ns 'kcats.core)
-
+(import [java.io ByteArrayoutputstream])
 (defonce core-words (atom {}))
 
 (def arithmetic-words
@@ -780,9 +797,23 @@ basically as-is in kcats.
           ::examples '[[[10 true [-2 * clone 50 <] loop] [160]]]}
    'pack {::spec (stack-spec :x ::item
                              :l ::list)
-          ::fn (stack-effect [x l] [(conj (vec l) x)])
+          #_::fn #_(stack-effect [x l] [(conj (vec l) x)])
+          ::definition '[[[[swap bytes?]
+                           [swap
+                            .java.io.ByteArrayOutputStream.
+                            .!!write
+                            .!!write
+                            .*toByteArray]]
+
+                          [[swap string?]
+                           [.*java.lang.String/valueOf swap .**concat]]                            
+
+                          [[true] [[+*vec] dip +**conj]]]
+                         decide]
           ::examples '[[[[] 1 pack] [[1]]]
-                       [[[1 2 3] 4 pack] [[1 2 3 4]]]]}
+                       [[[1 2 3] 4 pack] [[1 2 3 4]]]
+                       [["foo" \d pack] ["food"]]
+                       [["foo" bytes 32 pack .*java.lang.String.] ["foo "]]]}
    'unpack {::spec (stack-spec :l ::list)
             ::fn (stack-effect [[l & others]] [(nil->nothing l) (vec others)])
             ::examples '[[[["a" "b" "c"] unpack] ["a" ["b" "c"]]]]}
@@ -898,7 +929,7 @@ that we notice any bugs as we're developing.
      (test/testing (str word)
        (doseq [[program exp-stack] examples]
          (->> program
-              (k {:max-steps 500})
+              (k {:max-steps 2500})
               vec
               (= exp-stack)
               test/is)))))
@@ -944,14 +975,14 @@ axiom words, or calling clojure functions.
                             recur] ;; now it's generic recur
              ::examples '[[[5 [1] [*] primrec] [120]]]}
    '= {::spec (stack-spec :x ::item, :y ::item)
-       ::definition '[..=]
+       ::definition '[+**=]
        ::examples '[[[1 1 =] [true]]
                     [["hi" "hi" =] [true]]
                     [["hi" "there" =] [false]]
                     [[[] false =] [false]]
                     [[1 "hi" "hi" =] [true 1]]]}
    'count {::spec (stack-spec :l ::list)
-           ::definition '[.count]
+           ::definition '[+*count]
            ::examples '[[[["a" "b" "c"] count] [3]]]}
    'prepend {::spec (stack-spec :a ::item
                                 :l ::list)
@@ -976,19 +1007,17 @@ axiom words, or calling clojure functions.
               ::examples '[[[1 2 3 snapshot] [[3 2 1] 3 2 1]]
                            [[snapshot] [[]]]]}
    'first {::spec (stack-spec :l ::list)
-           ::definition '[.first]
+           ::definition '[+*first]
            ::examples '[[[[4 5 6] first] [4]]]}
    'second {::spec (stack-spec :l ::list)
-            ::definition '[.second]
+            ::definition '[+*second]
             ::examples '[[[[4 5 6] second] [5]]]}
    'bytes? {::spec (stack-spec :a ::item)
-            ::definition '[.bytes?]}
+            ::definition '[+*bytes?]}
    'string? {::spec (stack-spec :a ::item)
-             ::definition '[.string?]}
-   'getbytes {::spec (stack-spec :string ::string)
-              ::definition '[.+getBytes]}
+             ::definition '[+*string?]}
    'bytes {::spec (stack-spec :a ::item)
-           ::definition '[[[[clone string?] [getbytes]]
+           ::definition '[[[[clone string?] [.*getBytes]]
                            [[clone bytes?] []]]
                           decide]}
    'map {::spec (stack-spec :p ::program
@@ -1645,45 +1674,71 @@ pipes, which is just two pipes with the sender and receiver swapped)
 (swap! core/core-words merge
        {'hash {::core/spec (core/stack-spec :input ::core/bytes)
                ::core/definition '[[[[bytes?] ["SHA-256"
-                                               .+java.security.MessageDigest/getInstance
-                                               .+digest]]
+                                               .*java.security.MessageDigest/getInstance
+                                               .*digest]]
                                     [[string?] [bytes hash]]
                                     [[list?] [string hash]]]
                                    decide]}
         'key {::core/spec (core/stack-spec :seed ::item)
               ::core/definition '[bytes
 
-                                  "SHA1PRNG" .+java.security.SecureRandom/getInstance
-                                  [..+setSeed] void
+                                  "SHA1PRNG" .*java.security.SecureRandom/getInstance
+                                  .!!(k '[1 [1 2 3] [+] map])setSeed
 
-                                  256 "EC" .+java.security.KeyPairGenerator/getInstance
-                                  [..+initialize] void
+                                  256 "EC" .*java.security.KeyPairGenerator/getInstance
+                                  .!!initialize 
+                                  
+                                  swap discard ;; don't need the SR on stack anymore
 
-                                  .+generateKeyPair
-                                  [.+getPublic] shield
+                                  .*generateKeyPair
+                                  [.*getPublic] shield
 
                                   wrap [ec-keypair] join
                                   swap
-                                  .+getPrivate pack
+                                  .*getPrivate pack
                                   [public type private] swap zip]}
-        'sign {::core/spec (core/stack-spec :key ::core/item
-                                            :message ::core/item)
-               ::core/fn (core/stack-effect
-                          [k m]
-                          [(let [signer (doto (Signature/getInstance "SHA256withECDSA")
-                                          (.initSign k)
-                                          (.update m))]
-                             (.sign signer))])}
+        'sign {::core/spec (core/stack-spec :message ::core/item
+                                            :key ::core/item)
+               #_::core/fn #_(core/stack-effect
+                              [m k]
+                              [(let [signer (doto (Signature/getInstance "SHA256withECDSA")
+                                              (.initSign k)
+                                              (.update m))]
+                                 (.sign signer))])
+               ::core/definition '[swap
+                                   "SHA256withECDSA" .*java.security.Signature/getInstance
+                                   .!!initSign
+                                   .!!update
+                                   .*sign]}
         'verify {::core/spec (core/stack-spec :signature ::core/item
-                                              :key ::core/item
-                                              :message ::core/item)
+                                              :message ::core/item
+                                              :key ::core/item)
                  ::core/fn (core/stack-effect
-                            [s k m]
+                            [s m k]
                             [(let [signer (doto (Signature/getInstance "SHA256withECDSA")
                                             (.initVerify k)
                                             (.update m))]
                                (.verify signer s))])}})
 #+end_src
+
+#+begin_example
+;; in progress example sign
+(k 
+             '["foo" key [private] unwrap lookup
+               "We strike at dawn"
+               "SHA256withECDSA" .+java.security.Signature/getInstance
+               swap discard ;; drop the full key
+               [..+initSign] void
+               [..+update] void])
+
+;; next iteration
+["foo" key 
+"We attack at dawn" bytes 
+[[[private] unwrap lookup] dip sign] shield
+;[discard "bar" key] dipdown ;; try different key for verify
+;;20 pack ;; add another byte to the sig, to make it invalid
+[[public] unwrap lookup] dipdown verify]
+#+end_example
 * Tasks
 ** TODO Make a reader for the language
 needs to support comments. clojure reader probably sufficient?
