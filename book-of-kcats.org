@@ -330,8 +330,8 @@ lists). We'll also spec out programs, which are lists but intended to
 be executed (otherwise there is no difference).
 
 #+BEGIN_SRC clojure
-  (expound/def ::list (spec/coll-of ::item :kind vector?) "list?")
-  (expound/def ::value-list (spec/coll-of ::value :kind vector?) "value-list?")
+  (expound/def ::list (spec/coll-of ::item) "list?")
+  (expound/def ::value-list (spec/coll-of ::value?) "value-list?")
   (expound/def ::program ::list)
 #+END_SRC
 
@@ -538,14 +538,6 @@ with its definition. Otherwise it's put onto the stack.
     
     ;; eval the thing onto the stack
     (onto-stack env)))
-
-(defn print-env
-  "Prints the expression/stack and then return env"
-  [{::keys [expression stack] :as env}]
-  (apply pr (reverse expression))
-  (print " . ")
-  (apply prn stack)
-  env)
  
 (defn step-over
   "Executes the next word in the expression completely, returning the
@@ -556,10 +548,75 @@ with its definition. Otherwise it's put onto the stack.
      (if (< (count expression) depth)
        env
        (recur (eval-step env))))))
+
 #+END_SRC
 
 Recall what =eval= does, it just keeps iterating =eval-step= until
 there's nothing left in the expression.
+
+** Printing
+Printing out (or serializing) kcats data is mostly just printing the
+underlying clojure data structures, as-is. However we want to note the
+difference between raw data and data that's been put into an optimized
+structure for processing. A map (or mapping, dictionary etc) lets you
+look up a value given a key. The raw data is just a list of key/value
+pairs. Arranging it in a hashmap is a performance optimization. When
+we print out data, it's the raw format we want. In kcats there's no
+difference in raw data, between a list of pairs and a map. Under the
+covers though, it may actually be a hashmap. 
+
+We're going to define our own print-method and pr that mirror's
+clojure's except for a few small changes.
+#+begin_src clojure
+(refer-clojure :exclude [pr-on pr prn])
+
+(defn pr-on
+  {:private true
+   :static true}
+  [x w]
+  (let [orig clojure.core/print-method]
+    (with-redefs [clojure.core/print-method (fn [x w] (if (map? x)
+                                                        (orig (into [] x) w)
+                                                        (orig x w)))]
+      (print-method x w)))
+  nil)
+
+(defn pr
+  "Prints the object(s) to the output stream that is the current value
+  of *out*.  Prints the object(s), separated by spaces if there is
+  more than one.  By default, pr and prn print in a way that objects
+  can be read by the reader"
+  {:dynamic true
+   :added "1.0"}
+  ([] nil)
+  ([x]
+     (pr-on x *out*))
+  ([x & more]
+   (pr x)
+   (. *out* (append \space))
+   (if-let [nmore (next more)]
+     (recur (first more) nmore)
+     (apply pr more))))
+
+(defn prn
+  "Same as pr followed by (newline). Observes *flush-on-newline*"
+  {:added "1.0"
+   :static true}
+  [& more]
+    (apply pr more)
+    (newline)
+    (when *flush-on-newline*
+      (flush)))
+
+(defn print-env
+  "Prints the expression/stack and then return env"
+  [{::keys [expression stack] :as env}]
+  (apply pr (reverse expression))
+  (print " . ")
+  (apply prn stack)
+  env)
+
+#+end_src
 ** Concept of nothing/nil/null
 Kcats is not going to have a concept of =null= or =nil=. If we want to
 express "nothing" we will use an empty list. We'll need some functions
@@ -854,7 +911,13 @@ basically as-is in kcats.
                             [not]] ;; then
                            dip ;; underneath the r1
                            [execute] recur ;; r2 and recur!
-                           swap discard]} ;; drop leftover list
+                           swap discard] ;; drop leftover list
+            ::examples '[[[[2 4 6] [even?] every?] [true]]
+                         [[[2 4 5] [even?] every?] [false]]
+                         [[[] [even?] every?] [true]]
+                         [[[2 4 6] [] every?] [true]]
+                         [[11 [2 4 6] [+ odd?] every?] [true 11]]
+                         [[12 [[even?] [pos?] [3 rem 0 =]] [execute] every?] [true 12]]]} 
    'any? {::spec (stack-spec :p ::program
                              :l ::list)
           ::definition '[;; build the r1
@@ -869,7 +932,13 @@ basically as-is in kcats.
                           []] ;; then
                          dip ;; underneath the r1
                          [execute] recur ;; r2 and recur!
-                         swap discard]}
+                         swap discard]
+          ::examples '[[[[2 4 6] [even?] any?] [true]]
+                       [[[3 5 7] [even?] any?] [false]]
+                       [[[] [even?] any?] [false]]
+                       [[[2 4 6] [] any?] [true]]
+                       [[11 [3 5 6] [+ odd?] any?] [true 11]]
+                       [[-15 [[even?] [pos?] [3 rem 0 =]] [execute] any?] [true -15]]]}
    'and {::spec (stack-spec :a ::item
                             :b ::item)
          ::fn (f-stack 2 (fn [a b]
@@ -1096,12 +1165,15 @@ Then include some words that depend on this functionality.
 
 (expound/def ::pair (spec/coll-of ::item :kind vector? :count 2))
 
-(expound/def ::association-list (spec/coll-of ::pair
-                                              :kind vector?))
-
+(expound/def ::association-list (spec/or :map map?
+                                         :pairs (spec/coll-of ::pair
+                                                              :kind vector?)))
 (defn lookup
   [alist k]
-  (get (into {} alist) k []))
+  (get (if (map? alist)
+         alist
+         (into {} alist))
+       k []))
 
 ;;TODO: axiom words should be separated
 (def associative-words
@@ -1111,10 +1183,12 @@ Then include some words that depend on this functionality.
                                :key ::item,
                                :alist ::association-list)
             ::fn (f-stack 3 (fn [alist k v]
-                              (let [i (.indexOf (mapv first alist) k)]
-                                (if (= -1 i)
-                                  (conj alist [k v])
-                                  (assoc alist i [k v])))))
+                              (if (map? alist)
+                                (assoc alist k v)
+                                (let [i (.indexOf (mapv first alist) k)]
+                                  (if (= -1 i)
+                                    (conj alist [k v])
+                                    (assoc alist i [k v]))))))
             ::examples '[[[[[a b] [c d]] a x assign] #_-> [[[a x] [c d]]]]
                          [[[[a b] [c d]] e x assign] #_-> [[[a b] [c d] [e x]]]]]}
    'lookup {::spec (stack-spec :keylist ::list
