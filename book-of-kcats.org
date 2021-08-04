@@ -593,7 +593,19 @@ covers though, it may actually be a hashmap.
 We're going to define our own print-method and pr that mirror's
 clojure's except for a few small changes.
 #+begin_src clojure
-(refer-clojure :exclude [pr-on pr prn])
+(defn kw->sym
+  "Converts keywords to symbols, dropping any namespace. Non-keywords
+  are unchanged"
+  [k]
+  (if (keyword? k)
+    (-> k name symbol)
+    k))
+
+(defn kws->syms
+  "Converts map keys that are keywords, to symbols"
+  [m]
+  (zipmap (->> m keys (map kw->sym))
+          (vals m)))
 
 (defn pr-on
   {:private true
@@ -601,7 +613,7 @@ clojure's except for a few small changes.
   [x w]
   (let [orig clojure.core/print-method]
     (with-redefs [clojure.core/print-method (fn [x w] (if (map? x)
-                                                        (orig (into [] x) w)
+                                                        (orig (into [] (kws->syms x)) w)
                                                         (orig x w)))]
       (print-method x w)))
   nil)
@@ -1106,7 +1118,7 @@ axiom words, or calling clojure functions.
               ::examples '[[[1 2 3 snapshot] [[3 2 1] 3 2 1]]
                            [[snapshot] [[]]]]}
    'first {::spec (stack-spec :l ::list)
-           ::definition '[+first]
+           ::definition '[+first +nil->nothing]
            ::examples '[[[[4 5 6] first] [4]]]}
    'second {::spec (stack-spec :l ::list)
             ::definition '[+second]
@@ -1198,17 +1210,19 @@ Then include some words that depend on this functionality.
                                                               :kind vector?)))
 (defn lookup
   [alist k]
-  (get (if (map? alist)
-         alist
-         (into {} alist))
-       k []))
+  (let [m? (map? alist)]
+    (get (if m?
+           alist
+           (into {} alist))
+         (cond-> k
+           (and m? (symbol? k)) (->> name (keyword "kcats.core")))
+         [])))
 
 (defn assign
   [alist ks v]
   (if (map? alist)
     (assoc-in alist ks v)
     (let [[k & ks] ks
-          _ (println "Hi" k ks alist)
           i (.indexOf (mapv first alist) k)]
       (if (= -1 i)
         (conj alist [k (if (seq ks)
@@ -1245,7 +1259,9 @@ Then include some words that depend on this functionality.
                             [execute]
                             every?]
                            [unpack swap [++lookup] dip] ;; extract the first key and lookup
-                           while  [something?]
+                           while
+
+                           [something?]
                            ;; fail if we could not drill down all the way
                            ["Lookup attempted on non associative value" fail]
                            [discard]  ;; get rid of remaining keylist
@@ -1375,11 +1391,11 @@ operations on it.
 *** Implementation
 First let's spec what a nested environment looks like
 #+begin_src clojure
-  (in-ns 'kcats.core)
-  (declare env->clj)
+(in-ns 'kcats.core)
+(declare env->clj)
 
-  (expound/def ::nested-environment
-    (spec/and ::association-list #(->> % env->clj (spec/valid? ::environment))))
+(expound/def ::nested-environment
+  #(->> % env->internal (spec/valid? ::environment)))
 #+end_src
 
 We'll need to be able to move back and forth between clojure's idea of
@@ -1417,6 +1433,11 @@ the environment's dictionary.
                             :when definition] ;; leave out core-words
                         [k definition]))]
    ['expression (-> e ::expression vec)]])
+
+(defn env->internal
+  [e]
+  (cond-> e
+    (not (map? e)) env->clj))
 #+end_src
 
 Now we can define an axiom word that steps through a nested
@@ -1426,7 +1447,9 @@ environment's execution.
 (in-ns 'kcats.core)
 (swap! core-words merge
        {'eval-step {::spec (stack-spec :environment ::nested-environment)
-                    ::fn (f-stack 1 (comp vec env->k eval-step env->clj))}})
+                    ::fn (f-stack 1 (comp env->internal eval-step))}
+        'environment {::spec (stack-spec :expression ::list)
+                      ::fn (f-stack 1 (comp default-env list*))}})
 #+end_src
 
 Now that we can step, and we have predicates, we can specify in kcats
