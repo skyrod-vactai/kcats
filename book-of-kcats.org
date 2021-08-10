@@ -593,64 +593,22 @@ covers though, it may actually be a hashmap.
 We're going to define our own print-method and pr that mirror's
 clojure's except for a few small changes.
 #+begin_src clojure
-(defn kw->sym
-  "Converts keywords to symbols, dropping any namespace. Non-keywords
-  are unchanged"
-  [k]
-  (if (keyword? k)
-    (-> k name symbol)
-    k))
-
-(defn kws->syms
-  "Converts map keys that are keywords, to symbols"
-  [m]
-  (zipmap (->> m keys (map kw->sym))
-          (vals m)))
-
-(defn pr-on
-  {:private true
-   :static true}
-  [x w]
-  (let [orig clojure.core/print-method]
-    (with-redefs [clojure.core/print-method (fn [x w] (if (map? x)
-                                                        (orig (into [] (kws->syms x)) w)
-                                                        (orig x w)))]
-      (print-method x w)))
-  nil)
-
-(defn pr
-  "Prints the object(s) to the output stream that is the current value
-  of *out*.  Prints the object(s), separated by spaces if there is
-  more than one.  By default, pr and prn print in a way that objects
-  can be read by the reader"
-  {:dynamic true
-   :added "1.0"}
-  ([] nil)
-  ([x]
-     (pr-on x *out*))
-  ([x & more]
-   (pr x)
-   (. *out* (append \space))
-   (if-let [nmore (next more)]
-     (recur (first more) nmore)
-     (apply pr more))))
-
-(defn prn
-  "Same as pr followed by (newline). Observes *flush-on-newline*"
-  {:added "1.0"
-   :static true}
-  [& more]
-    (apply pr more)
-    (newline)
-    (when *flush-on-newline*
-      (flush)))
+(defn repr
+  "The kcats canonical representation, in clojure data
+  structures. Converts clojure maps to vectors, keywords to symbols."
+  [x]
+  (cond
+    (map? x) (mapv (fn [[k v]] [(repr k) (repr v)]) x)
+    (keyword? x) (-> x name symbol)
+    (coll? x) (mapv repr x)
+    :else x)) 
 
 (defn print-env
   "Prints the expression/stack and then return env"
   [{::keys [expression stack] :as env}]
-  (apply pr (reverse expression))
+  (apply clojure.core/pr (reverse (repr expression)))
   (print " . ")
-  (apply prn stack)
+  (apply clojure.core/prn (repr stack))
   env)
 
 #+end_src
@@ -1019,10 +977,13 @@ basically as-is in kcats.
   stop execution after `max-steps` if still unfinished, to prevent
   accidental infinite loops (for debugging purposes)"
   ([opts p]
-   (::stack (eval opts (assoc (default-env) ::expression p))))
+   (repr (::stack (eval opts (assoc (default-env) ::expression p)))))
   ([p] (k {:before-step print-env} p)))
 
 #+END_SRC
+
+We'll also wrap a bunch of clojure functions that will be used
+basically as-is in kcats.
 
 Next we can add a way to test that all the examples are working, so
 that we notice any bugs as we're developing.
@@ -1041,14 +1002,12 @@ that we notice any bugs as we're developing.
        (doseq [[program exp-stack] examples]
          (->> program
               (k {:max-steps 2500})
-              vec
+              repr
               (= exp-stack)
               test/is)))))
   ([] (test nil)))
 #+end_src
 
-Next we can add some more words that are defined in terms of the
-axiom words, or calling clojure functions.
 #+begin_src clojure
 ;;TODO: Allow these words to be defined in a .kcats file and read in
 ;; natively. it would probably mean we can't use spec. But we could
@@ -1218,19 +1177,17 @@ Then include some words that depend on this functionality.
            (and m? (symbol? k)) (->> name (keyword "kcats.core")))
          [])))
 
-(defn assign
-  [alist ks v]
-  (if (map? alist)
-    (assoc-in alist ks v)
-    (let [[k & ks] ks
-          i (.indexOf (mapv first alist) k)]
-      (if (= -1 i)
-        (conj alist [k (if (seq ks)
-                         (assign [] ks v)
-                         v)])
-        (assoc alist i [k (if (seq ks)
-                            (assign (get-in alist [i 1]) ks v)
-                            v)])))))
+(defn assoc-in
+  "Associates a value in a nested associative structure, where ks is a
+  sequence of keys and v is the new value and returns a new nested structure.
+  If any levels do not exist, hash-maps will be created."
+  {:added "1.0"
+   :static true}
+  [m [k & ks] v]
+  (let [m (into {} m)]
+    (if ks
+      (assoc m k (assoc-in (get m k) ks v))
+      (assoc m k v))))
 
 ;;TODO: axiom words should be separated
 (def associative-words
@@ -1239,7 +1196,7 @@ Then include some words that depend on this functionality.
    'assign {::spec (stack-spec :value ::item
                                :keylist ::list,
                                :alist ::association-list)
-            ::fn (f-stack 3 assign)
+            ::fn (f-stack 3 #'assoc-in)
             ::examples '[[[[[a b] [c d]] [a] 5 assign] #_-> [[[a 5] [c d]]]]
                          [[[[a b] [c d]] [e] 5 assign] #_-> [[[a b] [c d] [e 5]]]]
                          [[[[a b] [c [[d e]]]] [c d] 5 assign] #_-> [[[a b] [c [[d 5]]]]]]]}
@@ -1247,7 +1204,7 @@ Then include some words that depend on this functionality.
                                :keylist ::list
                                :alist ::association-list)
             ::definition '[[[lookup] shield] dip ;; m ks v p
-                           execute
+                           shielddown
                            assign]}
    'lookup {::spec (stack-spec :keylist ::list
                                :map ::association-list)
