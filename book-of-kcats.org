@@ -568,14 +568,21 @@ with its definition. Otherwise it's put onto the stack.
   [{::keys [dictionary] :as env} item]
   (some-> dictionary (get item) ::definition))
 
+(declare repr)
+
 (defn eval-step
   "Evaluate one step in the environment."
   [{[next-item & items :as expression] ::expression ::keys [stack dictionary] :as env}]
-  (if-let [d (definition env next-item)]
-    (assoc env ::expression (concat (list* d) items)) ;; replace item with definition
-    
-    ;; eval the thing onto the stack
-    (onto-stack env)))
+  (try
+    (if-let [d (definition env next-item)]
+      (assoc env ::expression (concat (list* d) items)) ;; replace item with definition
+      
+      ;; eval the thing onto the stack
+      (onto-stack env))
+    (catch Exception e
+      (throw (ex-info (str "Error during evaluation of " (repr next-item))
+                      {:environment (dissoc env ::dictionary)}
+                      e)))))
  
 (defn step-over
   "Executes the next word in the expression completely, returning the
@@ -633,9 +640,7 @@ to treat empty lists as clojure treats =nil=.
 #+begin_src clojure
 (def nothing [])
 
-(defn nothing?
-  [x]
-  (= nothing x))
+(def nothing? (partial = nothing))
 
 (defn nothing->nil
   "Returns argument unless it's a kcats 'nothing' (empty list), in
@@ -716,12 +721,16 @@ word doesn't get the stack arguments that it needs.
 
 We'll also wrap a bunch of clojure functions that will be used
 basically as-is in kcats.
-
 #+BEGIN_SRC clojure
 (in-ns 'kcats.core)
+(require '[clojure.java.io :as io])
 (import [java.io ByteArrayOutputStream])
+
+;; some state to hold our core words, so we can build them up a chunk
+;; at a time.
 (defonce core-words (atom {}))
 
+;; math symbols are ok - non-programmers already know what they mean
 (def arithmetic-words
   (into {} cat
         [(for [sym ['+ '- '/ '* '< '<= '> '>= 'min 'max 'quot 'rem 'mod]]
@@ -1388,7 +1397,7 @@ operations on it.
 First let's spec what a nested environment looks like
 #+begin_src clojure
 (in-ns 'kcats.core)
-(declare env->clj)
+(declare env->clj env->internal)
 
 (expound/def ::nested-environment
   #(->> % env->internal (spec/valid? ::environment)))
@@ -1538,7 +1547,8 @@ access to the "in" end, but not the "out" (that's on a remote machine).
             [clojure.spec.alpha :as spec]
             [expound.alpha :as expound])
   (:refer-clojure :exclude [take empty?])
-  (:import [java.util.concurrent BlockingQueue ArrayBlockingQueue SynchronousQueue]))
+  (:import [java.util.concurrent BlockingQueue ArrayBlockingQueue SynchronousQueue]
+           [java.util Queue]))
 
 (defprotocol Select
   (poll [pipe] "Returns a value if available, otherwise nil"))
@@ -1750,14 +1760,14 @@ it returned -1, then we know EOF has been reached.
           chars-read (.read rdr buf)]
       (if (= -1 chars-read)
         (throw (Exception. "EOF on reader while reading"))
-        (.toString (let [retbuf (make-array Byte/TYPE chars-read)]
+        (let [retbuf (make-array Byte/TYPE chars-read)]
           (System/arraycopy #^bytes buf 0
                             #^bytes retbuf 0 ^int (alength retbuf))
-          retbuf)chars-read))))
+          retbuf))))
   Select
   (poll [is] (take is))
   Close
-  (close [is] (.close is))
+  (close [is])
   (closed? [is] (try (-> is .available (= 0))
                      (catch java.io.IOException ioe
                        true))))
@@ -1773,8 +1783,6 @@ it returned -1, then we know EOF has been reached.
 *** Words
 #+begin_src clojure :tangle src/kcats/pipe.clj
 (in-ns 'kcats.pipe)
-
-(require '[clojure.java.io])
 
 (expound/def ::in (partial satisfies? In))
 (expound/def ::out (partial satisfies? Out))
@@ -1884,8 +1892,6 @@ pipes, which is just two pipes with the sender and receiver swapped)
                                   ["EC" !*java.security.KeyPairGenerator/getInstance 256] dip
                                   ,*!**initialize 
                                   
-                                  ;;swap discard ;; don't need the SR on stack anymore
-
                                   !*generateKeyPair
                                   [!*getPublic] shield
 
