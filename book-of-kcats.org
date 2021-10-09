@@ -1574,13 +1574,12 @@ only wants keywords as keys, not symbols) and it breaks the levels of
 abstraction.
 ** Pipes
 *** Basics
-Pipes are a coordination construct - a way to get values from here to
-there, when "there" is further away than a simple function call. In
-that sense it adds impurities to functional programming by introducing
-state, but quite often real programs need to deal with state. That
-state could just be something introduced by, and consumed by, the
-local environment, or it could be received from another machine
-thousands of miles away.
+Pipes help you coordinate - they give you a way to get values from
+here to there. You might know where the pipe comes out, but you don't
+know or care how it gets there. Pipes should be used for communicating
+rather than calculating. You can send or receive from the filesystem
+or the network via pipes. You can also use pipes to send or receive
+values to/from other environments.
 
 The interface is simple enough - we just need to be able to put values
 into a pipe at one end, and take them off at the other. It's also
@@ -1590,8 +1589,14 @@ end is removed).
 
 The program doesn't necessarily have access to both ends of the
 pipe. For example, when sending data over a socket, the program has
-access to the "in" end, but not the "out" (that's on a remote machine). 
+access to the "in" end, but not the "out" (that's on a remote
+machine - whatever you put in is sent over the network).
 
+Pipes can also contain infinite sequences, which are handy
+sometimes. For example, a pipe that contains 1, 2, 3 etc. Each time
+you take from it, you'll get a number one higher than the last. In
+reality the pipe doesn't have infinite stuff it it, it's just being
+put in as needed.
 #+begin_src clojure :tangle src/kcats/pipe.clj
 (ns kcats.pipe
   (:require [kcats.core :as core]
@@ -1636,13 +1641,62 @@ kcats primitives will be defined in terms of.
       ;; everything empty, start over
       (do (Thread/sleep default-sleep)
           (recur pipes)))))
+
+(defn put!
+  [pipe value]
+  (doto pipe (put value)))
+
+;; TODO: I don't think it makes any sense to make a pipeline when the
+;; pipes don't alter the content. We need to really link up envs where
+;; each env takes from one pipe, does processing and puts into
+;; another.
+(defn pipeline
+  "Takes a coll of pipes, connects them together into a
+  pipeline (starting with the first item's `in` and ending with the
+  last item's `out`). Handles moving things through the pipeline
+  automatically so that they act as a single pipe."
+  [pipes]
+  ;; check that we can actually pipeline these pipes (no file/socket
+  ;; operations in the middle, etc)
+  (doseq [[in out] (partition 2 1 pipes)]
+    (if-not (satisfies? Out in)
+      (throw (ex-info "Trying to add pipe to pipeline, but we don't have access to the Out end"
+                      {:pipe in}))
+      (if-not (satisfies? In out)
+        (throw (ex-info "Trying to add pipe to pipeline, but we don't have access to the In end"
+                        {:pipe out})))))
+  ;; start from the end, siphoning things out
+  (future (loop [[in out & remaining] pipes]
+            (if (and in out)
+              (if-let [item (poll in)]
+                (if-not (empty )))
+              ))))
 #+end_src
+
 
 Now we can define a few different kinds of pipes, starting with simple
 "local" types.
 *** Closing
-Pipes need to be closed pretty often (eg there's no more bytes to be
-read from a file, so we need to know when to stop waiting for more)
+When waiting at the end of a pipe for more items to emerge, it'd be
+nice to know if whoever's at the other end has gone away (doesn't
+intend to ever send anything else). It's also nice to know, when
+putting items into a pipe, that whoever is taking them out has gone
+away. We'll call that "closing" the pipe, regardless of which end does
+it.
+
+This can get a little complicated because often there is more than one
+process at one end of the pipe or the other. Imagine 3 people all
+standing at the end of a pipe, and all putting items into it, and then
+one person seals the pipe shut forever. The other two people might not
+appreciate that, if they weren't done with the pipe. Only close the
+pipe if you're sure that everyone's done with it.
+
+It may turn out that best practice is to never allow more than one
+process per pipe, instead joining pipes together, such that the joint
+only closes when all the input pipes close (or the output closes).
+
+This implementation provides no logic (yet) to automatically close a
+pipe when all its inputs or outputs close.
 #+begin_src clojure :tangle src/kcats/pipe.clj
 (in-ns 'kcats.pipe)
 
@@ -1730,7 +1784,16 @@ channels.
   (ArrayBlockingQueue. buffer-size))
 
 (defn ->filled [coll]
-  (ArrayBlockingQueue. (count coll) false coll))
+  (let [q (ArrayBlockingQueue. (count coll) false coll)]
+    (reify
+      Out
+      (take [this] (.take q))
+      Select
+      (poll [this] (.poll q))
+      Close
+      (close [this] (.clear q))
+      (closed? [this] (-> q .size (= 0))))))
+
 #+end_src
 *** Atoms
 This is a pipe that when you take, always returns the last value
@@ -1751,20 +1814,22 @@ combo that you can send programs to: in-pipe takes programs that act
 as swap! fns, out-pipe returns current value. But that is more of a
 clojure ref than an atom. 
 
-Another approach is to use clojure atoms but make the whole env be the
-(clojure atom) value (only difference is that instead of a pipe on top
-it's the pipe's value in its place). For kcats atom swap, run the env
-with the program in the expression, with =shielddown=. The clojure
-atom would then be properly updated. The kcats take, however would
-need to just return ToS instead of the entire clojure atom value. The
-problem with this is the =put= word doesn't usually care about the
-whole env and would have to have a separate impl for atoms.
+The problem here is that clojure atoms actually return something when
+you =put= into them: the previous value. Pipes don't really have that
+swapping feature. They *could* but it seems a little forced since I
+can't think of anything else that would use it.
 
-Thinking about tihs more, atoms should probably have a different
-contract: puts take programs to run on the env (with pipe replaced with
-the actual value). Takes return the value.
+Being able to get and set atomically is pretty hard to do without for
+an atom. Maybe atoms should not implement the =In= protocol at all,
+and instead have their own separate Atom protocol that has an
+=exchange= word (swap is already taken!)
 
-For example:
+#+begin_src clojure
+
+#+end_src
+
+
+  For example:
 #+begin_src clojure :tangle no
 ;; swap! is done with a program that replaces previous ToS
 ;; note no stack items are consumed
@@ -1833,7 +1898,7 @@ that at least one of them will return something eventually.
     (let [buf (make-array Byte/TYPE 1024)
           bytes-read (.read is buf)]
       (if (= -1 bytes-read)
-        (throw (Exception. "EOF on inputstream while reading"))
+        (throw (java.io.EOFException. "EOF on inputstream while reading"))
         (let [retbuf (make-array Byte/TYPE bytes-read)]
           (System/arraycopy #^bytes buf 0
                             #^bytes retbuf 0 ^int (alength retbuf))
@@ -1846,9 +1911,33 @@ that at least one of them will return something eventually.
                      (catch java.io.IOException ioe
                        true))))
 
+;; add state to remember if InputStream is closed
+
+(defrecord InputStream [is closed?]
+  Out
+  (take [this]
+    (let [buf (make-array Byte/TYPE 1024)
+          bytes-read (.read is buf)]
+      (if (= -1 bytes-read)
+        (reset! closed? true)
+        (let [retbuf (make-array Byte/TYPE bytes-read)]
+          (System/arraycopy #^bytes buf 0
+                            #^bytes retbuf 0 ^int (alength retbuf))
+          retbuf))))
+  Select
+  (poll [this] (poll is))
+  Close
+  (close [is]
+    (.close is)
+    (reset! closed? true))
+  (closed? [is] @closed?))
+
+(defn make-inputstream [is]
+  (->InputStream is (atom false)))
+
 (extend-type java.io.OutputStream
   In
-  (put [os bs] (doto os (.write bs)))
+  (put [os bs] (doto os (.write bs) (.flush)))
   Close
   (close [os] (doto os (.flush) (.close)))
   (closed? [os] false))
@@ -1896,7 +1985,7 @@ it returned -1, then we know EOF has been reached.
     (let [buf (java.nio.CharBuffer/allocate 1024)
           chars-read (.read rdr buf)]
       (if (= -1 chars-read)
-        (throw (Exception. "EOF on reader while reading"))
+        (throw (java.io.EOFException. "EOF on reader while reading"))
         (let [retbuf (make-array Byte/TYPE chars-read)]
           (System/arraycopy #^bytes buf 0
                             #^bytes retbuf 0 ^int (alength retbuf))
@@ -1912,10 +2001,36 @@ it returned -1, then we know EOF has been reached.
 #+end_src
 
 *** Sockets
-A socket has an in and out pipe that go to, and come from
-(respectively) a remote machine or process.
+A server socket creates a stream of sockets, 
+(one for each accepted connection from a client)
 
+Then a socket has both in and out, via the input/output streams.
+#+begin_src clojure :tangle src/kcats/pipe.clj
+(in-ns 'kcats.pipe)
+(extend-type java.net.Socket
+  Out
+  (take [s] (try
+              (-> s .getInputStream take)
+              (catch java.io.EOFException eofe
+                )))
+  Select
+  (poll [s] (-> s .getInputStream poll))
+  In
+  (put [s obj] (doto s
+                 (-> .getOutputStream (put obj))))
+  Close
+  (close [s] (.close s))
+  (closed? [s] (.isClosed s)))
 
+(extend-type java.net.ServerSocket
+  Out
+  (take [ss] (.accept ss))
+  Select
+  (poll [ss] (take ss))
+  Close
+  (close [ss] (.close ss))
+  (closed? [ss] (.isClosed ss)))
+#+end_src
 *** Words
 #+begin_src clojure :tangle src/kcats/pipe.clj
 (in-ns 'kcats.pipe)
@@ -1932,6 +2047,8 @@ A socket has an in and out pipe that go to, and come from
                  ::core/fn (core/stack-effect [s] [(->buffered s)])}
         'timeout {::core/spec (core/stack-spec :timeout-ms ::core/integer)
                  ::core/fn (core/stack-effect [t] [(->timeout t)])}
+        'filled {::core/spec (core/stack-spec :values ::core/list)
+                 ::core/fn (core/stack-effect [l] [(->filled l)])}
         'handoff {::core/spec (core/stack-spec)
                   ::core/fn (core/stack-effect [] [(->handoff)])} 
         'select {::core/spec (core/stack-spec :pipes (spec/coll-of ::out))
@@ -1942,7 +2059,10 @@ A socket has an in and out pipe that go to, and come from
                ::core/fn (core/stack-effect [p] [(take p) p])}
         'put {::core/spec (core/stack-spec :value ::core/item
                                            :pipe ::in)
-              ::core/definition '[bytes [++kcats.pipe/put] shielddown]}
+              ;; TODO: not appropriate to call `bytes` here.  Some
+              ;; pipes (from one env to another) take any value, not
+              ;; just bytes.
+              ::core/definition '[++kcats.pipe/put!]}
         'close {::core/spec (core/stack-spec :pipe ::core/pipe)
                 ::core/fn (core/stack-effect [p] (do (close p) [p]))}
         'closed? {::core/spec (core/stack-spec :pipe ::core/pipe)
@@ -1960,10 +2080,7 @@ A socket has an in and out pipe that go to, and come from
                       [clone
                        [port] lookup
                        [[address] lookup] dip
-                       !**java.net.Socket.
-                       !!getInputStream
-                       [!*getOutputStream] dip
-                       ++kcats.pipe/->Tunnel]]]
+                       !**java.net.Socket.]]]
                     decide]}
         'pipe-out {::core/spec (core/stack-spec :obj ::item)
                    ::core/definition
@@ -1971,21 +2088,69 @@ A socket has an in and out pipe that go to, and come from
                      [[[type [file] unwrap =]
                        [value
                         +clojure.java.io/file
-                        +clojure.java.io/input-stream]]
+                        +clojure.java.io/input-stream
+                        +kcats.pipe/make-inputstream]]
+                      [[type [ip-port] unwrap =]
+                       [[port] lookup !*java.net.ServerSocket.]]
                       [[list?]
                        [+kcats.pipe/->filled]]]
                      decide]}
         'assemble {::core/spec (core/stack-spec :pipe ::core/pipe
                                                 :reducer ::core/program)
-                   ::core/doc "Takes from the pipe and runs reducer,
-                   until the pipe closes, discards the pipe"
+                   ::core/doc "Takes a large value out of a pipe by
+                   `take`ing it piece by piece, and assembling the
+                   pieces with `reducer`. `reducer` should take a
+                   piece, and the so-far assembled value and return a
+                   new value with the piece incorporated."
                    ::core/definition '[swap
                                        [take swap] swap pack
                                        [dip] join
                                        [[closed? not]] dip
                                        while
                                        discard]}
-        'spit {::core/spec (core/stack-spec :contents ::core/item
+        ;; TODO: is there any point to this? If we already have a
+        ;; complex/large value in memory, we don't save any memory by
+        ;; breaking it down, we can just shove the whole thing into
+        ;; the pipe with a single put. For flat lists, we can just
+        ;; `[put] step`. Maybe doing the byte conversion piece-wise is
+        ;; useful, so I'm going to keep it for now.
+        
+
+        ;; At least with the `assemble` we probably don't want to get
+        ;; a 1gb entire file with a single `take` if we end up
+        ;; throwing away most of the contents as we go.
+        ;;
+        ;; As a higher-level abstraction might be useful to have pipes
+        ;; with paired reducer/splitter so the other end knows how to
+        ;; assemble. Maybe send the reducer over the pipe first?
+        'disassemble {::core/spec (core/stack-spec :splitter ::core/program
+                                                   :stuff ::core/item
+                                                   
+                                                   :pipe ::core/pipe)
+                      ::core/doc "Puts a large value into a pipe by
+                      taking it apart with the `splitter`
+                      program. This program should take a large value
+                      and break it into two parts, such that the
+                      topmost will fit into the pipe."
+                      ::core/definition '[;; build a while body that includes splitter
+                                          [swap [put] dip] join
+                                          [nothing? not] swap
+                                          while
+                                          discard ;; drop the 'nothing' value
+                                          ]}
+        'pump {::core/spec (core/stack-spec :program ::core/program
+                                            :input ::core/pipe
+                                            :output ::core/pipe)
+               ;; while neither pipe is closed, take from input, run
+               ;; program, put into output
+               ::core/definition '[wrap [shield] join
+                                  ;; create a list to use with any
+                                  [[] sink [pack] dip swapdown [pack] dip
+                                   [[closed?] any?] dip swap]
+                                  ]}
+        
+        'spit
+        {::core/spec (core/stack-spec :contents ::core/item
                                             :target ::core/item)
                ::core/definition '[[pipe-in] dip bytes put close discard]}
         'slurp {::core/spec (core/stack-spec :target ::item)
