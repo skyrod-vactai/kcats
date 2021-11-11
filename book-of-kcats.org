@@ -632,7 +632,7 @@ our serialized data format.
   "Prints the expression/stack and then return env"
   [{::keys [expression stack] :as env}]
   (apply clojure.core/pr (reverse (repr expression)))
-  (print " . ")
+  (print " :. ")
   (apply clojure.core/prn (repr stack))
   env)
 
@@ -1066,7 +1066,7 @@ Now that we have a lot of axiom words, we can define more words as a
 standard library, in native kcats. It will be an association list
 (which we'll define later 
 
-#+begin_src clojure :tangle src/kcats/lexicon.kcats
+#+begin_src kcats :tangle src/kcats/lexicon.kcats
 [[shield [[spec [[p program]]]
           [[doc "Runs program keeping top of stack produced but protects existing items from being consumed."]]
           [definition [[snapshot] dip inject first]]
@@ -1642,6 +1642,9 @@ kcats primitives will be defined in terms of.
   [pipe value]
   (doto pipe (put value)))
 
+#+end_src
+
+#+begin_src clojure :tangle no
 ;; TODO: I don't think it makes any sense to make a pipeline when the
 ;; pipes don't alter the content. We need to really link up envs where
 ;; each env takes from one pipe, does processing and puts into
@@ -1667,8 +1670,8 @@ kcats primitives will be defined in terms of.
               (if-let [item (poll in)]
                 (if-not (empty )))
               ))))
-#+end_src
 
+#+end_src
 
 Now we can define a few different kinds of pipes, starting with simple
 "local" types.
@@ -2261,6 +2264,146 @@ pipes, which is just two pipes with the sender and receiver swapped)
 ;;20 pack ;; add another byte to the sig, to make it invalid
 [[public] lookup] dipdown verify]
 #+end_example
+* Tools
+** Debugging
+*** Trace analyzer
+**** Overview
+We can trace the execution of any program already (see [[Printing]] and
+=before-step= option for evaluation). But once we have the trace
+output it can be huge and difficult to find the place where things
+went wrong.
+
+We can apply a debugger after the fact, just using the trace output -
+it contains all the data about what happened. We can do typical debug
+operations like =step into=, =step over=, =breakpoint= etc.
+
+**** Emacs lisp
+#+begin_src emacs-lisp
+;; Some functions to move around in a buffer containing
+;; kcats trace output
+
+(require 'parseedn 'parseclj-alist)
+
+(setq kcats.trace/stack-expression-splitter :.)
+
+(defun kcats.trace/split-line
+    (parsed-line)
+  (let ((splitter-pos (seq-position parsed-line kcats.trace/stack-expression-splitter)))
+    (list (seq-subseq parsed-line 0 splitter-pos)
+	  (seq-subseq parsed-line (1+ splitter-pos)))))
+
+(defun kcats.trace/parse-current ()
+  (interactive)
+  (let ((l (thing-at-point 'line t)))
+    (with-temp-buffer
+      (insert l)
+      (goto-char (point-min))
+      (parseedn-read `((object . ,#'identity))))))
+
+(defun kcats.trace/expression-depth ()
+  (interactive)
+  (length (first (kcats.trace/split-line (kcats.trace/parse-current)))))
+
+(defun kcats.trace/step-over-forward ()
+  (interactive)
+  (let* ((starting-depth (kcats.trace/expression-depth))
+	 (current-depth starting-depth)
+	 (lines-unmoved 0))
+    (while (and (>= current-depth starting-depth)
+		(= lines-unmoved 0))
+      (setq lines-unmoved (forward-line 1))
+      (setq current-depth (kcats.trace/expression-depth))))
+  (search-forward " :. "))
+
+;; Why is there no "step-over-backward"? Because lots of words can end
+;; on the same line, we don't know which one we want to search
+;; backward for the beginning of. If you are stepping forward through
+;; execution and you go too far, use `point-stack-pop' to return to
+;; the last place you were.
+
+;; Why is there no step-out? There is no function call stack. We don't
+;; know which function we're currently executing, so we can't tell
+;; when we've finished it.
+#+end_src
+
+#+RESULTS:
+: kcats\.trace/step-over-forward
+
+** Developing
+*** Emacs mode
+#+begin_src emacs-lisp
+(defface kcats-brackets 
+  '((((class color)) (:foreground "DimGrey" :weight bold)))
+  "kcats brackets" :group 'faces)
+(defface kcats-stackop 
+  '((((class color)) (:foreground "LightGreen" :inherit 'font-lock-keyword-face)))
+  "kcats stack manipulation operation" :group 'faces)
+
+(defconst kcats-font-lock-keywords
+      `(("\\[\\|\\]" 0 'kcats-brackets)
+	(";;.*" 0 'font-lock-comment-face)
+	(,(regexp-opt '("swap" "swapdown" "discard" "sink" "float" "clone" "snapshot" "evert") 'symbols) . (0 font-lock-builtin-face))
+	(,(regexp-opt '("true" "false" "[]") 'symbols) . (0 font-lock-keyword-face))
+        (,(regexp-opt '("first" "second" "pack" "unpack" "step" "filter"
+			"map" "count" "join" "rest" "wrap" "unwrap") 'symbols) . (0 font-lock-function-name-face))
+	(,(regexp-opt '("execute" "dip" "dipdown" "shield" "shielddown" "shielddowndown" "inject"
+			"loop" "while" "if" "branch" "recur") 'symbols) . '(0 font-lock-preprocessor-face))
+        ("#?\"" 0 'double-quote prepend)))
+
+(add-hook 'kcats-mode-hook (lambda () (font-lock-add-keywords nil kcats-font-lock-keywords)))
+
+(require 'smie) ;; indentation engine
+
+(setq kcats-mode-syntax-table (let ((table (make-syntax-table)))
+    ;; Initialize ASCII charset as symbol syntax
+    (modify-syntax-entry '(0 . 127) "_" table)
+
+    ;; Word syntax
+    (modify-syntax-entry '(?0 . ?9) "w" table)
+    (modify-syntax-entry '(?a . ?z) "w" table)
+    (modify-syntax-entry '(?A . ?Z) "w" table)
+
+    ;; Whitespace
+    (modify-syntax-entry ?\s " " table)
+    (modify-syntax-entry ?\xa0 " " table) ; non-breaking space
+    (modify-syntax-entry ?\t " " table)
+    (modify-syntax-entry ?\f " " table)
+    ;; Setting commas as whitespace makes functions like `delete-trailing-whitespace' behave unexpectedly (#561)
+    (modify-syntax-entry ?, "." table)
+
+    ;; Delimiters
+    (modify-syntax-entry ?\[ "(]" table)
+    (modify-syntax-entry ?\] ")[" table)
+
+    ;; Others
+    (modify-syntax-entry ?\; "<" table) ; comment start
+    (modify-syntax-entry ?\n ">" table) ; comment end
+    (modify-syntax-entry ?\" "\"" table) ; string
+    (modify-syntax-entry ?\\ "\\" table) ; escape
+
+    table))
+
+(define-derived-mode kcats-mode fundamental-mode "kcats"
+  "major mode for editing kcats."
+  (set-syntax-table kcats-mode-syntax-table)
+  (setq-local comment-start ";") ;; try ";;"
+  (setq-local comment-end "")
+  
+  (smie-setup nil (lambda (method arg)
+		    (when (eq method :list-intro)
+		      t)))
+  (setq font-lock-defaults '(kcats-font-lock-keywords)))
+
+(add-to-list 'auto-mode-alist '("\\.kcats\\'" . kcats-mode))
+(defun my-restart-kcats-mode ()
+  (interactive)
+  (let ((kcats-mode-hook nil))
+    (normal-mode)))
+#+end_src
+
+#+RESULTS:
+: my-restart-kcats-mode
+
 * Tasks
 ** TODO Make a reader for the language
 needs to support comments. clojure reader probably sufficient?
@@ -3047,8 +3190,8 @@ take ;; the value from the pipe, which will come from the spawned env
   [discard discard] dip] ;; drop the original args, just leaving the primes
 #+end_example
 ** Prime factors
-#+begin_example clojure
-(k '[300
+#+begin_example kcats
+[300
 
      [] swap 2
 
@@ -3059,7 +3202,7 @@ take ;; the value from the pipe, which will come from the spawned env
        if]
      while
 
-     discard pack])
+     discard pack]
 #+end_example
 ** bidirectional comms from a socket
 #+begin_example clojure
