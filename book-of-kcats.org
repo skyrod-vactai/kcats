@@ -711,11 +711,26 @@ words.
   [in out]
   `(env-effect ~(count in) (fn ~in ~out)))
 
+
 (defmacro stack-effect
   "Takes a stack effect notation and turns it into a call to
   env-effect"
   [in out]
   `(env-effect ~(count in) (fn ~in [[] ~out])))
+
+(defmacro spec-effect
+  "Takes a spec and generates the function (only useful for words that
+  rearrange stack items but don't modify any single values)"
+  [[in out :as spec] other-props]
+  (println in out)
+  (let [->body (fn [spec-item]
+                 (if (vector? spec-item)
+                   (first spec-item)
+                   spec-item))]
+    `(merge ~other-props
+            {::spec (quote ~spec)
+             ::fn (stack-effect ~(mapv ->body in)
+                                ~(mapv ->body out))})))
 #+END_SRC
 
 #+BEGIN_SRC clojure
@@ -730,14 +745,17 @@ words.
 ;; math symbols are ok - non-programmers already know what they mean
 (def arithmetic-words
   (into {} cat
-        [(for [sym ['+ '- '/ '* '< '<= '> '>= 'min 'max 'quot 'rem 'mod]]
+        [(for [sym ['+ '- '/ '* 'min 'max 'quot 'rem 'mod]]
            [sym
-            {::spec (stack-spec :x ::number
-                                :y ::number)
+            {::spec '[[number number] [number]]
+             ::fn (f-stack 2 (resolve sym))}])
+         (for [sym ['< '<= '> '>=]]
+           [sym
+            {::spec '[[number number] [boolean]]
              ::fn (f-stack 2 (resolve sym))}])
          (for [sym ['inc 'dec]]
            [sym
-            {::spec (stack-spec :x ::number)
+            {::spec '[[integer] [integer]]
              ::fn (f-stack 1 (resolve sym))}])]))
 
 ;; need to implement `some` to respect empty list being falsey
@@ -746,35 +764,21 @@ words.
         [(for [sym ['odd? 'even? 'sequential? 'zero? 'pos? 'neg?
                     'number? 'int? 'true? 'false?
                     'string? 'empty?]]
-           [sym {::spec (stack-spec :x ::item)
+           [sym {::spec [[item] [boolean]]
                  ::fn (f-stack 1 (resolve sym))}])
          (for [sym ['starts-with? 'ends-with?]]
-           [sym {::spec (stack-spec :subject ::item
-                                    :object ::item)
+           [sym {::spec [[[subject item] [object item]] [boolean]]
                  ::fn (f-stack 2 (resolve sym))}])]))
 
+(defn from-spec
+  "Build a native function from the spec (in cases where the spec
+  completely describes it, like for stack motion words, eg swap)"
+  [{::keys [spec] :as dfn}]
+  (let [[in out] spec]
+    (assoc dfn ::fn (eval `(stack-effect in out)))))
+
 (def axiom-words
-  {'discard {::spec (stack-spec :a ::item)
-             ::fn (stack-effect [a] [])
-             ::examples '[[[1 2 3 discard] [2 1]]
-                          [[1 2 3 [a b c] discard] [3 2 1]]]}
-   'clone {::spec (stack-spec :a ::item)
-           ::fn (stack-effect [a] [a a])
-           ::examples '[[[1 2 3 clone] [3 3 2 1]]]}
-   'swap {::spec (stack-spec :a ::item, :b ::item)
-          ::fn (stack-effect [a b] [b a])
-          ::examples '[[[1 2 3 swap] [2 3 1]]]}
-   ;; TODO: this is just [swap] dip. worth having its own word?
-   'swapdown {::spec (stack-spec :a ::item, :b ::item, :c ::item)
-              ::fn (stack-effect [a b c] [a c b])
-              ::examples '[[[1 2 3 swapdown] [3 1 2]]]}
-   'float {::spec (stack-spec :a ::item, :b ::item, :c ::item)
-           ::fn (stack-effect [a b c] [c a b])
-           ::examples '[[[1 2 3 float] [1 3 2]]]}
-   'sink {::spec (stack-spec :a ::item, :b ::item, :c ::item)
-          ::fn (stack-effect [a b c] [b c a])
-          ::examples '[[[1 2 3 sink] [2 1 3]]]}
-   'execute {::spec (stack-spec :p ::program)
+  {'execute {::spec (stack-spec :p ::program)
              ::fn (effect [p] [p []])
              ::examples '[[[[1 2 +] execute] [3]]
                           [[2 [+] 4 swap execute] [6]]]}
@@ -835,14 +839,25 @@ words.
                          ::keys [expression dictionary]}]
                      {::stack others
                       ::expression expression
-                      ::dictionary (assoc dictionary word
-                                          (into {}
-                                                (for [[k v] word-def]
-                                                  [({'definition ::definition
-                                                     'examples ::examples
-                                                     'spec ::spec} k)
-                                                   (cond-> v
-                                                     (= k 'spec) build-spec)])))})
+                      ::dictionary (let [dfn (into {}
+                                                   (for [[k v] word-def]
+                                                     [({'definition ::definition
+                                                        'examples ::examples
+                                                        'spec ::spec} k)
+                                                      (cond-> v
+                                                        (= k 'spec) build-spec)]))
+                                         axiom (get axiom-words word)]
+                                     (assoc dictionary
+                                            word
+                                            (if (and axiom
+                                                     (not (::definition dfn)))
+                                              (if (::fn axiom)
+                                                ;; keep existing native fn
+                                                (merge dfn axiom)
+                                                ;; no native fn and no definition
+                                                ;; means we generate the fn from spec
+                                                (from-spec dfn))
+                                              dfn)))})
               ::examples '[[[[add3] unwrap [[definition [3 +]]
                                             [spec [[number integer]]]]
                              inscribe
@@ -891,7 +906,7 @@ words.
           ::definition '[[[[swap bytes?]
                            [[!java.io.ByteArrayOutputStream.] dipdown 
                             [*!*write] dip ;; the list into the stream
-                            *!*write ;; the item into the stream
+                            ,*!*write ;; the item into the stream
                             !*toByteArray]]
 
                           [[swap string?]
@@ -988,11 +1003,12 @@ words.
    'lexicon {::spec (stack-spec)
              ::fn (fn [{::keys [stack expression dictionary]}]
                     ;; read in the standard library aka lexicon
-                    {::stack (list (-> "src/kcats/lexicon.kcats"
-                                       io/file
-                                       io/reader
-                                       java.io.PushbackReader.
-                                       edn/read))
+                    {::stack (concat (list (-> "src/kcats/lexicon.kcats"
+                                               io/file
+                                               io/reader
+                                               java.io.PushbackReader.
+                                               edn/read))
+                                           stack)
                      ;; step through the word alist and inscribe each one
                      ::expression (concat '([unwrap swap inscribe] step) expression)
                      ;; keep the base dictionary intact
@@ -1067,41 +1083,136 @@ standard library, in native kcats. It will be an association list
 (which we'll define later 
 
 #+begin_src kcats :tangle src/kcats/lexicon.kcats
-[[shield [[spec [[p program]]]
-          [[doc "Runs program keeping top of stack produced but protects existing items from being consumed."]]
+;; TODO: remove the word from the end of all the examples inputs, and
+;; have the test runner add it at test-time
+
+[[discard [[spec [[a] []]]
+           [examples [[[1 2 3 discard] [2 1]]
+                      [[1 2 3 [a b c] discard] [3 2 1]]]]]]
+ [clone [[spec [[a] [a a]]]
+         [examples [[[1 2 3 clone] [3 3 2 1]]]]]]
+
+ [swap [[spec [[a b] [b a]]]
+        [examples [[[1 2 3 swap] [2 3 1]]]]]]
+
+ [swapdown [[spec [[a b c] [a c b]]]
+            [examples [[[1 2 3 swapdown] [3 1 2]]]]]]
+
+ [float [[spec [[a b c] [c a b]]]
+         [examples [[[1 2 3 float] [1 3 2]]]]]]
+
+ [sink [[spec [[a b c] [b c a]]]
+        [examples [[[1 2 3 sink] [2 1 3]]]]]]
+
+ [execute [[spec [[program] [*]]]
+           [examples [[[[1 2 +] execute] [3]]
+                      [[2 [+] 4 swap execute] [6]]]]]]
+ 
+ [wrap [[spec [[item] [list]]]
+        [examples [[[1 wrap] [[1]]]
+                   [[[1 2] wrap] [[[1 2]]]]]]]]
+
+ [unwrap [[spec [[list] [*]]]
+          [examples [[[[1] unwrap] [1]]]]]]
+
+ [rest [[spec [[list] [list]]]
+       [examples [[[[1 2 3] rest] [[2 3]]]]]]]
+
+ [fail [[spec [[string] [*]]]]]
+
+ [dip [[spec [[program [item a]] [a *]]]
+       [examples [[[1 8 [inc] dip] [8 2]]
+                  [[1 2 [dec] unwrap
+                    [+] dip] [dec 3]]]]]]
+
+ [list? [[spec [[item] [boolean]]]
+         [examples [[[[1] list?] [true]]
+                    [[[] list?] [true]]
+                    [[5 list?] [false]]]]]]
+
+ [number? [[spec [[item] [boolean]]]
+           [examples [[[[1] number?] [false]]
+                      [[[] number?] [false]]
+                      [[5 number?] [true]]
+                      [[5.01 number?] [true]]]]]]
+ 
+ [string [[spec [[item] [string]]]
+          [examples [[[1 string] ["1"]]
+                     [[[1 2 3] string] ["[1 2 3]"]]
+                     [[[] string] ["[]"]]]]]]
+
+ [read [[spec [[string] [item]]]
+        [examples [[["[1 [2] 3]" read] [[1 [2] 3]]]]]]]
+
+ [inscribe [[spec [[list word] []]]
+            [examples [[[[add3] unwrap [[definition [3 +]]
+                                        [spec [[number] [number]]]]
+                         inscribe
+                         5 add3] [8]]]]]]
+ 
+ [describe [[spec [[word] [list]]]]]
+
+ [branch [[spec [[[false-branch program]
+                  [true-branch program]
+                  [condition item]]
+                 [*]]]
+          [examples [[[5 true [3 *] [4 +] branch] [15]]
+                     [[6 false [3 *] [4 +] branch] [10]]]]]]
+
+ [step [[spec [[program list] [*]]]
+        [examples [[[1 [2 3 4] [*] step] [24]]
+                   [[1 [] [*] step] [1]]]]]]
+
+ [recur [[spec [[[rec2 program]
+                 [rec1 program]
+                 [true-branch program]
+                 [false-branch program]]
+                [*]]]
+         [examples [[[3 [clone 1 <=]
+                      [] [clone dec] [execute *] recur] [6]]]]]]
+ 
+ [shield [[spec [[program]
+                  [item]]]
+          [doc "Runs program keeping top of stack produced but protects existing items from being consumed."]
           [definition [[snapshot] dip inject first]]
           [examples [[[1 2 3 [=] shield] [false 3 2 1]]]]]]
 
- [shielddown [[spec [[p program]]]
+ [shielddown [[spec [[program item]
+                     [item]]]
               [definition [shield swap discard]]]]
 
- [shielddowndown [[spec [[p program]]]
+ [shielddowndown [[spec [[[p program] [consumed item] [consumed item]]
+                         [[result item]]]]
                   [definition [shield [discard discard] dip]]]]
 
- [if [[spec [[false-branch program]
-             [true-branch program]
-             [condition program]]]
+ [if [[spec [[[false-branch program]
+              [true-branch program]
+              [condition program]]
+             [*]]]
       [definition [[shield] dipdown branch]]
       [examples [[[5 [5 =] [3 *] [4 +] if] [15]]
                  [[6 [5 =] [3 *] [4 +] if] [10]]]]]]
 
- [dipdown [[spec [[p program]
-                  [a item]
-                  [b item]]]
+ [dipdown [[spec [[program
+                   [a item]
+                   [b item]]
+                  [a b *]]]
            [definition [wrap [dip] join dip]]
            [examples [[[1 2 3 [inc] dipdown] [3 2 2]]]]]]
 
- [primrec [[spec [[rec1 program]
-                  [exit program]
-                  [data number]]]
+ [primrec [[spec [[[rec1 program]
+                   [exit program]
+                   [data number]]
+                  [*]]
            [definition [[execute] swap join ;; add execute to rec1 to be recurs rec2
                         [[discard] swap join] dip ;; add discard to exit condition
                         [[clone zero?]] dipdown  ;; put the condition on bottom
                         [[clone dec]] dip ;; add the r1
                         recur]] ;; now its generic recur
-           [examples [[[5 [1] [*] primrec] [120]]]]]]
+           [examples [[[5 [1] [*] primrec] [120]]]]]]]
 
- [= [[spec [[ x item], [y item]]]
+ [= [[spec [[item item]
+            [boolean]]]
      [definition [++=]]
      [examples [[[1 1 =] [true]]
                 [["hi" "hi" =] [true]]
@@ -1109,62 +1220,63 @@ standard library, in native kcats. It will be an association list
                 [[[] false =] [false]]
                 [[1 "hi" "hi" =] [true 1]]]]]]
 
- [count [[spec [[l list]]]
+ [count [[spec [[list]
+                [number]]]
          [definition [+count]]
          [examples [[[["a" "b" "c"] count] [3]]]]]]
 
- [prepend [[spec [[a item]
-                  [l list]]]
+ [prepend [[spec [[item list]
+                  [list]]]
            [definition [wrap swap join]]
            [examples [[[[1 2] 3 prepend] [[3 1 2]]]]]]]
 
- [assert [[spec [[p program]]]
+ [assert [[spec [[program]
+                 [*]]]
           [definition [snapshot ;; save stack to print in err message
                        [shield] dip swap ;; run the assertion under the saved stack
                        [discard] ;; if passes, drop the saved stack, dont need
                        [string ["assertion failed "] dip join fail] ;; else throw err
                        branch]]]]
 
- [inject [[spec [[p program]
-                 [l list]]]
+ [inject [[spec [[program list]
+                 [list]]]
           [doc "Inject the quoted program into the list below
                    it (runs the program with the list as its
                    stack).  Does not affect the rest of the stack."]
           [definition [swap evert unpack dip evert]]
           [examples [[[1 2 3 [4 5 6] [* +] inject] [[26] 3 2 1]]]]]]
 
- [snapshot [[spec []]
+ [snapshot [[spec [[] [list]]]
             [doc "Save the whole stack as a list on the stack"]
             [definition [[] evert clone evert unwrap]]
             [examples [[[1 2 3 snapshot] [[3 2 1] 3 2 1]]
                        [[snapshot] [[]]]]]]]
 
- [first [[spec [[l list]]]
+ [first [[spec [[list] [item]]]
          [definition [+first +nil->nothing]]
          [examples [[[[4 5 6] first] [4]]]]]]
 
- [second [[spec [[l list]]]
+ [second [[spec [[list] [item]]]
           [definition [+second]]
           [examples [[[[4 5 6] second] [5]]]]]]
 
- [bytes? [[spec [[a item]]]
+ [bytes? [[spec [[item] [boolean]]]
           [definition [+bytes?]]]]
 
- [string? [[spec [[a item]]]
+ [string? [[spec [[item] [boolean]]]
            [definition [+string?]]]]
 
- [bytes [[spec [[a item]]]
-         [definition [[[[clone string?] [!*getBytes]]
-                       [[clone bytes?] []]]
+ [bytes [[spec [[item] [bytes]]]
+         [definition [[[[string?] [!*getBytes]]
+                       [[bytes?] []]]
                       decide]]]]
 
- [map [[spec [[p program]
-              [l list]]]
+ [map [[spec [[program list] [list]]]
        [definition [[snapshot [] swap] ;; save original stack, and
                     ;; add an empty list to
                     ;; hold results
                     dipdown ;; do this underneath the program and list
-                    [wrap swap clone rotate] ;; program snippet a to
+                    [wrap swap clone float] ;; program snippet a to
                     ;; copy the original stack
                     ;; that we saved, will make
                     ;; new copy for each item
@@ -1186,14 +1298,13 @@ standard library, in native kcats. It will be an association list
                     ;; the list as data
                     discard ;; we dont need the copy of the
                     ;; original stack anymore
-                    ]]
+                   ]]
        [examples [[[[1 2 3] [inc] map] [[2 3 4]]]
                   [[1 [1 2 3] [+] map] [[2 3 4] 1]]
                   [[7 9 [1 2 3] [+ *] map] [[70 77 84] 9 7]]
                   [[7 9 [+] [] map] [[+] 9 7]]]]]]
 
- [filter [[spec [[p program]
-                 [l list]]]
+ [filter [[spec [[program list] [list]]]
           [definition [[snapshot [] swap]
                        dipdown
                        ;; clone the original value so we can save it in results if needed
@@ -1209,14 +1320,15 @@ standard library, in native kcats. It will be an association list
                         dip]
                        join step discard]]]]
 
- [nothing? [[spec [[a item]]]
+ [nothing? [[spec [[item] [boolean]]]
             [definition [[] =]]]]
 
- [something? [[spec [[a item]]]
+ [something? [[spec [[item] [boolean]]]
               [definition [nothing? not]]]]
 
- [while [[spec [[body program]
-                [pred program]]]
+ [while [[spec [[[body program]
+                 [pred program]]
+                [*]]]
          [definition [swap wrap [shield] join ;; add shield to the pred program
                       clone dipdown ;; run it on the previous ToS
                       join loop]]
