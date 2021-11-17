@@ -557,7 +557,7 @@ with its definition. Otherwise it's put onto the stack.
   (if (symbol? item)
     (let [{f ::fn spec ::spec} (dictionary item)]
       (when spec
-        (spec/assert spec stack))
+        #_(spec/assert spec stack))
       (if f
         (f (update env ::expression rest)) ;; drop this word now that we've used it
         (invoke* env)))
@@ -722,7 +722,6 @@ words.
   "Takes a spec and generates the function (only useful for words that
   rearrange stack items but don't modify any single values)"
   [[in out :as spec] other-props]
-  (println in out)
   (let [->body (fn [spec-item]
                  (if (vector? spec-item)
                    (first spec-item)
@@ -733,10 +732,15 @@ words.
                                 ~(mapv ->body out))})))
 #+END_SRC
 
+We're going to start adding definitions of words here, but only the
+actual functions that carry out the word's meaning. All the other data
+about the word (specs, docs, examples etc) will go in the lexicon
+later. We put this here because this has to be clojure code.
 #+BEGIN_SRC clojure
 (in-ns 'kcats.core)
-(require '[clojure.java.io :as io])
 (import [java.io ByteArrayOutputStream])
+(require '[clojure.java.io :as io]
+         '[clojure.edn :as edn])
 
 ;; some state to hold our core words, so we can build them up a chunk
 ;; at a time.
@@ -764,10 +768,10 @@ words.
         [(for [sym ['odd? 'even? 'sequential? 'zero? 'pos? 'neg?
                     'number? 'int? 'true? 'false?
                     'string? 'empty?]]
-           [sym {::spec [[item] [boolean]]
+           [sym {::spec '[[item] [boolean]]
                  ::fn (f-stack 1 (resolve sym))}])
          (for [sym ['starts-with? 'ends-with?]]
-           [sym {::spec [[[subject item] [object item]] [boolean]]
+           [sym {::spec '[[[subject item] [object item]] [boolean]]
                  ::fn (f-stack 2 (resolve sym))}])]))
 
 (defn from-spec
@@ -775,247 +779,108 @@ words.
   completely describes it, like for stack motion words, eg swap)"
   [{::keys [spec] :as dfn}]
   (let [[in out] spec]
-    (assoc dfn ::fn (eval `(stack-effect in out)))))
+    (assoc dfn ::fn (clojure.core/eval `(stack-effect ~in ~out)))))
+
+(defn inscribe [dictionary [word word-def]]
+  (let [dfn (into {}
+                  (for [[k v] word-def]
+                    [({'definition ::definition
+                       'examples ::examples
+                       'spec ::spec} k)
+                     v]))
+        existing (get dictionary word)]
+    (assoc dictionary
+           word
+           (if (::definition dfn)
+             dfn
+             (if (::fn existing)
+               ;; keep existing native fn
+               (merge dfn existing)
+               ;; no native fn and no definition
+               ;; means we generate the fn from spec
+               (from-spec dfn))))))
 
 (def axiom-words
-  {'execute {::spec (stack-spec :p ::program)
-             ::fn (effect [p] [p []])
-             ::examples '[[[[1 2 +] execute] [3]]
-                          [[2 [+] 4 swap execute] [6]]]}
-   'wrap {::spec (stack-spec :a ::item)
-          ::fn (stack-effect [a] [[a]])
-          ::examples '[[[1 wrap] [[1]]]
-                       [[[1 2] wrap] [[[1 2]]]]]}
+  {'execute (effect [p] [p []])
+   'wrap (stack-effect [a] [[a]])
    ;; TODO: possible security issue with unwrap and bare words on the
    ;; stack: It's possible for malicious code to squat on a word that
    ;; was intended to be data, and not an action word, causing
    ;; unexpected behavior. May want to reconsider whether undefined
    ;; words should be placed onto the stack unquoted.
-   'unwrap {::spec (stack-spec :l ::list)
-            ::pre '[list?]
-            ::post [true] ;; can be anything
-            ::fn (stack-effect [l] l)
-            ::examples '[[[[1] unwrap] [1]]]}
-   'rest {::spec (stack-spec :l ::list)
-          ::pre '[list?]
-          ::post '[list?]
-          ::fn (stack-effect [l] [(vec (rest l))])
-          ::examples '[[[[1 2 3] rest] [[2 3]]]]}
-   'fail {::spec (stack-spec :s ::string)
-          ::fn (stack-effect [s] (throw (Exception. s)))}
-   'dip {::spec (stack-spec :p ::program
-                            :a ::item)
-         ::pre '[list?]
-         ::fn (effect [p a] [(conj (vec p) [a] 'unwrap) []])
-         ::examples '[[[1 8 [inc] dip] [8 2]]
-                      [[1 2 [dec] unwrap
-                        [+] dip] [dec 3]]]}
-   'list? {::spec (stack-spec :a ::item)
-           ::fn (stack-effect [a] [(vector? a)])
-           ::examples '[[[[1] list?] [true]]
-                        [[[] list?] [true]]
-                        [[5 list?] [false]]]}
-   'number? {::spec (stack-spec :a ::item)
-             ::fn (stack-effect [a] [(number? a)])
-             ::examples '[[[[1] number?] [false]]
-                          [[[] number?] [false]]
-                          [[5 number?] [true]]
-                          [[5.01 number?] [true]]]}
-   'string {::spec (stack-spec :a ::item)
-            ::fn (stack-effect [a] [(if (bytes? a)
-                                      (String. a)
-                                      (str a))])
-            ::examples '[[[1 string] ["1"]]
-                         [[[1 2 3] string] ["[1 2 3]"]]
-                         [[[] string] ["[]"]]]}
-   'read {::spec (stack-spec :s ::string)
-          ::fn (stack-effect [s] [(edn/read-string s)])
-          ::examples '[[["[1 [2] 3]" read] [[1 [2] 3]]]]}
+   'unwrap (stack-effect [l] l)
+   'rest (stack-effect [l] [(vec (rest l))])
+   'fail (stack-effect [s] (throw (Exception. s)))
+   'dip (effect [p a] [(conj (vec p) [a] 'unwrap) []])
+   'list? (stack-effect [a] [(vector? a)])
+   'number? (stack-effect [a] [(number? a)])
+   'string (stack-effect [a] [(if (bytes? a)
+                                (String. a)
+                                (str a))])
+   'read (stack-effect [s] [(edn/read-string s)])
    ;; maybe this should be something like
    ;; timesfive [[definition [5 *]] [examples [...]]] inscribe
-   'inscribe {::spec (stack-spec :definition ::program
-                                 :word ::word)
-              ::fn (fn [{[word-def word & others] ::stack
-                         ::keys [expression dictionary]}]
-                     {::stack others
-                      ::expression expression
-                      ::dictionary (let [dfn (into {}
-                                                   (for [[k v] word-def]
-                                                     [({'definition ::definition
-                                                        'examples ::examples
-                                                        'spec ::spec} k)
-                                                      (cond-> v
-                                                        (= k 'spec) build-spec)]))
-                                         axiom (get axiom-words word)]
-                                     (assoc dictionary
-                                            word
-                                            (if (and axiom
-                                                     (not (::definition dfn)))
-                                              (if (::fn axiom)
-                                                ;; keep existing native fn
-                                                (merge dfn axiom)
-                                                ;; no native fn and no definition
-                                                ;; means we generate the fn from spec
-                                                (from-spec dfn))
-                                              dfn)))})
-              ::examples '[[[[add3] unwrap [[definition [3 +]]
-                                            [spec [[number integer]]]]
-                             inscribe
-                             5 add3] [8]]]}
-   'describe {::spec (stack-spec :word ::word)
-              ::fn (fn [{[word & others] ::stack dict ::dictionary :as env}]
-                     (if-let [dfn (get dict word)]
-                       (assoc env ::stack (conj others dfn))
-                       nothing))}
-   'branch {::spec (stack-spec :false-branch ::program
-                               :true-branch ::program
-                               :condition ::item)
-            ::fn (effect [f t b]
-                         [(if (nothing->nil b) t f) []])
-            ::examples '[[[5 true [3 *] [4 +] branch] [15]]
-                         [[6 false [3 *] [4 +] branch] [10]]]}
-   'step {::spec (stack-spec :p ::program
-                             :a ::list)
-          ::fn (effect [p [agg-item & agg-rest :as agg]]
-                       (if (seq agg)
-                         [(cond-> ['execute]
-                            (seq agg-rest) (concat [(vec agg-rest) p 'step]))
-                          [p agg-item]]
-                         [[] []]))
-          ::examples '[[[1 [2 3 4] [*] step] [24]]
-                       [[1 [] [*] step] [1]]]}
-   'recur {::spec (stack-spec :rec2 ::program
-                              :rec1 ::program
-                              :true-branch ::program
-                              :false-branch ::program)
-           ::fn (effect [rec2 rec1 then pred]
-                        ['[if]
-                         [(vec (concat rec1 [[pred then rec1 rec2 'recur]] rec2))
-                          then pred]])
-           ::examples '[[[3 [clone 1 <=] [] [clone dec] [execute *] recur] [6]]]}
-   'loop {::spec (stack-spec :p ::program
-                             :flag ::item)
-          ::fn (effect [p f]
-                       [(when (nothing->nil f)
-                          (concat p [p 'loop]))
-                        []])
-          ::examples '[[[10 true [-2 * clone 50 <] loop] [160]]]}
-   'pack {::spec (stack-spec :x ::item
-                             :l ::list)
-          #_::fn #_(stack-effect [x l] [(conj (vec l) x)])
-          ::definition '[[[[swap bytes?]
-                           [[!java.io.ByteArrayOutputStream.] dipdown 
-                            [*!*write] dip ;; the list into the stream
-                            ,*!*write ;; the item into the stream
-                            !*toByteArray]]
-
-                          [[swap string?]
-                           [!*java.lang.String/valueOf !**concat]]                            
-
-                          [[true] [[+vec] dip ++conj]]]
-                         decide]
-          ::examples '[[[[] 1 pack] [[1]]]
-                       [[[1 2 3] 4 pack] [[1 2 3 4]]]
-                       [["foo" \d pack] ["food"]]
-                       [["foo" bytes 32 pack !*java.lang.String.] ["foo "]]]}
-   'unpack {::spec (stack-spec :l ::list)
-            ::fn (stack-effect [[l & others]] [(nil->nothing l) (vec others)])
-            ::examples '[[[["a" "b" "c"] unpack] ["a" ["b" "c"]]]]}
-   'join {::spec (stack-spec :a ::item
-                             :b ::item)
-          ::fn (stack-effect [a b]
-                             (if (and (string? a) (string? b))
-                               [(str b a)]
-                               [(vec (concat b a))]))
-          ::examples '[[[["a" "b"] ["c" "d"] join] [["a" "b" "c" "d"]]]]}
-   'range {::spec (stack-spec :from ::integer
-                              :to ::integer)
-           ::fn (f-stack 2 (comp vec range))
-           ::examples '[[[1 5 range] [[1 2 3 4]]]]}
-   'evert {::spec (stack-spec :l ::list)
-           ::doc "Turns the list on top of the stack inside out (puts
-                  the list as the rest of the stack, and vice versa)"
-           ::fn (fn [{[l & others] ::stack ::keys [dictionary expression]}]
-                  {::stack (apply list (vec others) l)
-                   ::expression expression
-                   ::dictionary dictionary})
-           ::examples '[[[1 2 3 [4 5 6] evert] [[3 2 1] 4 5 6]]]}
-   'some? {::spec (stack-spec :a ::item)
-           ::fn (f-stack 1 (comp some? nothing->nil))}
-   'every? {::spec (stack-spec :p ::program
-                               :l ::list)
-            ::definition '[ ;; build the r1
-                           [shielddown] swap prepend ;; run pred with unary
-                           [unpack swap] swap pack ;; add rest of dip program
-                           [dip swap not] join ;; add the rest of outer dip
-                           wrap [dip or] join ;; add rest of r1
-                           ;; put the other recur clauses under r1
-                           [false
-                            [[[nothing?] shield] dip
-                             swap [or] shielddown] ;; the 'if' 
-                            [not]] ;; then
-                           dip ;; underneath the r1
-                           [execute] recur ;; r2 and recur!
-                           swap discard] ;; drop leftover list
-            ::examples '[[[[2 4 6] [even?] every?] [true]]
-                         [[[2 4 5] [even?] every?] [false]]
-                         [[[] [even?] every?] [true]]
-                         [[[2 4 6] [] every?] [true]]
-                         [[11 [2 4 6] [+ odd?] every?] [true 11]]
-                         [[12 [[even?] [pos?] [3 rem 0 =]] [execute] every?] [true 12]]]} 
-   'any? {::spec (stack-spec :p ::program
-                             :l ::list)
-          ::definition '[;; build the r1
-                         [shielddown] swap prepend ;; run pred with unary
-                         [unpack swap] swap pack ;; add rest of dip program
-                         [dip swap] join ;; add the rest of outer dip
-                         wrap [dip or] join ;; add rest of r1
-                         ;; put the other recur clauses under r1
-                         [false
-                          [[[nothing?] shield] dip
-                           swap [or] shielddown] ;; the 'if' 
-                          []] ;; then
-                         dip ;; underneath the r1
-                         [execute] recur ;; r2 and recur!
-                         swap discard]
-          ::examples '[[[[2 4 6] [even?] any?] [true]]
-                       [[[3 5 7] [even?] any?] [false]]
-                       [[[] [even?] any?] [false]]
-                       [[[2 4 6] [] any?] [2]]
-                       [[11 [3 5 6] [+ odd?] any?] [true 11]]
-                       [[-15 [[even?] [pos?] [3 rem 0 =]] [execute] any?] [true -15]]]}
-   'and {::spec (stack-spec :a ::item
-                            :b ::item)
-         ::fn (f-stack 2 (fn [a b]
-                           (and (nothing->nil a)
-                                (nothing->nil b))))
-         ::examples '[[[1 odd? 2 even? and] [true]]]}
-   'or {::spec (stack-spec :a ::item
-                           :b ::item)
-        ::fn (f-stack 2 (fn [a b]
-                          (or (nothing->nil a)
-                              (nothing->nil b))))
-        ::examples '[[[1 odd? 3 even? or] [true]]]}
-   'not {::spec (stack-spec :a ::item)
-         ::fn (f-stack 1 (fn [a]
-                           (not (nothing->nil a))))
-         ::examples '[[[1 even? not] [true]]]}
-   'lexicon {::spec (stack-spec)
-             ::fn (fn [{::keys [stack expression dictionary]}]
-                    ;; read in the standard library aka lexicon
-                    {::stack (concat (list (-> "src/kcats/lexicon.kcats"
-                                               io/file
-                                               io/reader
-                                               java.io.PushbackReader.
-                                               edn/read))
-                                           stack)
-                     ;; step through the word alist and inscribe each one
-                     ::expression (concat '([unwrap swap inscribe] step) expression)
-                     ;; keep the base dictionary intact
-                     ::dictionary dictionary})}})
+   'inscribe (fn [{[word-def word & others] ::stack
+                   ::keys [stack expression dictionary]}]
+               {::dictionary (inscribe dictionary [word word-def])
+                ::stack others
+                ::expression expression})
+   'describe (fn [{[word & others] ::stack dict ::dictionary :as env}]
+               (if-let [dfn (get dict word)]
+                 (assoc env ::stack (conj others dfn))
+                 nothing))
+   'branch (effect [f t b]
+                   [(if (nothing->nil b) t f) []])
+   'step (effect [p [agg-item & agg-rest :as agg]]
+                 (if (seq agg)
+                   [(cond-> ['execute]
+                      (seq agg-rest) (concat [(vec agg-rest) p 'step]))
+                    [p agg-item]]
+                   [[] []]))
+   'recur (effect [rec2 rec1 then pred]
+                  ['[if]
+                   [(vec (concat rec1 [[pred then rec1 rec2 'recur]] rec2))
+                    then pred]])
+   'loop (effect [p f]
+                 [(when (nothing->nil f)
+                    (concat p [p 'loop]))
+                  []])
+   
+   'unpack (stack-effect [[l & others]] [(nil->nothing l) (vec others)])
+   'join (stack-effect [a b]
+                       (if (and (string? a) (string? b))
+                         [(str b a)]
+                         [(vec (concat b a))]))
+   'range (f-stack 2 (comp vec range))
+   'evert (fn [{[l & others] ::stack ::keys [dictionary expression]}]
+            {::stack (apply list (vec others) l)
+             ::expression expression
+             ::dictionary dictionary})
+   'some? (f-stack 1 (comp some? nothing->nil))
+   'and (f-stack 2 (fn [a b]
+                     (and (nothing->nil a)
+                          (nothing->nil b))))
+   'or (f-stack 2 (fn [a b]
+                    (or (nothing->nil a)
+                        (nothing->nil b))))
+   'not (f-stack 1 (fn [a]
+                     (not (nothing->nil a))))
+   'dictionary (fn [{::keys [dictionary] :as env}]
+                 (update env ::stack conj (repr dictionary))) 
+   'lexicon (fn [env]
+              (reduce (fn [env dfn]
+                        (update env ::dictionary
+                                inscribe dfn))
+                      env
+                      (-> "src/kcats/lexicon.kcats"
+                          io/file
+                          io/reader
+                          java.io.PushbackReader.
+                          edn/read)))})
 
 (swap! core-words merge
-       axiom-words
+       (into {} (for [[word dfn] axiom-words]
+                  [word {::fn dfn}]))
        arithmetic-words
        predicates)
 
@@ -1170,7 +1035,61 @@ standard library, in native kcats. It will be an association list
                 [*]]]
          [examples [[[3 [clone 1 <=]
                       [] [clone dec] [execute *] recur] [6]]]]]]
+
+ [loop [[spec [[program [flag item]] [*]]]
+        [examples [[[10 true [-2 * clone 50 <] loop] [160]]]]]]
+
+ [unpack [[spec [[list] [item list]]]
+          [examples [[[["a" "b" "c"] unpack] ["a" ["b" "c"]]]]]]]
+
+
+ [join [[spec [[item item] [item]]]
+        [examples [[[["a" "b"] ["c" "d"] join] [["a" "b" "c" "d"]]]
+                   [["ab" "cd" join] ["abcd"]]]]]]
+
+ [range [[spec [[integer integer] [list]]]
+         [examples [[[1 5 range] [[1 2 3 4]]]]]]]
+
+ [evert [[spec [[list] [list *]]]
+         [examples [[[1 2 3 [4 5 6] evert] [[3 2 1] 4 5 6]]]]]]
+
+ [some? [[spec [[item] [boolean]]]
+         [examples []]]]
+
  
+
+ [and [[spec [[item item] [item]]]
+       [examples [[[1 odd? 2 even? and] [true]]]]]]
+
+ [or [[spec [[item item] [item]]]
+      [examples [[[1 odd? 3 even? or] [true]]]]]]
+
+ [not [[spec [[item] [boolean]]]
+       [examples [[[1 even? not] [true]]]]]]
+
+ [lexicon [[spec [[] []]]]]
+
+ ;; Words that have pure kcats definitions start here
+
+ ;; TODO: platform specific definitions shouldn't live here, but for
+ ;; now we'll allow it.
+ [pack [[spec [[item list] [list]]]
+        [definition [[[[swap bytes?]
+                       [[!java.io.ByteArrayOutputStream.] dipdown 
+                        [*!*write] dip ;; the list into the stream
+                        ,*!*write ;; the item into the stream
+                        !*toByteArray]]
+
+                      [[swap string?]
+                       [!*java.lang.String/valueOf !**concat]]                            
+
+                      [[true] [[+vec] dip ++conj]]]
+                     decide]]
+        [examples [[[[] 1 pack] [[1]]]
+                   [[[1 2 3] 4 pack] [[1 2 3 4]]]
+                   [["foo" \d pack] ["food"]]
+                   [["foo" bytes 32 pack string] ["foo "]]]]]]
+
  [shield [[spec [[program]
                   [item]]]
           [doc "Runs program keeping top of stack produced but protects existing items from being consumed."]
@@ -1200,16 +1119,56 @@ standard library, in native kcats. It will be an association list
            [definition [wrap [dip] join dip]]
            [examples [[[1 2 3 [inc] dipdown] [3 2 2]]]]]]
 
+ [every? [[spec [[program list] boolean]]
+          [definition [[shielddown] swap prepend ;; building r1, run pred with unary
+                       [unpack swap] swap pack ;; add rest of dip program
+                       [dip swap not] join ;; add the rest of outer dip
+                       wrap [dip or] join ;; add rest of r1
+                       ;; put the other recur clauses under r1
+                       [false
+                        [[[nothing?] shield] dip
+                         swap [or] shielddown] ;; the 'if' 
+                        [not]] ;; then
+                       dip ;; underneath the r1
+                       [execute] recur ;; r2 and recur!
+                       swap discard]]
+          [examples [[[[2 4 6] [even?] every?] [true]]
+                     [[[2 4 5] [even?] every?] [false]]
+                     [[[] [even?] every?] [true]]
+                     [[[2 4 6] [] every?] [true]]
+                     [[11 [2 4 6] [+ odd?] every?] [true 11]]
+                     [[12 [[even?] [pos?] [3 rem 0 =]] [execute] every?] [true 12]]]]]]
+
+ [any? [[spec [[program list] boolean]]
+        [definition [[shielddown] swap prepend ;; building r1, run pred with unary
+                     [unpack swap] swap pack ;; add rest of dip program
+                     [dip swap] join ;; add the rest of outer dip
+                     wrap [dip or] join ;; add rest of r1
+                     ;; put the other recur clauses under r1
+                     [false
+                      [[[nothing?] shield] dip
+                       swap [or] shielddown] ;; the 'if' 
+                      []] ;; then
+                     dip ;; underneath the r1
+                     [execute] recur ;; r2 and recur!
+                     swap discard]]
+        [examples [[[[2 4 6] [even?] any?] [true]]
+                   [[[3 5 7] [even?] any?] [false]]
+                   [[[] [even?] any?] [false]]
+                   [[[2 4 6] [] any?] [2]]
+                   [[11 [3 5 6] [+ odd?] any?] [true 11]]
+                   [[-15 [[even?] [pos?] [3 rem 0 =]] [execute] any?] [true -15]]]]]]
+
  [primrec [[spec [[[rec1 program]
                    [exit program]
                    [data number]]
-                  [*]]
+                  [*]]]
            [definition [[execute] swap join ;; add execute to rec1 to be recurs rec2
                         [[discard] swap join] dip ;; add discard to exit condition
                         [[clone zero?]] dipdown  ;; put the condition on bottom
                         [[clone dec]] dip ;; add the r1
                         recur]] ;; now its generic recur
-           [examples [[[5 [1] [*] primrec] [120]]]]]]]
+           [examples [[[5 [1] [*] primrec] [120]]]]]]
 
  [= [[spec [[item item]
             [boolean]]]
