@@ -248,11 +248,8 @@ small programs into one, and then =execute= it:
 #+end_example
 
 Note that words inside lists don't perform any action when the list is
-put on the stack. You can think of it as a quote. If you said to Bob,
-"Tell Alice 'bring your tennis racket'", Bob hears "bring your tennis
-racket" but he knows that isn't meant for him, it's just a message to
-be passed along to Alice. Similarly, when you put a program on the
-stack, it's a message to be passed on now, and perhaps acted on later.
+put on the stack. You can think of it as a quote, a message being
+passed along and not acted upon until it reaches the recipient.
 * Prototype implementation
 ** Status
 The first implementation is entirely experimental. Everything in it is
@@ -341,9 +338,11 @@ word's definition looks like - it's a program.
 
 Finally we want to be able to keep track of all words we've defined,
 so we'll spec a dictionary that allows us to look up a word's
-definition. In a dictionary we're also going to have inscrutable
-definitions are only implemented in clojure, not as other kcats words,
-so we have to allow for those also. We'll call those axiom words.
+definition. In our dictionary, we have to start with something - some
+words that aren't defined in terms of other words. We'll call them
+=axiom words= and their meaning is expressed as a clojure
+function. All the rest of the words are in terms of other words we've
+already defined.
 
 #+BEGIN_SRC clojure
 (def word? symbol?)
@@ -356,9 +355,11 @@ so we have to allow for those also. We'll call those axiom words.
                                        (spec/or :axiom ::axiom-definition
                                                 :user-defined ::program-definition)))
 #+END_SRC
-Next we'll spec a stack. We want it to easily implement a FIFO
-stack, (meaning the last item you put in is accessible in constant
-time), and clojure's built-in list type does this.
+
+Next we'll spec a stack. We want it to easily implement a
+first-in-first-out (FIFO) stack, (meaning the last item you put in is
+accessible in constant time), and clojure's built-in list type does
+this.
 
 An expression is a stack too, but it represents words waiting to be
 executed - parts of the program that haven't run yet. In kcats, the
@@ -382,8 +383,8 @@ stack, and expression put together.
   (expound/def ::environment (spec/keys :req [::stack ::dictionary ::expression]))
 #+END_SRC
 
-Finally, we'll make a bit of syntax for expressing what a particular
-word needs on the stack.
+Finally, we'll add some functions that help us build specs for new
+kcats words that we'll define later.
 
 #+begin_src clojure
 ;; since we'll commonly be defining specs for a stack, we'll nearly
@@ -414,12 +415,48 @@ that somewhere else, as long as you include what number it last
 produced. But you can't send files or sockets somewhere else (they're
 pointers to real world resources that may be different or nonexistent
 somewhere else). Discerning between the two may be a future feature.
+** Stack specs
+When writing a kcats program, you have a lot of words available to
+use. How do we know what a word does? Hopefully there are some
+examples, but having a brief description of what the word does to the
+stack is also helpful. Other stack based languages use a stack spec,
+which tells you what items the word uses from the stack and what it
+will replace them with. It looks like this: =a -> a a=. That's the
+spec for =clone=. It takes =a= from the top of the stack (which can be
+anything), and leaves =a= and then =a= again.
+
+We will use a slight variation of this syntax. We'll represent the
+same thing in kcats data structures, and we'll support optional type
+information. So in this format, =clone= spec would be =[[a] [a a]]=. A
+list of two items: what is taken from the stack, and what's left
+afterward. Only the top stack items are relevant here, there could be
+any number of items underneath, but they aren't touched. The order of
+items in each list is that the first item is the top of the stack.
+
+Some words can do very arbitrary things to the stack, for example,
+=execute=. It executes the program on top of the stack, which could do
+anything to the stack - add lots of items, remove lots of items, or
+both. To express this behavior we use =*=, which means "any number of
+stack changes". The spec for =execute= is =[[program][*]]=. 
+
+Let's look at the the spec for =dip= - it's =[[program [item a]][a
+\*]]=. What does this mean? This word takes a program on the top of
+the stack, and an item underneath called =a=. When it's done, =a= is on
+top and the rest of the stack has changed arbitrarily (because of the
+=*=). That's because =dip= takes =a= away, executes the program, then
+puts =a= back on top. In the input half of the spec, there's a type
+for =a= (=item=) but when we refer to =a= in the output half, we don't
+list the type again (we already said what type =a= is). 
+
+Having these specs for all the words in kcats data allows us to
+programmatically search for words. Here's an example of doing that [[*Search the
+ dictionary][Searching the dictionary]].
 
 ** Evaluation
 Next we're going to define how the kcats language executes (or
 evaluates) a program. First we can say that to evaluate a program, we
 will keep stepping through evaluation as long as the expression isn't
-empty. Once it's empty, there's nothing left to do and we return the
+empty. Once it's empty, there's nothing left to do, and we return the
 last environment.
 
 We also allow some execution options, like being able to stop after a
@@ -446,13 +483,15 @@ tracing what's happening).
 #+END_SRC
 
 Where the real action happens is when we evaluate a word. Each defined
-word has a clojure function that will run when that word is
-evaluated. If it's not defined, then the word will act like everything
-else and just be put on the stack.
+word is either in terms of other words, or has a clojure function that
+will run when that word is evaluated. If it's not defined, then the
+word will act like everything else and just be put on the stack.
 
 We'll include handling for calling down into the platform language
 directly. There will be syntax for calling clojure functions and java
-methods as if they are kcats words.
+methods as if they are kcats words. This allows us to leverage the
+platform functionality directly in kcats without having to write more
+code in the platform language.
 
 We'll also specify here what a step of evaluation is - it looks at the
 next item in the expression. If it has a definition, it's replaced
@@ -554,7 +593,7 @@ with its definition. Otherwise it's put onto the stack.
 (defn onto-stack
   "Move one item from the expression to the stack. "
   [{[item & others] ::expression ::keys [dictionary stack] :as env}]
-  (if (symbol? item)
+  (if (word? item)
     (let [{f ::fn spec ::spec} (dictionary item)]
       (when spec
         (spec/assert spec stack))
@@ -562,8 +601,8 @@ with its definition. Otherwise it's put onto the stack.
         (f (update env ::expression rest)) ;; drop this word now that we've used it
         (invoke* env)))
     (-> env
-      (assoc ::expression others)
-      (update ::stack conj item))))
+        (assoc ::expression others)
+        (update ::stack conj item))))
 
 (defn definition
   "Returns the definition of an item, if it's a word defined in terms
@@ -638,9 +677,9 @@ our serialized data format.
 
 #+end_src
 ** Concept of nothing/nil/null
-Kcats is not going to have a concept of =null= or =nil=. If we want to
-express "nothing" we will use an empty list =[]=. We'll need some functions
-to treat empty lists as clojure treats =nil=.
+Kcats is not going to have a separate concept of =null= or =nil=. If
+we want to express "nothing" we will use an empty list =[]=. We'll
+need some functions to treat empty lists as clojure treats =nil=.
 
 #+begin_src clojure
 (def nothing [])
@@ -665,7 +704,7 @@ to treat empty lists as clojure treats =nil=.
 ** Built-in words
 Eventually we'll want to define words in terms of other words. But
 right now we don't have any words! So we'll have to define some, not
-in terms of other words but as clojure functions. Then we can build
+in terms of other words, but as clojure functions. Then we can build
 new words on top of those.
 
 We'll need some utility functions that help us define these axiom
@@ -1032,9 +1071,6 @@ words.
 
 #+END_SRC
 
-Now we can go ahead and start filling out axiom words in our default
-dictionary.
-
 Next we can add a way to test that all the examples are working, so
 that we notice any bugs as we're developing.
 
@@ -1062,9 +1098,9 @@ that we notice any bugs as we're developing.
   ([env] (test env nil)))
 #+end_src
 
-Now that we have a lot of axiom words, we can define more words as a
-standard library, in native kcats. It will be an association list
-(which we'll define later 
+Now that we have enough axiom words, we can define more words as a
+standard library, in native kcats. It will be a list of pairs (we'll
+go into more detail on this particular data type in [[*Maps/associations][Association Lists]]).
 
 #+begin_src kcats :tangle src/kcats/lexicon.kcats
 [[shield [[spec [[p program]]]
@@ -1223,7 +1259,6 @@ standard library, in native kcats. It will be an association list
          [examples [[[3 [0 >] [clone dec] while] [0 1 2 3]]]]]]]
 #+end_src
 
-** Logical operators
 ** Maps/associations
 A simple implementation that works well for small lists: specify
 associations as lists of pairs.
@@ -3222,3 +3257,18 @@ take ;; the value from the pipe, which will come from the spawned env
  "blah" put
  close]
 #+end_example
+** Search the dictionary
+#+begin_src kcats
+[dictionary ;; put the dictionary of all words onto the stack as key value pairs
+ [second ;; the value of one of those pairs
+  [spec] lookup ;; look up the spec field
+   first ;; the input part of the spec
+   [program] =] ;; is it taking a single input, a program?
+ filter ;; filter the dictionary using the above criteria
+ [first] map] ;; of what remains, just keep the key (which is the word itself)
+
+;; when we run this, we get
+[[shield execute assert]]
+;; which are the words in the dictionary that take just a program as
+;; input.
+#+end_src
