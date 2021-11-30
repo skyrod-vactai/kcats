@@ -291,11 +291,16 @@ but best practice is that they should only be there temporarily,
 usually during the construction of a pipe[fn:2].
 
 #+BEGIN_SRC clojure
-(expound/def ::boolean boolean?)
-(expound/def ::number number?)
-(expound/def ::string string?)
-(expound/def ::bytes bytes?)
-(expound/def ::integer integer?)
+(spec/def ::boolean boolean?)
+(expound/defmsg ::boolean "should be true/false")
+(spec/def ::number number?)
+(expound/defmsg ::number "should be a number")
+(spec/def ::string string?)
+(expound/defmsg ::string "should be a string")
+(spec/def ::bytes bytes?)
+(expound/defmsg ::bytes "should be bytes")
+(spec/def ::integer integer?)
+(expound/defmsg ::integer "should be an integer")
 #+END_SRC
 
 Now we'll spec some concepts in kcats in terms of clojure
@@ -326,9 +331,14 @@ lists). We'll also spec out programs, which are lists but intended to
 be executed (otherwise there is no difference).
 
 #+BEGIN_SRC clojure
-(expound/def ::list (spec/coll-of ::item :kind vector?) "list?")
-(expound/def ::value-list (spec/coll-of ::value? :kind vector?) "value-list?")
-(expound/def ::program ::list)
+(spec/def ::list (spec/coll-of ::item :kind vector?))
+(expound/defmsg ::list "should be a list")
+
+(spec/def ::value-list (spec/coll-of ::value? :kind vector?))
+(expound/defmsg ::value-list "should be a value list")
+
+(spec/def ::program (spec/coll-of ::item :kind vector?))
+(expound/defmsg ::program "should be a program")
 #+END_SRC
 
 We'll also need words that perform actions- this maps well to
@@ -394,19 +404,6 @@ kcats words that we'll define later.
   [& args]
   `(spec/cat ~@args
              :others (spec/* ::item)))
-
-;; also make a function for creating a spec from kcats data
-(defn build-spec
-  [specs]
-  (assert (and (vector? specs)
-               (every? vector? specs)
-               (every? symbol? (into [] cat specs))))
-  (clojure.core/eval `(stack-spec
-                       ~@(into [] cat
-                               (for [[spec-name spec-type] specs]
-                                 [(keyword (str spec-name))
-                                  (keyword "kcats.core" (str spec-type))])))))
-
 #+end_src
 
 [fn:2] There are some pipes that may be technically values (think of a
@@ -427,7 +424,7 @@ anything), and leaves =a= and then =a= again.
 
 We will use a slight variation of this syntax. We'll represent the
 same thing in kcats data structures, and we'll support optional type
-information. So in this format, =clone= spec would be =[[a] [a a]]=. A
+information. So in this format, =clone= spec would be =[[[item a]] [a a]]=. A
 list of two items: what is taken from the stack, and what's left
 afterward. Only the top stack items are relevant here, there could be
 any number of items underneath, but they aren't touched. The order of
@@ -437,7 +434,9 @@ Some words can do very arbitrary things to the stack, for example,
 =execute=. It executes the program on top of the stack, which could do
 anything to the stack - add lots of items, remove lots of items, or
 both. To express this behavior we use =*=, which means "any number of
-stack changes". The spec for =execute= is =[[program][*]]=. 
+stack changes". The spec for =execute= is =[[program][*]]= - it takes
+a program from the top of the stack and excutes it, so what happens to
+the stack then is determined by the contents of that program. 
 
 Let's look at the the spec for =dip= - it's =[[program [item a]][a
 \*]]=. What does this mean? This word takes a program on the top of
@@ -451,6 +450,86 @@ list the type again (we already said what type =a= is).
 Having these specs for all the words in kcats data allows us to
 programmatically search for words. Here's an example of doing that [[*Search the
  dictionary][Searching the dictionary]].
+
+We'll add some functions that support stack specs and validate whether
+they actually are followed.
+
+#+BEGIN_SRC clojure
+(def spec-arbitrary-effect-designator '*)
+
+(defn build-spec
+  "Build a native clojure spec from the stack-spec"
+  [spec]
+  (clojure.core/eval `(spec/tuple ~@(for [s spec]
+                                      (keyword "kcats.core" (str (cond-> s
+                                                                   (not (symbol? s)) (first))))))))
+
+(defn cache-spec
+  "if the given env doesn't have a prebuilt native clojure spec, build
+  some from the stack spec"
+  [{::keys [dictionary] :as env} word]
+  (let [[in-spec out-spec] (get-in dictionary [word ::spec])
+        existing (get-in dictionary [word ::clojure-spec-in])]
+    (if (and (not existing) in-spec)
+      (-> env
+          (assoc-in [::dictionary word ::clojure-spec-in] (build-spec in-spec))
+          (assoc-in [::dictionary word ::clojure-spec-out] (build-spec out-spec)))
+      env)))
+
+(defn validate-stack-spec-before
+  [[in] word {::keys [stack dictionary]}]
+  (when (> (count in) (count stack))
+    (throw (Exception. (format "Word '%s' expects at least %d items in stack, but there were only %d"
+                               word (count in) (count stack)))))
+  (let [spec (get-in dictionary [word ::clojure-spec-in])]
+    (when (and spec (vector? spec))
+      (binding [spec/*explain-out* expound/printer]
+        (spec/assert spec (vec (take (count in) stack)))))))
+
+(defn- assigned-variables
+  [spec stack out?]
+  (let [values (dissoc (zipmap spec (take (count spec) stack))
+                       spec-arbitrary-effect-designator)]
+    (into {}
+          (for [[spec val] values
+                :when (or out? (vector? spec))]
+            [(if out? spec (second spec)) val]))))
+
+(require '[clojure.set :as set])
+
+(defn validate-placeholders
+  [[in out] before after]
+  (let [before (assigned-variables in before false)
+        after (assigned-variables out after true)
+        diff (set/difference (into #{} after) (into #{} before))]
+    (when (seq diff)
+      (throw (ex-info "Spec placeholder(s) not respected" {:in-spec in
+                                                           :out-spec out
+                                                           :unexpected-values diff})))))
+
+;; TODO: this doesn't work because some words don't really finish
+;; executing immediately, they add more stuff to the expression.  To
+;; really do this, might need to build up a list of validations to
+;; perform when going below a given stack height. This seems like
+;; something a nested environment setup might be good for (inner env
+;; has validation on, outer does not)
+(defn validate-stack-spec-after
+  [[in out :as spec] word {before ::stack} {after ::stack}]
+  (let [exp-length-change (- (count in) (count out))
+        actual-length-change (- (count before) (count after))]
+    
+    ;; length check
+    (and (-> out last (not= spec-arbitrary-effect-designator))
+         (not= exp-length-change actual-length-change)
+         (throw (Exception. (format "Word '%s' was supposed to %s %d item %s the stack, but instead %s %d"
+                                    word
+                                    (if (neg? exp-length-change) "remove" "add")
+                                    (Math/abs exp-length-change)
+                                    (if (neg? exp-length-change) "from" "to")
+                                    (if (neg? actual-length-change) "removed" "added")
+                                    (Math/abs actual-length-change)))))
+    (validate-placeholders spec before after)))
+#+END_SRC
 
 ** Evaluation
 Next we're going to define how the kcats language executes (or
@@ -482,22 +561,13 @@ tracing what's happening).
 
 #+END_SRC
 
-Where the real action happens is when we evaluate a word. Each defined
-word is either in terms of other words, or has a clojure function that
-will run when that word is evaluated. If it's not defined, then the
-word will act like everything else and just be put on the stack.
-
 We'll include handling for calling down into the platform language
 directly. There will be syntax for calling clojure functions and java
 methods as if they are kcats words. This allows us to leverage the
 platform functionality directly in kcats without having to write more
 code in the platform language.
 
-We'll also specify here what a step of evaluation is - it looks at the
-next item in the expression. If it has a definition, it's replaced
-with its definition. Otherwise it's put onto the stack.
-
-#+BEGIN_SRC clojure
+#+begin_src clojure
 (in-ns 'kcats.core)
 (require '[clojure.string :as string]
          '[clojure.edn :as edn])
@@ -589,14 +659,24 @@ with its definition. Otherwise it's put onto the stack.
       others))
    ::expression others
    ::dictionary dictionary})
+#+end_src
 
+Where the real action happens is when we evaluate a word. Each defined
+word is either in terms of other words, or has a clojure function that
+will run when that word is evaluated. If it's not defined, then the
+word will act like everything else and just be put on the stack.
+
+Recall what =eval= does, it just keeps iterating =eval-step= until
+there's nothing left in the expression.
+
+#+begin_src clojure
 (defn onto-stack
   "Move one item from the expression to the stack. "
   [{[item & others] ::expression ::keys [dictionary stack] :as env}]
   (if (word? item)
-    (let [{f ::fn spec ::spec} (dictionary item)]
-      (when spec
-        #_(spec/assert spec stack))
+    (let [{::keys [dictionary] :as env} (cache-spec env item)
+          {f ::fn spec ::spec} (dictionary item)]
+      (validate-stack-spec-before spec item env)
       (if f
         (f (update env ::expression rest)) ;; drop this word now that we've used it
         (invoke* env)))
@@ -635,11 +715,7 @@ with its definition. Otherwise it's put onto the stack.
      (if (< (count expression) depth)
        env
        (recur (eval-step env))))))
-
-#+END_SRC
-
-Recall what =eval= does, it just keeps iterating =eval-step= until
-there's nothing left in the expression.
+#+end_src
 
 ** Printing
 Printing out (or serializing) kcats data is mostly just printing the
@@ -670,11 +746,12 @@ our serialized data format.
 (defn print-env
   "Prints the expression/stack and then return env"
   [{::keys [expression stack] :as env}]
-  (apply clojure.core/pr (reverse (repr expression)))
-  (print " :. ")
-  (apply clojure.core/prn (repr stack))
+  (binding [*print-length* 10
+            *print-level* 8]
+    (apply clojure.core/pr (reverse (repr expression)))
+    (print " :. ")
+    (apply clojure.core/prn (repr stack)))
   env)
-
 #+end_src
 ** Concept of nothing/nil/null
 Kcats is not going to have a separate concept of =null= or =nil=. If
@@ -743,19 +820,24 @@ words.
            ::expression (into expression (reverse new-expression-items))
            ::dictionary dictionary})))
 
+(defn- strip-types
+  "stack specs will have inputs like [[string a]] but we just want [a]"
+  [spec]
+  (vec (for [s spec]
+         (if (vector? s) (second s) s))))
+
 (defmacro effect
   "Constructs a fn with given in args, whose body is out. That
   function body should return a pair (new-expression-items,
   new-stack-items)"
   [in out]
-  `(env-effect ~(count in) (fn ~in ~out)))
-
+  `(env-effect ~(count in) (fn ~(strip-types in) ~out)))
 
 (defmacro stack-effect
   "Takes a stack effect notation and turns it into a call to
   env-effect"
   [in out]
-  `(env-effect ~(count in) (fn ~in [[] ~out])))
+  `(env-effect ~(count in) (fn ~(strip-types in) [[] ~out])))
 
 (defmacro spec-effect
   "Takes a spec and generates the function (only useful for words that
@@ -969,7 +1051,6 @@ that we notice any bugs as we're developing.
                                           dict)]
        (test/testing (str word)
          (doseq [[program exp-stack] examples]
-           (println "testing" word)
            (->> program
                 (update env ::expression concat)
                 (eval {:max-steps 2500})
@@ -989,23 +1070,23 @@ go into more detail on this particular data type in [[*Maps/associations][Associ
 ;; have the test runner add it at test-time
 
 
-[discard [[spec [[a] []]]
+[discard [[spec [[[item a]] []]]
           [examples [[[1 2 3 discard] [2 1]]
                      [[1 2 3 [a b c] discard] [3 2 1]]]]]]
 
-[clone [[spec [[a] [a a]]]
+[clone [[spec [[[item a]] [a a]]]
         [examples [[[1 2 3 clone] [3 3 2 1]]]]]]
 
-[swap [[spec [[a b] [b a]]]
+[swap [[spec [[[item a] [item b]] [b a]]]
        [examples [[[1 2 3 swap] [2 3 1]]]]]]
 
-[swapdown [[spec [[a b c] [a c b]]]
+[swapdown [[spec [[[item a] [item b] [item c]] [a c b]]]
            [examples [[[1 2 3 swapdown] [3 1 2]]]]]]
 
-[float [[spec [[a b c] [c a b]]]
+[float [[spec [[[item a] [item b] [item c]] [c a b]]]
         [examples [[[1 2 3 float] [1 3 2]]]]]]
 
-[sink [[spec [[a b c] [b c a]]]
+[sink [[spec [[[item a] [item b] [item c]] [b c a]]]
        [examples [[[1 2 3 sink] [2 1 3]]]]]]
 
 [execute [[spec [[program] [*]]]
@@ -1054,9 +1135,9 @@ go into more detail on this particular data type in [[*Maps/associations][Associ
                         inscribe
                         5 add3] [8]]]]]]
 
-[branch [[spec [[[false-branch program]
-                 [true-branch program]
-                 [condition item]]
+[branch [[spec [[[program false-branch]
+                 [program true-branch]
+                 [item condition]]
                 [*]]]
          [examples [[[5 true [3 *] [4 +] branch] [15]]
                     [[6 false [3 *] [4 +] branch] [10]]]]]]
@@ -1065,15 +1146,15 @@ go into more detail on this particular data type in [[*Maps/associations][Associ
        [examples [[[1 [2 3 4] [*] step] [24]]
                   [[1 [] [*] step] [1]]]]]]
 
-[recur [[spec [[[rec2 program]
-                [rec1 program]
-                [true-branch program]
-                [false-branch program]]
+[recur [[spec [[[program rec2]
+                [program rec1]
+                [program true-branch]
+                [program false-branch]]
                [*]]]
         [examples [[[3 [clone 1 <=]
                      [] [clone dec] [execute *] recur] [6]]]]]]
 
-[loop [[spec [[program [flag item]] [*]]]
+[loop [[spec [[program [item flag]] [*]]]
        [examples [[[10 true [-2 * clone 50 <] loop] [160]]]]]]
 
 [unpack [[spec [[list] [item list]]]
@@ -1135,21 +1216,21 @@ go into more detail on this particular data type in [[*Maps/associations][Associ
                     [item]]]
              [definition [shield swap discard]]]]
 
-[shielddowndown [[spec [[[p program] [consumed item] [consumed item]]
-                        [[result item]]]]
+[shielddowndown [[spec [[[program p] [item consumed] [item consumed]]
+                        [[item result]]]]
                  [definition [shield [discard discard] dip]]]]
 
-[if [[spec [[[false-branch program]
-             [true-branch program]
-             [condition program]]
+[if [[spec [[[program false-branch]
+             [program true-branch]
+             [program condition]]
             [*]]]
      [definition [[shield] dipdown branch]]
      [examples [[[5 [5 =] [3 *] [4 +] if] [15]]
                 [[6 [5 =] [3 *] [4 +] if] [10]]]]]]
 
 [dipdown [[spec [[program
-                  [a item]
-                  [b item]]
+                  [item a]
+                  [item b]]
                  [a b *]]]
           [definition [wrap [dip] join dip]]
           [examples [[[1 2 3 [inc] dipdown] [3 2 2]]]]]]
@@ -1194,9 +1275,9 @@ go into more detail on this particular data type in [[*Maps/associations][Associ
                   [[11 [3 5 6] [+ odd?] any?] [true 11]]
                   [[-15 [[even?] [pos?] [3 rem 0 =]] [execute] any?] [true -15]]]]]]
 
-[primrec [[spec [[[rec1 program]
-                  [exit program]
-                  [data number]]
+[primrec [[spec [[[program rec1]
+                  [program exit]
+                  [number data]]
                  [*]]]
           [definition [[execute] swap join ;; add execute to rec1 to be recurs rec2
                        [[discard] swap join] dip ;; add discard to exit condition
@@ -1320,8 +1401,8 @@ go into more detail on this particular data type in [[*Maps/associations][Associ
 [something? [[spec [[item] [boolean]]]
              [definition [nothing? not]]]]
 
-[while [[spec [[[body program]
-                [pred program]]
+[while [[spec [[[program body]
+                [program pred]]
                [*]]]
         [definition [swap wrap [shield] join ;; add shield to the pred program
                      clone dipdown ;; run it on the previous ToS
@@ -1349,8 +1430,7 @@ Then include some words that depend on this functionality.
     (get (if m?
            alist
            (into {} alist))
-         (cond-> k
-           (and m? (symbol? k)) (->> name (keyword "kcats.core")))
+         k
          [])))
 
 (defn assoc-in
@@ -1398,8 +1478,8 @@ The rest of the definitions can be added to the lexicon.
 
 [associative? [[spec [[item] [boolean]]]]]
 
-[assign [[spec [[[value item]
-                 [keys list]
+[assign [[spec [[[item value]
+                 [list keys]
                  association-list]
                 [association-list]]]
          [examples [[[[[a b] [c d]] [a] 5 assign]
@@ -1411,7 +1491,7 @@ The rest of the definitions can be added to the lexicon.
                     [[[[a b] [c [[d e]]]] [c d] 5 assign]
                      [[[a b] [c [[d 5]]]]]]]]]]
 
-[update [[spec [[program [keys list] association-list]
+[update [[spec [[program [list keys] association-list]
                 [association-list]]]
          [definition [[[lookup] shield] dip ;; m ks v p
                       shielddown
@@ -1431,7 +1511,7 @@ The rest of the definitions can be added to the lexicon.
                     [[[[a [[c 3] [d 5]]] [b 2]] [a e] [5 6 +] update]
                      [[[a [[c 3] [d 5] [e 11]]] [b 2]]]]]]]]
 
-[lookup [[spec [[keys list] association-list] [item]]
+[lookup [[spec [[list keys] association-list] [item]]
          [definition [[[[swap associative?] ;; it's a map
                         [swap something?] ;; it's not empty
                         [something?]] ;; the keylist is not empty
@@ -1449,13 +1529,14 @@ The rest of the definitions can be added to the lexicon.
                     [[[[a b] [c d]] [e] lookup] [[]]]
                     [[[[outer [[a b] [c d]]]] [outer c] lookup] [d]]]]]]
 
-[unassign [[spec [[[key item] association-list] [association-list]]]
+[unassign [[spec [[[item key] association-list] [association-list]]]
            [examples [[[[[a b] [c d]] a unassign]
                        [[[c d]]]]
                       
                       [[[[a b] [c d]] e unassign]
                        [[[a b] [c d]]]]]]]]
-[decide [[spec [[[test-expr-pairs association-list] [*]]]]
+
+[decide [[spec [[[association-list test-expr-pairs] [*]]]]
          [doc "Takes a list of choices (pairs of test, program) and
                 executes the first program whose test passes. if none
                 pass, returns 'nothing'. Stack is reset between
@@ -1479,6 +1560,7 @@ The rest of the definitions can be added to the lexicon.
                          [[7 =] ["seven"]]]
                       decide]
                      [[] 9]]]]]]
+
 [type [[spec [[association-list] [item]]]
        [definition [[count 1 =] ;; if it's a single item
                     [first first] ;; the type is the key of that first item
@@ -1496,7 +1578,7 @@ The rest of the definitions can be added to the lexicon.
                    
                    [[[[type url] [value "http://foo.com"]] value]
                     ["http://foo.com"]]]]]]
-[zip [[spec [[[values list] [keys list]] [association-list]]]
+[zip [[spec [[[list values] [list keys]] [association-list]]]
       [definition [[[]] dipdown ;; add empty result below ToS
                    [[unpack wrap] ;; unpack the next key, wrap it
                     ;; to make a "pair" (adding
