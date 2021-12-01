@@ -2440,24 +2440,23 @@ pipes, which is just two pipes with the sender and receiver swapped)
                                (.verify signer s))])}})
 #+end_src
 
-#+begin_example
+#+begin_src kcats
 ;; in progress example sign
-(k 
-             '["foo" key [private] lookup
-               "We strike at dawn"
-               "SHA256withECDSA" .+java.security.Signature/getInstance
-               swap discard ;; drop the full key
-               [..+initSign] void
-               [..+update] void])
+["foo" key [private] lookup
+ "We strike at dawn"
+ "SHA256withECDSA" .+java.security.Signature/getInstance
+ swap discard ;; drop the full key
+ [..+initSign] void
+ [..+update] void]
 
 ;; next iteration
 ["foo" key 
-"We attack at dawn" bytes 
-[[[private] lookup] dip sign] shield
-;[discard "bar" key] dipdown ;; try different key for verify
-;;20 pack ;; add another byte to the sig, to make it invalid
-[[public] lookup] dipdown verify]
-#+end_example
+ "We attack at dawn" bytes 
+ [[[private] lookup] dip sign] shield
+ ;[discard "bar" key] dipdown ;; try different key for verify
+ ;;20 pack ;; add another byte to the sig, to make it invalid
+ [[public] lookup] dipdown verify]
+#+end_src
 * Tools
 ** Debugging
 *** Trace analyzer
@@ -2616,187 +2615,6 @@ stack is valid for the word. Probably not easy to get an explanation
 as detailed as clojure.spec, but most of the specs should be very
 simple list/number/etc. 
 * Notes
-** Instruction set
-It might be prudent to define some low level words, and then define
-the higher level words in terms of those words. Essentially trading
-some performance for portability. Here's a stab at what some of the
-low level words would be. We could refer to positions on the stack and
-expression with an integer (positive = on stack, negative = on
-expression)
-
-- shift* items from the expression to the stack, or vice versa (neg),
-  int argument. Oops the problem here is if you shift stuff from
-  stack->expr whatever you shifted will get eval'd next, instead of
-  what you probably wanted
-
-- move* better than swap as you can specify what you're moving AND how
-  far. This has the problem of needing to know how long the section of
-  program is that you need to move things past. I'm not sure this is
-  useful either, as moving things into the expression is not very useful
-  
-- exchange* items at the given locations (eg -1 1 swap would swap the
-  top of the stack and top of the expression)
-
-- swap* shorthand for 1 2 exchange* (swap the top two items)
-
-- conj* the item on top of the stack into the agg just below it
-
-- concat* the top n (or 2?) items (lists)
-
-- execute* unwrap agg on ToS, move it into expr (to be eval'd)
-
-- discard* get rid of items on the stack
-
-- clone* duplicate items on the stack
-
-- cleave* the env into two, execute the program on ToS on one of
-  them, put result on other. drop the mutated env. -  see below
-
-- booleans and* or* not*
-
-- =* 
-
-- branch*
-
-- unwrap* - unwraps the list at position n
-
-- inscribe*
-
-Using this we can define =dip= like this (nope, does not work due to
-neg shift being worthless)
-
-#+BEGIN_EXAMPLE
-  1 2 swap* -1 shift* conj*
-
-  3 1 2 [* +] . dip
-  3 1 [* +] 2 . -1 shift* conj*
-  3 1 [* +] . 2 conj*
-  3 1 [* + 2]  
-#+END_EXAMPLE
-
-
-ok how about this
-
-#+BEGIN_EXAMPLE
-  swap* conj* execute*
-
-  3 4 2 5 [* +] . dip
-  3 4 2 5 [* +] . swap* conj* execute*
-  3 4 2 [* +] 5 . conj* execute*
-  3 4 2 [* + 5] . execute*
-  3 4 2 . * + 5
-  3 8 . + 5
-  11 . 5
-  11 5
-#+END_EXAMPLE
-
-re cleave*, seems like there is some overlapping functionality
-between parallelism and preserving the stack for things like
-=shield=. In both cases we're cloning the environment (or part of
-it) so that multiple modifications don't conflict with each other.
-
-The only difference is how we join the cloned stacks back together.
-
-With shield, we clone the env, run the program on the clone, take
-the top of the stack and put it back on the original. throw the clone
-env away.
-
-With map, we clone the env (one for each item in the list), run the
-program in parallel on each env, gather up the top items in each env,
-and put it as a list on top of the original stack.
-
-The question is, can we leverage kcats itself to manage the intra-env
-computations? Seems like theoretically we could - make a new stack
-consisting of the other stacks as list items in the new one. Then you
-can process that arbitrarily and whatever remains can be used. Seems
-like maybe channels should be a dependency here, since that would
-easily pipe the right value back to the right env.
-
-So, what's needed here is another combinator (like genrec etc) that
-takes two programs:
-
-+ one that takes (a clone of) the current stack
-and leaves on top a list of lists (where each item will represent a
-stack in a new env).
-
-+ one that takes a list of items that were on top of the various
-stacks, and turns them back into items to be put back on the original
-stack. (in the case of map, noop).
-
-Let's try an example
-
-7 [1 2 3] [swap pop inc] map
-
-In this example, the =pop= would drop the =7= off the stack, so we're
-testing that it gets resurrected for each item in the list =[1 2 3]=.
-
-Let's define =f= as something that would take the input stack and leave
-
-=7 [[1 swap pop inc] [2 swap pop inc] [3 swap pop inc]]= (concat'ing the
-mapping function program onto each piece of data)
-
-Then that list-of-lists is what's used to make new environments (in
-the implementation of cleave*), each top-level item is a program to
-run.
-
-Then you'd have 3 environments, after the program had run, stacks look like this:
-
-2
-3
-4
-
-Then we'd need to specify how map gathers up the top items from this
-stack and adds them to the original:
-
-1 3 exchange pop pop
-
-#+BEGIN_EXAMPLE
-So, what's needed here is another combinator (like genrec etc) that
-takes two programs:
-
-,* one that takes (a clone of) the current stack
-and leaves on top a list of lists (where each item will represent a
-stack in a new env).
-
-,* one that takes a list of items that were on top of the various
-stacks, and turns them back into items to be put back on the original
-stack. (in the case of map, noop).
-
-Let's try an example
-
-7 [1 2 3] [swap pop inc] map
-
-In this example, the pop
-
-map
-
-7 [1 2 3] [inc] . map
-
-env1
-7 1 . inc
-7 2
-
-env2
-7 2 . inc
-7 3
-
-env3
-7 3 . inc
-7 4
-
-
-,* distribute items f(stack) -> new env(s) expression (in the case of map, enstacken or whatever takes the agg on ToS as the items to be added)
-,* run all the envs (one per item in the list below ToS) 
-,* reduce all the ToSs (in the case of map we're already done)
-
-Let's try shield
-
-2 3 [+] shield
-
-,* enstacken
-,* run all (one)
-,* conj o
-#+END_EXAMPLE
 ** Dispatch
 *** Basics
 A multimethod is a function broken into two parts:
@@ -3125,32 +2943,6 @@ special quote reading function.
     1 [1 2] 
   #+end_src
   
-** Feature dependency tree
-*** Types
-**** Multimethods
-***** Pipes
-needs multi's because words like get/put should probably be generic
-and have specific methods for pipes.
-
-** Shield/shielddown/etc?
-Do we need these? If a program knows that the items it consumes will
-be needed later, it can =clone= them. And if a program is going to run
-another program that it knows will consume items it needs, it can also
-=clone= them first.
-
-So at first glance it would seem that shield et al aren't needed. 
-
-Even if they were needed, these names are too difficult for the target
-audience to understand. We need better names and I can't think of any
-right now.
-
-Note: I later realized that shield isn't as voodoo as I originally
-thought. There's no magic in implementing shield, if you have the
-=stack= (or =evert=) word (capture the stack as a list). Then you can
-just clone it and it's easy to revert the stack back to a previous
-state from the copy. My current thinking is having this word isn't
-going to confuse users since it's not magic or exceptional.
-
 ** better names?
 - dipd :: dipdown, protect? 
 - ifte :: if
@@ -3192,112 +2984,6 @@ to do the actual job and those that are part of the execution setup
 (envs whose only job is to run other envs, say with logging or
 debugging). It's kind of hard have a library that introduces a
 hierarchy of envs and then still allow the user to debug it.
-** Hylomorphism
-From http://joypy.osdn.io/notebooks/Recursion_Combinators.html#hylomorphism
-#+begin_example
-[P] c [G] [F] [unit [pop] swoncat] dipd [dip] swoncat genrec
-;; translate to kcats
-[P] c [G] [F] [wrap [discard] swap join] dipdown [dip] swap join recur
-#+end_example
-** Every? impl
-#+begin_example
-(k 
- '[2 3 [3 5 7 9 13 11]          ; items exceptions? empty? continue?
-   false ;; any exceptions found
-   [[[nothing?] shield] dip ;; is the list empty? (keep the list intact)
-    swap [or] shielddown]
-   [not]
-   [[unpack swap [[+ even?] unary] dip swap not] dip or]
-   [execute]
-   recur
-   ;; drop the remaining items
-   swap discard
-   ])
-
-#+end_example
-
-The above seems to work (after inserting the 'swapdown' into the
-predicate to get the remaining list out of the way, so that when =dip=
-runs it is on on the stack.
-
-I think what's needed is a recur combinator that does the snapshotting
-and injecting, and lets the caller specify a) what to inject, b) what
-to do with the resulting snapshot afterward, c) when to stop
-
-So the general form is that we have a program to run on list
-items (and the rest of the stack below the list) P, a list L, a condition when to
-stop I, and a program to run on the snapshot after the program's been run C.
-
-The initial stack will be: P L I C
-Example:
-[inc odd?]
-[1 2 3]
-[[clone nothing?] dip swap [or] shielddown] 
-[first]
-
-During execution the program can expect that each time through the
-loop, the ToS is a result item that's being built. In the case of
-=every?= it's just a boolean of whether a false item has been
-found. The recur =if= will stop the loop only if that OR the remaining
-list is empty.
-
-So the recur will look like this (assuming result-so-far on ToS,
-remaining data, and then a snapshot beneath): R D S
-#+begin_src clojure :tangle no
-I
-[not] 
-[[clone] dipdown ;; clone the snapshot. -> R D S S
- [unpack] dip ;; unpack the next item. -> R I D S S
- swapdown [pack] dipdown ;; pack item into snapshot copy. -> R D S' S
- [P inject] dipdown ;; inject P into snapshot copy. -> R D S'' S 
- [first] dipdown swapdown C  ;; Run C on the result modified snapshot and current result -> R' D S
-]
-[execute]
-recur
-
-C I L P
-[rotate] dip
-#+end_src
-
-Would be nice to have some words that help construct programs.
-#+begin_src clojure :tangle no
-;; insert a program into a nested list at indices
-
-[what-to-do] [a [b c]] [2 2] insert -> [a [b [what-to-do] c]]
-
-[a b c] [what-to-do] 2 insert -> [a b [what-to-do] c]  
-
-[]
-#+end_src
-** Argument order
-Question: when calling a java or clojure method/fn what order should
-it expect the arguments to be on the stack?
-
-I think it's a lot clearer to write "5/2" as "5 2 /"
-instead of "2 5 /" - in which case =/= should expect its first
-argument to be the 2nd item on the stack and its 2nd arg on top.
-
-What about java method calls? "mylist 5 .addItem" seems most clear -
-addItem should expect the object below and the argument on top. It
-seems strange to put a method argument on the stack *before* the
-object whose method you intend to call.
-
-However there are some cases where this gets awkward. For example,
-when you construct an object and then want to call a method on it
-using data already on the stack. The object is then above the
-arguments and the stack needs to be rearranged.
-
-Some examples:
-
-#+begin_example
-
-foo.bar(5).baz(6)
-foo 5 .bar 6 .baz
-
-foo.bar(5, new Baz(6))
-foo 5 6 Baz. .bar 
-6 Baz. foo swap .bar  
-#+end_example
 * Example programs
 ** Factorial
 *** Recursive definition 
