@@ -474,15 +474,18 @@ they actually are followed.
 (defn build-spec
   "Build a native clojure spec from the stack-spec"
   [spec]
-  (clojure.core/eval `(spec/tuple ~@(for [s spec]
-                                      (keyword "kcats.core" (str (cond-> s
-                                                                   (not (symbol? s)) (first))))))))
+  (if (seq spec)
+    (clojure.core/eval `(spec/tuple ~@(for [s spec]
+                                        (keyword "kcats.core" (str (cond-> s
+                                                                     (not (symbol? s)) (first)))))))
+    ::nothing))
 
 (defn cache-spec
   "if the given env doesn't have a prebuilt native clojure spec, build
   some from the stack spec"
   [{::keys [dictionary] :as env} word]
-  (let [[in-spec out-spec] (get-in dictionary [word ::spec])
+  (let [spec (get-in dictionary [word ::spec])
+        [in-spec out-spec] spec
         existing (get-in dictionary [word ::clojure-spec-in])]
     (if (and (not existing) in-spec)
       (-> env
@@ -496,7 +499,7 @@ they actually are followed.
     (throw (Exception. (format "Word '%s' expects at least %d items in stack, but there were only %d"
                                word (count in) (count stack)))))
   (let [spec (get-in dictionary [word ::clojure-spec-in])]
-    (when (and spec (vector? spec))
+    (when spec
       (binding [spec/*explain-out* expound/printer]
         (spec/assert spec (vec (take (count in) stack)))))))
 
@@ -857,14 +860,10 @@ words.
   "Takes a spec and generates the function (only useful for words that
   rearrange stack items but don't modify any single values)"
   [[in out :as spec] other-props]
-  (let [->body (fn [spec-item]
-                 (if (vector? spec-item)
-                   (first spec-item)
-                   spec-item))]
-    `(merge ~other-props
-            {::spec (quote ~spec)
-             ::fn (stack-effect ~(mapv ->body in)
-                                ~(mapv ->body out))})))
+  `(merge ~other-props
+          {::spec (quote ~spec)
+           ::fn (stack-effect ~(mapv strip-types in)
+                              ~(mapv strip-types out))}))
 #+END_SRC
 
 We're going to start adding definitions of words here, but only the
@@ -963,12 +962,12 @@ later. We put this here because this has to be clojure code.
                 ::expression expression})
    'branch (effect [f t b]
                    [(if (nothing->nil b) t f) []])
-   'step (effect [p [agg-item & agg-rest :as agg]]
-                 (if (seq agg)
-                   [(cond-> ['execute]
-                      (seq agg-rest) (concat [(vec agg-rest) p 'step]))
-                    [p agg-item]]
-                   [[] []]))
+   'step (env-effect 2 (fn [p [agg-item & agg-rest :as agg]]
+                         (if (seq agg)
+                           [(cond-> ['execute]
+                              (seq agg-rest) (concat [(vec agg-rest) p 'step]))
+                            [p agg-item]]
+                           [[] []])))
    'recur (effect [rec2 rec1 then pred]
                   ['[if]
                    [(vec (concat rec1 [[pred then rec1 rec2 'recur]] rec2))
@@ -978,7 +977,8 @@ later. We put this here because this has to be clojure code.
                     (concat p [p 'loop]))
                   []])
    
-   'unpack (stack-effect [[l & others]] [(nil->nothing l) (vec others)])
+   'unpack (env-effect 1 (fn [[l & others]]
+                           [[] [(nil->nothing l) (vec others)]]))
    'join (stack-effect [a b]
                        (if (and (string? a) (string? b))
                          [(str b a)]
@@ -1550,7 +1550,7 @@ The rest of the definitions can be added to the lexicon.
                       [[[[a b] [c d]] e unassign]
                        [[[a b] [c d]]]]]]]]
 
-[decide [[spec [[[association-list test-expr-pairs] [*]]]]
+[decide [[spec [[[association-list test-expr-pairs]] [*]]]
          [doc "Takes a list of choices (pairs of test, program) and
                 executes the first program whose test passes. if none
                 pass, returns 'nothing'. Stack is reset between
@@ -1605,22 +1605,24 @@ The rest of the definitions can be added to the lexicon.
       [examples [[[[a b c] [1 2 3] zip] [[[a 1] [b 2] [c 3]]]]]]]]
 #+end_src
 ** Methods
-#+begin_src clojure
-(swap! core-words merge
-       {'addmethod {::spec (stack-spec :condition ::pair
-                                       :word ::word)
-                    ::definition '[[clone describe] dip ;; get definition of word beneath
-                                        ; and keep an extra copy for later inscribe
-                                   pack ;; new condition onto end of definition
-                                   [rotate ;; new condition to 1st
-                                           ;; position - TODO: note this
-                                           ;; could fail if the def is
-                                           ;; more than just an alist
-                                           ;; and 'decide'.
-                                    pack] ;; new condition onto end of conditions
-                                   inject ;; the above program to run on the conditions
-                                   swap inscribe ;; redefine word
-                                   ]}})
+We want a way of adding methods to a word that's already set up as a
+simple 'decide' form. This will add the method at the beginning -
+adding it at the end is not good because often there's a catchall
+condition at the end, and adding beyond that means the new condition
+is unreachable. Adding at the beginning is not always what the user
+wants either, though. So maybe this could be improved by taking
+another argument: a program to combine the item and the existing list
+(that defaults to =prepend= here).
+#+begin_src kcats :tangle src/kcats/lexicon.kcats
+[addmethod [[spec [[[pair condition] [program combinator] word] []]]
+            [definition [float ;; work with the word first to get definition: w c b
+                         [wrap dictionary swap lookup] shield ;; leave the word and put def on top: def w c b
+                         [wrap swap pack] dipdown float ;; [c b] def w 
+                         [  ;; b c decide cs
+                         float ;; decide b c cs
+                         [execute] dip] ;; run combinator which will work on c cs 
+                         join inject ;; join with [c b], the above program to run on the definition
+                         swap inscribe]]]] ;; redefine word
 #+end_src
 
 ** Programmable Runtime
