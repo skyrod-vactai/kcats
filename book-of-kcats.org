@@ -2248,130 +2248,131 @@ Then a socket has both in and out, via the input/output streams.
 (expound/def ::core/pipe (spec/or :in ::in
                                   :out ::out))
 
-(swap! core/core-words merge
-       {'atom {::core/spec (core/stack-spec :value ::core/item)
-               ::core/fn (core/stack-effect [v] [(->atom v)])}
-        'buffer {::core/spec (core/stack-spec :buffer-size ::core/integer)
-                 ::core/fn (core/stack-effect [s] [(->buffered s)])}
-        'timeout {::core/spec (core/stack-spec :timeout-ms ::core/integer)
-                 ::core/fn (core/stack-effect [t] [(->timeout t)])}
-        'filled {::core/spec (core/stack-spec :values ::core/list)
-                 ::core/fn (core/stack-effect [l] [(->filled l)])}
-        'handoff {::core/spec (core/stack-spec)
-                  ::core/fn (core/stack-effect [] [(->handoff)])} 
-        'select {::core/spec (core/stack-spec :pipes (spec/coll-of ::out))
-                 ::core/fn (core/stack-effect [pipes]
-                                              (let [[p v] (select pipes)]
-                                                [v p pipes]))}
-        'take {::core/spec (core/stack-spec :pipe ::out)
-               ::core/fn (core/stack-effect [p] [(take p) p])}
-        'put {::core/spec (core/stack-spec :value ::core/item
-                                           :pipe ::in)
-              ;; TODO: not appropriate to call `bytes` here.  Some
-              ;; pipes (from one env to another) take any value, not
-              ;; just bytes.
-              ::core/definition '[++kcats.pipe/put!]}
-        'close {::core/spec (core/stack-spec :pipe ::core/pipe)
-                ::core/fn (core/stack-effect [p] (do (close p) [p]))}
-        'closed? {::core/spec (core/stack-spec :pipe ::core/pipe)
-                  ::core/fn (core/stack-effect [p] [(closed? p)])} 
-        'pipe-in {::core/spec (core/stack-spec :obj ::item)
-                  ::core/definition
-                  '[[[[type [file] unwrap =]
-                      [value
-                       +clojure.java.io/file
-                       +clojure.java.io/output-stream]]]
-                    decide]}
-        'tunnel {::core/spec (core/stack-spec :obj ::item)
-                  ::core/definition
-                  '[[[[type [ip-port] unwrap =]
-                      [clone
-                       [port] lookup
-                       [[address] lookup] dip
-                       !**java.net.Socket.]]]
-                    decide]}
-        'pipe-out {::core/spec (core/stack-spec :obj ::item)
-                   ::core/definition
-                   '[
-                     [[[type [file] unwrap =]
-                       [value
-                        +clojure.java.io/file
-                        +clojure.java.io/input-stream
-                        +kcats.pipe/make-inputstream]]
-                      [[type [ip-port] unwrap =]
-                       [[port] lookup !*java.net.ServerSocket.]]
-                      [[list?]
-                       [+kcats.pipe/->filled]]]
-                     decide]}
-        'assemble {::core/spec (core/stack-spec :pipe ::core/pipe
-                                                :reducer ::core/program)
-                   ::core/doc "Takes a large value out of a pipe by
-                   `take`ing it piece by piece, and assembling the
-                   pieces with `reducer`. `reducer` should take a
-                   piece, and the so-far assembled value and return a
-                   new value with the piece incorporated."
-                   ::core/definition '[swap
-                                       [take swap] swap pack
-                                       [dip] join
-                                       [[closed? not]] dip
-                                       while
-                                       discard]}
-        ;; TODO: is there any point to this? If we already have a
-        ;; complex/large value in memory, we don't save any memory by
-        ;; breaking it down, we can just shove the whole thing into
-        ;; the pipe with a single put. For flat lists, we can just
-        ;; `[put] step`. Maybe doing the byte conversion piece-wise is
-        ;; useful, so I'm going to keep it for now.
-        
+(->> (for [[w f] {'atom (core/stack-effect [v] [(->atom v)])
+                  'buffer (core/stack-effect [s] [(->buffered s)])
+                  'timeout (core/stack-effect [t] [(->timeout t)])
+                  'filled (core/stack-effect [l] [(->filled l)])
+                  'handoff (core/stack-effect [] [(->handoff)]) 
+                  'select (core/stack-effect [pipes]
+                                             (let [[p v] (select pipes)]
+                                               [v p pipes]))
+                  'take (core/stack-effect [p] [(take p) p])
+                  'put (core/f-stack 2 put)
+                  'close (core/stack-effect [p] (do (close p) [p]))
+                  'closed? (core/stack-effect [p] [(closed? )]) 
+                  'spawn (fn [{::keys [stack] :as env}]
+                           ;;(print-env env)
+                           (let [expr (first stack)]
+                             (->> expr
+                                  core/default-env
+                                  (eval {:before-step core/print-env})
+                                  future))
+                           (update env ::stack rest))}]
+       [w {::fn f}])
+     (into {})
+     (swap! core/core-words merge))
+#+end_src
 
-        ;; At least with the `assemble` we probably don't want to get
-        ;; a 1gb entire file with a single `take` if we end up
-        ;; throwing away most of the contents as we go.
-        ;;
-        ;; As a higher-level abstraction might be useful to have pipes
-        ;; with paired reducer/splitter so the other end knows how to
-        ;; assemble. Maybe send the reducer over the pipe first?
-        'disassemble {::core/spec (core/stack-spec :splitter ::core/program
-                                                   :stuff ::core/item
-                                                   
-                                                   :pipe ::core/pipe)
-                      ::core/doc "Puts a large value into a pipe by
-                      taking it apart with the `splitter`
-                      program. This program should take a large value
-                      and break it into two parts, such that the
-                      topmost will fit into the pipe."
-                      ::core/definition '[;; build a while body that includes splitter
-                                          [swap [put] dip] join
-                                          [nothing? not] swap
-                                          while
-                                          discard ;; drop the 'nothing' value
-                                          ]}
-        'pump {::core/spec (core/stack-spec :program ::core/program
-                                            :input ::core/pipe
-                                            :output ::core/pipe)
-               ;; while neither pipe is closed, take from input, run
-               ;; program, put into output
-               ::core/definition '[wrap [shield] join
-                                  ;; create a list to use with any
-                                  [[] sink [pack] dip swapdown [pack] dip
-                                   [[closed?] any?] dip swap]
-                                  ]}
-        
-        'spit
-        {::core/spec (core/stack-spec :contents ::core/item
-                                            :target ::core/item)
-               ::core/definition '[[pipe-in] dip bytes put close discard]}
-        'slurp {::core/spec (core/stack-spec :target ::item)
-                ::core/definition '[]}
-        'spawn {::core/spec (core/stack-spec :expression ::core/list)
-                ::core/fn (fn [{::keys [stack] :as env}]
-                            ;;(print-env env)
-                            (let [expr (first stack)]
-                              (->> expr
-                                   core/default-env
-                                   (eval {:before-step core/print-env})
-                                   future))
-                            (update env ::stack rest))}})
+#+begin_src kcats :tangle src/kcats/lexicon.kcats
+[atom [[spec [[item] [pipe]]]]]
+
+[buffer [[spec [[integer] [pipe]]]]]
+
+[timeout [[spec [[integer] [pipe]]]]]
+
+[filled [[spec [[list] [pipe]]]]]
+
+[handoff [[spec [[] [pipe]]]]]
+
+[select [[spec [[[list pipes]] [item pipe [list pipes]]]]]]
+
+[take [[spec [[[pipe out]] [item [pipe out]]]]]]
+
+[put [[spec [[item [pipe in]] [[pipe in]]]]]]
+
+[close [[spec [[[pipe p]] [[pipe p]]]]]]
+
+[closed? [[spec [[pipe] [boolean]]]]]
+
+[pipe-in [[spec [[item] [pipe]]]
+          [definition [[[[type [file] unwrap =]
+                         [value
+                          +clojure.java.io/file
+                          +clojure.java.io/output-stream]]]
+                       decide]]]]
+
+[tunnel [[spec [[item] [pipe]]]
+         [definition [[[[type [ip-port] unwrap =]
+                        [clone
+                         [port] lookup
+                         [[address] lookup] dip
+                         !**java.net.Socket.]]]
+                      decide]]]]
+
+[pipe-out [[spec [[item] [pipe]]]
+           [definition [[[[type [file] unwrap =]
+                          [value
+                           +clojure.java.io/file
+                           +clojure.java.io/input-stream
+                           +kcats.pipe/make-inputstream]]
+                         [[type [ip-port] unwrap =]
+                          [[port] lookup !*java.net.ServerSocket.]]
+                         [[list?]
+                          [+kcats.pipe/->filled]]]
+                        decide]]]]
+
+[assemble [[spec [[pipe program] [item]]]
+           [definition [swap
+                        [take swap] swap pack
+                        [dip] join
+                        [[closed? not]] dip
+                        while
+                        discard]]
+           [doc "Takes a large value out of a pipe by
+                 `take`ing it piece by piece, and assembling the
+                 pieces with `reducer`. `reducer` should take a
+                 piece, and the so-far assembled value and return a
+                 new value with the piece incorporated."]]]
+
+;; TODO: is there any point to this? If we already have a
+;; complex/large value in memory, we don't save any memory by
+;; breaking it down, we can just shove the whole thing into
+;; the pipe with a single put. For flat lists, we can just
+;; `[put] step`. Maybe doing the byte conversion piece-wise is
+;; useful, so I'm going to keep it for now.
+;; At least with the `assemble` we probably don't want to get
+;; a 1gb entire file with a single `take` if we end up
+;; throwing away most of the contents as we go.
+;;
+;; As a higher-level abstraction might be useful to have pipes
+;; with paired reducer/splitter so the other end knows how to
+;; assemble. Maybe send the reducer over the pipe first?
+[disassemble [[spec [[program item [pipe in]] [[pipe in]]]]
+              [doc "Puts a large value into a pipe by
+                    taking it apart with the `splitter`
+                    program. This program should take a large value
+                    and break it into two parts, such that the
+                    topmost will fit into the pipe."]
+              [definition [[swap [put] dip] join ;; build a while body that includes splitter
+                           [nothing? not] swap
+                           while
+                           discard]]]] ;; drop the 'nothing' value
+
+;; TODO: definition incomplete
+;; while neither pipe is closed, take from input, run
+;; program, put into output
+[pump [[spec [[program [pipe in] [pipe out]] [[pipe in] [pipe out]]]]
+       [definition [wrap [shield] join
+                    ;; create a list to use with any
+                    [[] sink [pack] dip swapdown [pack] dip
+                     [[closed?] any?] dip swap]]]]]
+
+[spit [[spec [[item [item target]] []]]
+       [definition [[pipe-in] dip bytes put close discard]]]]
+
+[slurp [[spec [[[item target]] [item pipe]]]]]
+
+[spawn [[spec [[program] []]]]]
 #+end_src
 *** Notes
 core.async has an out-of-band close message. Do we need that? Seems
