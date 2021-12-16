@@ -947,6 +947,7 @@ later. We put this here because this has to be clojure code.
    'rest (stack-effect [l] [(vec (rest l))])
    'fail (stack-effect [s] (throw (Exception. s)))
    'dip (effect [p a] [(conj (vec p) [a] 'unwrap) []])
+   'dipdown (effect [p a b] [(conj (vec p) [a b] 'unwrap) []])
    'list? (stack-effect [a] [(vector? a)])
    'number? (stack-effect [a] [(number? a)])
    'string (stack-effect [a] [(if (bytes? a)
@@ -1028,23 +1029,16 @@ later. We put this here because this has to be clojure code.
   ([]
    (default-env '(lexicon))))
 
-(defonce k-env (atom (eval (default-env))))
-
-(defn prepare-env
-  "Adds the lexicon and expression and returns the uneval'd env"
-  [expr]
-  (update @k-env
-          ::expression
-          concat expr))
-
 (defn k
   "Run a program with the default env and return the result. Option to
   stop execution after `max-steps` if still unfinished, to prevent
   accidental infinite loops (for debugging purposes)"
   ([opts p]
-   ;; avoid having to constantly reset k-env manually during development
-   (reset! k-env (eval (default-env)))
-   (repr (::stack (eval opts (prepare-env p)))))
+   (->> p
+        (update (default-env) ::expression concat)
+        (eval opts)
+        ::stack
+        repr))
   ([p] (k {:before-step print-env} p)))
 
 #+END_SRC
@@ -1059,7 +1053,8 @@ that we notice any bugs as we're developing.
   "Run through all the examples in the default env and make sure they
   work. Takes optional list of words to test"
   ([env words]
-   (let [dict (::dictionary env)]
+   (let [env (eval env)
+         dict (::dictionary env)]
      (doseq [[word {::keys [examples]}] (if words
                                           (select-keys dict words)
                                           dict)]
@@ -1067,7 +1062,7 @@ that we notice any bugs as we're developing.
          (doseq [[program exp-stack] examples]
            (->> program
                 (update env ::expression concat)
-                (eval {:max-steps 2500})
+                (eval {:max-steps 5000})
                 ::stack
                 repr
                 (= exp-stack)
@@ -1174,10 +1169,15 @@ go into more detail on this particular data type in [[*Maps/associations][Associ
 [unpack [[spec [[list] [item list]]]
          [examples [[[["a" "b" "c"] unpack] ["a" ["b" "c"]]]]]]]
 
-
 [join [[spec [[item item] [item]]]
+       [definition [[[[list?] [++concat +vec]]
+                     [[[string?] both?] [++str]]
+                     ;; could also just check if it's an array 
+                     [[[bytes?] both?] [++concat +into-array]]]
+                    decide]]
        [examples [[[["a" "b"] ["c" "d"] join] [["a" "b" "c" "d"]]]
-                  [["ab" "cd" join] ["abcd"]]]]]]
+                  [["ab" "cd" join] ["abcd"]]
+                  [["ab" bytes "cd" bytes join "abcd" bytes =] [true]]]]]]
 
 [range [[spec [[integer integer] [list]]]
         [examples [[[1 5 range] [[1 2 3 4]]]]]]]
@@ -1246,7 +1246,8 @@ go into more detail on this particular data type in [[*Maps/associations][Associ
                   [item a]
                   [item b]]
                  [a b *]]]
-          [definition [wrap [dip] join dip]]
+          ;; [definition [wrap [dip] join dip]]
+          ;;[definition [wrap [dip] unwrap pack dip]]
           [examples [[[1 2 3 [inc] dipdown] [3 2 2]]]]]]
 
 [every? [[spec [[program list] boolean]]
@@ -1422,6 +1423,16 @@ go into more detail on this particular data type in [[*Maps/associations][Associ
                      clone dipdown ;; run it on the previous ToS
                      join loop]]
         [examples [[[3 [0 >] [clone dec] while] [0 1 2 3]]]]]]
+
+[pair [[spec [[item item] [list]]]
+       [definition [[wrap] dip pack]]
+       [examples [[[1 2 pair] [[1 2]]]
+                  [[["hi"] ["there" "foo"] pair] [[["hi"] ["there" "foo"]]]]]]]]
+
+[both? [[spec [[program item item] [boolean]]]
+        [definition [sink pair swap every?]]
+       [examples [[[1 2 [odd?] both?] [false]]
+                  [[1 3 [odd?] both?] [true]]]]]]
 #+end_src
 
 ** Maps/associations
@@ -2388,6 +2399,8 @@ he's "hanging up", but I think that function is better handled at a
 higher level of abstraction (something built on top of bidirectional
 pipes, which is just two pipes with the sender and receiver swapped)
 ** Crypto
+We're going to need to call some platform crypto functions, so lets
+make them accessible.
 #+begin_src clojure :tangle src/kcats/crypto.clj
 (ns kcats.crypto
   (:require [kcats.core :as core])
@@ -2437,18 +2450,19 @@ pipes, which is just two pipes with the sender and receiver swapped)
                       decide]]]]
 
 [sign [[spec [[[item message] [bytes key]] [bytes]]]
-       [definition [swap
-                    "SHA256withECDSA" .*java.security.Signature/getInstance
-                    .!!initSign
-                    .!!update
-                    .*sign]]]]
+       [definition [["SHA256withECDSA" !*java.security.Signature/getInstance] dipdown
+                    [*!*initSign] dip
+                    ,*!*update
+                    !*sign]]]]
 
 [verify [[spec [[[item signature] [item message] [item key]] [boolean]]]
-         [definition [swap
-                      "SHA256withECDSA" .*java.security.Signature/getInstance
-                      .!!initVerify
-                      .!!update
-                      .!!verify]]]] ;; not sure if the stack is in right order for this, see below
+         [definition [float ;; key to top
+                      ["SHA256withECDSA" !*java.security.Signature/getInstance] dip ;; under key
+                      ,*!*initVerify
+                      float ;; message to top
+                      ,*!*update
+                      swap
+                      !**verify]]]] 
 ;; (core/stack-effect
 ;; [s m k]
 ;; [(let [signer (doto (Signature/getInstance "SHA256withECDSA")
