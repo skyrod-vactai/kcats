@@ -372,6 +372,7 @@ already defined.
 (def word? symbol?)
 (expound/def ::word word?)
 
+;; TODO these keyword reqs are outdated
 (expound/def ::axiom-definition (spec/keys :req [::fn ::spec]))
 (expound/def ::program-definition (spec/keys :req [::definition]))
 
@@ -417,7 +418,7 @@ libs to read kcats data.
                                          :pairs (spec/coll-of ::pair
                                                               :kind vector?)))
 
-(expound/def ::environment ::association-list) ;; TODO: specifically call ou:syms
+(expound/def ::environment ::association-list) ;; TODO: specifically call out keys
 
 #+END_SRC
 
@@ -489,9 +490,10 @@ they actually are followed.
   "Build a native clojure spec from the stack-spec"
   [spec]
   (if (seq spec)
-    (clojure.core/eval `(spec/tuple ~@(for [s spec]
-                                        (keyword "kcats.core" (str (cond-> s
-                                                                     (not (symbol? s)) (first)))))))
+    (clojure.core/eval
+     `(spec/tuple ~@(for [s spec]
+                      (keyword "kcats.core" (str (cond-> s
+                                                   (not (symbol? s)) (first)))))))
     ::nothing))
 
 (defn cache-spec
@@ -577,7 +579,7 @@ tracing what's happening).
 (declare eval-step) ;; we'll define this later
 
 (defn eval
-  ([:syms [max-steps before-step histogram]} env]
+  ([{:syms [max-steps before-step histogram]} env]
    (let [hist (when histogram (atom {}))
          eval-step (if before-step
                      (comp eval-step before-step)
@@ -592,7 +594,6 @@ tracing what's happening).
              (recur (eval-step env) (inc step-count)))))))
   ([env]
    (eval {} env)))
-
 #+END_SRC
 
 We'll include handling for calling down into the platform language
@@ -722,7 +723,7 @@ there's nothing left in the expression.
   "Returns the definition of an item, if it's a word defined in terms
   of other words"
   [{:syms [dictionary] :as env} item]
-  (some-> dictionary (get item) 'definition))
+  (some-> dictionary (get item) (get 'definition)))
 
 (declare repr)
 
@@ -933,7 +934,8 @@ later. We put this here because this has to be clojure code.
     (assoc dfn 'fn (clojure.core/eval `(stack-effect ~in ~out)))))
 
 (defn inscribe [dictionary [word word-def]]
-  (let [existing (get dictionary word)]
+  (let [existing (get dictionary word)
+        word-def (into {} word-def)] ;; support kcats data structure
     (assoc dictionary
            word
            (if ('definition word-def)
@@ -1016,8 +1018,13 @@ later. We put this here because this has to be clojure code.
                             io/reader
                             java.io.PushbackReader.)]
                 (reduce (fn [env dfn]
-                          (update env 'dictionary
-                                  inscribe dfn))
+                          (try
+                            (update env 'dictionary
+                                   inscribe dfn)
+                            (catch Exception e
+                              (throw (ex-info "Error updating dictionary"
+                                              {:definition dfn}
+                                              e)))))
                         env
                         (->> #(edn/read {:eof nil} rdr)
                              repeatedly
@@ -1042,11 +1049,11 @@ later. We put this here because this has to be clojure code.
   stop execution after `max-steps` if still unfinished, to prevent
   accidental infinite loops (for debugging purposes)"
   ([opts p]
-   (->> p
-        (update (default-env) 'expression concat)
-        (eval opts)
-        'stack
-        repr))
+   (-> (->> p
+            (update (default-env) 'expression concat)
+            (eval opts))
+       (get 'stack)
+       repr))
   ([p] (k {:before-step print-env} p)))
 
 #+END_SRC
@@ -1068,13 +1075,13 @@ that we notice any bugs as we're developing.
                                           dict)]
        (test/testing (str word)
          (doseq [[program exp-stack] examples]
-           (->> program
-                (update env 'expression concat)
-                (eval {:max-steps 5000})
-                'stack
-                repr
-                (= exp-stack)
-                test/is))))))
+           (-> (->> program
+                    (update env 'expression concat)
+                    (eval {:max-steps 5000}))
+               (get 'stack)
+               repr
+               (= exp-stack)
+               test/is))))))
   ([env] (test env nil)))
 #+end_src
 
@@ -1364,6 +1371,9 @@ go into more detail on this particular data type in [[*Maps/associations][Associ
 [string? [[spec [[item] [boolean]]]
           [definition [+string?]]]]
 
+[word? [[spec [[item] [boolean]]]
+          [definition [+word?]]]]
+
 [bytes [[spec [[item] [bytes]]]
         [definition [[[[string?] [!*getBytes]]
                       [[bytes?] []]]
@@ -1539,9 +1549,9 @@ The rest of the definitions can be added to the lexicon.
                     [[[[a [[c 3] [d 5]]] [b 2]] [a e] [5 6 +] update]
                      [[[a [[c 3] [d 5] [e 11]]] [b 2]]]]]]]]
 
-[lookup [[spec [[list keys] association-list] [item]]
+[lookup [[spec [[[list keys] association-list] [item]]]
          [definition [[[[swap associative?] ;; it's a map
-                        [swap something?] ;; it's not empty
+                        ;; [swap something?] ;; it's not empty
                         [something?]] ;; the keylist is not empty
                        [execute]
                        every?]
@@ -1665,66 +1675,17 @@ environment can then use words like =eval-step= to step through the
 execution of the inner environment, or do whatever other arbitrary
 operations on it.
 *** Implementation
-First let's spec what a nested environment looks like
-#+begin_src clojure
-(in-ns 'kcats.core)
-(declare env->clj env->internal)
-
-(expound/def ::nested-environment
-  #(->> % env->internal (spec/valid? ::environment)))
-#+end_src
-
-We'll need to be able to move back and forth between clojure's idea of
-an environment and the equivalent representation in kcats. Even though
-it's quite inefficient, for this first implementation, we'll convert a
-kcats-format environment to clojure form (converting association lists
-to clojure maps, etc), evaluate, then convert back afterward. This
-allows maximum flexibility to treat a nested environment just like any
-other piece of data.
-
-Note that the =core-words= aren't representable in kcats (they're
-defined in terms of the base language). That's not really a problem,
-as we can make them available during evaluation by merging them in to
-the environment's dictionary.
-
+Let's add some words that help us step through execution of an
+environment expressed as kcats data.
 #+begin_src clojure
 (in-ns 'kcats.core)
 
-(defn env->clj
-  "Convert an env from kcats format to clj"
-  [e]
-  (let [ec (into {} e)]
-    {'stack (-> ec (get 'stack) list* (or '()))
-     'dictionary (merge core-words (into {}
-                                          (for [[k v] (get ec 'dictionary)]
-                                            [k {'definition v}])))
-     'expression (or (list* (get ec 'expression)) '())}))
-
-(defn env->k
-  "Convert an env from clj format to kcats"
-  [e]
-  [['stack (-> e 'stack vec)]
-   ['dictionary (into {}
-                      (for [[k {:syms [definition]}] ('dictionary e)
-                            :when definition] ;; leave out core-words
-                        [k definition]))]
-   ['expression (-> e 'expression vec)]])
-
-(defn env->internal
-  [e]
-  (cond-> e
-    (not (map? e)) env->clj))
-#+end_src
-
-Now we can define an axiom word that steps through a nested
-environment's execution.
-
-#+begin_src clojure
-(in-ns 'kcats.core)
 (swap! core-words merge
-       {'eval-step {'spec (stack-spec :environment ::nested-environment)
-                    'fn (f-stack 1 (comp env->internal eval-step))}
-        'environment {'spec (stack-spec :expression ::list)
+       {'eval-step {'spec '[[environment] [item]]
+                    'fn (f-stack 1
+                                 (comp eval-step
+                                       (partial into {})))} ;; turn kcats data into clj map
+        'environment {'spec '[[program] [environment]]
                       'fn (f-stack 1 (comp default-env list*))}})
 #+end_src
 
@@ -1744,20 +1705,46 @@ We can make some handy words to help.
 #+begin_src clojure
 (in-ns 'kcats.core)
 (swap! core-words merge
-       {'tos {'spec (stack-spec :environment ::nested-environment)
+       {'tos {'spec '[[environment] [item]]
               'definition '[[stack] lookup first]
-              ::doc "top of stack"
-              ::examples '[[[[[stack [1 2 3 4 5]]
-                              [expression [[+] step]]]
-                             tos]
-                            [1]]]}
-        'toe {'spec (stack-spec :environment ::nested-environment)
+              'doc "top of stack"
+              'examples '[[[[[stack [1 2 3 4 5]]
+                             [expression [[+] step]]]
+                            tos]
+                           [1]]]}
+        'toe {'spec '[[environment] [item]]
               'definition '[[expression] lookup first]
-              ::doc "top of expression"
-              ::examples '[[[[[stack [1 2 3 4 5]]
-                              [expression [[+] step]]]
-                             toe]
-                            [[+]]]]}})
+              'doc "top of expression"
+              'examples '[[[[[stack [1 2 3 4 5]]
+                             [expression [[+] step]]]
+                            toe]
+                           [[+]]]]}})
+#+end_src
+
+Here's an example showing how this functionality can be used. Let's
+say we want to count the number of times each word is executed while
+running a program.
+
+#+begin_src kcats
+[[] ;; empty list to put word counts in
+ [lexicon ;; the inner environment, load the lexicon - probably should make this automatic
+  10 [0 >] [clone dec] while]  ;; the sample program to run
+ environment 
+ [[expression] lookup nothing? not] ;; something still in the expression, keep running
+ [[[expression] lookup first] shield ;; get the item we're about to execute
+  swap ;; put it under the environment
+  [[word?] ; if it's a word
+   [wrap
+    [[something?] ;; if word count not empty
+     [inc] ;; increment the counter
+     [1] ;; if it is empty start the counter at 1
+     if]
+    update] ;; the results, the count for the word about to execute
+   [discard] ;; if it's not a word, do nothing
+   if] dip
+  eval-step] ;; evaluate the environment one step
+ while 
+ discard] ;; drop the environment and just report the word counts
 #+end_src
 *** Notes
 TODO: the dictionary spec can be replaced with predicate programs,
@@ -1768,8 +1755,8 @@ controlled.
 
 Is it better to have data structures that match clojure or kcats? For
 example, clojure idioms say that the environment should be a map with
-namespaced keywor:syms. But kcats would say it's a list of pairs with
-words a:syms. This matters in nested envs because each "step" of
+namespaced keyword keys. But kcats would say it's a list of pairs with
+words as keys. This matters in nested envs because each "step" of
 execution needs to do something with this data. If it's pure clojure,
 then it's easy for the runtime to manipulate but then the kcats user
 doesn't know what it is. If it's kcats data, then the user will
@@ -2179,7 +2166,7 @@ it returned -1, then we know EOF has been reached.
 ;; we'll wrap it in a record that adds a boolean for that state.
 (defrecord Reader [rdr closed?]
   Out
-  (take [:syms [rdr closed?]}]
+  (take [{:keys [rdr closed?]}]
     (let [buf (java.nio.CharBuffer/allocate 1024)
           chars-read (.read rdr buf)]
       (if (= -1 chars-read)
@@ -2192,10 +2179,10 @@ it returned -1, then we know EOF has been reached.
   Select
   (poll [this] (take this))
   Close
-  (close [:syms [rdr closed?]}]
+  (close [{:keys [rdr closed?]}]
     (.close rdr)
     (reset! closed? true))
-  (closed? [:syms [closed?]}] @closed?))
+  (closed? [{:keys [closed?]}] @closed?))
 
 (defn make-reader
   [rdr]
@@ -2282,7 +2269,7 @@ Then a socket has both in and out, via the input/output streams.
                                   (eval {:before-step core/print-env})
                                   future))
                            (update env 'stack rest))}]
-       [w {::core/fn f}])
+       [w {'fn f}])
      (into {})
      (swap! core/core-words merge))
 #+end_src
