@@ -598,6 +598,7 @@ code in the platform language.
 (in-ns 'kcats.core)
 (require '[clojure.string :as string]
          '[clojure.edn :as edn])
+;; TODO: needs to support no-arg fns, java fields, clojure vars
 ;; Invocation requires several things:
 ;; * Indication that it's meant to be invoking platform functionality
 ;; * Stack effect (how many args consumed and produced)
@@ -1032,21 +1033,28 @@ later. We put this here because this has to be clojure code.
   ([expression]
    {'stack '()
     'dictionary @core-words
-    'expression expression})
+    'expression (conj (list* expression) 'lexicon)})
   ([]
-   (default-env '(lexicon))))
+   (default-env '())))
+
+(defn exec
+  "Add p to the expression in env so that it executes when the env is
+  evaluated"
+  [env p]
+  (update env 'expression concat p))
 
 (defn k
-  "Run a program with the default env and return the result. Option to
-  stop execution after `max-steps` if still unfinished, to prevent
-  accidental infinite loops (for debugging purposes)"
-  ([opts p]
-   (-> (->> p
-            (update (default-env) 'expression concat)
-            (eval opts))
-       (get 'stack)
-       repr))
-  ([p] (k {:before-step print-env} p)))
+  "Run a program with the default env and return the result."
+  [p]
+  (-> (default-env)
+      (exec p)
+      eval
+      (get 'stack)
+      repr))
+
+(defn run
+  [env p]
+  (eval (exec env p)))
 
 #+END_SRC
 
@@ -1668,7 +1676,9 @@ execution of the inner environment, or do whatever other arbitrary
 operations on it.
 *** Implementation
 Let's add some words that help us step through execution of an
-environment expressed as kcats data.
+environment expressed as kcats data. First some core words to do low
+level operations (create an environment to execute a program in, and
+also step through the execution of that environment):
 #+begin_src clojure
 (in-ns 'kcats.core)
 
@@ -1681,48 +1691,49 @@ environment expressed as kcats data.
                       'fn (f-stack 1 (comp default-env list*))}})
 #+end_src
 
-Now that we can step, and we have predicates, we can specify in kcats
-itself when execution should stop, and just keep running until either
-that condition is true or the execution is finished. For example:
+We can make some handy words to help debug programs.
 
-#+begin_src clojure :tangle no
-[[stack [1 2 3 4 5]]
- [expression [[+] step]]]
-[clone [stack] lookup first 8 >] ;; ToS greater than 8
-continue ;; step until above is true or all done
+#+begin_src kcats :tangle src/kcats/lexicon.kcats
+[tos [[spec [[environment] [item]]]
+      [definition [[stack] lookup first]]
+      [examples [[[[[stack [1 2 3]]
+                    [expression [[+] step]]]
+                   tos]
+                  [1]]]]]]
+
+[toe [[spec [[environment] [item]]]
+      [definition [[expression] lookup first]]
+      [examples [[[[[stack [1 2 3]]
+                    [expression [[+] step]]]
+                   toe]
+                  [[+]]]]]]]
+
+[break [[spec [[environment [program condition]]
+               [environment [program condition]]]]
+        [definition [[[[[expression] lookup something?] ;; something still in the expression
+                       [swap execute not]] ;; check condition not true yet
+                      [execute]
+                      every?] ;; break?
+                     [eval-step]  ;; evaluate the environment one step
+                     while]]]]
+
+[advance [[spec [[environment environment]]]
+          [definition [[[expression] lookup count] shield swap ;; count up the expression length, we'll run until it's smaller than this
+                       
+                       [[expression] lookup count
+                        [[pos?] [<=]] [execute] every?] ;; only stop if expr empty or shorter than we started off
+                       [eval-step]  ;; evaluate the environment one step
+                       while]]]]
 #+end_src
 
-We can make some handy words to help.
-
-#+begin_src clojure
-(in-ns 'kcats.core)
-(swap! core-words merge
-       {'tos {'spec '[[environment] [item]]
-              'definition '[[stack] lookup first]
-              'doc "top of stack"
-              'examples '[[[[[stack [1 2 3 4 5]]
-                             [expression [[+] step]]]
-                            tos]
-                           [1]]]}
-        'toe {'spec '[[environment] [item]]
-              'definition '[[expression] lookup first]
-              'doc "top of expression"
-              'examples '[[[[[stack [1 2 3 4 5]]
-                             [expression [[+] step]]]
-                            toe]
-                           [[+]]]]}})
-#+end_src
-
-Here's an example showing how this functionality can be used. Let's
-say we want to count the number of times each word is executed while
-running a program.
+*** Other examples
+**** Count the number of times each word is executed while running a program.
 
 #+begin_src kcats
 [[] ;; empty list to put word counts in
- [lexicon ;; the inner environment, load the lexicon - probably should make this automatic
-  10 [0 >] [clone dec] while]  ;; the sample program to run
+ [10 [0 >] [clone dec] while]  ;; the sample program to run
  environment 
- [[expression] lookup nothing? not] ;; something still in the expression, keep running
+ [[expression] lookup something?] ;; something still in the expression, keep running
  [[[expression] lookup first] shield ;; get the item we're about to execute
   swap ;; put it under the environment
   [[word?] ; if it's a word
@@ -1738,39 +1749,65 @@ running a program.
  while 
  discard] ;; drop the environment and just report the word counts
 #+end_src
-*** Notes
-TODO: the dictionary spec can be replaced with predicate programs,
-that will be run with =shield= before the actual word and if it
-returns false, will raise an error. Then this functionality can be
-turned on optionally in the runtime, just as the debugger is
-controlled.
 
-Is it better to have data structures that match clojure or kcats? For
-example, clojure idioms say that the environment should be a map with
-namespaced keyword keys. But kcats would say it's a list of pairs with
-words as keys. This matters in nested envs because each "step" of
-execution needs to do something with this data. If it's pure clojure,
-then it's easy for the runtime to manipulate but then the kcats user
-doesn't know what it is. If it's kcats data, then the user will
-recognize it but it will be inefficient for the clojure runtime to
-work with.
+**** TODO spec checking
+clojure spec check can be replaced with predicate programs, that will
+be run with =shield= before the actual word and if it returns false,
+will raise an error. 
+**** TODO Trace output
+#+begin_src kcats
+[[0 [1 2 3 4 5] [+] step]  ;; the sample program to run
+ environment
+ 
+ [[expression] lookup something?] ;; break?
+ [+print-env eval-step]  ;; evaluate the environment one step
+ while]
 
-One solution (and I am coming around to this approach) is to remain
-clojure data structures all along but be able to convert it to kcats
-format when leaving control of the runtime (for example when printing
-out for a user, or being serialized over the wire). This is still
-tricky though, eg if you have a clojure map with namespaced keys and a
-kcats word key you want to look up, how do you know what namespace to
-prepend to find it? Maybe this will always be obvious (probably
-=kcats.core= since no kcats program could create a namespaced
-keyword). This approach is already used somewhat in association
-lists - clojure maps are valid on the stack as association lists.
-
-another approach is to ditch clojure's idioms and just make the
-internal data kcats data so that a kcats program can easily manipulate
-it. The downside here is that clojure tooling doesn't like it (eg spec
-only wants keywords as keys, not symbols) and it breaks the levels of
-abstraction.
+#+end_src
+**** DONE Step count limiting
+When testing or debugging, limit the number of steps to avoid a
+possible infinite loop.
+#+begin_src kcats
+[200 ;; step count remaining
+ [10 [0 >] [clone dec] while]  ;; the sample program to run
+ environment
+ 
+ [[expression] lookup something? ;; something still in the expression
+  [pos?] dip and] ;; still step budget remaining
+ [eval-step ;; evaluate the environment one step
+  [dec] dip] ;; decrease the step budget 
+ while
+ 
+ [stack] lookup] ;; return the output
+#+end_src
+**** DONE Breakpoint
+#+begin_src kcats
+[[[[toe [+] unwrap =]
+   [tos 3 >]]
+  [execute]
+  every?] ;; when to stop - when we're about to add and tos already >3
+ [0 [1 2 3 4 5] [+] step]  ;; the sample program to run
+ environment
+ 
+ [[[[expression] lookup something?] ;; something still in the expression
+   [swap execute not]] ;; don't stop yet
+  [execute]
+  every?] ;; break?
+ [eval-step]  ;; evaluate the environment one step
+ while]
+#+end_src
+**** TODO Step over
+#+begin_src kcats
+[[0 [1 2 3 4 5] [+] step]  ;; the sample program to run
+ environment
+ 
+[[expression] lookup count] shield swap;; count up the expression length, we'll run until it's smaller than this
+ 
+ [[expression] lookup count
+  [[pos?] [<=]] [execute] every?] ;; only stop if expr empty or shorter than we started off
+ [eval-step]  ;; evaluate the environment one step
+ while]
+#+end_src
 ** Pipes
 *** Basics
 Pipes help you coordinate - they give you a way to get values from
@@ -2254,13 +2291,13 @@ Then a socket has both in and out, via the input/output streams.
                   'close (core/stack-effect [p] (do (close p) [p]))
                   'closed? (core/stack-effect [p] [(closed? p)]) 
                   'spawn (fn [{:syms [stack] :as env}]
-                           ;;(print-env env)
                            (let [expr (first stack)]
                              (->> expr
                                   core/default-env
-                                  (eval {:before-step core/print-env})
+                                  core/eval
                                   future))
-                           (update env 'stack rest))}]
+                           (update env 'stack rest))
+                  'stdout (core/f-stack 0 (fn [] System/out))}]
        [w {'fn f}])
      (into {})
      (swap! core/core-words merge))
@@ -2291,7 +2328,9 @@ Then a socket has both in and out, via the input/output streams.
           [definition [[[[type [file] unwrap =]
                          [value
                           +clojure.java.io/file
-                          +clojure.java.io/output-stream]]]
+                          +clojure.java.io/output-stream]]
+                        [[type [stdout] unwrap =]
+                         [stdout]]]
                        decide]]]]
 
 [tunnel [[spec [[item] [pipe]]]
@@ -2621,7 +2660,7 @@ needs to support comments. clojure reader probably sufficient?
 ** DONE Nested envs no longer need to convert back and forth
 ** TODO More support for nested/related envs
 Debuggers, spawning, ingesting etc
-** TODO Native spec
+** DONE Native spec
 Write spec in terms of predicates that return true if what's on the
 stack is valid for the word. Probably not easy to get an explanation
 as detailed as clojure.spec, but most of the specs should be very
