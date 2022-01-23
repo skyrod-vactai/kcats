@@ -574,6 +574,16 @@ they actually are followed.
                                     (Math/abs actual-length-change)))))
     (validate-placeholders spec before after)))
 #+END_SRC
+*** TODO Add facilities to take a program and calculate its stack effect.
+
+For example: =clone discard= 
+
+The specs (respectively) are  =[[[item a]] [[item a] [item a]]]= and =[[item] []]=
+
+So if we run it on a stack =[1]=. The first step will apply labels to
+what's on the stack, so the =1= gets a label =[item a]=. The result is
+=[1 1]= and then the labels are applied again (since the resulting 1's
+are copies of the original, they already have this label.
 
 ** Evaluation
 Next we're going to define how the kcats language executes (or
@@ -2432,12 +2442,6 @@ pipes, which is just two pipes with the sender and receiver swapped)
 ** Crypto
 We're going to need to call some platform crypto functions, so lets
 make them accessible.
-#+begin_src clojure :tangle src/kcats/crypto.clj
-(ns kcats.crypto
-  (:require [kcats.core :as core])
-  (:import [java.security MessageDigest SecureRandom KeyPairGenerator Signature]))
-#+end_src
-
 #+begin_src kcats :tangle src/kcats/lexicon.kcats
 [hash [[spec [[bytes] [bytes]]]
        [definition [[[[bytes?] [["SHA-256"
@@ -2457,27 +2461,37 @@ make them accessible.
                    ,*!**initialize 
                    
                    !*generateKeyPair
-                   [!*getPublic] shield
+                   [!*getPublic !*getEncoded] shield
 
                    wrap [ec-keypair] join
                    swap
-                   !*getPrivate pack
+                   !*getPrivate !*getEncoded pack
                    [public type private] swap zip]]]]
 
-[encode [[spec [[[item data] [item as]] [item]]]
-         [definition [[[[swap type base64 =]
-                        [bytes
+[encode [[spec [[[item as] [item data]] [item]]]
+         [definition [[[[type base64 =]
+                        [discard
+                         bytes
                          [!java.util.Base64/getEncoder] dip
-                         !**encodeToString
-                         swap discard]]]
+                         !**encodeToString]]
+                       [[swap type publickey =]
+                        [discard
+                         [publickey] lookup
+                         !*getEncoded]]]
                       decide]]]]
 
-[decode [[spec [[[item data] [item as]] [item]]]
-         [definition [[[[swap type base64 =]
-                        [bytes
-                         [!java.util.Base64/getEncoder] dip
-                         !**encodeToString
-                         swap discard]]]
+[decode [[spec [[[item as] [item data]] [item]]]
+         [definition [[[[type base64 =]
+                        [discard
+                         bytes
+                         [!java.util.Base64/getDecoder] dip
+                         !**decode]]
+                       [[type publickey =]
+                        [discard
+                         value
+                         !*java.security.spec.X509EncodedKeySpec.
+                         "EC" !*java.security.KeyFactory/getInstance
+                         swap !**generatePublic]]]
                       decide]]]]
 
 [sign [[spec [[[item message] [bytes key]] [bytes]]]
@@ -2501,6 +2515,12 @@ make them accessible.
 ;;        (.update m))]
 ;;  (.verify signer s))])
 #+end_src
+
+#+begin_src clojure :tangle src/kcats/crypto.clj
+(ns kcats.crypto
+  (:require [kcats.core :as core])
+  (:import [java.security MessageDigest SecureRandom KeyPairGenerator Signature]))
+#+end_src
 #+begin_src kcats
 ;; in progress example sign
 ["foo" key [private] lookup
@@ -2517,6 +2537,43 @@ make them accessible.
  ;[discard "bar" key] dipdown ;; try different key for verify
  ;;20 pack ;; add another byte to the sig, to make it invalid
  [[public] lookup] dipdown verify]
+#+end_src
+
+We're going to need a way of encoding the public keys. java has its
+own (you can call .getEncoded()), and decode like this (haven't tried yet):
+
+#+begin_src java
+KeyFactory kf = KeyFactory.getInstance("ECDSA");
+PublicKey pubKey2 = kf.generatePublic(new X509EncodedKeySpec(encodedPubKey));
+#+end_src
+
+kcats example of key encode/decode
+#+begin_src kcats
+["foo" key [public] lookup !*getEncoded
+ !*java.security.spec.X509EncodedKeySpec.
+ "EC" !*java.security.KeyFactory/getInstance
+ swap !**generatePublic]
+
+;; should make this part of the 'decode' word somehow
+#+end_src
+
+How to encode things like byte arrays. Have to be careful here as byte
+arrays are mutable, passing to a pipe can lead to concurrency
+issues. But that applies to all mutable objects.
+#+begin_src clojure :tangle no
+; encode byte array as base64
+
+(defmethod print-method (Class/forName "[B") [b w]
+              (.write w "#bytes \"")
+              (.write w (String. (.encode (java.util.Base64/getEncoder) b)))
+              (.write w "\""))
+
+; reading the printed byte array back into bytes
+(prn (edn/read-string {:readers
+                              {'bytes (fn [s]
+                                            (.decode (java.util.Base64/getDecoder) s))}}
+                             "#bytes \"aGVsbG8gd29ybGQ=\""))
+
 #+end_src
 * Tools
 ** Debugging
