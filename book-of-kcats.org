@@ -958,6 +958,22 @@ later. We put this here because this has to be clojure code.
                ;; means we generate the fn from spec
                (from-spec word-def))))))
 
+;; add some functions to support immutable byte arrays
+(defn conj-byte
+  "adds another byte to ArraySeq bs"
+  [bs b]
+  (let [c (count bs)
+        bs (byte-array (inc c) bs)]
+    (seq (doto bs
+           (aset-byte c b)))))
+
+(defn concat-bytes
+  "joins two byte ArraySeqs"
+  [a b]
+  (seq (byte-array (concat a b))))
+
+(def bytes? (partial instance? clojure.lang.ArraySeq$ArraySeq_byte))
+
 (def axiom-words
   {'execute (effect [p] [p []])
    'wrap (stack-effect [a] [[a]])
@@ -1003,10 +1019,6 @@ later. We put this here because this has to be clojure code.
    
    'unpack (env-effect 1 (fn [[l & others]]
                            [[] [(nil->nothing l) (vec others)]]))
-   'join (stack-effect [a b]
-                       (if (and (string? a) (string? b))
-                         [(str b a)]
-                         [(vec (concat b a))]))
    'range (f-stack 2 (comp vec range))
    'evert (fn [{[l & others] 'stack :as env}]
             (assoc env 'stack (apply list (vec others) l)))
@@ -1208,7 +1220,7 @@ go into more detail on this particular data type in [[*Maps/associations][Associ
        [definition [[[[list?] [++concat +vec]]
                      [[[string?] both?] [++str]]
                      ;; could also just check if it's an array 
-                     [[[bytes?] both?] [++concat +into-array]]]
+                     [[[bytes?] both?] [++concat-bytes]]]
                     decide]]
        [examples [[[["a" "b"] ["c" "d"] join] [["a" "b" "c" "d"]]]
                   [["ab" "cd" join] ["abcd"]]
@@ -1240,10 +1252,7 @@ go into more detail on this particular data type in [[*Maps/associations][Associ
 ;; now we'll allow it.
 [pack [[spec [[item list] [list]]]
        [definition [[[[swap bytes?]
-                      [[!java.io.ByteArrayOutputStream.] dipdown 
-                       [*!*write] dip ;; the list into the stream
-                       ,*!*write ;; the item into the stream
-                       !*toByteArray]]
+                      [++conj-byte]]
 
                      [[swap string?]
                       [!*java.lang.String/valueOf !**concat]]                            
@@ -1385,7 +1394,7 @@ go into more detail on this particular data type in [[*Maps/associations][Associ
          [definition [+second]]
          [examples [[[[4 5 6] second] [5]]]]]]
 
-[bytes? [[spec [[item] [boolean]]]
+[bytes? [[spec [[item] [boolean]]] 
          [definition [+bytes?]]]]
 
 [string? [[spec [[item] [boolean]]]
@@ -1395,8 +1404,8 @@ go into more detail on this particular data type in [[*Maps/associations][Associ
           [definition [+word?]]]]
 
 [bytes [[spec [[item] [bytes]]]
-        [definition [[[[string?] [!*getBytes]]
-                      [[bytes?] []]]
+        [definition [[[[string?] [!*getBytes bytes]]
+                      [[+clojure.core/bytes?] [+seq]]] ;; convert to immutable byte sequence
                      decide]]]]
 
 [map [[spec [[program list] [list]]]
@@ -2563,10 +2572,17 @@ issues. But that applies to all mutable objects.
 #+begin_src clojure :tangle no
 ; encode byte array as base64
 
+
+
 (defmethod print-method (Class/forName "[B") [b w]
-              (.write w "#bytes \"")
-              (.write w (String. (.encode (java.util.Base64/getEncoder) b)))
-              (.write w "\""))
+  (.write w "#bytes \"")
+  (.write w (String. (.encode (java.util.Base64/getEncoder) b)))
+  (.write w "\""))
+
+(defmethod print-method clojure.lang.ArraySeq$ArraySeq_byte [b w]
+  (.write w "#bytes \"")
+  (.write w (String. (.encode (java.util.Base64/getEncoder) (.array b))))
+  (.write w "\""))
 
 ; reading the printed byte array back into bytes
 (prn (edn/read-string {:readers
@@ -2746,6 +2762,16 @@ in an application, and be able to
 + Revert changes
 ** TODO Code distribution method
 Let's say we write an app or library, how do we distribute it?
+** TODO Clean up all the vector conversion
+I've been calling =vec= a lot, sometimes just so the list will print
+out with square braces. I now have a =repr= function that could do
+this, so using =vec= for that purpose is no longer needed.
+
+However, I can't get rid of all of them- for example, calling =conj=
+on a vector vs list adds at different ends of the list so they are not
+interchangeable in that respect. It may be dangerous to leave any
+lists lying around if they might get conjed onto expecting it to go on
+the end.
 * Notes
 ** Dispatch
 *** Basics
