@@ -2726,24 +2726,14 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-rug = "1.15.0"    
+rug = "1.15.0"
+edn-rs = "0.17.0"    
 #+end_src
 ** Stack
-Let's try a hello world to make sure the toolchain is working
-#+begin_src rust :tangle src/helloworld.rs
-fn main() {
-    println!("Hello world!");   
-}
-#+end_src
 
-#+RESULTS:
-: Hello world!
-
-Success!
-
-#+begin_src rust :tangle src/main.rs
-//extern crate rug;
-//use rug::{Assign, Integer};
+#+begin_src rust :tangle src/main.rs :crates '((rug . "1.15.0") (edn-rs . "0.17.0"))
+extern crate rug;
+use rug::{Assign, Integer};
 
 use std::collections::HashMap;
 use std::iter::FromIterator;
@@ -2756,7 +2746,6 @@ type Bytes = Vec<u8>;
 
 type Int = i32;
 
-
 #[derive(Debug, Clone)]
 enum Item {
     Int(i32),
@@ -2765,7 +2754,7 @@ enum Item {
     Bytes(Bytes),
     String(String),
     Word(Word),
-    List(List)
+    List(List),
 }
 
 type Stack = Vec<Item>;
@@ -2775,25 +2764,25 @@ type Dictionary = HashMap<Word, WordDef>;
 //dictionary stuff
 struct WordDocs {
     examples: Option<List>,
-    spec: Option<List>
+    spec: Option<List>,
 }
 struct AxiomDef {
     docs: WordDocs,
 }
 struct DerivedDef {
     docs: WordDocs,
-    definition: List
+    definition: List,
 }
 
 enum WordDef {
     Axiom(AxiomDef),
-    Derived(DerivedDef)
+    Derived(DerivedDef),
 }
 
 struct Environment {
-    Stack: Stack,
-    Expression: Stack,
-    Dictionary: Dictionary
+    stack: Stack,
+    expression: Stack,
+    dictionary: Dictionary,
 }
 
 type StepResult<'a> = Result<&'a mut Environment, Error>;
@@ -2806,137 +2795,132 @@ type StepResult<'a> = Result<&'a mut Environment, Error>;
 
 // fn err(env: &mut Environment, s: String) -> Result<&mut Environment, String> {
 //    Err(EnvErr {Environment: env,
-//            Error: s}) 
+//            Error: s})
 // }
 
-
 fn f_stack1(f: fn(Item) -> Result<Item, Error>, env: &mut Environment) -> StepResult {
-    if let Some(x) = env.Stack.pop() {
-        env.Stack.push(f(x)?);
+    if let Some(x) = env.stack.pop() {
+        env.stack.push(f(x)?);
         Ok(env)
+    } else {
+        Err("stack underflow".to_string())
     }
-    else { Err("Stack underflow".to_string())}
 }
 
-fn f_stack2(f: fn(Item, Item)-> Result<Item, Error>, env: &mut Environment) -> StepResult {
-    let i = env.Stack.pop();
-    let j = env.Stack.pop();
+fn f_stack2(f: fn(Item, Item) -> Result<Item, Error>, env: &mut Environment) -> StepResult {
+    let i = env.stack.pop();
+    let j = env.stack.pop();
     match (i, j) {
         (Some(i), Some(j)) => {
-            env.Stack.push(f(i,j)?);
+            env.stack.push(f(i, j)?);
             Ok(env)
-        }, 
-        _ => { Err("Stack underflow".to_string()) }
+        }
+        _ => Err("stack underflow".to_string()),
     }
 }
 
-fn act_axiom(word: Word, e: &mut Environment)  -> StepResult {
+fn act_axiom(word: Word, e: &mut Environment) -> StepResult {
     match word.as_str() {
-        "+" => { f_stack2(plus, e)},
-        "clone" => { clone(e) },
-        "inc" => { f_stack1(inc, e)},
-        "discard" => { discard(e) },
-        _ => { Err("unknown axiom word".to_string())}    
+        "+" => f_stack2(plus, e),
+        "clone" => clone(e),
+        "inc" => f_stack1(inc, e),
+        "discard" => discard(e),
+        _ => Err("unknown axiom word".to_string()),
     }
 }
 
-fn eval_step (env: &mut Environment) -> StepResult {
-    let nextItem = env.Expression.pop();
+fn eval_step(env: &mut Environment) -> StepResult {
+    let nextItem = env.expression.pop();
 
     if let Some(val) = nextItem {
         if let Item::Word(word) = val {
-            
-            if let Some(dfn) = env.Dictionary.get(&word){
+            if let Some(dfn) = env.dictionary.get(&word) {
                 match dfn {
-                    WordDef::Axiom(..) => {
-                        act_axiom(word, env)
-                    }
+                    WordDef::Axiom(..) => act_axiom(word, env),
                     WordDef::Derived(d) => {
                         // has a definition, put it into expression (in reverse)
                         let mut items = d.definition.clone();
                         items.reverse();
-                        env.Expression.extend(items);
-                        
+                        env.expression.extend(items);
+
                         Ok(env)
                     }
                 }
-            }
-            else {
+            } else {
                 Err("unknown word ".to_string())
             }
-        }
-        else {
+        } else {
             // not a word, just push onto stack
-            env.Stack.push(val);
+            env.stack.push(val);
             Ok(env)
         }
-    }
-    else {
-        Err("Expression is empty".to_string())
+    } else {
+        Err("expression is empty".to_string())
     }
 }
-
 
 fn eval(env: &mut Environment) -> StepResult {
     let mut result: StepResult = Result::Ok(env);
     loop {
         if let Ok(env) = result {
-            if ! env.Expression.is_empty() {
+            if !env.expression.is_empty() {
                 result = eval_step(env);
+            } else {
+                break Ok(env);
             }
-            else {break Ok(env)}
-            
+        } else {
+            break result;
         }
-        else {break result}    
     }
 }
 
 // some axiom word functions
 fn plus(i: Item, j: Item) -> Result<Item, String> {
     match (i, j) {
-        (Item::Int(i), Item::Int(j)) => { Ok(Item::Int(i+j)) },
-        _ => { Err("Invalid type for +".to_string()) }
+        (Item::Int(i), Item::Int(j)) => Ok(Item::Int(i + j)),
+        _ => Err("Invalid type for +".to_string()),
     }
 }
 
 fn inc(i: Item) -> Result<Item, String> {
-    if let Item::Int(i) = i{
-        Ok(Item::Int(i+1))
+    if let Item::Int(i) = i {
+        Ok(Item::Int(i + 1))
     } else {
         Err("Invalid type for inc".to_string())
     }
 }
 
 fn clone(env: &mut Environment) -> StepResult {
-    if let Some(last) = env.Stack.last().map(|v| (*v).clone()) {
-        env.Stack.push(last);
+    if let Some(last) = env.stack.last().map(|v| (*v).clone()) {
+        env.stack.push(last);
         Ok(env)
-    }
-    else {
+    } else {
         Err("stack underflow".to_string())
     }
 }
 
 fn discard(env: &mut Environment) -> StepResult {
-    if let Some(_) = env.Stack.pop() {
+    if let Some(_) = env.stack.pop() {
         Ok(env)
-    }
-    else {
+    } else {
         Err("stack underflow".to_string())
     }
 }
 
 fn print_result(r: StepResult) {
     match r {
-        Err(e) => { println!("{}", e) },
-        Ok(env) => { println!("{:#?}", env.Stack); }
+        Err(e) => {
+            println!("{}", e)
+        }
+        Ok(env) => {
+            println!("{:#?}", env.stack);
+        }
     }
 }
 
 fn word(s: &str) -> Item {
     Item::Word(Word::from(s))
 }
-
 
 fn main() {
     let mut stack = vec![
@@ -2947,29 +2931,38 @@ fn main() {
         Item::Int(9),
         word("clone"),
         word("+"),
-        word("inc")
+        word("inc"),
+        word("inc"),
     ];
     stack.reverse();
 
-    let words = vec!["+".to_string(),
-                     "clone".to_string(),
-                     "inc".to_string(),
-                     "swap".to_string(),
-                     "discard".to_string(),
-                     "inc".to_string(),
-                     "inc".to_string(),
+    let words = vec![
+        "+".to_string(),
+        "clone".to_string(),
+        "inc".to_string(),
+        "swap".to_string(),
+        "discard".to_string(),
+        "inc".to_string(),
+        "inc".to_string(),
+    ];
 
-];
-    
-    let dict: Dictionary = HashMap::from_iter(
-        words.iter().map(|w| {
-            return (w.clone(), WordDef::Axiom(AxiomDef
-                               {docs: WordDocs {examples: None,
-                                                spec: None}}))}));
-    
-    let mut env = Environment {Stack : Vec::new(),
-                               Expression : stack,
-                               Dictionary: dict};
+    let dict: Dictionary = HashMap::from_iter(words.iter().map(|w| {
+        (
+            w.clone(),
+            WordDef::Axiom(AxiomDef {
+                docs: WordDocs {
+                    examples: None,
+                    spec: None,
+                },
+            }),
+        );
+    }));
+
+    let mut env = Environment {
+        stack: Vec::new(),
+        expression: stack,
+        dictionary: dict,
+    };
 
     print_result(eval(&mut env));
 }
