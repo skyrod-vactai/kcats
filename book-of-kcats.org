@@ -2727,28 +2727,24 @@ edition = "2021"
 
 [dependencies]
 rug = "1.15.0"
-edn-rs = "0.17.0"    
+edn-format = "3.2.2"    
 #+end_src
 ** Stack
-
-#+begin_src rust :tangle src/main.rs :crates '((rug . "1.15.0") (edn-rs . "0.17.0"))
-extern crate rug;
-use rug::{Assign, Integer};
-
+Let's start by defining some data structures in a separate module
+#+begin_src rust :tangle src/types.rs
 use std::collections::HashMap;
-use std::iter::FromIterator;
 
-type Word = String;
+pub type Word = String;
 
-type List = Vec<Item>;
+pub type List = Vec<Item>;
 
-type Bytes = Vec<u8>;
+pub type Bytes = Vec<u8>;
 
-type Int = i32;
+pub type Int = i64;
 
 #[derive(Debug, Clone)]
-enum Item {
-    Int(i32),
+pub enum Item {
+    Int(Int),
     Float(f64),
     Boolean(bool),
     Bytes(Bytes),
@@ -2757,35 +2753,48 @@ enum Item {
     List(List),
 }
 
-type Stack = Vec<Item>;
-type Error = String;
-type Dictionary = HashMap<Word, WordDef>;
+pub type Stack = Vec<Item>;
+pub type Error = String;
+pub type Dictionary = HashMap<Word, WordDef>;
 
 //dictionary stuff
-struct WordDocs {
-    examples: Option<List>,
-    spec: Option<List>,
+pub struct WordDocs {
+    pub examples: Option<List>,
+    pub spec: Option<List>,
 }
-struct AxiomDef {
-    docs: WordDocs,
+pub struct AxiomDef {
+    pub docs: WordDocs,
 }
-struct DerivedDef {
-    docs: WordDocs,
-    definition: List,
+pub struct DerivedDef {
+    pub docs: WordDocs,
+    pub definition: List,
 }
 
-enum WordDef {
+pub enum WordDef {
     Axiom(AxiomDef),
     Derived(DerivedDef),
 }
 
-struct Environment {
-    stack: Stack,
-    expression: Stack,
-    dictionary: Dictionary,
+pub struct Environment {
+    pub stack: Stack,
+    pub expression: Stack,
+    pub dictionary: Dictionary,
 }
 
-type StepResult<'a> = Result<&'a mut Environment, Error>;
+pub type StepResult<'a> = Result<&'a mut Environment, Error>;
+#+end_src
+
+#+RESULTS:
+
+#+begin_src rust :tangle src/main.rs :crates '((rug . "1.15.0") (edn-rs . "0.17.0"))
+extern crate rug;
+use rug::{Assign, Integer};
+mod types;
+use crate::types::*;
+mod axiom;
+mod serialize;
+use std::iter::FromIterator;
+use std::collections::HashMap;
 
 // #[derive(Debug)]
 // struct EnvErr {
@@ -2821,10 +2830,11 @@ fn f_stack2(f: fn(Item, Item) -> Result<Item, Error>, env: &mut Environment) -> 
 
 fn act_axiom(word: Word, e: &mut Environment) -> StepResult {
     match word.as_str() {
-        "+" => f_stack2(plus, e),
-        "clone" => clone(e),
-        "inc" => f_stack1(inc, e),
-        "discard" => discard(e),
+        "+" => f_stack2(axiom::plus, e),
+        "clone" => axiom::clone(e),
+        "inc" => f_stack1(axiom::inc, e),
+        "discard" => axiom::discard(e),
+        "execute" => axiom::execute(e),
         _ => Err("unknown axiom word".to_string()),
     }
 }
@@ -2874,38 +2884,6 @@ fn eval(env: &mut Environment) -> StepResult {
     }
 }
 
-// some axiom word functions
-fn plus(i: Item, j: Item) -> Result<Item, String> {
-    match (i, j) {
-        (Item::Int(i), Item::Int(j)) => Ok(Item::Int(i + j)),
-        _ => Err("Invalid type for +".to_string()),
-    }
-}
-
-fn inc(i: Item) -> Result<Item, String> {
-    if let Item::Int(i) = i {
-        Ok(Item::Int(i + 1))
-    } else {
-        Err("Invalid type for inc".to_string())
-    }
-}
-
-fn clone(env: &mut Environment) -> StepResult {
-    if let Some(last) = env.stack.last().map(|v| (*v).clone()) {
-        env.stack.push(last);
-        Ok(env)
-    } else {
-        Err("stack underflow".to_string())
-    }
-}
-
-fn discard(env: &mut Environment) -> StepResult {
-    if let Some(_) = env.stack.pop() {
-        Ok(env)
-    } else {
-        Err("stack underflow".to_string())
-    }
-}
 
 fn print_result(r: StepResult) {
     match r {
@@ -2923,19 +2901,7 @@ fn word(s: &str) -> Item {
 }
 
 fn main() {
-    let mut stack = vec![
-        Item::String("foo".to_string()),
-        Item::Int(3),
-        Item::Int(4),
-        word("discard"),
-        Item::Int(9),
-        word("clone"),
-        word("+"),
-        word("inc"),
-        word("inc"),
-    ];
-    stack.reverse();
-
+    
     let words = vec![
         "+".to_string(),
         "clone".to_string(),
@@ -2943,11 +2909,11 @@ fn main() {
         "swap".to_string(),
         "discard".to_string(),
         "inc".to_string(),
-        "inc".to_string(),
+        "execute".to_string()
     ];
 
     let dict: Dictionary = HashMap::from_iter(words.iter().map(|w| {
-        (
+        return (
             w.clone(),
             WordDef::Axiom(AxiomDef {
                 docs: WordDocs {
@@ -2958,139 +2924,119 @@ fn main() {
         );
     }));
 
+    let program = "3 4 discard 9 [clone + inc inc] execute";
+    let mut parsed = serialize::parse(program.to_string());
+    parsed.reverse();
     let mut env = Environment {
         stack: Vec::new(),
-        expression: stack,
+        expression: parsed,
         dictionary: dict,
     };
-
+    
     print_result(eval(&mut env));
 }
 #+end_src
 
 #+RESULTS:
-#+begin_example
-[
-    String(
-        "foo",
-    ),
-    Int(
-        3,
-    ),
-    Int(
-        19,
-    ),
-]
-#+end_example
+: error: Could not compile `cargoxVWZQV`.
 
-Now let's see if we can do some basic stack operations, hardcoded
+Here are the axiom functions. Some of them are just functions of the
+topmost stack items, and we'll call them with =f_stack1= etc. The rest
+modify the expression or dictionary and are functions of the environment.
+#+begin_src rust :tangle src/axiom.rs
+// some axiom word functions
+use crate::types::*;
 
-#+RESULTS:
-
-testing borrow
-
-#+begin_src rust
-#[derive(Debug)]
-struct Person {
-    age: i32,
-    names: Vec<String>
-}
-
-//fn ageUp(mut p: Person) -> Person {
-//    p.age = p.age + 1;
-//    return p;
-//}
-
-fn ageUp(p: &mut Person) {
-    p.age = p.age + 1;
-}
-
-fn main() {
-    let mut p = Person{age: 1,
-                       names: vec!["Abe".to_string(), "Lincoln".to_string()]};
-    let mut r: Result<&mut Person, String> = Ok(&mut p);
-    match r {
-        Ok(ref mut x) => { ageUp(x); },
-        Err(_) => { }
-    }
-    println!("{:#?}", r.unwrap());
-    //p = ageUp(p);
-    //println!("{:#?}", p);    
-}
-#+end_src
-
-#+RESULTS:
-: Person {
-:     age: 2,
-:     names: [
-:         "Abe",
-:         "Lincoln",
-:     ],
-: }
-
-#+begin_src rust
-#[derive(Debug)]
-struct Person {
-    age: i32,
-    names: Vec<String>
-}
-
-fn ageUp(p: &mut Person) {
-    p.age = p.age + 1;
-}
-
-fn main() {
-    let mut p = Person {age: 1,
-                        names: vec!["Abe".to_string(), "Lincoln".to_string()]};
-    ageUp(&mut p);
-    println!("{:#?}", p);
-    //p = ageUp(p);
-    //println!("{:#?}", p);    
-}
-#+end_src
-
-#+RESULTS:
-: Person {
-:     age: 2,
-:     names: [1
-:         "Abe",
-:         "Lincoln",
-:     ],
-: }
-
-Testing traits
-#+begin_src rust
-struct Env {
-    stack: Vec<i32>,
-    word: dyn Word
-}
-
-trait Word {
-    fn act(self, e: &mut Env) -> &Env;
-}
-
-struct Add {}
-
-impl Word for Add {
-    fn act(self, e: &mut Env) -> &Env {
-        let x = e.stack.pop().unwrap();
-        let y = e.stack.pop().unwrap();
-        e.stack.push(x + y);
-        e
+pub fn plus(i: Item, j: Item) -> Result<Item, String> {
+    match (i, j) {
+        (Item::Int(i), Item::Int(j)) => Ok(Item::Int(i + j)),
+        _ => Err("Invalid type for +".to_string()),
     }
 }
 
-fn eval (e: &mut Env) -> &Env {
-    e.word.act(e)
+pub fn inc(i: Item) -> Result<Item, String> {
+    if let Item::Int(i) = i {
+        Ok(Item::Int(i + 1))
+    } else {
+        Err("Invalid type for inc".to_string())
+    }
 }
-fn main() {
-    println!("{}", eval(&mut Env{stack: vec![5,3],
-                                 word: Add{}}));
-    
+
+pub fn clone(env: &mut Environment) -> StepResult {
+    if let Some(last) = env.stack.last().map(|v| (*v).clone()) {
+        env.stack.push(last);
+        Ok(env)
+    } else {
+        Err("stack underflow".to_string())
+    }
 }
+
+pub fn discard(env: &mut Environment) -> StepResult {
+    if let Some(_) = env.stack.pop() {
+        Ok(env)
+    } else {
+        Err("stack underflow".to_string())
+    }
+}
+
+pub fn execute(env: &mut Environment) -> StepResult {
+    if let Some(item) = env.stack.pop() {
+        match item {
+            Item::List(mut program) => {
+                program.reverse();
+                env.expression.append(&mut program);
+                Ok(env)
+            },
+            _ => { Err("Invalid type for execute".to_string())}
+        }
+    } else {
+        Err("stack underflow".to_string())
+    }
+}
+
+
 #+end_src
 
 #+RESULTS:
+: error: Could not compile `cargoYFTjBG`.
+
+Now we'll experiment with parsing edn (so the interpreter can read
+input instead of having it hardcoded):
+
+#+begin_src rust :tangle src/serialize.rs :crates '((edn-format . "3.2.2"))
+extern crate edn_format;
+use crate::types::*;
+
+fn to_item (item: &edn_format::Value) -> Item {
+    match item {
+        edn_format::Value::Integer(i) => { Item::Int(*i) },
+        edn_format::Value::Vector(v) => { Item::List(v.iter().map(|i| to_item(i)).collect::<Vec<Item>>())},
+        edn_format::Value::Symbol(s) => { Item::Word(s.name().to_string()) }
+        _ => { Item::Int(0) }
+        
+    }
+}
+
+fn from_item (item: &Item) -> edn_format::Value { 
+    match item {
+        Item::Int(i) => { edn_format::Value::Integer(*i) },
+        Item::List(v) => { edn_format::Value::Vector(v.iter().map(|i| from_item(i)).collect::<Vec<edn_format::Value>>()) },
+        Item::Word(w) => { edn_format::Value::Symbol(edn_format::Symbol::from_name(w))  }
+        _ => { edn_format::Value::Integer(0) }
+        
+    }
+}
+
+pub fn parse(s: String) -> Vec<Item> {
+    let parser = edn_format::Parser::from_iter(s.chars(), edn_format::ParserOptions::default());
+   
+    parser.map(|r| { to_item(&r.expect("expected valid element"))}).collect()
+}
+
+#+end_src
+
+#+RESULTS:
+: error: Could not compile `cargo75nfdJ`.
 
 * Tools
 ** Debugging
