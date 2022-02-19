@@ -2733,10 +2733,11 @@ edn-format = "3.2.2"
 Let's start by defining some data structures in a separate module
 #+begin_src rust :tangle src/types.rs
 use std::collections::HashMap;
+use std::collections::VecDeque;
 
 pub type Word = String;
 
-pub type List = Vec<Item>;
+pub type List = VecDeque<Item>;
 
 pub type Bytes = Vec<u8>;
 
@@ -2864,9 +2865,8 @@ fn eval_step(env: &mut Environment) -> StepResult {
                     WordDef::Axiom(..) => act_axiom(word, env),
                     WordDef::Derived(d) => {
                         // has a definition, put it into expression (in reverse)
-                        let mut items = d.definition.clone();
-                        items.reverse();
-                        env.expression.extend(items);
+                        let items = d.definition.clone();
+                        env.expression.extend(items.into_iter().rev());
 
                         Ok(env)
                     }
@@ -2907,7 +2907,7 @@ fn print_result(r: StepResult) {
         Ok(env) => {
             env.stack.reverse();
             //TODO: get rid of the clone here
-            println!("{}", serialize::emit(&Item::List(env.stack.clone())));
+            println!("{}", serialize::emit(&Item::List(List::from(env.stack.clone()))));
         }
     }
 }
@@ -2945,12 +2945,11 @@ fn main() {
 
     let mut program = String::new();
     match io::stdin().read_line(&mut program) {
-        Ok(n) => {
+        Ok(_) => {
             let mut parsed = serialize::parse(program);
-            parsed.reverse();
             let mut env = Environment {
                 stack: Vec::new(),
-                expression: parsed,
+                expression: Vec::from_iter(parsed.into_iter().rev()),
                 dictionary: dict,
             };
 
@@ -2972,6 +2971,7 @@ modify the expression or dictionary and are functions of the environment.
 #+begin_src rust :tangle src/axiom.rs
 // some axiom word functions
 use crate::types::*;
+use std::collections::VecDeque;
 
 fn stack_underflow() -> StepResult<'static> {
     Err("Stack underflow".to_string())
@@ -3037,16 +3037,15 @@ pub fn discard(env: &mut Environment) -> StepResult {
     }
 }
 
-fn append_expression(env: &mut Environment, mut p: Vec<Item>) -> StepResult {
-    p.reverse();
-    env.expression.append(&mut p);
+fn append_expression(env: &mut Environment, p: VecDeque<Item>) -> StepResult {
+    env.expression.extend(p.into_iter().rev());
     Ok(env)
 }
 
 pub fn execute(env: &mut Environment) -> StepResult {
     if let Some(item) = env.stack.pop() {
         match item {
-            Item::List(mut program) => append_expression(env, program),
+            Item::List(program) => append_expression(env, program),
             _ => Err("Invalid type for execute".to_string()),
         }
     } else {
@@ -3056,8 +3055,8 @@ pub fn execute(env: &mut Environment) -> StepResult {
 
 pub fn wrap(env: &mut Environment) -> StepResult {
     if let Some(item) = env.stack.pop() {
-        let mut v = Vec::<Item>::new();
-        v.push(item);
+        let mut v = List::new();
+        v.push_front(item);
         env.stack.push(Item::List(v));
         Ok(env)
     } else {
@@ -3067,9 +3066,8 @@ pub fn wrap(env: &mut Environment) -> StepResult {
 
 pub fn unwrap(env: &mut Environment) -> StepResult {
     if let Some(item) = env.stack.pop() {
-        if let Item::List(mut l) = item {
-            l.reverse();
-            env.stack.append(&mut l);
+        if let Item::List(l) = item {
+            env.stack.extend(l.into_iter().rev());
             Ok(env)
         } else {
             Err("Invalid type for unwrap".to_string())
@@ -3084,10 +3082,11 @@ pub fn dip(env: &mut Environment) -> StepResult {
     let s2 = env.stack.pop();
     match (s1, s2) {
         (Some(item1), Some(item2)) => match item1 {
-            Item::List(mut program) => {
+            Item::List(program) => {
                 env.expression.push(Item::Word("unwrap".to_string()));
-                let mut v = Vec::<Item>::new();
-                v.push(item2);
+                let mut v = List::new();
+                v.push_front(item2);            
+
                 env.expression.push(Item::List(v));
                 append_expression(env, program)
             }
@@ -3131,17 +3130,14 @@ pub fn step(env: &mut Environment) -> StepResult {
     let l = env.stack.pop();
     match (p, l) {
         (Some(p), Some(l)) => match (p, l) {
-            (Item::List(p), Item::List(l)) => {
-                if !l.is_empty() {
-                    let litem = l[0].clone();
-                    let lrest = &l[1..];
-                    let mut expr = vec![word("execute")];
-                    if !lrest.is_empty() {
-                        expr.push(Item::List(lrest.to_vec()));
-                        expr.push(Item::List(p.clone()));
-                        expr.push(word("step"))
+            (Item::List(p), Item::List(mut l)) => {
+                if let Some(litem) = l.pop_front() {
+                    if !l.is_empty() {
+                        env.expression.push(word("step"));
+                        env.expression.push(Item::List(p.clone()));
+                        env.expression.push(Item::List(l));
                     }
-                    append_expression(env, expr);
+                    env.expression.push(word("execute"));
                     env.stack.push(litem);
                     env.stack.push(Item::List(p));
                 }
@@ -3161,7 +3157,7 @@ pub fn range(env: &mut Environment) -> StepResult {
             (Item::Int(from), Item::Int(to)) => {
                 env.stack
                     .push(Item::List(
-                        (from..to).map(|i| Item::Int(i)).collect::<Vec<Item>>()));
+                        (from..to).map(|i| Item::Int(i)).collect::<VecDeque<Item>>()));
                 return Ok(env);
             }
             _ => Err("Invalid type for range".to_string()),
@@ -3180,11 +3176,12 @@ input instead of having it hardcoded):
 #+begin_src rust :tangle src/serialize.rs :crates '((edn-format . "3.2.2"))
 extern crate edn_format;
 use crate::types::*;
+use std::collections::VecDeque;
 
 fn to_item (item: &edn_format::Value) -> Item {
     match item {
         edn_format::Value::Integer(i) => { Item::Int(*i) },
-        edn_format::Value::Vector(v) => { Item::List(v.iter().map(|i| to_item(i)).collect::<Vec<Item>>())},
+        edn_format::Value::Vector(v) => { Item::List(v.iter().map(|i| to_item(i)).collect::<VecDeque<Item>>())},
         edn_format::Value::Symbol(s) => { Item::Word(s.name().to_string()) },
         edn_format::Value::Boolean(b) => { Item::Boolean(*b) },
         edn_format::Value::String(s) => { Item::String(s.to_string()) },
@@ -3207,7 +3204,7 @@ fn from_item (item: &Item) -> edn_format::Value {
     }
 }
 
-pub fn parse(s: String) -> Vec<Item> {
+pub fn parse(s: String) -> VecDeque<Item> {
     let parser = edn_format::Parser::from_iter(s.chars(), edn_format::ParserOptions::default());
     parser.map(|r| { to_item(&r.expect("expected valid element"))}).collect()
 }
@@ -3216,7 +3213,7 @@ pub fn emit(item: &Item) -> String {
     edn_format::emit_str(&from_item(item))
 }
 
-pub fn emit_all(items: &Vec<Item>) -> String {
+pub fn emit_all(items: &VecDeque<Item>) -> String {
     let mut s: String = String::new();  
     for i in items {
         s.push_str(&emit(&i));
