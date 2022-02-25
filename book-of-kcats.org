@@ -2733,8 +2733,8 @@ edn-format = "3.2.2"
 ** Stack
 Let's start by defining some data structures in a separate module
 #+begin_src rust :tangle src/types.rs
-use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::{collections::HashMap, hash::Hash};
 
 pub type Word = String;
 
@@ -2746,7 +2746,7 @@ pub type Int = i64;
 
 pub type Float = f64;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone)] 
 pub enum Item {
     Int(Int),
     Float(Float),
@@ -2792,7 +2792,35 @@ pub type StepResult<'a> = Result<&'a mut Environment, Error>;
 pub fn word(s: &str) -> Item {
     Item::Word(Word::from(s))
 }
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum NotDuple {
+    ZeroElements,
+    OneElement,
+    TooMany,
+}
+
+pub trait ToHash<T: Eq + Hash> {
+    fn to_hash(self) -> Result<HashMap<T, T>, NotDuple>;
+}
+
+impl<It: Iterator<Item = ItIt>, ItIt: Iterator<Item = T>, T: Eq + Hash> ToHash<T> for It {
+    fn to_hash(self) -> Result<HashMap<T, T>, NotDuple> {
+        self.map(|mut it_it| {
+            let a = it_it.next().ok_or(NotDuple::ZeroElements)?;
+            let b = it_it.next().ok_or(NotDuple::OneElement)?;
+            if !it_it.next().is_none() {
+                return Err(NotDuple::TooMany);
+            }
+            Ok((a, b))
+        })
+        .collect()
+    }
+}
 #+end_src
+
+#+RESULTS:
+: error: Could not compile `cargom2yLm4`.
 
 #+begin_src rust :tangle src/main.rs :crates '((rug . "1.15.0") (edn-rs . "0.17.0"))
 //extern crate rug;
@@ -2855,6 +2883,7 @@ fn act_axiom(word: Word, e: &mut Environment) -> StepResult {
         "range" => axiom::range(e),
         "recur" => axiom::recur(e),
         "evert" => axiom::evert(e),
+        "lexicon" => axiom::lexicon(e),
         _ => Err("unknown axiom word".to_string()),
     }
 }
@@ -2934,6 +2963,7 @@ fn main() {
         "range".to_string(),
         "recur".to_string(),
         "evert".to_string(),
+        "lexicon".to_string(),
     ];
 
     let dict: Dictionary = HashMap::from_iter(words.iter().map(|w| {
@@ -2975,9 +3005,12 @@ topmost stack items, and we'll call them with =f_stack1= etc. The rest
 modify the expression or dictionary and are functions of the environment.
 #+begin_src rust :tangle src/axiom.rs
 // some axiom word functions
+use super::serialize;
 use crate::types::*;
 use std::collections::VecDeque;
+use std::fs;
 use std::mem;
+use std::hash::Hash;
 
 fn stack_underflow() -> StepResult<'static> {
     Err("Stack underflow".to_string())
@@ -3091,7 +3124,7 @@ pub fn dip(env: &mut Environment) -> StepResult {
             Item::List(program) => {
                 env.expression.push_front(Item::Word("unwrap".to_string()));
                 let mut v = List::new();
-                v.push_front(item2);            
+                v.push_front(item2);
 
                 env.expression.push_front(Item::List(v));
                 append_expression(env, program)
@@ -3161,9 +3194,9 @@ pub fn range(env: &mut Environment) -> StepResult {
     match (from, to) {
         (Some(from), Some(to)) => match (from, to) {
             (Item::Int(from), Item::Int(to)) => {
-                env.stack
-                    .push_front(Item::List(
-                        (from..to).map(|i| Item::Int(i)).collect::<VecDeque<Item>>()));
+                env.stack.push_front(Item::List(
+                    (from..to).map(|i| Item::Int(i)).collect::<VecDeque<Item>>(),
+                ));
                 return Ok(env);
             }
             _ => Err("Invalid type for range".to_string()),
@@ -3219,38 +3252,55 @@ pub fn evert(env: &mut Environment) -> StepResult {
                 mem::swap(&mut env.stack, &mut l);
                 env.stack.push_front(Item::List(l));
                 Ok(env)
-            },
+            }
             _ => Err("Invalid type for evert".to_string()),
-        }
+        },
         _ => stack_underflow(),
     }
 }
 
-// pub fn lexicon(env: &mut Environment) -> StepResult {
-//     let s = fs::read_to_string("src/kcats/lexicon.kcats")?;
-//     let items = serialize::parse(s);
-//     for [w, dfn] in items {
-//         match (w, dfn) {
-//             (Item::Word(w), Item::List(dfn)) => {
-//                 let mut m: HashMap<Word, List>::new();
-//                 for [k, v] in dfn {
-//                     match (k, v) {
-//                         (Item::Word(k), Item::List(v)) => {
-//                             m.insert(Item::Word(k), Item::List(v));
-//                         },
-//                         _ => { return Err("Word definition has invalid type".to_string())}
-//                     }
-//                 }
-//                 env.dictionary.insert(Item::Word(w),
-//                                       DerivedDef{definition: Item::List(m.get(word("definition"))),
-//                                                  docs: WordDocs{examples: m.get(word("examples")),
-//                                                                 spec: m.get(word("spec"))}}
-//                 );
-//             }
-//         }
-//     }
-//     Ok(env);
-// }
+pub fn lexicon(env: &mut Environment) -> StepResult {
+    if let Ok(s) = fs::read_to_string("src/kcats/lexicon.kcats") {
+        let items = serialize::parse(s);
+
+        let h: Result<Vec<List>, String> = items
+            .into_iter()
+            .map(| i |   {
+                if let Item::List(l) = i {
+                    Ok(l)
+                } else {
+                    Err("Lexicon item isn't a list".to_string())
+                }
+            }).collect::<Result<Vec<List>, String>>();
+
+        println!("{:?}", h);
+        Ok(env)
+
+    }
+    else { Err("Could not read from lexicon file".to_string())  }
+
+    // for [w, dfn] in items {
+
+    //     match (w, dfn) {
+    //         (Item::Word(w), Item::List(dfn)) => {
+    //             let mut m: HashMap<Word, List>::new();
+    //             for [k, v] in dfn {
+    //                 match (k, v) {
+    //                     (Item::Word(k), Item::List(v)) => {
+    //                         m.insert(Item::Word(k), Item::List(v));
+    //                     },
+    //                     _ => { return Err("Word definition has invalid type".to_string())}
+    //                 }
+    //             }
+    //             env.dictionary.insert(Item::Word(w),
+    //                                   DerivedDef{definition: Item::List(m.get(word("definition"))),
+    //                                              docs: WordDocs{examples: m.get(word("examples")),
+    //                                                             spec: m.get(word("spec"))}}
+    //             );
+    //         }
+    //     }
+    // }
+}
 #+end_src
 
 #+RESULTS:
