@@ -2733,6 +2733,7 @@ use std::{collections::HashMap, hash::Hash};
 pub type Word = String;
 
 pub type List = VecDeque<Item>;
+pub type KeyList = VecDeque<KeyItem>;
 
 pub type Bytes = Vec<u8>;
 
@@ -2740,7 +2741,7 @@ pub type Int = i64;
 
 pub type Float = f64;
 
-#[derive(Debug, Clone)] 
+#[derive(Debug, Clone)]
 pub enum Item {
     Int(Int),
     Float(Float),
@@ -2749,44 +2750,49 @@ pub enum Item {
     String(String),
     Word(Word),
     List(List),
-    Nothing
+    Nothing,
 }
 
-#[derive(Debug, Clone)] 
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub enum KeyItem {
     Int(Int),
-    Float(Float),
     Boolean(bool),
     Bytes(Bytes),
     String(String),
     Word(Word),
     List(VecDeque<KeyItem>),
-    Nothing
+    Nothing,
 }
 
 pub type Stack = List;
 pub type Error = String;
-pub type Dictionary = HashMap<Word, WordDef>;
 
-//dictionary stuff
+#[derive(Debug)]
 pub struct WordDocs {
     pub examples: Option<List>,
     pub spec: Option<List>,
 }
+
+#[derive(Debug)]
 pub struct AxiomDef {
     pub docs: WordDocs,
 }
 
+#[derive(Debug)]
 pub struct DerivedDef {
     pub docs: WordDocs,
     pub definition: List,
 }
 
+#[derive(Debug)]
 pub enum WordDef {
     Axiom(AxiomDef),
     Derived(DerivedDef),
 }
 
+pub type Dictionary = HashMap<Word, WordDef>;
+
+#[derive(Debug)]
 pub struct Environment {
     pub stack: Stack,
     pub expression: Stack,
@@ -2799,36 +2805,84 @@ pub fn word(s: &str) -> Item {
     Item::Word(Word::from(s))
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum NotDuple {
-    ZeroElements,
-    OneElement,
-    TooMany,
-}
+// #[derive(Debug, PartialEq, Eq)]
+// pub enum NotDuple {
+//     ZeroElements,
+//     OneElement,
+//     TooMany,
+// }
 
-pub trait ToHash<K: Eq + Hash, V> {
-    fn to_hash(self) -> Result<HashMap<K, V>, NotDuple>;
-}
+// pub trait ToHash<K: Eq + Hash, V> {
+//     fn to_hash(self) -> Result<HashMap<K, V>, NotDuple>;
+// }
 
-impl<It: Iterator<Item = ItIt>, ItIt: Iterator<Item = K>, K: Eq + Hash, V> ToHash<K, V> for It {
-    fn to_hash(self) -> Result<HashMap<K, V>, NotDuple> {
-        self.map(|mut it_it| {
-            let a = it_it.next().ok_or(NotDuple::ZeroElements)?;
-            let b = it_it.next().ok_or(NotDuple::OneElement)?;
-            if !it_it.next().is_none() {
-                return Err(NotDuple::TooMany);
-            }
-            Ok((a, b))
-        })
-        .collect()
-    }
-}
+// impl<It: Iterator<Item = ItIt>, ItIt: Iterator<Item = K>, K: Eq + Hash, V> ToHash<K, V> for It {
+//     fn to_hash(self) -> Result<HashMap<K, V>, NotDuple> {
+//         self.map(|mut it_it| {
+//             let a = it_it.next().ok_or(NotDuple::ZeroElements)?;
+//             let b = it_it.next().ok_or(NotDuple::OneElement)?;
+//             if !it_it.next().is_none() {
+//                 return Err(NotDuple::TooMany);
+//             }
+//             Ok((a, b))
+//         })
+//         .collect()
+//     }
+// }
 
-fn to_key_item(i: Item) -> Result<KeyItem, String> {
+pub fn to_key_item(i: Item) -> Result<KeyItem, String> {
     match i {
-        Item::Int(i) => Ok(KeyItem::Int(i));
-        _ => Err("item is not allowed as a hashmap key".to_string())
+        Item::Int(i) => Ok(KeyItem::Int(i)),
+        Item::String(i) => Ok(KeyItem::String(i)),
+        Item::List(l) => Ok(KeyItem::List(
+            l.iter()
+                .map(|i| to_key_item(i.clone()))
+                .collect::<Result<KeyList, String>>()?,
+        )),
+        Item::Word(w) => Ok(KeyItem::Word(w)),
+        Item::Boolean(b) => Ok(KeyItem::Boolean(b)),
+        Item::Bytes(bs) => Ok(KeyItem::Bytes(bs)),
+        Item::Nothing => Ok(KeyItem::Nothing),
+        _ => Err("item is not allowed as a hashmap key".to_string()),
     }
+}
+
+pub fn to_value_item(i: KeyItem) -> Result<Item, String> {
+    match i {
+        KeyItem::Int(i) => Ok(Item::Int(i)),
+        KeyItem::String(i) => Ok(Item::String(i)),
+        KeyItem::List(l) => Ok(Item::List(
+            l.iter()
+                .map(|i| to_value_item(i.clone()))
+                .collect::<Result<List, String>>()?,
+        )),
+        KeyItem::Word(w) => Ok(Item::Word(w)),
+        KeyItem::Boolean(b) => Ok(Item::Boolean(b)),
+        KeyItem::Bytes(bs) => Ok(Item::Bytes(bs)),
+        KeyItem::Nothing => Ok(Item::Nothing),
+        
+    }
+}
+
+pub fn to_entry(mut i: Item) -> Result<(KeyItem, Item), String> {
+    match i {
+        Item::List(mut l) => {
+            let v = l.pop_back();
+            let k = l.pop_back();
+            let e = l.pop_back();
+            match (k, v, e) {
+                (Some(k), Some(v), None) => Ok((to_key_item(k)?, v)),
+                _ => Err("Entry must be a duple".to_string()),
+            }
+        }
+        _ => Err("Hash entry must be a list (of length 2)".to_string()),
+    }
+}
+
+pub fn to_hash(mut l: List) -> Result<HashMap<KeyItem, Item>, String> {
+    l.iter()
+        .map(|i| to_entry(i.clone()))
+        .collect::<Result<HashMap<KeyItem, Item>, String>>()
 }
 #+end_src
 
@@ -3020,10 +3074,9 @@ modify the expression or dictionary and are functions of the environment.
 // some axiom word functions
 use super::serialize;
 use crate::types::*;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::mem;
-use std::hash::Hash;
 
 fn stack_underflow() -> StepResult<'static> {
     Err("Stack underflow".to_string())
@@ -3272,29 +3325,72 @@ pub fn evert(env: &mut Environment) -> StepResult {
     }
 }
 
+fn key_item(s: &str) -> KeyItem {
+    to_key_item(word(s)).unwrap()
+}
+
+fn as_list(i: Option<&Item>) -> Option<List> {
+    if let Some(i) = i {
+        if let Item::List(l) = i {
+            Some(l.clone())
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+fn as_word(i: &KeyItem) -> Option<Word> {
+    if let KeyItem::Word(w) = i {
+        Some(w.clone())
+    } else {
+        None
+    }
+}
+
+fn to_dict(def: HashMap<KeyItem, Item>) -> WordDef {
+    let v = as_list(def.get(&key_item("definition")));
+    let docs = WordDocs {
+        examples: as_list(def.get(&key_item("examples"))),
+        spec: as_list(def.get(&key_item("spec"))),
+    };
+    if let Some(d) = v {
+        WordDef::Derived(DerivedDef {
+            definition: d,
+            docs: docs,
+        })
+    } else {
+        WordDef::Axiom(AxiomDef { docs: docs })
+    }
+}
+
 pub fn lexicon(env: &mut Environment) -> StepResult {
     if let Ok(s) = fs::read_to_string("src/kcats/lexicon.kcats") {
         let items = serialize::parse(s);
 
-        let h: HashMap<KeyItem, Item> = items
-            .into_iter()
-            .map(| i |   {
-                if let Item::List(l) = i {
-                    Ok(l)
-                } else {
-                    Err("Lexicon item isn't a list".to_string())
-                }
-            }).collect::<Result<Vec<List>, String>>()
-            .unwrap()
-            .into_iter()
-            .map(|i| i.into_iter())
-            .to_hash();
+        let vitems = List::from(items);
 
-        println!("{:?}", h);
+        // let mut h = HashMap::new();
+        // let entries = items
+        //     .iter()
+        //     .map(|item| to_entry(item.clone()))
+        //     .collect::<Result<Vec<(KeyItem, Item)>, String>>()?;
+        // for (k, v) in entries {
+        //     h.insert(k, v);
+        // }
+
+        let d: Dictionary = HashMap::from_iter(to_hash(vitems)?.iter().map(|(k, v)| {
+            let v = to_dict(to_hash(as_list(Some(v)).unwrap()).ok().unwrap());
+            (as_word(k).unwrap_or("".to_string()), v)
+        }));
+
+        //println!("{:#?}", d);
+
         Ok(env)
-
+    } else {
+        Err("Could not read from lexicon file".to_string())
     }
-    else { Err("Could not read from lexicon file".to_string())  }
 
     // for [w, dfn] in items {
 
@@ -3538,12 +3634,12 @@ comment is at beginning of line
 extern crate edn_format;
 
 fn main() {
-    println!("{:?}", edn_format::parse_str(";; abc\n ;; def \n\n ced"));
+    println!("{:?}", edn_format::parse_str(";; abc\n;; def \n\n ced"));
 }
 #+end_src
 
 #+RESULTS:
-: Ok(Symbol(Symbol { namespace: None, name: "ced" }))
+: Err(ParserErrorWithContext { context: [], row: 1, col: 2, error: UnexpectedCharacter(';') })
 
 #+begin_src rust
 use std::hash::Hash;
