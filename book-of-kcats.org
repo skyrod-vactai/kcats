@@ -2791,7 +2791,7 @@ pub enum WordDef {
 
 pub type Dictionary = HashMap<Word, WordDef>;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Environment {
     pub stack: Stack,
     pub expression: Stack,
@@ -2816,6 +2816,22 @@ impl From<String> for Error {
 impl From<&str> for Error {
     fn from(s: &str) -> Self {
         Error::from(s.to_string())
+    }
+}
+
+// print out envs in error messages
+impl fmt::Debug for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        if let Some(env) = f.environment {
+            fmt.debug_struct("Error")
+                .field("environment", &self.environment)
+                .field("message", &self.message)
+                .finish()
+        }
+        else {
+            write!(f, "{{ message: {} }}", self.message);
+        }
+        
     }
 }
 
@@ -2886,8 +2902,6 @@ pub fn to_hash(mut l: List) -> Result<HashMap<KeyItem, Item>, Error> {
 : error: Could not compile `cargoUFeO0S`.
 
 #+begin_src rust :tangle src/main.rs :crates '((rug . "1.15.0") (edn-rs . "0.17.0"))
-//extern crate rug;
-//use rug::{Assign, Integer};
 mod types;
 use crate::types::*;
 mod axiom;
@@ -2895,17 +2909,6 @@ mod serialize;
 use std::collections::HashMap;
 use std::io;
 use std::iter::FromIterator;
-
-// #[derive(Debug)]
-// struct EnvErr {
-//     Environment: Environment,
-//     Error: String
-// }
-
-// fn err(env: &mut Environment, s: String) -> Result<&mut Environment, String> {
-//    Err(EnvErr {Environment: env,
-//            Error: s})
-// }
 
 fn f_stack1(f: fn(Item) -> ItemResult, env: &mut Environment) -> StepResult {
     if let Some(x) = env.stack.pop_front() {
@@ -2946,9 +2949,12 @@ fn act_axiom(word: Word, e: &mut Environment) -> StepResult {
         "range" => axiom::range(e),
         "recur" => axiom::recur(e),
         "evert" => axiom::evert(e),
+        "unpack" => axiom::unpack(e),
         "lexicon" => axiom::lexicon(e),
-        _ => Err(Error {message: (format!("unimplemented axiom word: {}", word)),
-                        environment: Some(e.clone())}),
+        _ => Err(Error {
+            message: (format!("unimplemented axiom word: {}", word)),
+            environment: Some(e.clone()),
+        }),
     }
 }
 
@@ -2969,7 +2975,10 @@ fn eval_step(env: &mut Environment) -> StepResult {
                     }
                 }
             } else {
-                Err(Error::from(format!("Unknown word: {}", word)))
+                Err(Error {
+                    environment: Some(env.clone()),
+                    message: format!("Unknown word: {}", word),
+                })
             }
         } else {
             // not a word, just push onto stack
@@ -2999,7 +3008,7 @@ fn eval(env: &mut Environment) -> StepResult {
 fn print_result(r: StepResult) {
     match r {
         Err(e) => {
-            println!("{:?}", e)
+            println!("{:#?}", e)
         }
         Ok(env) => {
             let s = env.stack.clone();
@@ -3009,6 +3018,8 @@ fn print_result(r: StepResult) {
 }
 
 fn main() {
+    // TODO: probably not needed, we can read the lexicon as part of bootstrapping
+    // TODO: there's a bug here where words like + aren't in the lexicon and they get overwritten
     let words = vec![
         "+".to_string(),
         "-".to_string(),
@@ -3028,6 +3039,7 @@ fn main() {
         "recur".to_string(),
         "evert".to_string(),
         "lexicon".to_string(),
+        "unpack".to_string(),
     ];
 
     let dict: Dictionary = HashMap::from_iter(words.iter().map(|w| {
@@ -3077,7 +3089,7 @@ use std::mem;
 pub fn stack_underflow() -> StepResult<'static> {
     Err(Error::from("Stack underflow"))
 }
-    
+
 pub fn plus(i: Item, j: Item) -> ItemResult {
     match (i, j) {
         (Item::Int(i), Item::Int(j)) => Ok(Item::Int(i + j)),
@@ -3091,6 +3103,9 @@ pub fn plus(i: Item, j: Item) -> ItemResult {
 pub fn minus(i: Item, j: Item) -> ItemResult {
     match (i, j) {
         (Item::Int(i), Item::Int(j)) => Ok(Item::Int(i - j)),
+        (Item::Float(i), Item::Float(j)) => Ok(Item::Float(i - j)),
+        (Item::Int(i), Item::Float(j)) => Ok(Item::Float(i as Float - j)),
+        (Item::Float(i), Item::Int(j)) => Ok(Item::Float(i - j as Float)),
         _ => Err(Error::from("Invalid type for -")),
     }
 }
@@ -3139,7 +3154,10 @@ pub fn discard(env: &mut Environment) -> StepResult {
 }
 
 fn append_expression(env: &mut Environment, p: VecDeque<Item>) -> StepResult {
-    env.expression.extend(p.into_iter().rev());
+    //env.expression.extend(p.into_iter());
+    for i in p.into_iter() {
+        env.expression.push_front(i);
+    }
     Ok(env)
 }
 
@@ -3173,7 +3191,10 @@ pub fn unwrap(env: &mut Environment) -> StepResult {
             }
             Ok(env)
         } else {
-            Err(Error::from(format!("Can only unwrap on list, found {:?}", item)))
+            Err(Error::from(format!(
+                "Can only unwrap on list, found {:?}",
+                item
+            )))
         }
     } else {
         stack_underflow()
@@ -3199,6 +3220,20 @@ pub fn dip(env: &mut Environment) -> StepResult {
     }
 }
 
+pub fn unpack(env: &mut Environment) -> StepResult {
+    if let Some(mut s1) = env.stack.front_mut() {
+        if let Item::List(l) = s1 {
+            if let Some(i) = l.pop_front() {
+                env.stack.push_front(i);
+            }
+            Ok(env)
+        } else {
+            Err(Error::from("Invalid type for unpack - must be list"))
+        }
+    } else {
+        stack_underflow()
+    }
+}
 fn is_truthy(i: Item) -> bool {
     match i {
         Item::Boolean(b) => b,
@@ -3214,14 +3249,14 @@ pub fn branch(env: &mut Environment) -> StepResult {
     let b = env.stack.pop_front();
     match (f, t, b) {
         (Some(f), Some(t), Some(b)) => match (f, t) {
-            (Item::List(false_branch), Item::List(true_branch)) => {
-                let p = if is_truthy(b) {
+            (Item::List(false_branch), Item::List(true_branch)) => append_expression(
+                env,
+                if is_truthy(b) {
                     true_branch
                 } else {
                     false_branch
-                };
-                append_expression(env, p)
-            }
+                },
+            ),
             _ => Err(Error::from("Invalid type for branch")),
         },
         _ => stack_underflow(),
@@ -3368,49 +3403,16 @@ pub fn lexicon(env: &mut Environment) -> StepResult {
         let items = serialize::parse(s);
 
         let vitems = List::from(items);
-
-        // let mut h = HashMap::new();
-        // let entries = items
-        //     .iter()
-        //     .map(|item| to_entry(item.clone()))
-        //     .collect::<Result<Vec<(KeyItem, Item)>, String>>()?;
-        // for (k, v) in entries {
-        //     h.insert(k, v);
-        // }
-
         let d: Dictionary = HashMap::from_iter(to_hash(vitems)?.iter().map(|(k, v)| {
             let v = to_dict(to_hash(as_list(Some(v)).unwrap()).ok().unwrap());
             (as_word(k).unwrap_or("".to_string()), v)
         }));
 
-        //println!("{:#?}", d);
         env.dictionary = d;
         Ok(env)
     } else {
         Err(Error::from("Could not read from lexicon file"))
     }
-
-    // for [w, dfn] in items {
-
-    //     match (w, dfn) {
-    //         (Item::Word(w), Item::List(dfn)) => {
-    //             let mut m: HashMap<Word, List>::new();
-    //             for [k, v] in dfn {
-    //                 match (k, v) {
-    //                     (Item::Word(k), Item::List(v)) => {
-    //                         m.insert(Item::Word(k), Item::List(v));
-    //                     },
-    //                     _ => { return Err(Error::from("Word definition has invalid type"))}
-    //                 }
-    //             }
-    //             env.dictionary.insert(Item::Word(w),
-    //                                   DerivedDef{definition: Item::List(m.get(word("definition"))),
-    //                                              docs: WordDocs{examples: m.get(word("examples")),
-    //                                                             spec: m.get(word("spec"))}}
-    //             );
-    //         }
-    //     }
-    // }
 }
 #+end_src
 
@@ -3424,36 +3426,43 @@ input instead of having it hardcoded):
 extern crate edn_format;
 use crate::types::*;
 use std::collections::VecDeque;
+use std::fmt;
 
-fn to_item (item: &edn_format::Value) -> Item {
+fn to_item(item: &edn_format::Value) -> Item {
     match item {
-        edn_format::Value::Integer(i) => { Item::Int(*i) },
-        edn_format::Value::Vector(v) => { Item::List(v.iter().map(|i| to_item(i)).collect::<VecDeque<Item>>())},
-        edn_format::Value::Symbol(s) => { Item::Word(s.name().to_string()) },
-        edn_format::Value::Boolean(b) => { Item::Boolean(*b) },
-        edn_format::Value::String(s) => { Item::String(s.to_string()) },
-        edn_format::Value::Float(f) => { Item::Float(f.into_inner())}
-        _ => { Item::Int(0) }
-        
+        edn_format::Value::Integer(i) => Item::Int(*i),
+        edn_format::Value::Vector(v) => {
+            Item::List(v.iter().map(|i| to_item(i)).collect::<VecDeque<Item>>())
+        }
+        edn_format::Value::Symbol(s) => Item::Word(s.name().to_string()),
+        edn_format::Value::Boolean(b) => Item::Boolean(*b),
+        edn_format::Value::String(s) => Item::String(s.to_string()),
+        edn_format::Value::Float(f) => Item::Float(f.into_inner()),
+        _ => Item::Int(0),
     }
 }
 
-fn from_item (item: &Item) -> edn_format::Value { 
+fn from_item(item: &Item) -> edn_format::Value {
     match item {
-        Item::Int(i) => { edn_format::Value::Integer(*i) },
-        Item::List(v) => { edn_format::Value::Vector(v.iter().map(|i| from_item(i)).collect::<Vec<edn_format::Value>>()) },
-        Item::Word(w) => { edn_format::Value::Symbol(edn_format::Symbol::from_name(w)) },
-        Item::Boolean(b) => { edn_format::Value::Boolean(*b) },
-        Item::String(s) => { edn_format::Value::String(s.to_string()) }
-        Item::Float(f) => { edn_format::Value::from(*f)}
-        _ => { edn_format::Value::Integer(0) }
-        
+        Item::Int(i) => edn_format::Value::Integer(*i),
+        Item::List(v) => edn_format::Value::Vector(
+            v.iter()
+                .map(|i| from_item(i))
+                .collect::<Vec<edn_format::Value>>(),
+        ),
+        Item::Word(w) => edn_format::Value::Symbol(edn_format::Symbol::from_name(w)),
+        Item::Boolean(b) => edn_format::Value::Boolean(*b),
+        Item::String(s) => edn_format::Value::String(s.to_string()),
+        Item::Float(f) => edn_format::Value::from(*f),
+        _ => edn_format::Value::Integer(0),
     }
 }
 
 pub fn parse(s: String) -> List {
     let parser = edn_format::Parser::from_iter(s.chars(), edn_format::ParserOptions::default());
-    parser.map(|r| { to_item(&r.expect("expected valid element"))}).collect()
+    parser
+        .map(|r| to_item(&r.expect("expected valid element")))
+        .collect()
 }
 
 pub fn emit(item: &Item) -> String {
@@ -3461,16 +3470,26 @@ pub fn emit(item: &Item) -> String {
 }
 
 pub fn emit_all(items: &VecDeque<Item>) -> String {
-    let mut s: String = String::new();  
+    let mut s: String = String::new();
     for i in items {
         s.push_str(&emit(&i));
     }
     return s;
 }
+
+// print out envs in error messages
+impl fmt::Debug for Environment {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{{ stack: {}, expression: {} }}",
+               emit(&Item::List(self.stack.clone())),
+               emit(&Item::List(self.expression.clone())),
+        )
+    }
+}
 #+end_src
 
 #+RESULTS:
-: error: Could not compile `cargo75nfdJ`.
+: error: Could not compile `cargoVyY4IO`.
 
 #+begin_src rust
 // test swap
