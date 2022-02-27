@@ -2765,26 +2765,25 @@ pub enum KeyItem {
 }
 
 pub type Stack = List;
-pub type Error = String;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WordDocs {
     pub examples: Option<List>,
     pub spec: Option<List>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AxiomDef {
     pub docs: WordDocs,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DerivedDef {
     pub docs: WordDocs,
     pub definition: List,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum WordDef {
     Axiom(AxiomDef),
     Derived(DerivedDef),
@@ -2792,79 +2791,76 @@ pub enum WordDef {
 
 pub type Dictionary = HashMap<Word, WordDef>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Environment {
     pub stack: Stack,
     pub expression: Stack,
     pub dictionary: Dictionary,
 }
 
+#[derive(Debug)]
+pub struct Error {
+    pub environment: Option<Environment>,
+    pub message: String,
+}
+
+impl From<String> for Error {
+    fn from(s: String) -> Self {
+        Error {
+            environment: None,
+            message: s,
+        }
+    }
+}
+
+impl From<&str> for Error {
+    fn from(s: &str) -> Self {
+        Error::from(s.to_string())
+    }
+}
+
 pub type StepResult<'a> = Result<&'a mut Environment, Error>;
+
+pub type ItemResult = Result<Item, Error>;
 
 pub fn word(s: &str) -> Item {
     Item::Word(Word::from(s))
 }
 
-// #[derive(Debug, PartialEq, Eq)]
-// pub enum NotDuple {
-//     ZeroElements,
-//     OneElement,
-//     TooMany,
-// }
-
-// pub trait ToHash<K: Eq + Hash, V> {
-//     fn to_hash(self) -> Result<HashMap<K, V>, NotDuple>;
-// }
-
-// impl<It: Iterator<Item = ItIt>, ItIt: Iterator<Item = K>, K: Eq + Hash, V> ToHash<K, V> for It {
-//     fn to_hash(self) -> Result<HashMap<K, V>, NotDuple> {
-//         self.map(|mut it_it| {
-//             let a = it_it.next().ok_or(NotDuple::ZeroElements)?;
-//             let b = it_it.next().ok_or(NotDuple::OneElement)?;
-//             if !it_it.next().is_none() {
-//                 return Err(NotDuple::TooMany);
-//             }
-//             Ok((a, b))
-//         })
-//         .collect()
-//     }
-// }
-
-pub fn to_key_item(i: Item) -> Result<KeyItem, String> {
+pub fn to_key_item(i: Item) -> Result<KeyItem, Error> {
     match i {
         Item::Int(i) => Ok(KeyItem::Int(i)),
         Item::String(i) => Ok(KeyItem::String(i)),
         Item::List(l) => Ok(KeyItem::List(
             l.iter()
                 .map(|i| to_key_item(i.clone()))
-                .collect::<Result<KeyList, String>>()?,
+                .collect::<Result<KeyList, Error>>()?,
         )),
         Item::Word(w) => Ok(KeyItem::Word(w)),
         Item::Boolean(b) => Ok(KeyItem::Boolean(b)),
         Item::Bytes(bs) => Ok(KeyItem::Bytes(bs)),
         Item::Nothing => Ok(KeyItem::Nothing),
-        _ => Err("item is not allowed as a hashmap key".to_string()),
+        _ => Err(Error::from("item is not allowed as a hashmap key")),
     }
 }
 
-pub fn to_value_item(i: KeyItem) -> Result<Item, String> {
+pub fn to_value_item(i: KeyItem) -> ItemResult {
     match i {
         KeyItem::Int(i) => Ok(Item::Int(i)),
         KeyItem::String(i) => Ok(Item::String(i)),
         KeyItem::List(l) => Ok(Item::List(
             l.iter()
                 .map(|i| to_value_item(i.clone()))
-                .collect::<Result<List, String>>()?,
+                .collect::<Result<List, Error>>()?,
         )),
         KeyItem::Word(w) => Ok(Item::Word(w)),
         KeyItem::Boolean(b) => Ok(Item::Boolean(b)),
         KeyItem::Bytes(bs) => Ok(Item::Bytes(bs)),
         KeyItem::Nothing => Ok(Item::Nothing),
-        
     }
 }
 
-pub fn to_entry(mut i: Item) -> Result<(KeyItem, Item), String> {
+pub fn to_entry(mut i: Item) -> Result<(KeyItem, Item), Error> {
     match i {
         Item::List(mut l) => {
             let v = l.pop_back();
@@ -2872,17 +2868,17 @@ pub fn to_entry(mut i: Item) -> Result<(KeyItem, Item), String> {
             let e = l.pop_back();
             match (k, v, e) {
                 (Some(k), Some(v), None) => Ok((to_key_item(k)?, v)),
-                _ => Err("Entry must be a duple".to_string()),
+                _ => Err(Error::from("Item must be a duple")),
             }
         }
-        _ => Err("Hash entry must be a list (of length 2)".to_string()),
+        _ => Err(Error::from("Hash entry must be a list (of length 2)")),
     }
 }
 
-pub fn to_hash(mut l: List) -> Result<HashMap<KeyItem, Item>, String> {
+pub fn to_hash(mut l: List) -> Result<HashMap<KeyItem, Item>, Error> {
     l.iter()
         .map(|i| to_entry(i.clone()))
-        .collect::<Result<HashMap<KeyItem, Item>, String>>()
+        .collect::<Result<HashMap<KeyItem, Item>, Error>>()
 }
 #+end_src
 
@@ -2911,16 +2907,16 @@ use std::iter::FromIterator;
 //            Error: s})
 // }
 
-fn f_stack1(f: fn(Item) -> Result<Item, Error>, env: &mut Environment) -> StepResult {
+fn f_stack1(f: fn(Item) -> ItemResult, env: &mut Environment) -> StepResult {
     if let Some(x) = env.stack.pop_front() {
         env.stack.push_front(f(x)?);
         Ok(env)
     } else {
-        Err("stack underflow".to_string())
+        axiom::stack_underflow()
     }
 }
 
-fn f_stack2(f: fn(Item, Item) -> Result<Item, Error>, env: &mut Environment) -> StepResult {
+fn f_stack2(f: fn(Item, Item) -> ItemResult, env: &mut Environment) -> StepResult {
     let i = env.stack.pop_front();
     let j = env.stack.pop_front();
     match (i, j) {
@@ -2928,7 +2924,7 @@ fn f_stack2(f: fn(Item, Item) -> Result<Item, Error>, env: &mut Environment) -> 
             env.stack.push_front(f(j, i)?);
             Ok(env)
         }
-        _ => Err("stack underflow".to_string()),
+        _ => axiom::stack_underflow(),
     }
 }
 
@@ -2951,7 +2947,8 @@ fn act_axiom(word: Word, e: &mut Environment) -> StepResult {
         "recur" => axiom::recur(e),
         "evert" => axiom::evert(e),
         "lexicon" => axiom::lexicon(e),
-        _ => Err(format!("unimplemented axiom word: {}", word)),
+        _ => Err(Error {message: (format!("unimplemented axiom word: {}", word)),
+                        environment: Some(e.clone())}),
     }
 }
 
@@ -2972,8 +2969,7 @@ fn eval_step(env: &mut Environment) -> StepResult {
                     }
                 }
             } else {
-                println!("{:?}", env.dictionary.keys());
-                Err(format!("Unknown word: {}", word))
+                Err(Error::from(format!("Unknown word: {}", word)))
             }
         } else {
             // not a word, just push onto stack
@@ -2981,7 +2977,7 @@ fn eval_step(env: &mut Environment) -> StepResult {
             Ok(env)
         }
     } else {
-        Err("expression is empty".to_string())
+        Err(Error::from("Expression is empty"))
     }
 }
 
@@ -3003,7 +2999,7 @@ fn eval(env: &mut Environment) -> StepResult {
 fn print_result(r: StepResult) {
     match r {
         Err(e) => {
-            println!("{}", e)
+            println!("{:?}", e)
         }
         Ok(env) => {
             let s = env.stack.clone();
@@ -3064,8 +3060,7 @@ fn main() {
 #+end_src
 
 #+RESULTS:
-
-#+RESULTS:
+: error: Could not compile `cargo72cA7r`.
 : error: Could not compile `cargoxVWZQV`.
 
 Here are the axiom functions. Some of them are just functions of the
@@ -3079,32 +3074,32 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::mem;
 
-fn stack_underflow() -> StepResult<'static> {
-    Err("Stack underflow".to_string())
+pub fn stack_underflow() -> StepResult<'static> {
+    Err(Error::from("Stack underflow"))
 }
-
-pub fn plus(i: Item, j: Item) -> Result<Item, String> {
+    
+pub fn plus(i: Item, j: Item) -> ItemResult {
     match (i, j) {
         (Item::Int(i), Item::Int(j)) => Ok(Item::Int(i + j)),
         (Item::Float(i), Item::Float(j)) => Ok(Item::Float(i + j)),
         (Item::Int(i), Item::Float(j)) => Ok(Item::Float(i as Float + j)),
         (Item::Float(i), Item::Int(j)) => Ok(Item::Float(i + j as Float)),
-        _ => Err("Invalid type for +".to_string()),
+        _ => Err(Error::from("Invalid type for +")),
     }
 }
 
-pub fn minus(i: Item, j: Item) -> Result<Item, String> {
+pub fn minus(i: Item, j: Item) -> ItemResult {
     match (i, j) {
         (Item::Int(i), Item::Int(j)) => Ok(Item::Int(i - j)),
-        _ => Err("Invalid type for -".to_string()),
+        _ => Err(Error::from("Invalid type for -")),
     }
 }
 
-pub fn inc(i: Item) -> Result<Item, String> {
+pub fn inc(i: Item) -> ItemResult {
     if let Item::Int(i) = i {
         Ok(Item::Int(i + 1))
     } else {
-        Err("Invalid type for inc".to_string())
+        Err(Error::from("Invalid type for inc"))
     }
 }
 
@@ -3152,7 +3147,7 @@ pub fn execute(env: &mut Environment) -> StepResult {
     if let Some(item) = env.stack.pop_front() {
         match item {
             Item::List(program) => append_expression(env, program),
-            _ => Err("Invalid type for execute".to_string()),
+            _ => Err(Error::from("Invalid type for execute")),
         }
     } else {
         stack_underflow()
@@ -3178,7 +3173,7 @@ pub fn unwrap(env: &mut Environment) -> StepResult {
             }
             Ok(env)
         } else {
-            Err(format!("Invalid type for unwrap: {:?}", item))
+            Err(Error::from(format!("Can only unwrap on list, found {:?}", item)))
         }
     } else {
         stack_underflow()
@@ -3198,7 +3193,7 @@ pub fn dip(env: &mut Environment) -> StepResult {
                 env.expression.push_front(Item::List(v));
                 append_expression(env, program)
             }
-            _ => Err("Invalid type for dip".to_string()),
+            _ => Err(Error::from("Invalid type for dip")),
         },
         _ => stack_underflow(),
     }
@@ -3227,7 +3222,7 @@ pub fn branch(env: &mut Environment) -> StepResult {
                 };
                 append_expression(env, p)
             }
-            _ => Err("Invalid type for branch".to_string()),
+            _ => Err(Error::from("Invalid type for branch")),
         },
         _ => stack_underflow(),
     }
@@ -3251,7 +3246,7 @@ pub fn step(env: &mut Environment) -> StepResult {
                 }
                 Ok(env)
             }
-            _ => Err("Invalid type for step".to_string()),
+            _ => Err(Error::from("Invalid type for step")),
         },
         _ => stack_underflow(),
     }
@@ -3268,7 +3263,7 @@ pub fn range(env: &mut Environment) -> StepResult {
                 ));
                 return Ok(env);
             }
-            _ => Err("Invalid type for range".to_string()),
+            _ => Err(Error::from("Invalid type for range")),
         },
         _ => stack_underflow(),
     }
@@ -3304,7 +3299,7 @@ pub fn recur(env: &mut Environment) -> StepResult {
                 env.stack.push_front(Item::List(pred));
                 Ok(env)
             }
-            _ => Err("Invalid type for recur".to_string()),
+            _ => Err(Error::from("Invalid type for recur")),
         },
         _ => stack_underflow(),
     }
@@ -3322,7 +3317,7 @@ pub fn evert(env: &mut Environment) -> StepResult {
                 env.stack.push_front(Item::List(l));
                 Ok(env)
             }
-            _ => Err("Invalid type for evert".to_string()),
+            _ => Err(Error::from("Invalid type for evert")),
         },
         _ => stack_underflow(),
     }
@@ -3392,7 +3387,7 @@ pub fn lexicon(env: &mut Environment) -> StepResult {
         env.dictionary = d;
         Ok(env)
     } else {
-        Err("Could not read from lexicon file".to_string())
+        Err(Error::from("Could not read from lexicon file"))
     }
 
     // for [w, dfn] in items {
@@ -3405,7 +3400,7 @@ pub fn lexicon(env: &mut Environment) -> StepResult {
     //                     (Item::Word(k), Item::List(v)) => {
     //                         m.insert(Item::Word(k), Item::List(v));
     //                     },
-    //                     _ => { return Err("Word definition has invalid type".to_string())}
+    //                     _ => { return Err(Error::from("Word definition has invalid type"))}
     //                 }
     //             }
     //             env.dictionary.insert(Item::Word(w),
