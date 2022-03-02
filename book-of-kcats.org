@@ -914,43 +914,26 @@ later. We put this here because this has to be clojure code.
 (defonce core-words (atom {}))
 
 ;; math symbols are ok - non-programmers already know what they mean
-(def arithmetic-words
+(def thin-wrappers
   (into {} cat
         [;; use autopromoting versions of arithmetic operators
          (for [sym ['+' '-' '*']]
            [(-> sym str (subs 0 1) symbol) ;; drop the '
-            {'spec '[[number number] [number]]
-             'fn (f-stack 2 (resolve sym))}])
-
-         (for [sym ['/ 'min 'max 'quot 'rem 'mod]]
-           [sym
-            {'spec '[[number number] [number]]
-             'fn (f-stack 2 (resolve sym))}])
-         (for [sym ['< '<= '> '>=]]
-           [sym
-            {'spec '[[number number] [boolean]]
-             'fn (f-stack 2 (resolve sym))}])
-         (for [sym ['inc 'dec]]
-           [sym
-            {'spec '[[integer] [integer]]
-             'fn (f-stack 1 (resolve sym))}])]))
-
-;; need to implement `some` to respect empty list being falsey
-(def predicates
-  (into {} cat
-        [(for [sym ['odd? 'even? 'sequential? 'zero? 'pos? 'neg?
-                    'number? 'int? 'true? 'false?
-                    'string? 'empty?]]
-           [sym {'spec '[[item] [boolean]]
-                 'fn (f-stack 1 (resolve sym))}])
-         (for [sym ['starts-with? 'ends-with?]]
-           [sym {'spec '[[[subject item] [object item]] [boolean]]
-                 'fn (f-stack 2 (resolve sym))}])]))
+            {'fn (f-stack 2 (resolve sym))}])
+         (for [sym ['inc 'dec 'odd? 'even? 'sequential? 'zero? 'pos?
+                    'neg?  'number? 'int? 'true? 'false?  'string?
+                    'empty? 'first 'second 'string? 'bytes? 'count
+                    'word? 'reverse]]
+           [sym {'fn (f-stack 1 (resolve sym))}])
+         (for [sym ['/ 'min 'max 'quot 'rem 'mod '< '<= '> '>=
+                    'starts-with? 'ends-with? '= 'range]]
+           [sym {'fn (f-stack 2 (resolve sym))}])]))
 
 (defn from-spec
   "Build a native function from the spec (in cases where the spec
   completely describes it, like for stack motion words, eg swap)"
   [{:syms [spec] :as dfn}]
+  (println "from spec" dfn)
   (let [[in out] spec]
     (assoc dfn
            'fn (clojure.core/eval `(spec-effect ~in ~out))
@@ -1005,7 +988,8 @@ later. We put this here because this has to be clojure code.
                                 (-> a .array String.)
                                 (str a))])
    'read (stack-effect [s] [(edn/read-string s)])
-   ;; maybe this should be something like
+   
+   ;; maybe this should be something likefirst
    ;; timesfive [[definition [5 *]] [examples [...]]] inscribe
    'inscribe (fn [{[word-def word & others] 'stack
                    :syms [stack expression dictionary]}]
@@ -1031,8 +1015,6 @@ later. We put this here because this has to be clojure code.
    
    'unpack (env-effect 1 (fn [[l & others]]
                            [[] [(nil->nothing l) (vec others)]]))
-   'reverse (f-stack 1 (comp vec reverse))
-   'range (f-stack 2 (comp vec range))
    'evert (fn [{[l & others] 'stack :as env}]
             (assoc env 'stack (apply list (vec others) l)))
    'and (f-stack 2 (fn [a b]
@@ -1068,8 +1050,7 @@ later. We put this here because this has to be clojure code.
 (swap! core-words merge
        (into {} (for [[word dfn] axiom-words]
                   [word {'fn dfn}]))
-       arithmetic-words
-       predicates)
+       thin-wrappers)
 
 (defn default-env
   ([expression]
@@ -1137,6 +1118,9 @@ go into more detail on this particular data type in [[*Maps/associations][Associ
 
 
 ;; axiom defs
+
+[= [[spec [[item item] [boolean]]]]]
+
 [+ [[spec [[number number] [number]]]
           [examples [[[1 2 +] [3]]
                      [[1.1 2.2 +] [3.3]]
@@ -1147,15 +1131,36 @@ go into more detail on this particular data type in [[*Maps/associations][Associ
                      [[1.1 2.2 -] [-1.1]]
                      [[2.2 1 -] [1.2]]]]]]
 
-[> [[spec [[number number] [number]]]
+[* [[spec [[number number] [number]]]]]
+[/ [[spec [[number number] [number]]]]]
+[min [[spec [[number number] [number]]]]]
+[max [[spec [[number number] [number]]]]]
+[quot [[spec [[number number] [number]]]]]
+[rem [[spec [[number number] [number]]]]]
+[mod [[spec [[number number] [number]]]]]
+[< [[spec [[number number] [boolean]]]]]
+[<= [[spec [[number number] [boolean]]]]]
+[>= [[spec [[number number] [boolean]]]]]
+
+
+[> [[spec [[number number] [boolean]]]
           [examples [[[2 1 >] [true]]
                      [[1.1 2.2 >] [false]]
                      [[2.2 1 >] [true]]]]]]
 
-[inc [[spec [[number number] [number]]]
-          [examples [[[1 inc] [2]]
+[inc [[spec [[number] [number]]]
+      [examples [[[1 inc] [2]]
                      [[-1 inc] [0]]
                      [[99 inc] [100]]]]]]
+
+[dec [[spec [[number] [number]]]]]
+
+[odd? [[spec [[number] [boolean]]]]]
+[even? [[spec [[number] [boolean]]]]]
+[pos? [[spec [[number] [boolean]]]]]
+[zero? [[spec [[number] [boolean]]]]]
+[neg? [[spec [[number] [boolean]]]]]
+
 
 [discard [[spec [[item] []]]
           [examples [[[1 2 3 discard] [2 1]]
@@ -1244,7 +1249,7 @@ go into more detail on this particular data type in [[*Maps/associations][Associ
 [recur [[spec [[[program rec2]
                 [program rec1]
                 [program true-branch]
-                [program false-branch]]
+                [program pred]]
                [*]]]
         [examples [[[3
                      [1 <=] [] [clone dec] [execute *]
@@ -1383,7 +1388,6 @@ go into more detail on this particular data type in [[*Maps/associations][Associ
 
 [= [[spec [[item item]
            [boolean]]]
-    [definition [++=]]
     [examples [[[1 1 =] [true]]
                [["hi" "hi" =] [true]]
                [["hi" "there" =] [false]]
@@ -1392,7 +1396,6 @@ go into more detail on this particular data type in [[*Maps/associations][Associ
 
 [count [[spec [[list]
                [number]]]
-        [definition [+count]]
         [examples [[[["a" "b" "c"] count] [3]]]]]]
 
 [prepend [[spec [[item list]
@@ -1423,25 +1426,20 @@ go into more detail on this particular data type in [[*Maps/associations][Associ
                       [[snapshot] [[]]]]]]]
 
 [first [[spec [[list] [item]]]
-        [definition [+first +nil->nothing]]
         [examples [[[[4 5 6] first] [4]]]]]]
 
 [second [[spec [[list] [item]]]
-         [definition [+second]]
          [examples [[[[4 5 6] second] [5]]]]]]
 
-[bytes? [[spec [[item] [boolean]]] 
-         [definition [+bytes?]]]]
+[bytes? [[spec [[item] [boolean]]]]]
 
 [string? [[spec [[item] [boolean]]]
-          [definition [+string?]]
          [examples [[["hi" string?] [true]]
                     [["" string?] [true]]
                     [[["hi"] string?] [false]]
                     [[true string?] [false]]]]]]
 
 [word? [[spec [[item] [boolean]]]
-        [definition [+word?]]
         [examples [[[foo word?] [true]]
                    [[[foo] unwrap word?] [true]]
                    [[true word?] [false]]]]]] ;; TODO: but arguably 'true' is a word
@@ -2927,6 +2925,7 @@ mod serialize;
 use std::collections::HashMap;
 use std::io;
 use std::iter::FromIterator;
+use std::mem;
 
 fn f_stack1(f: fn(Item) -> ItemResult, env: &mut Environment) -> StepResult {
     if let Some(x) = env.stack.pop_front() {
@@ -2963,6 +2962,7 @@ fn act_axiom(word: Word, e: &mut Environment) -> StepResult {
         "wrap" => axiom::wrap(e),
         "unwrap" => axiom::unwrap(e),
         "dip" => axiom::dip(e),
+        "dipdown" => axiom::dipdown(e),
         "branch" => axiom::branch(e),
         "step" => axiom::step(e),
         "range" => axiom::range(e),
@@ -2970,6 +2970,7 @@ fn act_axiom(word: Word, e: &mut Environment) -> StepResult {
         "evert" => axiom::evert(e),
         "unpack" => axiom::unpack(e),
         "lexicon" => axiom::lexicon(e),
+        "first" => axiom::env_effect1(e, axiom::first),
         _ => Err(Error {
             message: (format!("unimplemented axiom word: {}", word)),
             environment: Some(e.clone()),
@@ -2978,6 +2979,7 @@ fn act_axiom(word: Word, e: &mut Environment) -> StepResult {
 }
 
 fn eval_step(env: &mut Environment) -> StepResult {
+    //println!("{:?}", env);
     let next_item = env.expression.pop_front();
 
     if let Some(val) = next_item {
@@ -2986,9 +2988,9 @@ fn eval_step(env: &mut Environment) -> StepResult {
                 match dfn {
                     WordDef::Axiom(..) => act_axiom(word, env),
                     WordDef::Derived(d) => {
-                        // has a definition, put it into expression (in reverse)
-                        let items = d.definition.clone();
-                        env.expression.extend(items.into_iter());
+                        let mut items = d.definition.clone();
+                        mem::swap(&mut items, &mut env.expression);
+                        env.expression.extend(items);
 
                         Ok(env)
                     }
@@ -3074,8 +3076,7 @@ fn main() {
 #+end_src
 
 #+RESULTS:
-: error: Could not compile `cargo72cA7r`.
-: error: Could not compile `cargoxVWZQV`.
+: error: Could not compile `cargo7G4HYj`.
 
 Here are the axiom functions. Some of them are just functions of the
 topmost stack items, and we'll call them with =f_stack1= etc. The rest
@@ -3132,7 +3133,6 @@ pub fn gt(i: Item, j: Item) -> ItemResult {
     }
 }
 
-
 pub fn clone(env: &mut Environment) -> StepResult {
     if let Some(last) = env.stack.front().map(|v| (*v).clone()) {
         env.stack.push_front(last);
@@ -3144,8 +3144,8 @@ pub fn clone(env: &mut Environment) -> StepResult {
 
 fn swap2(env: &mut Environment, offset: usize) -> StepResult {
     let len = env.stack.len();
-    if len >= 2 {
-        env.stack.swap(len - offset - 1, len - offset - 2);
+    if len >= offset + 2 {
+        env.stack.swap(offset, offset + 1);
         Ok(env)
     } else {
         stack_underflow()
@@ -3168,14 +3168,39 @@ pub fn discard(env: &mut Environment) -> StepResult {
     }
 }
 
-fn append_expression(env: &mut Environment, p: VecDeque<Item>) -> StepResult {
+fn append_expression(env: &mut Environment, mut items: VecDeque<Item>) -> StepResult {
     //env.expression.extend(p.into_iter());
-    for i in p.into_iter() {
-        env.expression.push_front(i);
-    }
+
+    mem::swap(&mut items, &mut env.expression);
+    env.expression.extend(items);
+
     Ok(env)
 }
 
+type EffectResult = Result<(Option<List>, List), Error>;
+    
+pub fn env_effect1(env: &mut Environment, f: fn(Item) -> EffectResult) -> StepResult {
+    if let Some(i) = env.stack.pop_front() {
+        let (expr_items, stack_items) = f(i)?;
+        for i in expr_items.into_iter() {
+            env.expression.push_front(Item::List(i));
+        }
+        for i in stack_items.into_iter() {
+            env.stack.push_front(i);
+        }
+        Ok(env)
+    }
+    else {stack_underflow()}
+}
+
+pub fn first(i: Item) -> EffectResult {
+    if let Item::List(mut l) = i {
+        Ok((None, VecDeque::from(vec![
+            if let Some(i) = l.pop_front() { i } else { Item::Nothing}])))
+        
+    }
+    else { Err(Error::from("Invalid type for first")) }
+}
 pub fn execute(env: &mut Environment) -> StepResult {
     if let Some(item) = env.stack.pop_front() {
         match item {
@@ -3221,7 +3246,7 @@ pub fn dip(env: &mut Environment) -> StepResult {
     let s2 = env.stack.pop_front();
     match (s1, s2) {
         (Some(item1), Some(item2)) => match item1 {
-            Item::List(program) => {
+            Item::List(mut program) => {
                 env.expression.push_front(Item::Word("unwrap".to_string()));
                 let mut v = List::new();
                 v.push_front(item2);
@@ -3230,6 +3255,26 @@ pub fn dip(env: &mut Environment) -> StepResult {
                 append_expression(env, program)
             }
             _ => Err(Error::from("Invalid type for dip")),
+        },
+        _ => stack_underflow(),
+    }
+}
+
+pub fn dipdown(env: &mut Environment) -> StepResult {
+    let s1 = env.stack.pop_front();
+    let s2 = env.stack.pop_front();
+    let s3 = env.stack.pop_front();
+    match (s1, s2, s3) {
+        (Some(item1), Some(item2), Some(item3)) => match item1 {
+            Item::List(program) => {
+                env.expression.push_front(Item::Word("unwrap".to_string()));
+                let mut v = List::new();
+                v.push_front(item2);
+                v.push_front(item3);
+                env.expression.push_front(Item::List(v));
+                append_expression(env, program)
+            }
+            _ => Err(Error::from("Invalid type for dipdown")),
         },
         _ => stack_underflow(),
     }
@@ -3335,18 +3380,21 @@ pub fn recur(env: &mut Environment) -> StepResult {
             (Item::List(rec2), Item::List(rec1), Item::List(then), Item::List(pred)) => {
                 env.expression.push_front(word("if"));
                 let mut b = List::new();
-                b.push_front(Item::List(pred.clone()));
-                b.push_front(Item::List(then.clone()));
-                b.push_front(Item::List(rec1.clone()));
-                b.push_front(Item::List(rec2.clone()));
-                b.push_front(word("recur"));
+                //TODO: ordering is wrong
+                let r = Item::List(List::from([
+                    Item::List(pred.clone()),
+                    Item::List(then.clone()),
+                    Item::List(rec1.clone()),
+                    Item::List(rec2.clone()),
+                    word("recur")]));
                 let mut e = List::new();
-                e.push_front(Item::List(rec1));
-                e.push_front(Item::List(b));
-                e.push_front(Item::List(rec2));
-                env.stack.push_front(Item::List(e));
-                env.stack.push_front(Item::List(then));
+                e.extend(rec1);
+                e.push_back(r);
+                e.extend(rec2);
+                
                 env.stack.push_front(Item::List(pred));
+                env.stack.push_front(Item::List(then));
+                env.stack.push_front(Item::List(e));
                 Ok(env)
             }
             _ => Err(Error::from("Invalid type for recur")),
