@@ -3128,8 +3128,7 @@ pub fn gt(i: Item, j: Item) -> ItemResult {
         (Item::Int(i), Item::Float(j)) => Ok(Item::Boolean(i as Float > j)),
         (Item::Float(i), Item::Int(j)) => Ok(Item::Boolean(i > j as Float)),
 
-        _ => Err(Error::from("Invalid type for >"))
-            
+        _ => Err(Error::from("Invalid type for >")),
     }
 }
 
@@ -3168,17 +3167,18 @@ pub fn discard(env: &mut Environment) -> StepResult {
     }
 }
 
+fn extend_front(l: &mut List, mut to_prepend: List) -> () {
+    mem::swap(l, &mut to_prepend);
+    l.extend(to_prepend);
+}
+
 fn append_expression(env: &mut Environment, mut items: VecDeque<Item>) -> StepResult {
-    //env.expression.extend(p.into_iter());
-
-    mem::swap(&mut items, &mut env.expression);
-    env.expression.extend(items);
-
+    extend_front(&mut env.expression, items);
     Ok(env)
 }
 
-type EffectResult = Result<(Option<List>, List), Error>;
-    
+type EffectResult = Result<(Option<List>, Option<List>), Error>;
+
 pub fn env_effect1(env: &mut Environment, f: fn(Item) -> EffectResult) -> StepResult {
     if let Some(i) = env.stack.pop_front() {
         let (expr_items, stack_items) = f(i)?;
@@ -3186,21 +3186,46 @@ pub fn env_effect1(env: &mut Environment, f: fn(Item) -> EffectResult) -> StepRe
             env.expression.push_front(Item::List(i));
         }
         for i in stack_items.into_iter() {
-            env.stack.push_front(i);
+            env.stack.push_front(Item::List(i));
         }
         Ok(env)
+    } else {
+        stack_underflow()
     }
-    else {stack_underflow()}
 }
 
 pub fn first(i: Item) -> EffectResult {
     if let Item::List(mut l) = i {
-        Ok((None, VecDeque::from(vec![
-            if let Some(i) = l.pop_front() { i } else { Item::Nothing}])))
-        
+        Ok((
+            None,
+            Some(VecDeque::from(vec![if let Some(i) = l.pop_front() {
+                i
+            } else {
+                Item::Nothing
+            }])),
+        ))
+    } else {
+        Err(Error::from("Invalid type for first"))
     }
-    else { Err(Error::from("Invalid type for first")) }
 }
+
+pub fn loop_(p: Item, f: Item) -> EffectResult {
+    if let Item::List(p) = p {
+        Ok({
+            if is_truthy(f) {
+                (
+                    Some(List::from([Item::List(p.clone()), word("loop")])),
+                    None,
+                )
+            } else {
+                (None, None)
+            }
+        })
+    } else {
+        Err(Error::from("Invalid type for loop"))
+    }
+}
+
 pub fn execute(env: &mut Environment) -> StepResult {
     if let Some(item) = env.stack.pop_front() {
         match item {
@@ -3379,19 +3404,18 @@ pub fn recur(env: &mut Environment) -> StepResult {
         (Some(rec2), Some(rec1), Some(then), Some(pred)) => match (rec2, rec1, then, pred) {
             (Item::List(rec2), Item::List(rec1), Item::List(then), Item::List(pred)) => {
                 env.expression.push_front(word("if"));
-                let mut b = List::new();
-                //TODO: ordering is wrong
                 let r = Item::List(List::from([
                     Item::List(pred.clone()),
                     Item::List(then.clone()),
                     Item::List(rec1.clone()),
                     Item::List(rec2.clone()),
-                    word("recur")]));
+                    word("recur"),
+                ]));
                 let mut e = List::new();
                 e.extend(rec1);
                 e.push_back(r);
                 e.extend(rec2);
-                
+
                 env.stack.push_front(Item::List(pred));
                 env.stack.push_front(Item::List(then));
                 env.stack.push_front(Item::List(e));
