@@ -2787,18 +2787,18 @@ pub enum KeyItem {
 
 pub type Stack = List;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WordDocs {
     pub examples: Option<List>,
     pub spec: Option<List>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AxiomDef {
     pub docs: WordDocs,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DerivedDef {
     pub docs: WordDocs,
     pub definition: List,
@@ -2823,7 +2823,7 @@ impl Doc for DerivedDef {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum WordDef {
     Axiom(AxiomDef),
     Derived(DerivedDef),
@@ -2831,13 +2831,14 @@ pub enum WordDef {
 
 pub type Dictionary = HashMap<Word, WordDef>;
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct Environment {
     pub stack: Stack,
     pub expression: Stack,
     pub dictionary: Dictionary,
 }
 
+#[derive(PartialEq)]
 pub struct Error {
     pub environment: Option<Environment>,
     pub message: String,
@@ -2861,14 +2862,27 @@ impl From<&str> for Error {
 impl TryFrom<Item> for List {
     type Error = Error;
     fn try_from(i: Item) -> Result<Self, Self::Error> {
-        if let Item::List(i) = i {
-            Ok(i)
+        println!("item is {:?}", i);
+        if let Item::List(l) = i {
+            println!("cast item is {:?}", l);
+            println!("cast item len {}", l.len());
+            
+            Ok(l)
         } else {
             Err(Error::from("Expected item to be list, but it wasn't"))
         }
     }
 }
 
+pub fn get_item(i: Item, index: usize) -> Option<Item> {
+    if let Item::List(l) = i {
+        match l.get(index) {
+            Some(x) => Some(x.clone()),
+            None => None
+        }
+    }
+    else { None }
+}
 
 // print out envs in error messages
 impl fmt::Debug for Error {
@@ -2882,7 +2896,7 @@ impl fmt::Debug for Error {
     }
 }
 
-pub type StepResult<'a> = Result<&'a mut Environment, Error>;
+pub type StepResult = Result<Environment, Error>;
 
 pub type ItemResult = Result<Item, Error>;
 
@@ -2956,7 +2970,7 @@ use std::io;
 use std::iter::FromIterator;
 use std::mem;
 
-fn f_stack1(f: fn(Item) -> ItemResult, env: &mut Environment) -> StepResult {
+fn f_stack1(f: fn(Item) -> ItemResult, mut env: Environment) -> StepResult {
     if let Some(x) = env.stack.pop_front() {
         env.stack.push_front(f(x)?);
         Ok(env)
@@ -2965,7 +2979,7 @@ fn f_stack1(f: fn(Item) -> ItemResult, env: &mut Environment) -> StepResult {
     }
 }
 
-fn f_stack2(f: fn(Item, Item) -> ItemResult, env: &mut Environment) -> StepResult {
+fn f_stack2(f: fn(Item, Item) -> ItemResult, mut env: Environment) -> StepResult {
     let i = env.stack.pop_front();
     let j = env.stack.pop_front();
     match (i, j) {
@@ -2977,7 +2991,7 @@ fn f_stack2(f: fn(Item, Item) -> ItemResult, env: &mut Environment) -> StepResul
     }
 }
 
-fn act_axiom(word: Word, e: &mut Environment) -> StepResult {
+fn act_axiom(word: Word, e: Environment) -> StepResult {
     match word.as_str() {
         "+" => f_stack2(axiom::plus, e),
         "-" => f_stack2(axiom::minus, e),
@@ -3007,7 +3021,7 @@ fn act_axiom(word: Word, e: &mut Environment) -> StepResult {
     }
 }
 
-fn eval_step(env: &mut Environment) -> StepResult {
+fn eval_step(mut env: Environment) -> StepResult {
     //println!("{:?}", env);
     let next_item = env.expression.pop_front();
 
@@ -3040,7 +3054,7 @@ fn eval_step(env: &mut Environment) -> StepResult {
     }
 }
 
-fn eval(env: &mut Environment) -> StepResult {
+fn eval(mut env: Environment) -> StepResult {
     let mut result: StepResult = Result::Ok(env);
     loop {
         if let Ok(env) = result {
@@ -3087,57 +3101,106 @@ fn standard_env(program: Option<List>) -> Environment {
 
     expr.push_front(word("lexicon"));
 
-    Environment {
+    eval(Environment {
         stack: Stack::new(),
         expression: expr,
         dictionary: standard_dictionary(),
-    }
+    })
+    .unwrap()
 }
+
 fn main() {
     let mut program = String::new();
     match io::stdin().read_line(&mut program) {
         Ok(_) => {
             let parsed = serialize::parse(program);
-            print_result(eval(&mut standard_env(Some(parsed))));
+            print_result(eval(standard_env(Some(parsed))));
         }
         Err(error) => println!("error: {}", error),
     }
 }
 
 fn test_example(mut env: Environment, w: Word, program: List, expected: List) -> Option<Error> {
+    println!("Testing example for {}", w);
+    let p = program.clone();
     env.expression.extend(program);
-    let res = eval(&mut env).ok()?;
+    let res = eval(env).ok()?;
+    println!("example test result: {:?}", res);
     if res.stack == expected {
         None
     } else {
         Some(Error {
             environment: Some(res.clone()),
-            message: format!("Result for {} did not match expected: \n{}\n{}", w,
-                          serialize::emit(&Item::List(expected)),
-                          serialize::emit(&Item::List(program))),
+            message: format!(
+                "Result for {} did not match expected: \n{}\n{}",
+                w,
+                serialize::emit(&Item::List(expected)),
+                serialize::emit(&Item::List(p))
+            ),
         })
     }
 }
 fn test_word(standard_env: Environment, w: Word) -> Vec<Error> {
+    println!("Testing word for {}", w);
     if let Some(d) = standard_env.dictionary.get(&w) {
-        for ex in d.examples().iter() {
-            let e = List::try_from(*ex).ok().unwrap();
-            let p = List::try_from(*e.get(0).unwrap()).ok().unwrap();
-            let exp = List::try_from(*e.get(1).unwrap()).ok().unwrap();
-            
-            test_example(standard_env.clone(), w, p,exp)
-        }.collect()
-        
+        d.clone()
+            .examples()
+            .iter()
+            .filter_map(|ex| {
+                println!("ex is {:?}", ex);
+                let x = ex.get(0).unwrap().clone();
+                if let (Item::List(p), Item::List(exp)) =
+                    (get_item(x.clone(), 0).unwrap(), get_item(x, 1).unwrap())
+                {
+                    test_example(standard_env.clone(), w.clone(), p.clone(), exp.clone())
+                } else {
+                    Some(Error::from("Invalid example"))
+                }
+            })
+            .collect::<Vec<Error>>()
+    } else {
+        println!("Word {} not found", w);
+
+        Vec::new()
     }
-    Vec::new()
 }
 
+#[cfg(test)]
+mod tests {
+    // Note this useful idiom: importing names from outer (for mod tests) scope.
+    use super::*;
+
+    #[test]
+    fn test_words() {
+        let e = standard_env(None);
+
+        let words = vec![
+            "+", "-", ">", "clone", "swap", "swapdown", "inc", "discard", "execute", "wrap",
+            "unwrap", "dip", "dipdown", "branch", "step", "range", "recur", "evert", "unpack",
+            "lexicon", "first",
+        ];
+
+        for word in words {
+            assert_eq!(
+            test_word(e.clone(), word.to_string()),
+            Vec::<Error>::new()
+        )};
+    }
+}
 
 // if let (Item::List(program), Item::List(expected)) = (program, expected) {
-        
+
 //     } else {
 //         Err(Error::from("Example should be a pair"))
 //     }
+
+// for ex in d.examples().iter() {
+//             let e = List::try_from(*ex).ok().unwrap();
+//             let p = List::try_from(*e.get(0).unwrap()).ok().unwrap();
+//             let exp = List::try_from(*e.get(1).unwrap()).ok().unwrap();
+
+//             test_example(standard_env.clone(), w, p,exp)
+//         }.retain(|i| i.is_some()).collect::<Vec<Error>>()
 #+end_src
 
 #+RESULTS:
@@ -3154,7 +3217,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::mem;
 
-pub fn stack_underflow() -> StepResult<'static> {
+pub fn stack_underflow() -> StepResult {
     Err(Error::from("Stack underflow"))
 }
 
@@ -3197,7 +3260,7 @@ pub fn gt(i: Item, j: Item) -> ItemResult {
     }
 }
 
-pub fn clone(env: &mut Environment) -> StepResult {
+pub fn clone(mut env: Environment) -> StepResult {
     if let Some(last) = env.stack.front().map(|v| (*v).clone()) {
         env.stack.push_front(last);
         Ok(env)
@@ -3206,7 +3269,7 @@ pub fn clone(env: &mut Environment) -> StepResult {
     }
 }
 
-fn swap2(env: &mut Environment, offset: usize) -> StepResult {
+fn swap2(mut env: Environment, offset: usize) -> StepResult {
     let len = env.stack.len();
     if len >= offset + 2 {
         env.stack.swap(offset, offset + 1);
@@ -3216,15 +3279,15 @@ fn swap2(env: &mut Environment, offset: usize) -> StepResult {
     }
 }
 
-pub fn swap(env: &mut Environment) -> StepResult {
+pub fn swap(mut env: Environment) -> StepResult {
     swap2(env, 0)
 }
 
-pub fn swapdown(env: &mut Environment) -> StepResult {
+pub fn swapdown(mut env: Environment) -> StepResult {
     swap2(env, 1)
 }
 
-pub fn discard(env: &mut Environment) -> StepResult {
+pub fn discard(mut env: Environment) -> StepResult {
     if let Some(_) = env.stack.pop_front() {
         Ok(env)
     } else {
@@ -3237,14 +3300,14 @@ fn extend_front(l: &mut List, mut to_prepend: List) -> () {
     l.extend(to_prepend);
 }
 
-fn append_expression(env: &mut Environment, mut items: VecDeque<Item>) -> StepResult {
+fn append_expression(mut env: Environment, mut items: VecDeque<Item>) -> StepResult {
     extend_front(&mut env.expression, items);
     Ok(env)
 }
 
 type EffectResult = Result<(Option<List>, Option<List>), Error>;
 
-pub fn env_effect1(env: &mut Environment, f: fn(Item) -> EffectResult) -> StepResult {
+pub fn env_effect1(mut env: Environment, f: fn(Item) -> EffectResult) -> StepResult {
     if let Some(i) = env.stack.pop_front() {
         let (expr_items, stack_items) = f(i)?;
         for i in expr_items.into_iter() {
@@ -3291,7 +3354,7 @@ pub fn loop_(p: Item, f: Item) -> EffectResult {
     }
 }
 
-pub fn execute(env: &mut Environment) -> StepResult {
+pub fn execute(mut env: Environment) -> StepResult {
     if let Some(item) = env.stack.pop_front() {
         match item {
             Item::List(program) => append_expression(env, program),
@@ -3302,7 +3365,7 @@ pub fn execute(env: &mut Environment) -> StepResult {
     }
 }
 
-pub fn wrap(env: &mut Environment) -> StepResult {
+pub fn wrap(mut env: Environment) -> StepResult {
     if let Some(item) = env.stack.pop_front() {
         let mut v = List::new();
         v.push_front(item);
@@ -3313,7 +3376,7 @@ pub fn wrap(env: &mut Environment) -> StepResult {
     }
 }
 
-pub fn unwrap(env: &mut Environment) -> StepResult {
+pub fn unwrap(mut env: Environment) -> StepResult {
     if let Some(item) = env.stack.pop_front() {
         if let Item::List(mut l) = item {
             for i in l {
@@ -3331,7 +3394,7 @@ pub fn unwrap(env: &mut Environment) -> StepResult {
     }
 }
 
-pub fn dip(env: &mut Environment) -> StepResult {
+pub fn dip(mut env: Environment) -> StepResult {
     let s1 = env.stack.pop_front();
     let s2 = env.stack.pop_front();
     match (s1, s2) {
@@ -3350,7 +3413,7 @@ pub fn dip(env: &mut Environment) -> StepResult {
     }
 }
 
-pub fn dipdown(env: &mut Environment) -> StepResult {
+pub fn dipdown(mut env: Environment) -> StepResult {
     let s1 = env.stack.pop_front();
     let s2 = env.stack.pop_front();
     let s3 = env.stack.pop_front();
@@ -3370,7 +3433,7 @@ pub fn dipdown(env: &mut Environment) -> StepResult {
     }
 }
 
-pub fn unpack(env: &mut Environment) -> StepResult {
+pub fn unpack(mut env: Environment) -> StepResult {
     if let Some(mut s1) = env.stack.front_mut() {
         if let Item::List(l) = s1 {
             if let Some(i) = l.pop_front() {
@@ -3393,7 +3456,7 @@ fn is_truthy(i: Item) -> bool {
     }
 }
 
-pub fn branch(env: &mut Environment) -> StepResult {
+pub fn branch(mut env: Environment) -> StepResult {
     let f = env.stack.pop_front();
     let t = env.stack.pop_front();
     let b = env.stack.pop_front();
@@ -3413,7 +3476,7 @@ pub fn branch(env: &mut Environment) -> StepResult {
     }
 }
 
-pub fn step(env: &mut Environment) -> StepResult {
+pub fn step(mut env: Environment) -> StepResult {
     let p = env.stack.pop_front();
     let l = env.stack.pop_front();
     match (p, l) {
@@ -3437,7 +3500,7 @@ pub fn step(env: &mut Environment) -> StepResult {
     }
 }
 
-pub fn range(env: &mut Environment) -> StepResult {
+pub fn range(mut env: Environment) -> StepResult {
     let to = env.stack.pop_front();
     let from = env.stack.pop_front();
     match (from, to) {
@@ -3460,7 +3523,7 @@ pub fn range(env: &mut Environment) -> StepResult {
 //         [[pred then rec1 rec2 'recur]] rec2)
 // then pred]])
 
-pub fn recur(env: &mut Environment) -> StepResult {
+pub fn recur(mut env: Environment) -> StepResult {
     let rec2 = env.stack.pop_front();
     let rec1 = env.stack.pop_front();
     let then = env.stack.pop_front();
@@ -3495,7 +3558,7 @@ pub fn recur(env: &mut Environment) -> StepResult {
 //(fn [{[l & others] 'stack :as env}]
 //            (assoc env 'stack (apply list (vec others) l)))
 
-pub fn evert(env: &mut Environment) -> StepResult {
+pub fn evert(mut env: Environment) -> StepResult {
     let l = env.stack.pop_front();
     match l {
         Some(l) => match l {
@@ -3550,7 +3613,7 @@ fn to_dict(def: HashMap<KeyItem, Item>) -> WordDef {
     }
 }
 
-pub fn lexicon(env: &mut Environment) -> StepResult {
+pub fn lexicon(mut env: Environment) -> StepResult {
     if let Ok(s) = fs::read_to_string("src/kcats/lexicon.kcats") {
         let items = serialize::parse(s);
 
