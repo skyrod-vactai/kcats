@@ -2998,11 +2998,17 @@ fn act_axiom(word: Word, e: Environment) -> StepResult {
     match word.as_str() {
         "+" => f_stack2(axiom::plus, e),
         "-" => f_stack2(axiom::minus, e),
+        "*" => f_stack2(axiom::mult, e),
+        "/" => f_stack2(axiom::div, e),
         ">" => f_stack2(axiom::gt, e),
+        "<" => f_stack2(axiom::lt, e),
+        ">=" => f_stack2(axiom::gte, e),
+        "<=" => f_stack2(axiom::lte, e),
         "clone" => axiom::clone(e),
         "swap" => axiom::swap(e),
         "swapdown" => axiom::swapdown(e),
         "inc" => f_stack1(axiom::inc, e),
+        "dec" => f_stack1(axiom::dec, e),
         "discard" => axiom::discard(e),
         "execute" => axiom::execute(e),
         "wrap" => axiom::wrap(e),
@@ -3016,6 +3022,7 @@ fn act_axiom(word: Word, e: Environment) -> StepResult {
         "evert" => axiom::evert(e),
         "unpack" => axiom::unpack(e),
         "lexicon" => axiom::lexicon(e),
+        "loop" => axiom::env_effect2(e, axiom::loop_),
         "first" => axiom::env_effect1(e, axiom::first),
         _ => Err(Error {
             message: (format!("unimplemented axiom word: {}", word)),
@@ -3151,13 +3158,11 @@ fn test_example(mut env: Environment, w: Word, program: List, expected: List) ->
 }
 
 fn test_word(standard_env: Environment, w: Word) -> Vec<Error> {
-    println!("Testing word for {}", w);
     if let Some(d) = standard_env.dictionary.get(&w) {
         d.clone()
             .examples()
             .iter()
             .filter_map(|ex| {
-                println!("ex is {:?}", ex);
                 let x = ex.get(0).unwrap().clone();
                 if let (Item::List(p), Item::List(exp)) =
                     (get_item(x.clone(), 0).unwrap(), get_item(x, 1).unwrap())
@@ -3169,8 +3174,6 @@ fn test_word(standard_env: Environment, w: Word) -> Vec<Error> {
             })
             .collect::<Vec<Error>>()
     } else {
-        println!("Word {} not found", w);
-
         Vec::new()
     }
 }
@@ -3278,11 +3281,39 @@ pub fn minus(i: Item, j: Item) -> ItemResult {
     }
 }
 
+pub fn mult(i: Item, j: Item) -> ItemResult {
+    match (i, j) {
+        (Item::Int(i), Item::Int(j)) => Ok(Item::Int(i * j)),
+        (Item::Float(i), Item::Float(j)) => Ok(Item::Float(i * j)),
+        (Item::Int(i), Item::Float(j)) => Ok(Item::Float(i as Float * j)),
+        (Item::Float(i), Item::Int(j)) => Ok(Item::Float(i * j as Float)),
+        _ => Err(Error::from("Invalid type for *")),
+    }
+}
+
+pub fn div(i: Item, j: Item) -> ItemResult {
+    match (i, j) {
+        (Item::Int(i), Item::Int(j)) => Ok(Item::Int(i / j)),
+        (Item::Float(i), Item::Float(j)) => Ok(Item::Float(i / j)),
+        (Item::Int(i), Item::Float(j)) => Ok(Item::Float(i as Float / j)),
+        (Item::Float(i), Item::Int(j)) => Ok(Item::Float(i / j as Float)),
+        _ => Err(Error::from("Invalid type for /")),
+    }
+}
+
 pub fn inc(i: Item) -> ItemResult {
     if let Item::Int(i) = i {
         Ok(Item::Int(i + 1))
     } else {
         Err(Error::from("Invalid type for inc"))
+    }
+}
+
+pub fn dec(i: Item) -> ItemResult {
+    if let Item::Int(i) = i {
+        Ok(Item::Int(i - 1))
+    } else {
+        Err(Error::from("Invalid type for dec"))
     }
 }
 
@@ -3297,6 +3328,39 @@ pub fn gt(i: Item, j: Item) -> ItemResult {
     }
 }
 
+pub fn lt(i: Item, j: Item) -> ItemResult {
+    match (i, j) {
+        (Item::Int(i), Item::Int(j)) => Ok(Item::Boolean(i < j)),
+        (Item::Float(i), Item::Float(j)) => Ok(Item::Boolean(i < j)),
+        (Item::Int(i), Item::Float(j)) => Ok(Item::Boolean((i as Float) < j)),
+        (Item::Float(i), Item::Int(j)) => Ok(Item::Boolean(i < j as Float)),
+
+        _ => Err(Error::from("Invalid type for <")),
+    }
+}
+
+pub fn gte(i: Item, j: Item) -> ItemResult {
+    match (i, j) {
+        (Item::Int(i), Item::Int(j)) => Ok(Item::Boolean(i >= j)),
+        (Item::Float(i), Item::Float(j)) => Ok(Item::Boolean(i >= j)),
+        (Item::Int(i), Item::Float(j)) => Ok(Item::Boolean(i as Float >= j)),
+        (Item::Float(i), Item::Int(j)) => Ok(Item::Boolean(i >= j as Float)),
+
+        _ => Err(Error::from("Invalid type for >=")),
+    }
+}
+
+pub fn lte(i: Item, j: Item) -> ItemResult {
+    match (i, j) {
+        (Item::Int(i), Item::Int(j)) => Ok(Item::Boolean(i <= j)),
+        (Item::Float(i), Item::Float(j)) => Ok(Item::Boolean(i <= j)),
+        (Item::Int(i), Item::Float(j)) => Ok(Item::Boolean(i as Float <= j)),
+        (Item::Float(i), Item::Int(j)) => Ok(Item::Boolean(i <= j as Float)),
+
+        _ => Err(Error::from("Invalid type for <=")),
+    }
+}
+    
 pub fn clone(mut env: Environment) -> StepResult {
     if let Some(last) = env.stack.front().map(|v| (*v).clone()) {
         env.stack.push_front(last);
@@ -3347,6 +3411,22 @@ type EffectResult = Result<(Option<List>, Option<List>), Error>;
 pub fn env_effect1(mut env: Environment, f: fn(Item) -> EffectResult) -> StepResult {
     if let Some(i) = env.stack.pop_front() {
         let (expr_items, stack_items) = f(i)?;
+        if expr_items.is_some() {
+            extend_front(&mut env.expression, expr_items.unwrap());
+        }
+        if stack_items.is_some() {
+            extend_front(&mut env.stack, stack_items.unwrap());
+        }
+
+        Ok(env)
+    } else {
+        stack_underflow()
+    }
+}
+
+pub fn env_effect2(mut env: Environment, f: fn(Item, Item) -> EffectResult) -> StepResult {
+    if let (Some(i), Some(j)) = (env.stack.pop_front(), env.stack.pop_front()) {
+        let (expr_items, stack_items) = f(i, j)?;
         if expr_items.is_some() {
             extend_front(&mut env.expression, expr_items.unwrap());
         }
