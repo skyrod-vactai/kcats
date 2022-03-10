@@ -2742,7 +2742,10 @@ edition = "2021"
 
 [dependencies]
 rug = "1.15.0"
-edn-format = "3.2.2"    
+edn-format = "3.2.2"
+
+[dev-dependencies]
+test-case = "2.0.0"
 #+end_src
 ** Stack
 Let's start by defining some data structures in a separate module
@@ -3094,19 +3097,22 @@ fn standard_dictionary() -> Dictionary {
 }
 
 fn standard_env(program: Option<List>) -> Environment {
-    let mut expr = match program {
+    let mut prog_expr = match program {
         Some(p) => Stack::from(p),
         _ => Stack::new(),
     };
 
-    expr.push_front(word("lexicon"));
+    let expr = Stack::from(vec![word("lexicon")]);
 
-    eval(Environment {
+    let mut initialized = eval(Environment {
         stack: Stack::new(),
         expression: expr,
         dictionary: standard_dictionary(),
     })
-    .unwrap()
+    .unwrap();
+
+    initialized.expression = prog_expr;
+    initialized
 }
 
 fn main() {
@@ -3121,25 +3127,29 @@ fn main() {
 }
 
 fn test_example(mut env: Environment, w: Word, program: List, expected: List) -> Option<Error> {
-    println!("Testing example for {}", w);
     let p = program.clone();
     env.expression.extend(program);
-    let res = eval(env).ok()?;
-    println!("example test result: {:?}", res);
-    if res.stack == expected {
-        None
-    } else {
-        Some(Error {
-            environment: Some(res.clone()),
-            message: format!(
-                "Result for {} did not match expected: \n{}\n{}",
-                w,
-                serialize::emit(&Item::List(expected)),
-                serialize::emit(&Item::List(p))
-            ),
-        })
+    //let res = eval(env).ok()?;
+    match eval(env) {
+        Err(e) => Some(e),
+        Ok(res) => {
+            if res.stack == expected {
+                None
+            } else {
+                Some(Error {
+                    environment: Some(res.clone()),
+                    message: format!(
+                        "Result for {} did not match expected: \n{}\n{}",
+                        w,
+                        serialize::emit(&Item::List(expected)),
+                        serialize::emit(&Item::List(p))
+                    ),
+                })
+            }
+        }
     }
 }
+
 fn test_word(standard_env: Environment, w: Word) -> Vec<Error> {
     println!("Testing word for {}", w);
     if let Some(d) = standard_env.dictionary.get(&w) {
@@ -3168,6 +3178,8 @@ fn test_word(standard_env: Environment, w: Word) -> Vec<Error> {
 #[cfg(test)]
 mod tests {
     // Note this useful idiom: importing names from outer (for mod tests) scope.
+    use test_case::test_case;
+
     use super::*;
 
     #[test]
@@ -3177,14 +3189,39 @@ mod tests {
         let words = vec![
             "+", "-", ">", "clone", "swap", "swapdown", "inc", "discard", "execute", "wrap",
             "unwrap", "dip", "dipdown", "branch", "step", "range", "recur", "evert", "unpack",
-            "lexicon", "first",
+            "lexicon", "first", "recur", "snapshot", "loop",
         ];
 
         for word in words {
-            assert_eq!(
-            test_word(e.clone(), word.to_string()),
-            Vec::<Error>::new()
-        )};
+            assert_eq!(test_word(e.clone(), word.to_string()), Vec::<Error>::new())
+        }
+    }
+
+    #[test_case("+" ; "plus")]
+    #[test_case("-" ; "minus")]
+    #[test_case(">" ; "gt")]
+    #[test_case("clone")]
+    #[test_case("swap")]
+    #[test_case("swapdown")]
+    #[test_case("inc")]
+    #[test_case("discard")]
+    #[test_case("execute")]
+    #[test_case("wrap")]
+    #[test_case("unwrap")]
+    #[test_case("dip")]
+    #[test_case("dipdown")]
+    #[test_case("branch")]
+    #[test_case("step")]
+    #[test_case("range")]
+    #[test_case("evert")]
+    #[test_case("unpack")]
+    #[test_case("first")]
+    #[test_case("recur")]
+    #[test_case("snapshot")]
+    #[test_case("loop")]
+    fn test_lexicon(word: &str) {
+        let e = standard_env(None);
+        assert_eq!(test_word(e.clone(), word.to_string()), Vec::<Error>::new());
     }
 }
 
@@ -3310,12 +3347,13 @@ type EffectResult = Result<(Option<List>, Option<List>), Error>;
 pub fn env_effect1(mut env: Environment, f: fn(Item) -> EffectResult) -> StepResult {
     if let Some(i) = env.stack.pop_front() {
         let (expr_items, stack_items) = f(i)?;
-        for i in expr_items.into_iter() {
-            env.expression.push_front(Item::List(i));
+        if expr_items.is_some() {
+            extend_front(&mut env.expression, expr_items.unwrap());
         }
-        for i in stack_items.into_iter() {
-            env.stack.push_front(Item::List(i));
+        if stack_items.is_some() {
+            extend_front(&mut env.stack, stack_items.unwrap());
         }
+
         Ok(env)
     } else {
         stack_underflow()
@@ -3324,14 +3362,12 @@ pub fn env_effect1(mut env: Environment, f: fn(Item) -> EffectResult) -> StepRes
 
 pub fn first(i: Item) -> EffectResult {
     if let Item::List(mut l) = i {
-        Ok((
-            None,
-            Some(VecDeque::from(vec![if let Some(i) = l.pop_front() {
-                i
-            } else {
-                Item::Nothing
-            }])),
-        ))
+        let x = List::from(vec![if let Some(i) = l.pop_front() {
+            i
+        } else {
+            Item::Nothing
+        }]);
+        Ok((None, Some(x)))
     } else {
         Err(Error::from("Invalid type for first"))
     }
