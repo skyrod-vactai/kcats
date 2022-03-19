@@ -2764,6 +2764,7 @@ use std::{collections::HashMap, hash::Hash};
 use std::rc::Rc;
 use internment::Intern;
 use std::ptr;
+use std::hash::Hasher;
 
 pub type Word = Intern<String>;
 
@@ -2779,6 +2780,12 @@ pub type Int = i64;
 
 pub type Float = f64;
 
+#[derive(Clone)]
+pub struct BuiltinWord {
+    pub word: Word,
+    pub f: Rc<StepFn>
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Item {
     Int(Int),
@@ -2787,6 +2794,7 @@ pub enum Item {
     Bytes(Bytes),
     String(String),
     Word(Word),
+    Builtin(BuiltinWord),
     List(List),
     Nothing,
 }
@@ -2798,6 +2806,7 @@ pub enum KeyItem {
     Bytes(Bytes),
     String(String),
     Word(Word),
+    Builtin(BuiltinWord),
     List(VecDeque<KeyItem>),
     Nothing,
 }
@@ -2826,6 +2835,20 @@ impl PartialEq for AxiomDef {
     }
 }
 
+impl PartialEq for BuiltinWord {
+    fn eq(&self, other: &Self) -> bool {
+        self.word == other.word
+    }
+}
+
+impl Eq for BuiltinWord {}
+
+impl Hash for BuiltinWord {
+
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.word.hash(state);
+    }
+}
 #[derive(Debug, Clone, PartialEq)]
 pub struct DerivedDef {
     pub docs: WordDocs,
@@ -2925,6 +2948,14 @@ impl fmt::Debug for Error {
     }
 }
 
+impl fmt::Debug for BuiltinWord {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let mut ds = f.debug_struct("BuiltinWord");
+        ds.field("word", &self.word);
+        ds.finish()
+    }
+}
+
 pub type StepResult = Result<Environment, Error>;
 
 pub type ItemResult = Result<Item, Error>;
@@ -2943,6 +2974,7 @@ pub fn to_key_item(i: Item) -> Result<KeyItem, Error> {
                 .collect::<Result<KeyList, Error>>()?,
         )),
         Item::Word(w) => Ok(KeyItem::Word(w)),
+        Item::Builtin(w) => Ok(KeyItem::Builtin(w)),
         Item::Boolean(b) => Ok(KeyItem::Boolean(b)),
         Item::Bytes(bs) => Ok(KeyItem::Bytes(bs)),
         Item::Nothing => Ok(KeyItem::Nothing),
@@ -2958,6 +2990,7 @@ pub fn to_value_item(i: KeyItem) -> Item {
             Item::List(l.iter().map(|i| to_value_item(i.clone())).collect::<List>())
         }
         KeyItem::Word(w) => Item::Word(w),
+        KeyItem::Builtin(b) => Item::Builtin(b),
         KeyItem::Boolean(b) => Item::Boolean(b),
         KeyItem::Bytes(bs) => Item::Bytes(bs),
         KeyItem::Nothing => Item::Nothing,
@@ -2985,9 +3018,6 @@ pub fn to_hash(mut l: List) -> Result<HashMap<KeyItem, Item>, Error> {
         .collect::<Result<HashMap<KeyItem, Item>, Error>>()
 }
 
-pub trait Step {
-    fn step(self, env: Environment) -> StepResult;
-}
 #+end_src
 
 #+RESULTS:
@@ -3003,101 +3033,41 @@ use std::io;
 use std::iter::FromIterator;
 use std::mem;
 use std::rc::Rc;
-
-fn f_stack1(f: fn(Item) -> ItemResult) -> impl Fn(Environment) -> StepResult {
-    move |mut env: Environment| {
-        if let Some(x) = env.stack.pop_front() {
-            env.stack.push_front(f(x)?);
-            Ok(env)
-        } else {
-            axiom::stack_underflow()
-        }
-    }
-}
-
-fn f_stack2(f: fn(Item, Item) -> ItemResult) -> impl Fn(Environment) -> StepResult {
-    move |mut env: Environment| {
-        let i = env.stack.pop_front();
-        let j = env.stack.pop_front();
-        match (i, j) {
-            (Some(i), Some(j)) => {
-                env.stack.push_front(f(j, i)?);
-                Ok(env)
-            }
-            _ => axiom::stack_underflow(),
-        }
-    }
-}
-
-// fn act_axiom(word: Word, e: Environment) -> StepResult {
-//     match word.as_str() {
-//         "+" => f_stack2(axiom::plus, e),
-//         "-" => f_stack2(axiom::minus, e),
-//         "*" => f_stack2(axiom::mult, e),
-//         "/" => f_stack2(axiom::div, e),
-//         ">" => f_stack2(axiom::gt, e),
-//         "<" => f_stack2(axiom::lt, e),
-//         ">=" => f_stack2(axiom::gte, e),
-//         "<=" => f_stack2(axiom::lte, e),
-//         "clone" => axiom::clone(e),
-//         "swap" => axiom::swap(e),
-//         "swapdown" => axiom::swapdown(e),
-//         "inc" => f_stack1(axiom::inc, e),
-//         "dec" => f_stack1(axiom::dec, e),
-//         "discard" => axiom::discard(e),
-//         "execute" => axiom::execute(e),
-//         "wrap" => axiom::wrap(e),
-//         "unwrap" => axiom::unwrap(e),
-//         "dip" => axiom::dip(e),
-//         "dipdown" => axiom::dipdown(e),
-//         "branch" => axiom::branch(e),
-//         "step" => axiom::step(e),
-//         "range" => axiom::range(e),
-//         "recur" => axiom::recur(e),
-//         "evert" => axiom::evert(e),
-//         "unpack" => axiom::unpack(e),
-//         "lexicon" => axiom::lexicon(e),
-//         "loop" => axiom::env_effect2(e, axiom::loop_),
-//         "=" => axiom::env_effect2(e, axiom::eq),
-//         "count" => axiom::env_effect1(e, axiom::count),
-//         "string?" => axiom::env_effect1(e, axiom::is_string),
-//         "number?" => axiom::env_effect1(e, axiom::is_number),
-//         "list?" => axiom::env_effect1(e, axiom::is_list),
-//         "first" => axiom::env_effect1(e, axiom::first),
-//         _ => Err(Error {
-//             message: (format!("unimplemented axiom word: {}", word)),
-//             environment: Some(e.clone()),
-//         }),
-//     }
-// }
+use internment::Intern;
 
 fn eval_step(mut env: Environment) -> StepResult {
     //println!("{:?}", env);
     let next_item = env.expression.pop_front();
-
+    
     if let Some(val) = next_item {
-        if let Item::Word(word) = val {
-            if let Some(dfn) = env.dictionary.get(&word) {
-                match dfn {
-                    WordDef::Axiom(d) => (d.f.clone())(env),
-                    WordDef::Derived(d) => {
-                        let mut items = d.definition.clone();
-                        mem::swap(&mut items, &mut env.expression);
-                        env.expression.extend(items);
+        match val {
+            Item::Word(word) => {
+                if let Some(dfn) = env.dictionary.get(&word) {
+                    match dfn {
+                        WordDef::Axiom(d) => (d.f.clone())(env),
+                        WordDef::Derived(d) => {
+                            let mut items = d.definition.clone();
+                            mem::swap(&mut items, &mut env.expression);
+                            env.expression.extend(items);
 
-                        Ok(env)
+                            Ok(env)
+                        }
                     }
+                } else {
+                    Err(Error {
+                        environment: Some(env.clone()),
+                        message: format!("Unknown word: {}", word),
+                    })
                 }
-            } else {
-                Err(Error {
-                    environment: Some(env.clone()),
-                    message: format!("Unknown word: {}", word),
-                })
             }
-        } else {
-            // not a word, just push onto stack
-            env.stack.push_front(val);
-            Ok(env)
+            Item::Builtin(builtin) => {
+                Ok((builtin.f)(env)?)
+            }
+            _ => {
+                // not a word, just push onto stack
+                env.stack.push_front(val);
+                Ok(env)
+            }
         }
     } else {
         Err(Error::from("Expression is empty"))
@@ -3131,33 +3101,6 @@ fn print_result(r: StepResult) {
     }
 }
 
-fn axiom_entry<'a>(s: &str, f: Rc<StepFn>) -> (Word, WordDef) {
-    (
-        Word::from(s),
-        WordDef::Axiom(AxiomDef {
-            docs: WordDocs {
-                examples: None,
-                spec: None,
-            },
-            f: f
-        }),
-    )
-}
-
-fn unimplemented(s: &'static str) -> (Word, WordDef) {
-    axiom_entry(s, Rc::new(move | _: Environment | 
-                           Err(Error::from(format!("Unimplemented word: {}", s)))))        
-}
-
-
-fn standard_dictionary() -> Dictionary {
-    HashMap::from([axiom_entry("lexicon", Rc::new(axiom::lexicon)),
-                   axiom_entry("+", Rc::new(f_stack2(axiom::plus))),
-                   unimplemented("-")
-
-    ])
-}
-
 fn standard_env(program: Option<List>) -> Environment {
     let mut prog_expr = match program {
         Some(p) => Stack::from(p),
@@ -3169,7 +3112,7 @@ fn standard_env(program: Option<List>) -> Environment {
     let mut initialized = eval(Environment {
         stack: Stack::new(),
         expression: expr,
-        dictionary: standard_dictionary(),
+        dictionary: axiom::standard_dictionary(),
     })
     .unwrap();
 
@@ -3181,7 +3124,7 @@ fn main() {
     let mut program = String::new();
     match io::stdin().read_line(&mut program) {
         Ok(_) => {
-            let parsed = serialize::parse(program);
+            let parsed = serialize::parse(program, &Some(axiom::standard_dictionary()));
             print_result(eval(standard_env(Some(parsed))));
         }
         Err(error) => println!("error: {}", error),
@@ -3274,7 +3217,7 @@ mod tests {
     #[test_case("list?" ; "is_list")]
     fn test_lexicon(word: &str) {
         let e = standard_env(None);
-        assert_eq!(test_word(e.clone(), word.to_string()), Vec::<Error>::new());
+        assert_eq!(test_word(e.clone(), Intern::new(word.to_string())), Vec::<Error>::new());
     }
 }
 
@@ -3308,6 +3251,91 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::mem;
 use std::rc::Rc;
+
+fn f_stack1(f: fn(Item) -> ItemResult) -> impl Fn(Environment) -> StepResult {
+    move |mut env: Environment| {
+        if let Some(x) = env.stack.pop_front() {
+            env.stack.push_front(f(x)?);
+            Ok(env)
+        } else {
+            stack_underflow()
+        }
+    }
+}
+
+fn f_stack2(f: fn(Item, Item) -> ItemResult) -> impl Fn(Environment) -> StepResult {
+    move |mut env: Environment| {
+        let i = env.stack.pop_front();
+        let j = env.stack.pop_front();
+        match (i, j) {
+            (Some(i), Some(j)) => {
+                env.stack.push_front(f(j, i)?);
+                Ok(env)
+            }
+            _ => stack_underflow(),
+        }
+    }
+}
+
+fn axiom_entry<'a>(s: &str, f: Rc<StepFn>) -> (Word, WordDef) {
+    (
+        Word::from(s),
+        WordDef::Axiom(AxiomDef {
+            docs: WordDocs {
+                examples: None,
+                spec: None,
+            },
+            f: f,
+        }),
+    )
+}
+
+fn unimplemented(s: &'static str) -> (Word, WordDef) {
+    axiom_entry(
+        s,
+        Rc::new(move |_: Environment| Err(Error::from(format!("Unimplemented word: {}", s)))),
+    )
+}
+
+pub fn standard_dictionary() -> Dictionary {
+    HashMap::from([
+        axiom_entry("lexicon", Rc::new(lexicon)),
+        axiom_entry("+", Rc::new(f_stack2(plus))),
+        axiom_entry("-", Rc::new(f_stack2(minus))),
+        axiom_entry("*", Rc::new(f_stack2(mult))),
+        axiom_entry("/", Rc::new(f_stack2(div))),
+        axiom_entry(">", Rc::new(f_stack2(gt))),
+        axiom_entry("<", Rc::new(f_stack2(lt))),
+        axiom_entry(">=", Rc::new(f_stack2(gte))),
+        axiom_entry("<=", Rc::new(f_stack2(lte))),
+        axiom_entry("clone", Rc::new(clone)),
+        axiom_entry("swap", Rc::new(swap)),
+        axiom_entry("swapdown", Rc::new(swapdown)),
+        axiom_entry("inc", Rc::new(f_stack1(inc))),
+        axiom_entry("dec", Rc::new(f_stack1(dec))),
+        axiom_entry("discard", Rc::new(discard)),
+        axiom_entry("execute", Rc::new(execute)),
+        axiom_entry("wrap", Rc::new(wrap)),
+        axiom_entry("unwrap", Rc::new(unwrap)),
+        axiom_entry("dip", Rc::new(dip)),
+        axiom_entry("dipdown", Rc::new(dipdown)),
+        axiom_entry("branch", Rc::new(branch)),
+        axiom_entry("step", Rc::new(step)),
+        axiom_entry("range", Rc::new(range)),
+        axiom_entry("recur", Rc::new(recur)),
+        axiom_entry("evert", Rc::new(evert)),
+        axiom_entry("unpack", Rc::new(unpack)),
+        axiom_entry("lexicon", Rc::new(lexicon)),
+        axiom_entry("loop", Rc::new(env_effect2(loop_))),
+        axiom_entry("=", Rc::new(env_effect2(eq))),
+        axiom_entry("count", Rc::new(env_effect1(count))),
+        axiom_entry("string?", Rc::new(env_effect1(is_string))),
+        axiom_entry("number?", Rc::new(env_effect1(is_number))),
+        axiom_entry("list?", Rc::new(env_effect1(is_list))),
+        axiom_entry("first", Rc::new(env_effect1(first))),
+    ])
+}
+
 
 pub fn stack_underflow() -> StepResult {
     Err(Error::from("Stack underflow"))
@@ -3820,14 +3848,15 @@ fn as_list(i: Option<&Item>) -> Option<List> {
 }
 
 fn as_word(i: &KeyItem) -> Option<Word> {
-    if let KeyItem::Word(w) = i {
-        Some(w.clone())
-    } else {
-        None
+    match i {
+        KeyItem::Word(w) => { Some(w.clone()) },
+        KeyItem::Builtin(b) => { Some(b.word.clone()) },
+        _ => { None }
     }
 }
 
 fn to_lexicon_entry(w: Word, def: HashMap<KeyItem, Item>) -> WordDef {
+    //println!("{:?}", def);
     let docs = WordDocs {
         examples: as_list(def.get(&key_item("examples"))),
         spec: as_list(def.get(&key_item("spec"))),
@@ -3847,7 +3876,7 @@ fn to_lexicon_entry(w: Word, def: HashMap<KeyItem, Item>) -> WordDef {
 
 pub fn lexicon(mut env: Environment) -> StepResult {
     if let Ok(s) = fs::read_to_string("src/kcats/lexicon.kcats") {
-        let items = serialize::parse(s);
+        let items = serialize::parse(s, &Some(standard_dictionary()));
         let vitems = to_hash(List::from(items))?;
         for (k, def) in vitems.iter() {
             let h = to_hash(as_list(Some(def)).unwrap()).ok().unwrap();
@@ -3888,13 +3917,26 @@ use std::collections::VecDeque;
 use std::fmt;
 use internment::Intern;
 
-fn to_item(item: &edn_format::Value) -> Item {
+fn lookup_builtin(w: Word, standard_dictionary: &Option<Dictionary>) -> Item {
+    if let Some(dict) = standard_dictionary {
+        //println!("Looking up {} in dict of {} words", w, dict.len());
+        if let Some(def) = dict.get(&w) {
+            if let WordDef::Axiom(a) = def {
+                //println!("Compiled builtin! {}", w);
+                return Item::Builtin(BuiltinWord {word: w, f: a.f.clone()})
+            }
+        }
+    }
+    return Item::Word(w)
+}
+
+fn to_item(item: &edn_format::Value, standard_dictionary: &Option<Dictionary>) -> Item {
     match item {
         edn_format::Value::Integer(i) => Item::Int(*i),
         edn_format::Value::Vector(v) => {
-            Item::List(v.iter().map(|i| to_item(i)).collect::<VecDeque<Item>>())
+            Item::List(v.iter().map(|i| to_item(i, standard_dictionary)).collect::<VecDeque<Item>>())
         }
-        edn_format::Value::Symbol(s) => Item::Word(Intern::new(s.name().to_string())),
+        edn_format::Value::Symbol(s) => lookup_builtin(Intern::new(s.name().to_string()), standard_dictionary),
         edn_format::Value::Boolean(b) => Item::Boolean(*b),
         edn_format::Value::String(s) => Item::String(s.to_string()),
         edn_format::Value::Float(f) => Item::Float(f.into_inner()),
@@ -3918,12 +3960,13 @@ fn from_item(item: &Item) -> edn_format::Value {
     }
 }
 
-pub fn parse(s: String) -> List {
+pub fn parse(s: String, standard_dictionary: &Option<Dictionary>) -> List {
     let parser = edn_format::Parser::from_iter(s.chars(), edn_format::ParserOptions::default());
     parser
-        .map(|r| to_item(&r.expect("expected valid element")))
+        .map(move |r| to_item(&r.expect("expected valid element"), standard_dictionary))
         .collect()
 }
+
 
 pub fn emit(item: &Item) -> String {
     edn_format::emit_str(&from_item(item))
