@@ -2818,10 +2818,11 @@ pub struct AxiomDef {
     pub f: Rc<StepFn>
 }
 
+// dictionary entries are equal if they have the same function reference,
+// no need to compare the function values
 impl PartialEq for AxiomDef {
     fn eq(&self, other: &Self) -> bool {
-        self.docs == other.docs && ptr::eq(self.f.as_ref(), other.f.as_ref())
-        
+        self.docs == other.docs && ptr::eq(self.f.as_ref(), other.f.as_ref())        
     }
 }
 
@@ -3142,9 +3143,19 @@ fn axiom_entry<'a>(s: &str, f: Rc<StepFn>) -> (Word, WordDef) {
         }),
     )
 }
+
+fn unimplemented(s: &'static str) -> (Word, WordDef) {
+    axiom_entry(s, Rc::new(move | _: Environment | 
+                           Err(Error::from(format!("Unimplemented word: {}", s)))))        
+}
+
+
 fn standard_dictionary() -> Dictionary {
     HashMap::from([axiom_entry("lexicon", Rc::new(axiom::lexicon)),
-                   axiom_entry("+", Rc::new(f_stack2(axiom::plus)))])
+                   axiom_entry("+", Rc::new(f_stack2(axiom::plus))),
+                   unimplemented("-")
+
+    ])
 }
 
 fn standard_env(program: Option<List>) -> Environment {
@@ -3296,6 +3307,7 @@ use internment::Intern;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::mem;
+use std::rc::Rc;
 
 pub fn stack_underflow() -> StepResult {
     Err(Error::from("Stack underflow"))
@@ -3815,29 +3827,47 @@ fn as_word(i: &KeyItem) -> Option<Word> {
     }
 }
 
-fn to_dict(def: HashMap<KeyItem, Item>) -> WordDef {
-    let v = as_list(def.get(&key_item("definition")));
+fn to_lexicon_entry(w: Word, def: HashMap<KeyItem, Item>) -> WordDef {
     let docs = WordDocs {
         examples: as_list(def.get(&key_item("examples"))),
         spec: as_list(def.get(&key_item("spec"))),
     };
-    WordDef::Derived(DerivedDef {
-            definition: v.unwrap(),
+    if let Some(d) = as_list(def.get(&key_item("definition"))) {
+        WordDef::Derived(DerivedDef {
+            definition: d,
             docs: docs,
-    })
+        })
+    } else {
+        WordDef::Axiom(AxiomDef {
+            docs: docs,
+            f: Rc::new(move |_: Environment| Err(Error::from(format!("Unimplemented word: {}", w)))),
+        })
+    }
 }
 
 pub fn lexicon(mut env: Environment) -> StepResult {
     if let Ok(s) = fs::read_to_string("src/kcats/lexicon.kcats") {
         let items = serialize::parse(s);
-
-        let vitems = List::from(items);
-        let d: Dictionary = HashMap::from_iter(to_hash(vitems)?.iter().map(|(k, v)| {
-            let v = to_dict(to_hash(as_list(Some(v)).unwrap()).ok().unwrap());
-            (as_word(k).unwrap_or(Intern::new("".to_string())), v)
-        }));
-
-        env.dictionary = d;
+        let vitems = to_hash(List::from(items))?;
+        for (k, def) in vitems.iter() {
+            let h = to_hash(as_list(Some(def)).unwrap()).ok().unwrap();
+            let word = as_word(k).unwrap();
+            let newdef = to_lexicon_entry(word, h);
+            let newdef2 = newdef.clone();
+            env.dictionary
+                .entry(word)
+                .and_modify(|e| match (e, newdef) {
+                    (WordDef::Axiom(a), WordDef::Axiom(new_a)) => {
+                        a.docs = new_a.docs;
+                    },
+                    (WordDef::Derived(d), WordDef::Derived(new_d)) => {
+                        d.docs = new_d.docs;
+                        d.definition = new_d.definition;
+                    },
+                    _ => {}
+                })
+                .or_insert(newdef2);
+        }
         Ok(env)
     } else {
         Err(Error::from("Could not read from lexicon file"))
