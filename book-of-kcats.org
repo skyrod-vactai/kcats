@@ -2778,11 +2778,12 @@ use std::rc::Rc;
 use internment::Intern;
 use std::ptr;
 use std::hash::{Hash, Hasher};
-use ordered_float::OrderedFloat;
 
 pub type Word = Intern<String>;
 
 pub type List = VecDeque<Item>;
+
+pub type KeyList = VecDeque<KeyItem>;
 
 pub type Stack = List;
 
@@ -2790,11 +2791,7 @@ pub type Bytes = Vec<u8>;
 
 pub type Int = i64;
 
-pub type InnerFloat = f64;
-
-pub type Float = OrderedFloat<InnerFloat>;
-
-pub type Associative = BTreeMap<Item, Item>;
+pub type Float = f64;
 
 #[derive(Clone)]
 pub struct BuiltinWord {
@@ -2802,7 +2799,7 @@ pub struct BuiltinWord {
     pub f: Rc<StepFn>
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Item {
     Int(Int),
     Float(Float),
@@ -2812,7 +2809,18 @@ pub enum Item {
     Word(Word),
     Builtin(BuiltinWord),
     List(List),
-    Assoc(Associative),
+    Nothing,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub enum KeyItem {
+    Int(Int),
+    Boolean(bool),
+    Bytes(Bytes),
+    String(String),
+    Word(Word),
+    Builtin(BuiltinWord),
+    List(VecDeque<KeyItem>),
     Nothing,
 }
 
@@ -2969,14 +2977,47 @@ pub fn word(s: &str) -> Item {
     Item::Word(Word::from(s))
 }
 
-pub fn to_entry(mut i: Item) -> Result<(Item, Item), Error> {
+pub fn to_key_item(i: Item) -> Result<KeyItem, Error> {
+    match i {
+        Item::Int(i) => Ok(KeyItem::Int(i)),
+        Item::String(i) => Ok(KeyItem::String(i)),
+        Item::List(l) => Ok(KeyItem::List(
+            l.iter()
+                .map(|i| to_key_item(i.clone()))
+                .collect::<Result<KeyList, Error>>()?,
+        )),
+        Item::Word(w) => Ok(KeyItem::Word(w)),
+        Item::Builtin(w) => Ok(KeyItem::Builtin(w)),
+        Item::Boolean(b) => Ok(KeyItem::Boolean(b)),
+        Item::Bytes(bs) => Ok(KeyItem::Bytes(bs)),
+        Item::Nothing => Ok(KeyItem::Nothing),
+        _ => Err(Error::from("item is not allowed as a hashmap key")),
+    }
+}
+
+pub fn to_value_item(i: KeyItem) -> Item {
+    match i {
+        KeyItem::Int(i) => Item::Int(i),
+        KeyItem::String(i) => Item::String(i),
+        KeyItem::List(l) => {
+            Item::List(l.iter().map(|i| to_value_item(i.clone())).collect::<List>())
+        }
+        KeyItem::Word(w) => Item::Word(w),
+        KeyItem::Builtin(b) => Item::Builtin(b),
+        KeyItem::Boolean(b) => Item::Boolean(b),
+        KeyItem::Bytes(bs) => Item::Bytes(bs),
+        KeyItem::Nothing => Item::Nothing,
+    }
+}
+
+pub fn to_entry(mut i: Item) -> Result<(KeyItem, Item), Error> {
     match i {
         Item::List(mut l) => {
             let v = l.pop_back();
             let k = l.pop_back();
             let e = l.pop_back();
             match (k, v, e) {
-                (Some(k), Some(v), None) => Ok((k, v)),
+                (Some(k), Some(v), None) => Ok((to_key_item(k)?, v)),
                 _ => Err(Error::from("Item must be a duple")),
             }
         }
@@ -2984,10 +3025,10 @@ pub fn to_entry(mut i: Item) -> Result<(Item, Item), Error> {
     }
 }
 
-pub fn to_hash(mut l: List) -> Result<Associative, Error> {
+pub fn to_hash(mut l: List) -> Result<HashMap<KeyItem, Item>, Error> {
     l.iter()
         .map(|i| to_entry(i.clone()))
-        .collect::<Result<HashMap<Item, Item>, Error>>()
+        .collect::<Result<HashMap<KeyItem, Item>, Error>>()
 }
 #+end_src
 
@@ -3226,7 +3267,6 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::mem;
 use std::rc::Rc;
-use ordered_float::OrderedFloat;
 
 fn f_stack1(f: fn(Item) -> ItemResult) -> impl Fn(Environment) -> StepResult {
     move |mut env: Environment| {
@@ -3328,8 +3368,8 @@ pub fn plus(i: Item, j: Item) -> ItemResult {
     match (i, j) {
         (Item::Int(i), Item::Int(j)) => Ok(Item::Int(i + j)),
         (Item::Float(i), Item::Float(j)) => Ok(Item::Float(i + j)),
-        (Item::Int(i), Item::Float(j)) => Ok(Item::Float(OrderedFloat(i as InnerFloat) + j)),
-        (Item::Float(i), Item::Int(j)) => Ok(Item::Float(i + OrderedFloat(j as InnerFloat))),
+        (Item::Int(i), Item::Float(j)) => Ok(Item::Float(i as Float + j)),
+        (Item::Float(i), Item::Int(j)) => Ok(Item::Float(i + j as Float)),
         _ => Err(invalid_type("+")),
     }
 }
@@ -3338,8 +3378,8 @@ pub fn minus(i: Item, j: Item) -> ItemResult {
     match (i, j) {
         (Item::Int(i), Item::Int(j)) => Ok(Item::Int(i - j)),
         (Item::Float(i), Item::Float(j)) => Ok(Item::Float(i - j)),
-        (Item::Int(i), Item::Float(j)) => Ok(Item::Float(OrderedFloat(i as InnerFloat) - j)),
-        (Item::Float(i), Item::Int(j)) => Ok(Item::Float(i - OrderedFloat(j as InnerFloat))),
+        (Item::Int(i), Item::Float(j)) => Ok(Item::Float(i as Float - j)),
+        (Item::Float(i), Item::Int(j)) => Ok(Item::Float(i - j as Float)),
         _ => Err(invalid_type("-")),
     }
 }
@@ -3348,8 +3388,8 @@ pub fn mult(i: Item, j: Item) -> ItemResult {
     match (i, j) {
         (Item::Int(i), Item::Int(j)) => Ok(Item::Int(i * j)),
         (Item::Float(i), Item::Float(j)) => Ok(Item::Float(i * j)),
-        (Item::Int(i), Item::Float(j)) => Ok(Item::Float(OrderedFloat(i as InnerFloat) * j)),
-        (Item::Float(i), Item::Int(j)) => Ok(Item::Float(i * OrderedFloat(j as InnerFloat))),
+        (Item::Int(i), Item::Float(j)) => Ok(Item::Float(i as Float * j)),
+        (Item::Float(i), Item::Int(j)) => Ok(Item::Float(i * j as Float)),
         _ => Err(invalid_type("*")),
     }
 }
@@ -3358,8 +3398,8 @@ pub fn div(i: Item, j: Item) -> ItemResult {
     match (i, j) {
         (Item::Int(i), Item::Int(j)) => Ok(Item::Int(i / j)),
         (Item::Float(i), Item::Float(j)) => Ok(Item::Float(i / j)),
-        (Item::Int(i), Item::Float(j)) => Ok(Item::Float(OrderedFloat(i as InnerFloat) / j)),
-        (Item::Float(i), Item::Int(j)) => Ok(Item::Float(i / OrderedFloat(j as InnerFloat))),
+        (Item::Int(i), Item::Float(j)) => Ok(Item::Float(i as Float / j)),
+        (Item::Float(i), Item::Int(j)) => Ok(Item::Float(i / j as Float)),
         _ => Err(invalid_type("/")),
     }
 }
@@ -3391,8 +3431,8 @@ pub fn gt(i: Item, j: Item) -> ItemResult {
     match (i, j) {
         (Item::Int(i), Item::Int(j)) => Ok(Item::Boolean(i > j)),
         (Item::Float(i), Item::Float(j)) => Ok(Item::Boolean(i > j)),
-        (Item::Int(i), Item::Float(j)) => Ok(Item::Boolean(OrderedFloat(i as InnerFloat) > j)),
-        (Item::Float(i), Item::Int(j)) => Ok(Item::Boolean(i > OrderedFloat(j as InnerFloat))),
+        (Item::Int(i), Item::Float(j)) => Ok(Item::Boolean(i as Float > j)),
+        (Item::Float(i), Item::Int(j)) => Ok(Item::Boolean(i > j as Float)),
 
         _ => Err(invalid_type(">")),
     }
@@ -3402,8 +3442,8 @@ pub fn lt(i: Item, j: Item) -> ItemResult {
     match (i, j) {
         (Item::Int(i), Item::Int(j)) => Ok(Item::Boolean(i < j)),
         (Item::Float(i), Item::Float(j)) => Ok(Item::Boolean(i < j)),
-        (Item::Int(i), Item::Float(j)) => Ok(Item::Boolean((OrderedFloat(i as InnerFloat)) < j)),
-        (Item::Float(i), Item::Int(j)) => Ok(Item::Boolean(i < OrderedFloat(j as InnerFloat))),
+        (Item::Int(i), Item::Float(j)) => Ok(Item::Boolean((i as Float) < j)),
+        (Item::Float(i), Item::Int(j)) => Ok(Item::Boolean(i < j as Float)),
 
         _ => Err(invalid_type("<")),
     }
@@ -3413,8 +3453,8 @@ pub fn gte(i: Item, j: Item) -> ItemResult {
     match (i, j) {
         (Item::Int(i), Item::Int(j)) => Ok(Item::Boolean(i >= j)),
         (Item::Float(i), Item::Float(j)) => Ok(Item::Boolean(i >= j)),
-        (Item::Int(i), Item::Float(j)) => Ok(Item::Boolean(OrderedFloat(i as InnerFloat) >= j)),
-        (Item::Float(i), Item::Int(j)) => Ok(Item::Boolean(i >= OrderedFloat(j as InnerFloat))),
+        (Item::Int(i), Item::Float(j)) => Ok(Item::Boolean(i as Float >= j)),
+        (Item::Float(i), Item::Int(j)) => Ok(Item::Boolean(i >= j as Float)),
 
         _ => Err(invalid_type(">=")),
     }
@@ -3424,8 +3464,8 @@ pub fn lte(i: Item, j: Item) -> ItemResult {
     match (i, j) {
         (Item::Int(i), Item::Int(j)) => Ok(Item::Boolean(i <= j)),
         (Item::Float(i), Item::Float(j)) => Ok(Item::Boolean(i <= j)),
-        (Item::Int(i), Item::Float(j)) => Ok(Item::Boolean((OrderedFloat(i as InnerFloat)).le(&j))),
-        (Item::Float(i), Item::Int(j)) => Ok(Item::Boolean(i <= OrderedFloat(j as InnerFloat))),
+        (Item::Int(i), Item::Float(j)) => Ok(Item::Boolean((i as Float).le(&j))),
+        (Item::Float(i), Item::Int(j)) => Ok(Item::Boolean(i <= j as Float)),
 
         _ => Err(invalid_type("<=")),
     }
@@ -3861,6 +3901,10 @@ pub fn evert(mut env: Environment) -> StepResult {
     }
 }
 
+fn key_item(s: &str) -> KeyItem {
+    to_key_item(word(s)).unwrap()
+}
+
 fn as_list(i: Option<&Item>) -> Option<List> {
     if let Some(i) = i {
         if let Item::List(l) = i {
@@ -3873,21 +3917,21 @@ fn as_list(i: Option<&Item>) -> Option<List> {
     }
 }
 
-fn as_word(i: &Item) -> Option<Word> {
+fn as_word(i: &KeyItem) -> Option<Word> {
     match i {
-        Item::Word(w) => Some(w.clone()),
-        Item::Builtin(b) => Some(b.word.clone()),
+        KeyItem::Word(w) => Some(w.clone()),
+        KeyItem::Builtin(b) => Some(b.word.clone()),
         _ => None,
     }
 }
 
-fn to_lexicon_entry(w: Word, def: Associative) -> WordDef {
+fn to_lexicon_entry(w: Word, def: HashMap<KeyItem, Item>) -> WordDef {
     //println!("{:?}", def);
     let docs = WordDocs {
-        examples: as_list(def.get(&word("examples"))),
-        spec: as_list(def.get(&word("spec"))),
+        examples: as_list(def.get(&key_item("examples"))),
+        spec: as_list(def.get(&key_item("spec"))),
     };
-    if let Some(d) = as_list(def.get(&word("definition"))) {
+    if let Some(d) = as_list(def.get(&key_item("definition"))) {
         WordDef::Derived(DerivedDef {
             definition: d,
             docs: docs,
@@ -3944,7 +3988,6 @@ use crate::types::*;
 use std::collections::VecDeque;
 use std::fmt;
 use internment::Intern;
-use ordered_float::OrderedFloat;
 
 fn lookup_builtin(w: Word, standard_dictionary: &Option<Dictionary>) -> Item {
     if let Some(dict) = standard_dictionary {
@@ -3968,7 +4011,7 @@ fn to_item(item: &edn_format::Value, standard_dictionary: &Option<Dictionary>) -
         edn_format::Value::Symbol(s) => lookup_builtin(Intern::new(s.name().to_string()), standard_dictionary),
         edn_format::Value::Boolean(b) => Item::Boolean(*b),
         edn_format::Value::String(s) => Item::String(s.to_string()),
-        edn_format::Value::Float(f) => Item::Float(OrderedFloat(f.into_inner())),
+        edn_format::Value::Float(f) => Item::Float(f.into_inner()),
         _ => Item::Int(0),
     }
 }
@@ -3985,11 +4028,6 @@ fn from_item(item: &Item) -> edn_format::Value {
         Item::Boolean(b) => edn_format::Value::Boolean(*b),
         Item::String(s) => edn_format::Value::String(s.to_string()),
         Item::Float(f) => edn_format::Value::from(*f),
-        Item::Assoc(h) => edn_format::Value::Vector(
-            h.iter().map(|(k, v)| {
-                vec![from_item(k), from_item(v)]
-            }).collect::<Vec<edn_format::Value>>()
-        ),
         _ => edn_format::Value::Integer(0),
     }
 }
@@ -4027,26 +4065,6 @@ impl fmt::Debug for Environment {
 
 #+RESULTS:
 : error: Could not compile `cargoVyY4IO`.
-** Playground
-#+begin_src rust
-use std::collections::HashMap;
-
-#[derive(Debug)]
-enum Item {
-    Num(i32),
-    Str(String)
-}
-
-
-fn main() {
-    let h: HashMap<String, i32> = HashMap::from([("foo".to_string(), 1)]);
-    let v: Vec<_> = h.into_iter().map(|(k, v)| vec![Item::Str(k), Item::Num(v)]).collect();
-    println!("{:?}", v);
-}
-#+end_src
-
-#+RESULTS:
-: [[Str("foo"), Num(1)]]
 
 #+begin_src rust
 // test swap
