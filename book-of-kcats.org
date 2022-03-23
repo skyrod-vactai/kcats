@@ -3202,6 +3202,7 @@ mod tests {
     #[test_case("branch")]
     #[test_case("clone")]
     #[test_case("count")]
+    #[test_case("decide")]
     #[test_case("dip")]
     #[test_case("dipdown")]
     #[test_case("discard")]
@@ -3235,6 +3236,7 @@ mod tests {
     #[test_case("swapdown")]
     #[test_case("unpack")]
     #[test_case("unwrap")]
+    #[test_case("update")]
     #[test_case("wrap")]
     fn test_lexicon(word: &str) {
         let e = standard_env(None);
@@ -3353,6 +3355,7 @@ pub fn standard_dictionary() -> Dictionary {
         axiom_entry("clone", Rc::new(clone)),
         axiom_entry("count", Rc::new(env_effect1(count))),
         axiom_entry("dec", Rc::new(f_stack1(dec))),
+        axiom_entry("decide", Rc::new(decide)),
         axiom_entry("dip", Rc::new(dip)),
         axiom_entry("dipdown", Rc::new(dipdown)),
         axiom_entry("discard", Rc::new(discard)),
@@ -4017,7 +4020,6 @@ fn assoc_in(i: Item, ks: &[KeyItem], v: Item) -> Result<Associative, Error> {
                     let inner = h.get(&k.clone()).unwrap_or(&Item::Nothing).clone();
                     h.insert(k.clone(), Item::Assoc(assoc_in(inner, ks, v)?));
                 }
-
             }
             Ok(h)
         }
@@ -4028,8 +4030,8 @@ fn assoc_in(i: Item, ks: &[KeyItem], v: Item) -> Result<Associative, Error> {
 }
 
 pub fn assign(m: Item, ks: Item, v: Item) -> ItemResult {
-    match (m, ks, v) {
-        (m, Item::List(ks), v) => {
+    match ks {
+        Item::List(ks) => {
             let mut ksvec = ks
                 .into_iter()
                 .map(|k| to_key_item(k))
@@ -4042,16 +4044,22 @@ pub fn assign(m: Item, ks: Item, v: Item) -> ItemResult {
     }
 }
 
+//TODO: this should really take a keylist like assign and lookup
+pub fn unassign(m: Item, k: Item) -> ItemResult {
+    match m {
+        Item::List(m) => { unassign(Item::Assoc(to_hash(m)?), k)}
+        Item::Assoc(mut m) => { m.remove(&to_key_item(k)?);
+                            Ok(Item::Assoc(m))}
+        _ => Err(invalid_type("unassign")),
+    }
+}
+
 pub fn lookup(m: Item, k: Item) -> ItemResult {
     let k = to_key_item(k)?;
     match (m, k) {
-        (Item::Assoc(m), k) => {
-            Ok(m.get(&k).unwrap_or(&Item::Nothing).clone())
-        },
-        (Item::List(l), k) => {
-            Ok(lookup(Item::Assoc(to_hash(l)?), to_value_item(k))?)
-        },
-        _ => Err(invalid_type("lookup"))
+        (Item::Assoc(m), k) => Ok(m.get(&k).unwrap_or(&Item::Nothing).clone()),
+        (Item::List(l), k) => Ok(lookup(Item::Assoc(to_hash(l)?), to_value_item(k))?),
+        _ => Err(invalid_type("lookup")),
     }
 }
 
@@ -4067,15 +4075,12 @@ pub fn not(i: Item) -> ItemResult {
     Ok(Item::Boolean(!is_truthy(i)))
 }
 
-
 pub fn is_associative(i: Item) -> ItemResult {
-    Ok(Item::Boolean(
-        match i {
-            Item::Assoc(_) => { true },
-            Item::List(l) => { to_hash(l).is_ok() },
-            _ => { false }
-        }
-    ))
+    Ok(Item::Boolean(match i {
+        Item::Assoc(_) => true,
+        Item::List(l) => to_hash(l).is_ok(),
+        _ => false,
+    }))
 }
 
 pub fn is_odd(i: Item) -> ItemResult {
@@ -4094,7 +4099,49 @@ pub fn is_even(i: Item) -> ItemResult {
     }
 }
 
+pub fn decide(mut env: Environment) -> StepResult {
+    let i = env.stack.pop_front();
+    if let Some(clauses) = i {
+        if let Item::List(mut clauses) = clauses {
+            let clause = clauses.pop_front();
+            if let Some(clause) = clause {
+                if let Item::List(mut clause) = clause {
+                    if clause.len() != 2 {
+                        Err(Error::from("Clauses in 'decide' must have exactly 2 items"))
+                    } else {
+                        let test = clause.pop_front().unwrap();
+                        let expr = clause.pop_front().unwrap();
 
+                        if let (Item::List(test), Item::List(expr)) = (test, expr) {
+                            // construct if
+                            let testp = List::from(vec![Item::List(test), word("shield")]);
+                            let elsep = List::from(vec![Item::List(clauses), word("decide")]);
+                            let newexpr = List::from(vec![
+                                Item::List(testp),
+                                Item::List(expr),
+                                Item::List(elsep),
+                                word("if"),
+                            ]);
+                            append_expression(env, newexpr)
+                        } else {
+                            Err(invalid_type("decide clause test or expr"))
+                        }
+                    }
+                } else {
+                    Err(invalid_type("decide clause"))
+                }
+            } else {
+                // clauses empty, return nothing
+                env.stack.push_front(Item::Nothing);
+                Ok(env)
+            }
+        } else {
+            Err(invalid_type("decide"))
+        }
+    } else {
+        stack_underflow()
+    }
+}
 #+end_src
 
 #+RESULTS:
