@@ -1,0 +1,1947 @@
+* Production implementation
+** Status
+Experimental, currently learning a new language.
+** Base Language
+We will use Rust - it's fast and modern, its memory allocation model
+seems well suited to kcats.
+** Project File
+#+begin_src toml :tangle Cargo.toml
+[package]
+name = "kcats"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+#rug = "1.15.0"
+edn-format = "3.2.3"
+base64 = "0.13.0"
+internment = "0.6.0" 
+
+[dev-dependencies]
+test-case = "2.0.0"
+#+end_src
+** Code
+Let's start by defining some data structures in a separate module
+#+begin_src rust :tangle src/types.rs
+use std::collections::{VecDeque, HashMap};
+use std::fmt;
+use std::rc::Rc;
+use internment::Intern;
+use std::ptr;
+use std::hash::{Hash, Hasher};
+
+pub type Word = Intern<String>;
+
+pub type List = VecDeque<Item>;
+
+pub type KeyList = VecDeque<KeyItem>;
+
+pub type Stack = List;
+
+pub type Bytes = Vec<u8>;
+
+pub type Int = i64;
+
+pub type Float = f64;
+
+pub type Associative = HashMap<KeyItem, Item>;
+
+#[derive(Clone)]
+pub struct BuiltinWord {
+    pub word: Word,
+    pub f: Rc<StepFn>
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Item {
+    Int(Int),
+    Float(Float),
+    Boolean(bool),
+    Bytes(Bytes),
+    String(String),
+    Word(Word),
+    Builtin(BuiltinWord),
+    Assoc(Associative),
+    List(List),
+    Nothing,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub enum KeyItem {
+    Int(Int),
+    Boolean(bool),
+    Bytes(Bytes),
+    String(String),
+    Word(Word),
+    Builtin(BuiltinWord),
+    List(VecDeque<KeyItem>),
+    Nothing,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WordDocs {
+    pub examples: Option<List>,
+    pub spec: Option<List>,
+}
+
+pub type StepFn = dyn Fn(Environment) -> StepResult;
+
+pub type AxiomWords = HashMap<Word, StepFn>;
+
+#[derive(Clone)]
+pub struct AxiomDef {
+    pub docs: WordDocs,
+    pub f: Rc<StepFn>
+}
+
+// dictionary entries are equal if they have the same function reference,
+// no need to compare the function values
+impl PartialEq for AxiomDef {
+    fn eq(&self, other: &Self) -> bool {
+        self.docs == other.docs && ptr::eq(self.f.as_ref(), other.f.as_ref())        
+    }
+}
+
+impl PartialEq for BuiltinWord {
+    fn eq(&self, other: &Self) -> bool {
+        self.word == other.word
+    }
+}
+
+impl Eq for BuiltinWord {}
+
+impl Hash for BuiltinWord {
+
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.word.hash(state);
+    }
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct DerivedDef {
+    pub docs: WordDocs,
+    pub definition: List,
+}
+
+pub trait Doc {
+    fn examples(self) -> Option<List>;
+}
+
+impl Doc for WordDef {
+    fn examples(self) -> Option<List> {
+        match self {
+            WordDef::Axiom(a) => a.docs.examples,
+            WordDef::Derived(a) => a.docs.examples,
+        }
+    }
+}
+
+impl Doc for DerivedDef {
+    fn examples(self) -> Option<List> {
+        self.docs.examples
+    }
+}
+
+#[derive(Clone, PartialEq)]
+pub enum WordDef {
+    Axiom(AxiomDef),
+    Derived(DerivedDef),
+}
+
+pub type Dictionary = HashMap<Word, WordDef>;
+
+#[derive(Clone, PartialEq)]
+pub struct Environment {
+    pub stack: Stack,
+    pub expression: Stack,
+    pub dictionary: Dictionary,
+}
+
+#[derive(PartialEq)]
+pub struct Error {
+    pub environment: Option<Environment>,
+    pub message: String,
+}
+
+impl From<String> for Error {
+    fn from(s: String) -> Self {
+        Error {
+            environment: None,
+            message: s,
+        }
+    }
+}
+
+impl From<&str> for Error {
+    fn from(s: &str) -> Self {
+        Error::from(s.to_string())
+    }
+}
+
+impl TryFrom<Item> for List {
+    type Error = Error;
+    fn try_from(i: Item) -> Result<Self, Self::Error> {
+        println!("item is {:?}", i);
+        if let Item::List(l) = i {
+            println!("cast item is {:?}", l);
+            println!("cast item len {}", l.len());
+
+            Ok(l)
+        } else {
+            Err(Error::from("Expected item to be list, but it wasn't"))
+        }
+    }
+}
+
+pub fn get_item(i: Item, index: usize) -> Option<Item> {
+    if let Item::List(l) = i {
+        match l.get(index) {
+            Some(x) => Some(x.clone()),
+            None => None,
+        }
+    } else {
+        None
+    }
+}
+
+// print out envs in error messages
+impl fmt::Debug for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let mut ds = f.debug_struct("Error");
+        ds.field("message", &self.message);
+        if let Some(env) = &self.environment {
+            ds.field("environment", &env);
+        }
+        ds.finish()
+    }
+}
+
+impl fmt::Debug for BuiltinWord {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let mut ds = f.debug_struct("BuiltinWord");
+        ds.field("word", &self.word);
+        ds.finish()
+    }
+}
+
+pub type StepResult = Result<Environment, Error>;
+
+pub type ItemResult = Result<Item, Error>;
+
+pub fn word(s: &str) -> Item {
+    Item::Word(Word::from(s))
+}
+
+pub fn to_key_item(i: Item) -> Result<KeyItem, Error> {
+    match i {
+        Item::Int(i) => Ok(KeyItem::Int(i)),
+        Item::String(i) => Ok(KeyItem::String(i)),
+        Item::List(l) => Ok(KeyItem::List(
+            l.iter()
+                .map(|i| to_key_item(i.clone()))
+                .collect::<Result<KeyList, Error>>()?,
+        )),
+        Item::Word(w) => Ok(KeyItem::Word(w)),
+        Item::Builtin(w) => Ok(KeyItem::Builtin(w)),
+        Item::Boolean(b) => Ok(KeyItem::Boolean(b)),
+        Item::Bytes(bs) => Ok(KeyItem::Bytes(bs)),
+        Item::Nothing => Ok(KeyItem::Nothing),
+        _ => Err(Error::from("item is not allowed as a hashmap key")),
+    }
+}
+
+pub fn to_value_item(i: KeyItem) -> Item {
+    match i {
+        KeyItem::Int(i) => Item::Int(i),
+        KeyItem::String(i) => Item::String(i),
+        KeyItem::List(l) => {
+            Item::List(l.iter().map(|i| to_value_item(i.clone())).collect::<List>())
+        }
+        KeyItem::Word(w) => Item::Word(w),
+        KeyItem::Builtin(b) => Item::Builtin(b),
+        KeyItem::Boolean(b) => Item::Boolean(b),
+        KeyItem::Bytes(bs) => Item::Bytes(bs),
+        KeyItem::Nothing => Item::Nothing,
+    }
+}
+
+pub fn to_entry(i: Item) -> Result<(KeyItem, Item), Error> {
+    match i {
+        Item::List(mut l) => {
+            let v = l.pop_back();
+            let k = l.pop_back();
+            let e = l.pop_back();
+            match (k, v, e) {
+                (Some(k), Some(v), None) => Ok((to_key_item(k)?, v)),
+                _ => Err(Error::from("Item must be a duple")),
+            }
+        }
+        _ => Err(Error::from("Hash entry must be a list (of length 2)")),
+    }
+}
+
+pub fn to_hash(l: List) -> Result<Associative, Error> {
+    l.iter()
+        .map(|i| to_entry(i.clone()))
+        .collect::<Result<HashMap<KeyItem, Item>, Error>>()
+}
+#+end_src
+
+#+RESULTS:
+: error: Could not compile `cargoUFeO0S`.
+
+#+begin_src rust :tangle src/main.rs :crates '((rug . "1.15.0") (edn-rs . "0.17.0"))
+mod types;
+use crate::types::*;
+mod axiom;
+mod serialize;
+use std::io;
+use std::mem;
+
+fn eval_step(mut env: Environment) -> StepResult {
+    //println!("{:?}", env);
+    let next_item = env.expression.pop_front();
+
+    if let Some(val) = next_item {
+        match val {
+            Item::Word(word) => {
+                if let Some(dfn) = env.dictionary.get(&word) {
+                    match dfn {
+                        WordDef::Axiom(d) => (d.f.clone())(env),
+                        WordDef::Derived(d) => {
+                            let mut items = d.definition.clone();
+                            mem::swap(&mut items, &mut env.expression);
+                            env.expression.extend(items);
+
+                            Ok(env)
+                        }
+                    }
+                } else {
+                    Err(Error {
+                        environment: Some(env.clone()),
+                        message: format!("Unknown word: {}", word),
+                    })
+                }
+            }
+            Item::Builtin(builtin) => Ok((builtin.f)(env)?),
+            _ => {
+                // not a word, just push onto stack
+                env.stack.push_front(val);
+                Ok(env)
+            }
+        }
+    } else {
+        Err(Error::from("Expression is empty"))
+    }
+}
+
+fn eval(env: Environment) -> StepResult {
+    let mut result: StepResult = Result::Ok(env);
+    loop {
+        if let Ok(env) = result {
+            if !env.expression.is_empty() {
+                result = eval_step(env);
+            } else {
+                break Ok(env);
+            }
+        } else {
+            break result;
+        }
+    }
+}
+
+fn print_result(r: StepResult) {
+    match r {
+        Err(e) => {
+            println!("{:#?}", e)
+        }
+        Ok(env) => {
+            let s = env.stack.clone();
+            println!("{}", serialize::emit(&Item::List(s)));
+        }
+    }
+}
+
+fn standard_env(program: Option<List>) -> Environment {
+    let prog_expr = match program {
+        Some(p) => Stack::from(p),
+        _ => Stack::new(),
+    };
+
+    let expr = Stack::from(vec![word("lexicon")]);
+
+    let mut initialized = eval(Environment {
+        stack: Stack::new(),
+        expression: expr,
+        dictionary: axiom::standard_dictionary(),
+    })
+    .unwrap();
+
+    initialized.expression = prog_expr;
+    initialized
+}
+
+fn main() {
+    let mut program = String::new();
+    match io::stdin().read_line(&mut program) {
+        Ok(_) => {
+            let parsed = serialize::parse(program, &Some(axiom::standard_dictionary()));
+            print_result(eval(standard_env(Some(parsed))));
+        }
+        Err(error) => println!("error: {}", error),
+    }
+}
+
+fn test_example(mut env: Environment, w: Word, program: List, expected: List) -> Option<Error> {
+    let p = program.clone();
+    env.expression.extend(program);
+    //let res = eval(env).ok()?;
+    match eval(env) {
+        Err(e) => Some(e),
+        Ok(res) => {
+            if res.stack == expected {
+                None
+            } else {
+                Some(Error {
+                    environment: Some(res.clone()),
+                    message: format!(
+                        "Result for {} did not match expected: \n{}\n{}",
+                        w,
+                        serialize::emit(&Item::List(expected)),
+                        serialize::emit(&Item::List(p))
+                    ),
+                })
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Note this useful idiom: importing names from outer (for mod tests) scope.
+    use test_case::test_case;
+    use internment::Intern;
+    use super::*;
+    
+    fn test_word(standard_env: Environment, w: Word) -> Vec<Error> {
+        if let Some(d) = standard_env.dictionary.get(&w) {
+            d.clone()
+                .examples()
+                .iter()
+                .filter_map(|ex| {
+                    let x = ex.get(0).unwrap().clone();
+                    if let (Item::List(p), Item::List(exp)) =
+                        (get_item(x.clone(), 0).unwrap(), get_item(x, 1).unwrap())
+                    {
+                        test_example(standard_env.clone(), w.clone(), p.clone(), exp.clone())
+                    } else {
+                        Some(Error::from("Invalid example"))
+                    }
+                })
+                .collect::<Vec<Error>>()
+        } else {
+            Vec::new()
+        }
+    }
+
+    #[test_case("+" ; "plus")]
+    #[test_case("-" ; "minus")]
+    #[test_case("=" ; "eq")]
+    #[test_case(">" ; "gt")]
+    #[test_case("and")]
+    #[test_case("assign")]
+    #[test_case("associative?")]
+    #[test_case("branch")]
+    #[test_case("clone")]
+    #[test_case("count")]
+    #[test_case("decide")]
+    #[test_case("dip")]
+    #[test_case("dipdown")]
+    #[test_case("discard")]
+    #[test_case("evert")]
+    #[test_case("execute")]
+    #[test_case("first")]
+    #[test_case("float")]
+    #[test_case("if")]
+    #[test_case("inc")]
+    #[test_case("inject")]
+    #[test_case("join")]
+    #[test_case("list?" ; "is_list")]
+    #[test_case("lookup")]
+    #[test_case("loop")]
+    #[test_case("not")]
+    #[test_case("odd?" ; "is_odd")]
+    #[test_case("even?" ; "is_even")]
+    #[test_case("number?" ; "is_number")]
+    #[test_case("or")]
+    #[test_case("pack")]
+    #[test_case("range")]
+    #[test_case("recur")]
+    #[test_case("shield")]
+    #[test_case("shielddown")]
+    #[test_case("shielddowndown")]
+    #[test_case("sink")]
+    #[test_case("snapshot")]
+    #[test_case("step")]
+    #[test_case("string?" ; "is_string")]
+    #[test_case("swap")]
+    #[test_case("swapdown")]
+    #[test_case("unpack")]
+    #[test_case("unwrap")]
+    #[test_case("update")]
+    #[test_case("wrap")]
+    fn test_lexicon(word: &str) {
+        let e = standard_env(None);
+        assert_eq!(
+            test_word(e.clone(), Intern::new(word.to_string())),
+            Vec::<Error>::new()
+        );
+    }
+}
+
+// if let (Item::List(program), Item::List(expected)) = (program, expected) {
+
+//     } else {
+//         Err(Error::from("Example should be a pair"))
+//     }
+
+// for ex in d.examples().iter() {
+//             let e = List::try_from(*ex).ok().unwrap();
+//             let p = List::try_from(*e.get(0).unwrap()).ok().unwrap();
+//             let exp = List::try_from(*e.get(1).unwrap()).ok().unwrap();
+
+//             test_example(standard_env.clone(), w, p,exp)
+//         }.retain(|i| i.is_some()).collect::<Vec<Error>>()
+#+end_src
+
+#+RESULTS:
+: error: Could not compile `cargo7G4HYj`.
+
+Here are the axiom functions. Some of them are just functions of the
+topmost stack items, and we'll call them with =f_stack1= etc. The rest
+modify the expression or dictionary and are functions of the environment.
+#+begin_src rust :tangle src/axiom.rs
+// some axiom word functions
+use super::serialize;
+use crate::types::*;
+use internment::Intern;
+use std::collections::{HashMap, VecDeque};
+use std::fs;
+use std::mem;
+use std::rc::Rc;
+
+fn f_stack1(f: fn(Item) -> ItemResult) -> impl Fn(Environment) -> StepResult {
+    move |mut env: Environment| {
+        if let Some(x) = env.stack.pop_front() {
+            env.stack.push_front(f(x)?);
+            Ok(env)
+        } else {
+            stack_underflow()
+        }
+    }
+}
+
+fn f_stack2(f: fn(Item, Item) -> ItemResult) -> impl Fn(Environment) -> StepResult {
+    move |mut env: Environment| {
+        let i = env.stack.pop_front();
+        let j = env.stack.pop_front();
+        match (i, j) {
+            (Some(i), Some(j)) => {
+                env.stack.push_front(f(j, i)?);
+                Ok(env)
+            }
+            _ => stack_underflow(),
+        }
+    }
+}
+
+fn f_stack3(f: fn(Item, Item, Item) -> ItemResult) -> impl Fn(Environment) -> StepResult {
+    move |mut env: Environment| {
+        let i = env.stack.pop_front();
+        let j = env.stack.pop_front();
+        let k = env.stack.pop_front();
+        match (i, j, k) {
+            (Some(i), Some(j), Some(k)) => {
+                env.stack.push_front(f(k, j, i)?);
+                Ok(env)
+            }
+            _ => stack_underflow(),
+        }
+    }
+}
+
+fn axiom_entry<'a>(s: &str, f: Rc<StepFn>) -> (Word, WordDef) {
+    (
+        Word::from(s),
+        WordDef::Axiom(AxiomDef {
+            docs: WordDocs {
+                examples: None,
+                spec: None,
+            },
+            f: f,
+        }),
+    )
+}
+
+fn unimplemented(s: &'static str) -> (Word, WordDef) {
+    axiom_entry(
+        s,
+        Rc::new(move |_: Environment| Err(Error::from(format!("Unimplemented word: {}", s)))),
+    )
+}
+
+pub fn standard_dictionary() -> Dictionary {
+    HashMap::from([
+        axiom_entry("*", Rc::new(f_stack2(mult))),
+        axiom_entry("+", Rc::new(f_stack2(plus))),
+        axiom_entry("-", Rc::new(f_stack2(minus))),
+        axiom_entry("/", Rc::new(f_stack2(div))),
+        axiom_entry("<", Rc::new(f_stack2(lt))),
+        axiom_entry("<=", Rc::new(f_stack2(lte))),
+        axiom_entry("=", Rc::new(env_effect2(eq))),
+        axiom_entry(">", Rc::new(f_stack2(gt))),
+        axiom_entry(">=", Rc::new(f_stack2(gte))),
+        axiom_entry("assign", Rc::new(f_stack3(assign))),
+        axiom_entry("associative?", Rc::new(f_stack1(is_associative))),
+        axiom_entry("branch", Rc::new(branch)),
+        axiom_entry("clone", Rc::new(clone)),
+        axiom_entry("count", Rc::new(env_effect1(count))),
+        axiom_entry("dec", Rc::new(f_stack1(dec))),
+        axiom_entry("decide", Rc::new(decide)),
+        axiom_entry("dip", Rc::new(dip)),
+        axiom_entry("dipdown", Rc::new(dipdown)),
+        axiom_entry("discard", Rc::new(discard)),
+        axiom_entry("evert", Rc::new(evert)),
+        axiom_entry("execute", Rc::new(execute)),
+        axiom_entry("first", Rc::new(env_effect1(first))),
+        axiom_entry("float", Rc::new(float)),
+        axiom_entry("inc", Rc::new(f_stack1(inc))),
+        axiom_entry("join", Rc::new(f_stack2(join))),
+        axiom_entry("lexicon", Rc::new(lexicon)),
+        axiom_entry("list?", Rc::new(env_effect1(is_list))),
+        axiom_entry("++lookup", Rc::new(f_stack2(lookup))),
+        axiom_entry("loop", Rc::new(env_effect2(loop_))),
+        axiom_entry("mod", Rc::new(f_stack2(mod_))),
+        axiom_entry("not", Rc::new(f_stack1(not))),
+        axiom_entry("even?", Rc::new(f_stack1(is_even))),
+        axiom_entry("odd?", Rc::new(f_stack1(is_odd))),
+        axiom_entry("number?", Rc::new(env_effect1(is_number))),
+        axiom_entry("or", Rc::new(f_stack2(or))),
+        axiom_entry("and", Rc::new(f_stack2(and))),
+        axiom_entry("pack", Rc::new(f_stack2(pack))),
+        axiom_entry("range", Rc::new(range)),
+        axiom_entry("recur", Rc::new(recur)),
+        axiom_entry("sink", Rc::new(sink)),
+        axiom_entry("step", Rc::new(step)),
+        axiom_entry("string?", Rc::new(env_effect1(is_string))),
+        axiom_entry("swap", Rc::new(swap)),
+        axiom_entry("swapdown", Rc::new(swapdown)),
+        axiom_entry("unpack", Rc::new(unpack)),
+        axiom_entry("unwrap", Rc::new(unwrap)),
+        axiom_entry("wrap", Rc::new(wrap)),
+    ])
+}
+
+pub fn stack_underflow() -> StepResult {
+    Err(Error::from("Stack underflow"))
+}
+
+pub fn invalid_type(w: &str) -> Error {
+    Error::from(format!("Invalid type for {}", w))
+}
+
+pub fn plus(i: Item, j: Item) -> ItemResult {
+    match (i, j) {
+        (Item::Int(i), Item::Int(j)) => Ok(Item::Int(i + j)),
+        (Item::Float(i), Item::Float(j)) => Ok(Item::Float(i + j)),
+        (Item::Int(i), Item::Float(j)) => Ok(Item::Float(i as Float + j)),
+        (Item::Float(i), Item::Int(j)) => Ok(Item::Float(i + j as Float)),
+        _ => Err(invalid_type("+")),
+    }
+}
+
+pub fn minus(i: Item, j: Item) -> ItemResult {
+    match (i, j) {
+        (Item::Int(i), Item::Int(j)) => Ok(Item::Int(i - j)),
+        (Item::Float(i), Item::Float(j)) => Ok(Item::Float(i - j)),
+        (Item::Int(i), Item::Float(j)) => Ok(Item::Float(i as Float - j)),
+        (Item::Float(i), Item::Int(j)) => Ok(Item::Float(i - j as Float)),
+        _ => Err(invalid_type("-")),
+    }
+}
+
+pub fn mult(i: Item, j: Item) -> ItemResult {
+    match (i, j) {
+        (Item::Int(i), Item::Int(j)) => Ok(Item::Int(i * j)),
+        (Item::Float(i), Item::Float(j)) => Ok(Item::Float(i * j)),
+        (Item::Int(i), Item::Float(j)) => Ok(Item::Float(i as Float * j)),
+        (Item::Float(i), Item::Int(j)) => Ok(Item::Float(i * j as Float)),
+        _ => Err(invalid_type("*")),
+    }
+}
+
+pub fn div(i: Item, j: Item) -> ItemResult {
+    match (i, j) {
+        (Item::Int(i), Item::Int(j)) => Ok(Item::Int(i / j)),
+        (Item::Float(i), Item::Float(j)) => Ok(Item::Float(i / j)),
+        (Item::Int(i), Item::Float(j)) => Ok(Item::Float(i as Float / j)),
+        (Item::Float(i), Item::Int(j)) => Ok(Item::Float(i / j as Float)),
+        _ => Err(invalid_type("/")),
+    }
+}
+
+pub fn mod_(i: Item, j: Item) -> ItemResult {
+    match (i, j) {
+        (Item::Int(i), Item::Int(j)) => Ok(Item::Int(i % j)),
+        _ => Err(invalid_type("mod")),
+    }
+}
+
+pub fn inc(i: Item) -> ItemResult {
+    if let Item::Int(i) = i {
+        Ok(Item::Int(i + 1))
+    } else {
+        Err(invalid_type("inc"))
+    }
+}
+
+pub fn dec(i: Item) -> ItemResult {
+    if let Item::Int(i) = i {
+        Ok(Item::Int(i - 1))
+    } else {
+        Err(invalid_type("dec"))
+    }
+}
+
+pub fn gt(i: Item, j: Item) -> ItemResult {
+    match (i, j) {
+        (Item::Int(i), Item::Int(j)) => Ok(Item::Boolean(i > j)),
+        (Item::Float(i), Item::Float(j)) => Ok(Item::Boolean(i > j)),
+        (Item::Int(i), Item::Float(j)) => Ok(Item::Boolean(i as Float > j)),
+        (Item::Float(i), Item::Int(j)) => Ok(Item::Boolean(i > j as Float)),
+
+        _ => Err(invalid_type(">")),
+    }
+}
+
+pub fn lt(i: Item, j: Item) -> ItemResult {
+    match (i, j) {
+        (Item::Int(i), Item::Int(j)) => Ok(Item::Boolean(i < j)),
+        (Item::Float(i), Item::Float(j)) => Ok(Item::Boolean(i < j)),
+        (Item::Int(i), Item::Float(j)) => Ok(Item::Boolean((i as Float) < j)),
+        (Item::Float(i), Item::Int(j)) => Ok(Item::Boolean(i < j as Float)),
+
+        _ => Err(invalid_type("<")),
+    }
+}
+
+pub fn gte(i: Item, j: Item) -> ItemResult {
+    match (i, j) {
+        (Item::Int(i), Item::Int(j)) => Ok(Item::Boolean(i >= j)),
+        (Item::Float(i), Item::Float(j)) => Ok(Item::Boolean(i >= j)),
+        (Item::Int(i), Item::Float(j)) => Ok(Item::Boolean(i as Float >= j)),
+        (Item::Float(i), Item::Int(j)) => Ok(Item::Boolean(i >= j as Float)),
+
+        _ => Err(invalid_type(">=")),
+    }
+}
+
+pub fn lte(i: Item, j: Item) -> ItemResult {
+    match (i, j) {
+        (Item::Int(i), Item::Int(j)) => Ok(Item::Boolean(i <= j)),
+        (Item::Float(i), Item::Float(j)) => Ok(Item::Boolean(i <= j)),
+        (Item::Int(i), Item::Float(j)) => Ok(Item::Boolean((i as Float).le(&j))),
+        (Item::Float(i), Item::Int(j)) => Ok(Item::Boolean(i <= j as Float)),
+
+        _ => Err(invalid_type("<=")),
+    }
+}
+
+pub fn join(i: Item, j: Item) -> ItemResult {
+    match (i, j) {
+        (Item::List(mut i), Item::List(j)) => {
+            i.extend(j);
+            Ok(Item::List(i))
+        }
+        (Item::String(mut i), Item::String(j)) => {
+            i.push_str(&j);
+            Ok(Item::String(i))
+        }
+        _ => Err(invalid_type("join")),
+    }
+}
+
+pub fn pack(i: Item, j: Item) -> ItemResult {
+    match i {
+        Item::List(mut i) => {
+            i.push_back(j);
+            Ok(Item::List(i))
+        }
+        _ => Err(invalid_type("pack")),
+    }
+}
+
+pub fn clone(mut env: Environment) -> StepResult {
+    if let Some(last) = env.stack.front().map(|v| (*v).clone()) {
+        env.stack.push_front(last);
+        Ok(env)
+    } else {
+        stack_underflow()
+    }
+}
+
+fn swap2(mut env: Environment, offset: usize) -> StepResult {
+    let len = env.stack.len();
+    if len >= offset + 2 {
+        env.stack.swap(offset, offset + 1);
+        Ok(env)
+    } else {
+        stack_underflow()
+    }
+}
+
+pub fn swap(env: Environment) -> StepResult {
+    swap2(env, 0)
+}
+
+pub fn swapdown(env: Environment) -> StepResult {
+    swap2(env, 1)
+}
+
+pub fn sink(mut env: Environment) -> StepResult {
+    if env.stack.len() >= 3 {
+        env.stack.swap(0, 2);
+        env.stack.swap(0, 1);
+        Ok(env)
+    } else {
+        stack_underflow()
+    }
+}
+
+pub fn float(mut env: Environment) -> StepResult {
+    if env.stack.len() >= 3 {
+        env.stack.swap(0, 2);
+        env.stack.swap(1, 2);
+        Ok(env)
+    } else {
+        stack_underflow()
+    }
+}
+
+pub fn discard(mut env: Environment) -> StepResult {
+    if let Some(_) = env.stack.pop_front() {
+        Ok(env)
+    } else {
+        stack_underflow()
+    }
+}
+
+fn extend_front(l: &mut List, mut to_prepend: List) -> () {
+    mem::swap(l, &mut to_prepend);
+    l.extend(to_prepend);
+}
+
+fn append_expression(mut env: Environment, items: VecDeque<Item>) -> StepResult {
+    extend_front(&mut env.expression, items);
+    Ok(env)
+}
+
+type EffectResult = Result<(Option<List>, Option<List>), Error>;
+
+pub fn env_effect1(f: fn(Item) -> EffectResult) -> impl Fn(Environment) -> StepResult {
+    move |mut env: Environment| {
+        if let Some(i) = env.stack.pop_front() {
+            let (expr_items, stack_items) = f(i)?;
+            if expr_items.is_some() {
+                extend_front(&mut env.expression, expr_items.unwrap());
+            }
+            if stack_items.is_some() {
+                extend_front(&mut env.stack, stack_items.unwrap());
+            }
+
+            Ok(env)
+        } else {
+            stack_underflow()
+        }
+    }
+}
+
+pub fn env_effect2(f: fn(Item, Item) -> EffectResult) -> impl Fn(Environment) -> StepResult {
+    move |mut env: Environment| {
+        let i = env.stack.pop_front();
+        let j = env.stack.pop_front();
+        if let (Some(i), Some(j)) = (i, j) {
+            let (expr_items, stack_items) = f(i, j)?;
+            if expr_items.is_some() {
+                extend_front(&mut env.expression, expr_items.unwrap());
+            }
+            if stack_items.is_some() {
+                extend_front(&mut env.stack, stack_items.unwrap());
+            }
+
+            Ok(env)
+        } else {
+            stack_underflow()
+        }
+    }
+}
+
+pub fn eq(i: Item, j: Item) -> EffectResult {
+    Ok((None, Some(List::from(vec![Item::Boolean(i == j)]))))
+}
+
+pub fn count(i: Item) -> EffectResult {
+    if let Item::List(l) = i {
+        Ok((
+            None,
+            Some(List::from(vec![Item::Int(l.len().try_into().unwrap())])),
+        ))
+    } else {
+        Err(invalid_type("count"))
+    }
+}
+
+pub fn is_string(i: Item) -> EffectResult {
+    Ok((
+        None,
+        Some(List::from(vec![Item::Boolean(
+            if let Item::String(_) = i { true } else { false },
+        )])),
+    ))
+}
+
+pub fn is_number(i: Item) -> EffectResult {
+    Ok((
+        None,
+        Some(List::from(vec![Item::Boolean(
+            if let Item::Int(_) | Item::Float(_) = i {
+                true
+            } else {
+                false
+            },
+        )])),
+    ))
+}
+
+pub fn is_list(i: Item) -> EffectResult {
+    Ok((
+        None,
+        Some(List::from(vec![Item::Boolean(
+            if let Item::List(_) | Item::Nothing = i {
+                true
+            } else {
+                false
+            },
+        )])),
+    ))
+}
+
+pub fn first(i: Item) -> EffectResult {
+    if let Item::List(mut l) = i {
+        let x = List::from(vec![if let Some(i) = l.pop_front() {
+            i
+        } else {
+            Item::Nothing
+        }]);
+        Ok((None, Some(x)))
+    } else {
+        Err(invalid_type("first"))
+    }
+}
+
+pub fn loop_(p: Item, f: Item) -> EffectResult {
+    if let Item::List(mut p) = p {
+        Ok({
+            if is_truthy(f) {
+                let p2 = p.clone();
+                p.push_back(Item::List(p2));
+                p.push_back(word("loop"));
+                (Some(p), None)
+            } else {
+                (None, None)
+            }
+        })
+    } else {
+        Err(invalid_type("loop"))
+    }
+}
+
+pub fn execute(mut env: Environment) -> StepResult {
+    if let Some(item) = env.stack.pop_front() {
+        match item {
+            Item::List(program) => append_expression(env, program),
+            _ => Err(invalid_type("+")),
+        }
+    } else {
+        stack_underflow()
+    }
+}
+
+pub fn wrap(mut env: Environment) -> StepResult {
+    if let Some(item) = env.stack.pop_front() {
+        let mut v = List::new();
+        v.push_front(item);
+        env.stack.push_front(Item::List(v));
+        Ok(env)
+    } else {
+        stack_underflow()
+    }
+}
+
+pub fn unwrap(mut env: Environment) -> StepResult {
+    if let Some(item) = env.stack.pop_front() {
+        if let Item::List(l) = item {
+            for i in l {
+                env.stack.push_front(i);
+            }
+            Ok(env)
+        } else {
+            Err(Error::from(format!(
+                "Can only unwrap on list, found {:?}",
+                item
+            )))
+        }
+    } else {
+        stack_underflow()
+    }
+}
+
+pub fn dip(mut env: Environment) -> StepResult {
+    let s1 = env.stack.pop_front();
+    let s2 = env.stack.pop_front();
+    match (s1, s2) {
+        (Some(item1), Some(item2)) => match item1 {
+            Item::List(program) => {
+                env.expression
+                    .push_front(Item::Word(Intern::new("unwrap".to_string())));
+                let mut v = List::new();
+                v.push_front(item2);
+
+                env.expression.push_front(Item::List(v));
+                append_expression(env, program)
+            }
+            _ => Err(invalid_type("dip")),
+        },
+        _ => stack_underflow(),
+    }
+}
+
+pub fn dipdown(mut env: Environment) -> StepResult {
+    let s1 = env.stack.pop_front();
+    let s2 = env.stack.pop_front();
+    let s3 = env.stack.pop_front();
+    match (s1, s2, s3) {
+        (Some(item1), Some(item2), Some(item3)) => match item1 {
+            Item::List(program) => {
+                env.expression
+                    .push_front(Item::Word(Intern::new("unwrap".to_string())));
+                let mut v = List::new();
+                v.push_front(item2);
+                v.push_front(item3);
+                env.expression.push_front(Item::List(v));
+                append_expression(env, program)
+            }
+            _ => Err(invalid_type("+")),
+        },
+        _ => stack_underflow(),
+    }
+}
+
+pub fn unpack(mut env: Environment) -> StepResult {
+    if let Some(s1) = env.stack.front_mut() {
+        if let Item::List(l) = s1 {
+            if let Some(i) = l.pop_front() {
+                env.stack.push_front(i);
+            }
+            Ok(env)
+        } else {
+            Err(invalid_type("+"))
+        }
+    } else {
+        stack_underflow()
+    }
+}
+
+fn is_truthy(i: Item) -> bool {
+    match i {
+        Item::Boolean(b) => b,
+        Item::Nothing => false,
+        Item::List(l) => !l.is_empty(),
+        _ => true,
+    }
+}
+
+pub fn branch(mut env: Environment) -> StepResult {
+    let f = env.stack.pop_front();
+    let t = env.stack.pop_front();
+    let b = env.stack.pop_front();
+    match (f, t, b) {
+        (Some(f), Some(t), Some(b)) => match (f, t) {
+            (Item::List(false_branch), Item::List(true_branch)) => append_expression(
+                env,
+                if is_truthy(b) {
+                    true_branch
+                } else {
+                    false_branch
+                },
+            ),
+            _ => Err(invalid_type("+")),
+        },
+        _ => stack_underflow(),
+    }
+}
+
+pub fn step(mut env: Environment) -> StepResult {
+    let p = env.stack.pop_front();
+    let l = env.stack.pop_front();
+    match (p, l) {
+        (Some(p), Some(l)) => match (p, l) {
+            (Item::List(p), Item::List(mut l)) => {
+                if let Some(litem) = l.pop_front() {
+                    if !l.is_empty() {
+                        env.expression.push_front(word("step"));
+                        env.expression.push_front(Item::List(p.clone()));
+                        env.expression.push_front(Item::List(l));
+                    }
+                    env.expression.push_front(word("execute"));
+                    env.stack.push_front(litem);
+                    env.stack.push_front(Item::List(p));
+                }
+                Ok(env)
+            }
+            _ => Err(invalid_type("+")),
+        },
+        _ => stack_underflow(),
+    }
+}
+
+pub fn range(mut env: Environment) -> StepResult {
+    let to = env.stack.pop_front();
+    let from = env.stack.pop_front();
+    match (from, to) {
+        (Some(from), Some(to)) => match (from, to) {
+            (Item::Int(from), Item::Int(to)) => {
+                env.stack.push_front(Item::List(
+                    (from..to).map(|i| Item::Int(i)).collect::<VecDeque<Item>>(),
+                ));
+                return Ok(env);
+            }
+            _ => Err(invalid_type("+")),
+        },
+        _ => stack_underflow(),
+    }
+}
+
+// (effect [rec2 rec1 then pred]
+//                   ['[if]
+//[(concat rec1
+//         [[pred then rec1 rec2 'recur]] rec2)
+// then pred]])
+
+pub fn recur(mut env: Environment) -> StepResult {
+    let rec2 = env.stack.pop_front();
+    let rec1 = env.stack.pop_front();
+    let then = env.stack.pop_front();
+    let pred = env.stack.pop_front();
+    match (rec2, rec1, then, pred) {
+        (Some(rec2), Some(rec1), Some(then), Some(pred)) => match (rec2, rec1, then, pred) {
+            (Item::List(rec2), Item::List(rec1), Item::List(then), Item::List(pred)) => {
+                env.expression.push_front(word("if"));
+                let r = Item::List(List::from([
+                    Item::List(pred.clone()),
+                    Item::List(then.clone()),
+                    Item::List(rec1.clone()),
+                    Item::List(rec2.clone()),
+                    word("recur"),
+                ]));
+                let mut e = List::new();
+                e.extend(rec1);
+                e.push_back(r);
+                e.extend(rec2);
+
+                env.stack.push_front(Item::List(pred));
+                env.stack.push_front(Item::List(then));
+                env.stack.push_front(Item::List(e));
+                Ok(env)
+            }
+            _ => Err(invalid_type("+")),
+        },
+        _ => stack_underflow(),
+    }
+}
+
+//(fn [{[l & others] 'stack :as env}]
+//            (assoc env 'stack (apply list (vec others) l)))
+
+pub fn evert(mut env: Environment) -> StepResult {
+    let l = env.stack.pop_front();
+    match l {
+        Some(l) => match l {
+            Item::List(mut l) => {
+                mem::swap(&mut env.stack, &mut l);
+                env.stack.push_front(Item::List(l));
+                Ok(env)
+            }
+            _ => Err(invalid_type("+")),
+        },
+        _ => stack_underflow(),
+    }
+}
+
+fn key_item(s: &str) -> KeyItem {
+    to_key_item(word(s)).unwrap()
+}
+
+fn as_list(i: Option<&Item>) -> Option<List> {
+    if let Some(i) = i {
+        if let Item::List(l) = i {
+            Some(l.clone())
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+fn as_word(i: &KeyItem) -> Option<Word> {
+    match i {
+        KeyItem::Word(w) => Some(w.clone()),
+        KeyItem::Builtin(b) => Some(b.word.clone()),
+        _ => None,
+    }
+}
+
+fn to_lexicon_entry(w: Word, def: HashMap<KeyItem, Item>) -> WordDef {
+    //println!("{:?}", def);
+    let docs = WordDocs {
+        examples: as_list(def.get(&key_item("examples"))),
+        spec: as_list(def.get(&key_item("spec"))),
+    };
+    if let Some(d) = as_list(def.get(&key_item("definition"))) {
+        WordDef::Derived(DerivedDef {
+            definition: d,
+            docs: docs,
+        })
+    } else {
+        WordDef::Axiom(AxiomDef {
+            docs: docs,
+            f: Rc::new(move |_: Environment| {
+                Err(Error::from(format!("Unimplemented word: {}", w)))
+            }),
+        })
+    }
+}
+
+pub fn lexicon(mut env: Environment) -> StepResult {
+    if let Ok(s) = fs::read_to_string("src/kcats/lexicon.kcats") {
+        let items = serialize::parse(s, &Some(standard_dictionary()));
+        let vitems = to_hash(List::from(items))?;
+        for (k, def) in vitems.iter() {
+            let h = to_hash(as_list(Some(def)).unwrap()).ok().unwrap();
+            let word = as_word(k).unwrap();
+            let newdef = to_lexicon_entry(word, h);
+            let newdef2 = newdef.clone();
+            env.dictionary
+                .entry(word)
+                .and_modify(|e| match (e, newdef) {
+                    (WordDef::Axiom(a), WordDef::Axiom(new_a)) => {
+                        a.docs = new_a.docs;
+                    }
+                    (WordDef::Derived(d), WordDef::Derived(new_d)) => {
+                        d.docs = new_d.docs;
+                        d.definition = new_d.definition;
+                    }
+                    _ => {}
+                })
+                .or_insert(newdef2);
+        }
+        Ok(env)
+    } else {
+        Err(Error::from("Could not read from lexicon file"))
+    }
+}
+
+fn assoc_in(i: Item, ks: &[KeyItem], v: Item) -> Result<Associative, Error> {
+    match i {
+        Item::Assoc(mut h) => {
+            if let [k, ks @ ..] = ks {
+                if ks.is_empty() {
+                    h.insert(k.clone(), v);
+                } else {
+                    let inner = h.get(&k.clone()).unwrap_or(&Item::Nothing).clone();
+                    h.insert(k.clone(), Item::Assoc(assoc_in(inner, ks, v)?));
+                }
+            }
+            Ok(h)
+        }
+        Item::Nothing => assoc_in(Item::Assoc(Associative::new()), ks, v),
+        Item::List(l) => assoc_in(Item::Assoc(to_hash(l.clone())?), ks, v),
+        _ => Err(Error::from("Invalid type for assign")),
+    }
+}
+
+pub fn assign(m: Item, ks: Item, v: Item) -> ItemResult {
+    match ks {
+        Item::List(ks) => {
+            let mut ksvec = ks
+                .into_iter()
+                .map(|k| to_key_item(k))
+                .collect::<Result<KeyList, Error>>()?;
+            ksvec.make_contiguous();
+            let (ks, _) = ksvec.as_slices();
+            Ok(Item::Assoc(assoc_in(m, ks, v)?))
+        }
+        _ => Err(invalid_type("assign")),
+    }
+}
+
+//TODO: this should really take a keylist like assign and lookup
+pub fn unassign(m: Item, k: Item) -> ItemResult {
+    match m {
+        Item::List(m) => { unassign(Item::Assoc(to_hash(m)?), k)}
+        Item::Assoc(mut m) => { m.remove(&to_key_item(k)?);
+                            Ok(Item::Assoc(m))}
+        _ => Err(invalid_type("unassign")),
+    }
+}
+
+pub fn lookup(m: Item, k: Item) -> ItemResult {
+    let k = to_key_item(k)?;
+    match (m, k) {
+        (Item::Assoc(m), k) => Ok(m.get(&k).unwrap_or(&Item::Nothing).clone()),
+        (Item::List(l), k) => Ok(lookup(Item::Assoc(to_hash(l)?), to_value_item(k))?),
+        _ => Err(invalid_type("lookup")),
+    }
+}
+
+pub fn or(i: Item, j: Item) -> ItemResult {
+    Ok(Item::Boolean(is_truthy(i) || is_truthy(j)))
+}
+
+pub fn and(i: Item, j: Item) -> ItemResult {
+    Ok(Item::Boolean(is_truthy(i) && is_truthy(j)))
+}
+
+pub fn not(i: Item) -> ItemResult {
+    Ok(Item::Boolean(!is_truthy(i)))
+}
+
+pub fn is_associative(i: Item) -> ItemResult {
+    Ok(Item::Boolean(match i {
+        Item::Assoc(_) => true,
+        Item::List(l) => to_hash(l).is_ok(),
+        _ => false,
+    }))
+}
+
+pub fn is_odd(i: Item) -> ItemResult {
+    if let Item::Int(i) = i {
+        Ok(Item::Boolean(i & 1 == 1))
+    } else {
+        Err(invalid_type("odd?"))
+    }
+}
+
+pub fn is_even(i: Item) -> ItemResult {
+    if let Item::Int(i) = i {
+        Ok(Item::Boolean(i & 1 == 0))
+    } else {
+        Err(invalid_type("even?"))
+    }
+}
+
+pub fn decide(mut env: Environment) -> StepResult {
+    let i = env.stack.pop_front();
+    if let Some(clauses) = i {
+        if let Item::List(mut clauses) = clauses {
+            let clause = clauses.pop_front();
+            if let Some(clause) = clause {
+                if let Item::List(mut clause) = clause {
+                    if clause.len() != 2 {
+                        Err(Error::from("Clauses in 'decide' must have exactly 2 items"))
+                    } else {
+                        let test = clause.pop_front().unwrap();
+                        let expr = clause.pop_front().unwrap();
+
+                        if let (Item::List(test), Item::List(expr)) = (test, expr) {
+                            // construct if
+                            let testp = List::from(vec![Item::List(test), word("shield")]);
+                            let elsep = List::from(vec![Item::List(clauses), word("decide")]);
+                            let newexpr = List::from(vec![
+                                Item::List(testp),
+                                Item::List(expr),
+                                Item::List(elsep),
+                                word("if"),
+                            ]);
+                            append_expression(env, newexpr)
+                        } else {
+                            Err(invalid_type("decide clause test or expr"))
+                        }
+                    }
+                } else {
+                    Err(invalid_type("decide clause"))
+                }
+            } else {
+                // clauses empty, return nothing
+                env.stack.push_front(Item::Nothing);
+                Ok(env)
+            }
+        } else {
+            Err(invalid_type("decide"))
+        }
+    } else {
+        stack_underflow()
+    }
+}
+#+end_src
+
+#+RESULTS:
+: error: Could not compile `cargoUpWAU9`.
+
+Now we'll experiment with parsing edn (so the interpreter can read
+input instead of having it hardcoded):
+
+#+begin_src rust :tangle src/serialize.rs :crates '((edn-format . "3.2.2"))
+extern crate edn_format;
+use crate::types::*;
+use std::collections::VecDeque;
+use std::fmt;
+use internment::Intern;
+
+fn lookup_builtin(w: Word, standard_dictionary: &Option<Dictionary>) -> Item {
+    if let Some(dict) = standard_dictionary {
+        //println!("Looking up {} in dict of {} words", w, dict.len());
+        if let Some(def) = dict.get(&w) {
+            if let WordDef::Axiom(a) = def {
+                //println!("Compiled builtin! {}", w);
+                return Item::Builtin(BuiltinWord {word: w, f: a.f.clone()})
+            }
+        }
+    }
+    return Item::Word(w)
+}
+
+fn to_item(item: &edn_format::Value, standard_dictionary: &Option<Dictionary>) -> Item {
+    match item {
+        edn_format::Value::Integer(i) => Item::Int(*i),
+        edn_format::Value::Vector(v) => {
+            Item::List(v.iter().map(|i| to_item(i, standard_dictionary)).collect::<VecDeque<Item>>())
+        }
+        edn_format::Value::Symbol(s) => lookup_builtin(Intern::new(s.name().to_string()), standard_dictionary),
+        edn_format::Value::Boolean(b) => Item::Boolean(*b),
+        edn_format::Value::String(s) => Item::String(s.to_string()),
+        edn_format::Value::Float(f) => Item::Float(f.into_inner()),
+        _ => Item::Int(9999),
+    }
+}
+
+fn from_item(item: &Item) -> edn_format::Value {
+    match item {
+        Item::Int(i) => edn_format::Value::Integer(*i),
+        Item::List(v) => edn_format::Value::Vector(
+            v.iter()
+                .map(|i| from_item(i))
+                .collect::<Vec<edn_format::Value>>(),
+        ),
+        Item::Word(w) => edn_format::Value::Symbol(edn_format::Symbol::from_name(w)),
+        Item::Builtin(w) => edn_format::Value::Symbol(edn_format::Symbol::from_name(&w.word)),
+        Item::Boolean(b) => edn_format::Value::Boolean(*b),
+        Item::String(s) => edn_format::Value::String(s.to_string()),
+        Item::Float(f) => edn_format::Value::from(*f),
+        Item::Assoc(h) => edn_format::Value::Vector(
+            h.iter().map(|(k, v)| {
+                edn_format::Value::Vector(vec![from_item(&to_value_item(k.clone())), from_item(v)])
+            }).collect()
+        ),
+        _ => edn_format::Value::Integer(999),
+    }
+}
+
+pub fn parse(s: String, standard_dictionary: &Option<Dictionary>) -> List {
+    let parser = edn_format::Parser::from_iter(s.chars(), edn_format::ParserOptions::default());
+    parser
+        .map(move |r| to_item(&r.expect("expected valid element"), standard_dictionary))
+        .collect()
+}
+
+
+pub fn emit(item: &Item) -> String {
+    edn_format::emit_str(&from_item(item))
+}
+
+pub fn emit_all(items: &VecDeque<Item>) -> String {
+    let mut s: String = String::new();
+    for i in items {
+        s.push_str(&emit(&i));
+    }
+    return s;
+}
+
+// print out envs in error messages
+impl fmt::Debug for Environment {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{{ stack: {}, expression: {} }}",
+               emit(&Item::List(self.stack.clone())),
+               emit(&Item::List(self.expression.clone())),
+        )
+    }
+}
+#+end_src
+
+#+RESULTS:
+: error: Could not compile `cargoVyY4IO`.
+
+#+begin_src rust
+// test swap
+use std::collections::VecDeque;
+type List = Vec<Item>;
+
+type Stack = VecDeque<i32>;
+#[derive(Debug)]
+enum Item {
+    Int(i32),
+    List(List),
+}
+
+fn main(){
+    use std::mem;
+    let mut x = List::new();
+    x.push(Item::Int(5));
+    let mut y = List::new();
+    y.push(Item::Int(6));
+    //x.push(Item::List(y));
+    mem::swap(&mut x, &mut y);
+    y.push(Item::List(x));
+    println!("{:?}",y);
+
+    let mut v = Stack::new();
+    v.push_front(5);
+    v.push_front(6);
+    println!("{:?}", v);
+}
+
+#+end_src
+
+#+RESULTS:
+: [Int(5), List([Int(6)])]
+: [6, 5]
+
+Test hash of fn
+#+begin_src rust :crates
+use std::collections::HashMap;
+//use std::boxed::Box;
+use std::rc::Rc;
+
+struct Env {
+    number: Option<i32>,
+    dict: HashMap<String, Rc<dyn Fn(Env) -> Env>>
+}
+
+fn inc(i: i32) -> i32 {
+    i + 1
+}
+
+struct Builtins {
+    inc: fn(i32) -> i32
+}
+
+fn make_thing(f: fn(i32) -> i32) -> impl Fn(Env) -> Env {
+    move | mut e: Env | {
+        if let Some(n) = e.number {
+            e.number = Some(f(n));
+            e
+        } else { e }
+        
+    }
+}
+
+fn main () {
+    let mut dict = HashMap::<String, Rc<dyn Fn(Env) -> Env>>::new();
+    let i = make_thing(inc);
+    let builtins = Builtins { inc: inc };
+    dict.insert("inc".to_string(), Rc::new(i));
+    let mut env = Env { number: Some(12), dict: dict };
+    let f = env.dict.get(&"inc".to_string()).unwrap().clone();
+    println!("{}", f(env).number.unwrap());
+}
+#+end_src
+
+#+RESULTS:
+: 13
+
+#+begin_src rust
+use std::boxed::Box;
+struct Environment {
+    stack: Vec<Box<dyn Item>>
+}
+
+struct Inc {}
+
+trait Item {
+    fn onto_stack(self, env: Environment);
+}
+
+impl Item for i32 {
+    fn onto_stack(self, mut env: Environment){
+        env.stack.push(Box::new(self));
+    }
+}
+
+impl Item for Inc {
+    fn onto_stack(self, mut env: Environment) {
+        
+    }
+    
+}
+  
+#+end_src
+
+destructuring
+#+begin_src rust
+let a = [];
+let [x, y @ ..] = a;
+
+println!("{:?}", y);
+#+end_src
+
+#+begin_src rust
+use std::collections::VecDeque;
+
+let x = VecDeque::from(vec![1, 2, 3]);
+let y = &x[0..1];
+
+println!("{}", y);
+
+#+end_src
+
+#+RESULTS:
+: error: Could not compile `cargoewKZ71`.
+
+experiment with single vecdeque
+
+#+begin_src rust
+use std::collections::VecDeque;
+
+pub struct Plus {}
+pub struct Inc {}
+
+#[derive(Debug)]
+pub enum Item {
+    Number(i32),
+    Plus,
+    Inc
+}
+#[derive(Debug)]
+pub struct Stack {
+    stack: VecDeque<Item>,
+    tos: usize
+}
+
+// move from expr to stack
+fn push(v: &mut Stack) {
+    v.stack.rotate_left(1);
+    v.tos -= 1  
+}
+    
+fn exec2(v: &mut Stack) {
+
+    let i = v.stack.pop_back().unwrap();
+    let j = v.stack.pop_back().unwrap();
+    v.stack.pop_front();
+    println!("exec {:?} {:?}", i, j);
+    if let (Item::Number(i), Item::Number(j)) = (i, j) {
+        let res = i + j;
+        v.stack.push_front(Item::Number(res));
+        v.tos -= 1;
+    }
+}
+    
+
+fn main(){
+    let mut env = Stack { stack: VecDeque::new(),
+                          tos: 0 };
+    // load the program
+    env.stack.extend(vec![Item::Number(1), Item::Number(2), Item::Number(3), Item::Plus]);
+    env.tos = 4;
+    //buf.push_front(Item::Plus);
+
+    //
+    println!("{:?}", env);
+    push(&mut env);
+    println!("{:?}", env);
+    push(&mut env);
+    println!("{:?}", env);
+    push(&mut env);
+    println!("{:?}", env);
+    exec2(&mut env);
+    println!("{:?}", env);
+    println!("{:?}", env.stack.front());
+    
+
+}
+
+
+#+end_src
+
+#+RESULTS:
+: Stack { stack: [Number(1), Number(2), Number(3), Plus], tos: 4 }
+: Stack { stack: [Number(2), Number(3), Plus, Number(1)], tos: 3 }
+: Stack { stack: [Number(3), Plus, Number(1), Number(2)], tos: 2 }
+: Stack { stack: [Plus, Number(1), Number(2), Number(3)], tos: 1 }
+: exec Number(3) Number(2)
+: Stack { stack: [Number(5), Number(1)], tos: 0 }
+: Some(Number(5))
+
+experiment with stackexpr trait
+#+begin_src rust
+use std::collections::VecDeque;
+pub enum Item {
+    Int(i32),
+    Plus,
+    Inc
+}
+
+pub struct Environment {
+    stack: VecDeque<Item>,
+}
+
+trait StackExpr {
+    fn tos(self) -> Option<&'static Item>;
+    fn toe(self) -> Option<&'static Item>;
+    fn pop_stack(self) -> Option<Item>;
+    fn pop_expression(self) -> Option<Item>;
+    fn prepend_expression(self, l: List);
+    fn append_expression(self, l: List);
+    fn onto_stack(self);
+}
+
+impl StackExpr for VecDeque<T> {
+    fn tos(self) -> Option<&'static Item> {
+        self.as_slices().
+    }
+    fn toe(self) -> Option<&'static Item> {
+        self.stack.front()
+    }
+    fn pop_stack(self) -> Option<Item> {
+        self.stack.pop_back()
+    }
+    fn pop_expression(self) -> Option<Item> {
+        let item = self.stack.pop_front();
+        
+    }
+    fn prepend_expression(self, l: List);
+    fn append_expression(self, l: List);
+    fn onto_stack(self);
+
+}
+#+end_src
+
+#+RESULTS:
+
+#+begin_src rust
+use std::collections::VecDeque;
+
+let mut vector = VecDeque::new();
+
+vector.push_back(0);
+vector.push_back(1);
+vector.push_back(2);
+
+assert_eq!(vector.as_slices(), (&[0, 1, 2][..], &[][..]));
+
+vector.push_front(10);
+vector.push_front(9);
+
+assert_eq!(vector.as_slices(), (&[9, 10][..], &[0, 1, 2][..]));
+
+let mut v = VecDeque::new();
+v.push_back(1);
+assert_eq!(v.as_slices(), (&[1][..], &[][..]));
+
+#+end_src
+
+#+RESULTS:
+
+vec to hashmap
+#+begin_src rust
+use std::collections::HashMap;
+use std::hash::Hash;
+
+impl<K, V> TryFrom<dyn Iterator<Item = dyn Eq>> for HashMap<K, V>
+where K: Eq + Hash,
+    
+{
+    type Error = ();
+
+    fn try_from(v: dyn Iterator<Item = dyn Eq>) -> Result<Self, Self::Error> {
+        
+        HashMap::from_iter(v.map(|i| {
+            if let [k,v] = i[0..2] {
+                (k, v)
+            }
+            else {Err()}
+        }))
+    }
+}
+
+fn main() {
+    let a = vec![1, 2];
+    let b = vec![3, 4];
+    let vec = vec![a, b];
+    let h: HashMap<i32, i32> = HashMap::from_iter(
+        vec.iter().map(|i| {
+            if let [k,v] = i[0..2] {
+                (k, v)
+            }
+            else {(0,0)}
+        })
+    );
+    println!("{:?}", h);
+}
+
+
+#+end_src
+
+#+RESULTS:
+: error: Could not compile `cargo8MBNov`.
+
+from reddit:
+#+begin_src rust
+use std::collections::HashMap;
+use std::hash::Hash;
+#[derive(Debug)]
+struct NotPairsError;
+
+fn to_hashmap<T>(v: Vec<Vec<T>>) -> Result<HashMap<T, T>,NotPairsError>
+    where T: Eq + Hash,
+{
+    v.iter().map(|v| match (v.get(0), v.get(1), v.get(2)) {
+        (Some(k), Some(v), None) => Ok((k, v)),
+        _ => Err(NotPairsError),
+    }).collect()
+}
+
+
+fn main() {
+    
+    let a = vec![vec!["a", "b"], vec!["c", "d"], vec![]];
+
+    
+    println!("{:?}", to_hashmap(a));
+}
+
+#+end_src
+
+#+RESULTS:
+: error: Could not compile `cargorhVTIG`.
+
+from reddit:
+
+#+begin_src rust :crates '((itertools . "0.10.0"))
+use itertools::Itertools;
+
+use std::collections::HashMap;
+
+fn into_hm<I, T, V>(iter: I) -> Result<HashMap<V, V>, String>
+where
+    I: IntoIterator<Item = T>,
+    T: IntoIterator<Item = V>,
+    V: std::hash::Hash + Eq,
+{
+    
+}
+
+trait IntoHashMap<T> {
+    fn into_hashmap(self) -> Result<HashMap<T, T>, String>;
+}
+
+impl<I, T, V> IntoHashMap<V> for I
+where
+    I: IntoIterator<Item = T>,
+    T: IntoIterator<Item = V>,
+    V: std::hash::Hash + Eq,
+{
+    fn into_hashmap(self) -> Result<HashMap<V, V>, String> {
+        into_hm(self.into_iter())
+    }
+}
+
+fn main() {
+    let v = vec![vec!["k1", "v1"], vec!["k2", "v2"]];
+    println!("{:#?}", v.into_hashmap());
+}
+#+end_src
+
+
+
+#+RESULTS:
+: error: Could not compile `cargoTmcGbz`.
+
+edn comment bug - doesn't parse correctly when 2nd line comment in multiline
+comment is at beginning of line
+#+begin_src rust :crates '((edn-format . "3.2.2"))
+extern crate edn_format;
+
+fn main() {
+    println!("{:?}", edn_format::parse_str(";; abc\n;; def \n\n ced"));
+}
+#+end_src
+
+#+RESULTS:
+: Err(ParserErrorWithContext { context: [], row: 1, col: 2, error: UnexpectedCharacter(';') })
+
+#+begin_src rust
+use std::hash::Hash;
+fn into_entry<T, K, V>(k: T, v: V) -> Result<(K, V), String>
+where K: Eq + Hash
+{
+    match k {
+        
+    }
+}
+#+end_src
+
+#+RESULTS:
+
+#+begin_src rust
+#[derive(Debug)]
+enum Value {
+    Int(i32),
+    Float(f32),
+    String(String)
+}
+
+#[derive(Debug)]
+enum Key {
+    Int(i32),
+    String(String)
+}
+
+fn entry(mut l: Vec<Value>) -> Result<(Key, Value), String> {
+    let v = l.pop();
+    let k = l.pop();
+    let e = l.pop();
+    match (k, v, e) {
+        (Some(k), Some(v), None) => {
+            match (k) {
+                Value::Int(k) => { Ok((Key::Int(k), v)) }
+                _ => {Err("Key is wrong type".to_string())}
+            }
+            
+        },
+        _ => { Err("Entry must be a duple".to_string()) }
+    }
+}
+fn main(){
+
+    let v = vec![Value::Float(1.2), Value::Float(3.12)];
+    println!("{:?}", entry(v));
+    
+}
+#+end_src
+
+#+RESULTS:
+: Err("Key is wrong type")
+

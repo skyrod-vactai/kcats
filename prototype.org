@@ -1,0 +1,2484 @@
+* Prototype implementation
+** Status
+The first implementation is entirely experimental. Everything in it is
+subject to change. Vast areas of functionality are missing or broken.
+** Base Language
+We select Clojure to build the prototype, as it's a solid prototyping
+language, is fairly well matched to the goals. Clojure will likely not
+be a "production" implementation.
+** Project file
+We're building this clojure project with leiningen, so let's make a
+project file.
+
+#+begin_src clojure :tangle project.clj
+(defproject kcats "0.1.0-SNAPSHOT"
+  :description "The kcats programming language"
+  :jvm-opts ["-Xverify:none"]
+  :license {:name "EPL-2.0 OR GPL-2.0-or-later WITH Classpath-exception-2.0"
+            :url "https://www.eclipse.org/legal/epl-2.0/"}
+  :dependencies [[org.clojure/clojure "1.10.0"]
+                 [expound "0.7.2"]]
+  :repl-options {:init-ns kcats.core})
+#+end_src
+** Basic type specs
+First we'll create a clojure namespace and define some specs, which
+will help us debug and document what is happening. We'll use the
+clojure's built in spec and the library =expound= which gives easier
+to understand error messages.
+
+#+BEGIN_SRC clojure
+  (ns kcats.core
+    (:require [clojure.spec.alpha :as spec]
+              [expound.alpha :as expound])
+    (:refer-clojure :exclude [eval test]))
+
+  (set! spec/*explain-out* (expound/custom-printer
+                            {:show-valid-values? true}))
+  (spec/check-asserts true)
+#+END_SRC
+
+Kcats will use some types more or less unchanged from the way clojure
+uses them. If it's a clojure boolean, it's a kcats boolean, etc.
+
+What's important here is that we have some basic value types. Values
+are stateless - they can be sent over a wire to some remote machine
+without losing any meaning (the number 5 is always the number
+5). 
+
+There is only one common type in the system that has state (and
+therefore would lose meaning being sent to a remote machine): a
+pipe. See [[*Pipes][this later section]] for more detail. Kcats allows other
+stateful things on the stack (like java objects, clojure atoms etc)
+but best practice is that they should only be there temporarily,
+usually during the construction of a pipe[fn:2].
+
+#+BEGIN_SRC clojure
+(spec/def ::boolean boolean?)
+(expound/defmsg ::boolean "should be true/false")
+(spec/def ::number number?)
+(expound/defmsg ::number "should be a number")
+(spec/def ::string string?)
+(expound/defmsg ::string "should be a string")
+(spec/def ::bytes bytes?)
+(expound/defmsg ::bytes "should be bytes")
+(spec/def ::integer integer?)
+(expound/defmsg ::integer "should be an integer")
+#+END_SRC
+
+Now we'll spec some concepts in kcats in terms of clojure
+concepts. We'll need to specify what kinds of things can go in a
+program or be put on a stack. We'll call those =items=. Note that
+items can be list, which we haven't specced yet. That's ok, recursive
+specs are allowed. Lists contain items, and items can be lists.
+
+Values are a particular kind of item, which is what most =words= will
+operate upon. A value list is one where all the contents are
+values.
+#+BEGIN_SRC clojure
+(in-ns 'kcats.core)
+
+(expound/def ::value
+  (spec/or :value-list ::value-list
+           :boolean ::boolean
+           :number ::number
+           :string ::string
+           :bytes ::bytes
+           :word ::word))
+
+(expound/def ::item (constantly true))
+#+END_SRC
+
+Now we'll spec a list. We'll use clojure's vectors (which are indexed
+lists). We'll also spec out programs, which are lists but intended to
+be executed (otherwise there is no difference).
+
+#+BEGIN_SRC clojure
+(spec/def ::list (spec/coll-of ::item :kind vector?))
+(expound/defmsg ::list "should be a list")
+
+(spec/def ::value-list (spec/coll-of ::value? :kind vector?))
+(expound/defmsg ::value-list "should be a value list")
+
+(spec/def ::program (spec/coll-of ::item :kind vector?))
+(expound/defmsg ::program "should be a program")
+#+END_SRC
+
+We'll also need words that perform actions- this maps well to
+clojure's symbols which are used similarly. Then we will want to be
+able to define new words in our new language so let's spec out what a
+word's definition looks like - it's a program.
+
+Finally we want to be able to keep track of all words we've defined,
+so we'll spec a dictionary that allows us to look up a word's
+definition. In our dictionary, we have to start with something - some
+words that aren't defined in terms of other words. We'll call them
+=axiom words= and their meaning is expressed as a clojure
+function. All the rest of the words are in terms of other words we've
+already defined.
+
+#+BEGIN_SRC clojure
+(def word? symbol?)
+(expound/def ::word word?)
+
+;; TODO these keyword reqs are outdated
+(expound/def ::axiom-definition (spec/keys :req [::fn ::spec]))
+(expound/def ::program-definition (spec/keys :req [::definition]))
+
+(expound/def ::dictionary (spec/map-of ::word
+                                       (spec/or :axiom ::axiom-definition
+                                                :user-defined ::program-definition)))
+#+END_SRC
+
+Next we'll spec a stack. We want it to easily implement a
+first-in-first-out (FIFO) stack, (meaning the last item you put in is
+accessible in constant time), and clojure's built-in list type does
+this.
+
+An expression is a stack too, but it represents words waiting to be
+executed - parts of the program that haven't run yet. In kcats, the
+program modifies itself heavily, so it is constantly adding pieces to
+the expression.
+#+BEGIN_SRC clojure
+(def stack? (every-pred (complement indexed?) sequential?))
+
+(expound/def ::stack (spec/coll-of ::item
+                                   :kind stack?))
+
+(expound/def ::expression (spec/coll-of ::item
+                                        :kind stack?))
+
+#+END_SRC
+
+Next we'll spec what an Environment is - it's just a dictionary,
+stack, and expression put together.
+
+We'll call this an "association list" so that it's not tied directly
+to clojure maps (which don't exist in kcats). We're going to want to
+represent environments in kcats and not just as clojure data
+structures. See [[*Maps/associations][Association Lists]]. We're also going to use symbols
+instead of clojure keywords, because again, kcats only has the
+equivalent of symbols. This will allow us to, for example, use clojure
+libs to read kcats data.
+#+BEGIN_SRC clojure
+(expound/def ::pair (spec/coll-of ::item :kind vector? :count 2))
+
+(expound/def ::association-list (spec/or :map map?
+                                         :pairs (spec/coll-of ::pair
+                                                              :kind vector?)))
+
+(expound/def ::environment ::association-list) ;; TODO: specifically call out keys
+
+#+END_SRC
+
+Finally, we'll add some functions that help us build specs for new
+kcats words that we'll define later.
+
+#+begin_src clojure
+;; since we'll commonly be defining specs for a stack, we'll nearly
+;; always not care about anything below a certain depth, so let's make
+;; a macro that encapsulates that.
+(defmacro stack-spec
+  [& args]
+  `(spec/cat ~@args
+             :others (spec/* ::item)))
+#+end_src
+
+[fn:2] There are some pipes that may be technically values (think of a
+pipe that produces the infinite sequence 1,2,3...). You could send
+that somewhere else, as long as you include what number it last
+produced. But you can't send files or sockets somewhere else (they're
+pointers to real world resources that may be different or nonexistent
+somewhere else). Discerning between the two may be a future feature.
+** Stack specs
+When writing a kcats program, you have a lot of words available to
+use. How do we know what a word does? Hopefully there are some
+examples, but having a brief description of what the word does to the
+stack is also helpful. Other stack based languages use a stack spec,
+which tells you what items the word uses from the stack and what it
+will replace them with. It looks like this: =a -> a a=. That's the
+spec for =clone=. It takes =a= from the top of the stack (which can be
+anything), and leaves =a= and then =a= again.
+
+We will use a slight variation of this syntax. We'll represent the
+same thing in kcats data structures, and we'll support optional type
+information. So in this format, =clone= spec would be =[[[item a]]
+[[item a] [item a]]=. A list of two items: what is taken from the
+stack, and what's left afterward. Only the top stack items are
+relevant here, there could be any number of items underneath, but they
+aren't touched. The order of items in each list is that the first item
+is the top of the stack.
+
+Some words can do very arbitrary things to the stack, for example,
+=execute=. It executes the program on top of the stack, which could do
+anything to the stack - add lots of items, remove lots of items, or
+both. To express this behavior we use =*=, which means "any number of
+stack changes". The spec for =execute= is =[[program][*]]= - it takes
+a program from the top of the stack and excutes it, so what happens to
+the stack then is determined by the contents of that program. 
+
+Let's look at the the spec for =dip= - it's =[[program [item a]][a
+\*]]=. What does this mean? This word takes a program on the top of
+the stack, and an item underneath called =a=. When it's done, =a= is on
+top and the rest of the stack has changed arbitrarily (because of the
+=*=). That's because =dip= takes =a= away, executes the program, then
+puts =a= back on top. In the input half of the spec, there's a type
+for =a= (=item=) but when we refer to =a= in the output half, we don't
+list the type again (we already said what type =a= is). 
+
+Having these specs for all the words in kcats data allows us to
+programmatically search for words. Here's an example of doing that [[*Search the
+ dictionary][Searching the dictionary]].
+
+We'll add some functions that support stack specs and validate whether
+they actually are followed.
+
+#+BEGIN_SRC clojure
+(def spec-arbitrary-effect-designator '*)
+
+(defn build-spec
+  "Build a native clojure spec from the stack-spec"
+  [spec]
+  (if (seq spec)
+    (clojure.core/eval
+     `(spec/tuple ~@(for [s spec]
+                      (keyword "kcats.core" (str (cond-> s
+                                                   (not (symbol? s)) (first)))))))
+    (constantly true)))
+
+(defn cache-spec
+  "if the given env doesn't have a prebuilt native clojure spec, build
+  some from the stack spec"
+  [{:syms [dictionary] :as env} word]
+  (let [spec (get-in dictionary [word 'spec])
+        [in-spec out-spec] spec
+        existing (get-in dictionary [word 'clojure-spec-in])]
+    (if (and (not existing) in-spec)
+      (-> env
+          (assoc-in ['dictionary word 'clojure-spec-in] (build-spec in-spec))
+          (assoc-in ['dictionary word 'clojure-spec-out] (build-spec out-spec)))
+      env)))
+
+(defn validate-stack-spec-before
+  [[in] word {:syms [stack dictionary]}]
+  (when (> (count in) (count stack))
+    (throw (Exception. (format "Word '%s' expects at least %d items in stack, but there were only %d"
+                               word (count in) (count stack)))))
+  (let [spec (get-in dictionary [word 'clojure-spec-in])]
+    (when spec
+      (binding [spec/*explain-out* expound/printer]
+        (spec/assert spec (vec (take (count in) stack)))))))
+
+(defn- assigned-variables
+  [spec stack out?]
+  (let [values (dissoc (zipmap spec (take (count spec) stack))
+                       spec-arbitrary-effect-designator)]
+    (into {}
+          (for [[spec val] values
+                :when (or out? (vector? spec))]
+            [(if out? spec (second spec)) val]))))
+
+(require '[clojure.set :as set])
+
+(defn validate-placeholders
+  [[in out] before after]
+  (let [before (assigned-variables in before false)
+        after (assigned-variables out after true)
+        diff (set/difference (into #{} after) (into #{} before))]
+    (when (seq diff)
+      (throw (ex-info "Spec placeholder(s) not respected" {:in-spec in
+                                                           :out-spec out
+                                                           :unexpected-values diff})))))
+
+;; TODO: this doesn't work because some words don't really finish
+;; executing immediately, they add more stuff to the expression.  To
+;; really do this, might need to build up a list of validations to
+;; perform when going below a given stack height. This seems like
+;; something a nested environment setup might be good for (inner env
+;; has validation on, outer does not)
+(defn validate-stack-spec-after
+  [[in out :as spec] word {before 'stack} {after 'stack}]
+  (let [exp-length-change (- (count in) (count out))
+        actual-length-change (- (count before) (count after))]
+    
+    ;; length check
+    (and (-> out last (not= spec-arbitrary-effect-designator))
+         (not= exp-length-change actual-length-change)
+         (throw (Exception. (format "Word '%s' was supposed to %s %d item %s the stack, but instead %s %d"
+                                    word
+                                    (if (neg? exp-length-change) "remove" "add")
+                                    (Math/abs exp-length-change)
+                                    (if (neg? exp-length-change) "from" "to")
+                                    (if (neg? actual-length-change) "removed" "added")
+                                    (Math/abs actual-length-change)))))
+    (validate-placeholders spec before after)))
+#+END_SRC
+*** TODO Add facilities to take a program and calculate its stack effect.
+
+For example: =clone discard= 
+
+The specs (respectively) are  =[[[item a]] [[item a] [item a]]]= and =[[item] []]=
+
+So if we run it on a stack =[1]=. The first step will apply labels to
+what's on the stack, so the =1= gets a label =[item a]=. The result is
+=[1 1]= and then the labels are applied again (since the resulting 1's
+are copies of the original, they already have this label.
+
+** Evaluation
+Next we're going to define how the kcats language executes (or
+evaluates) a program. First we can say that to evaluate a program, we
+will keep stepping through evaluation as long as the expression isn't
+empty. Once it's empty, there's nothing left to do, and we return the
+last environment.
+
+We also allow some execution options, like being able to stop after a
+certain number of steps (to prevent infinite looping), or do something
+before each step (like printing out the environment as a way of
+tracing what's happening).
+#+BEGIN_SRC clojure 
+(declare eval-step) ;; we'll define this later
+
+(defn eval
+  [env]
+  (loop [{:syms [expression] :as env} env]
+    (if (seq expression)
+      (recur (eval-step env))
+      env)))
+#+END_SRC
+
+We'll include handling for calling down into the platform language
+directly. There will be syntax for calling clojure functions and java
+methods as if they are kcats words. This allows us to leverage the
+platform functionality directly in kcats without having to write more
+code in the platform language.
+
+#+begin_src clojure
+(in-ns 'kcats.core)
+(require '[clojure.string :as string]
+         '[clojure.edn :as edn])
+;; TODO: needs to support no-arg fns, java fields, clojure vars
+;; Invocation requires several things:
+;; * Indication that it's meant to be invoking platform functionality
+;; * Stack effect (how many args consumed and produced)
+;; * Platform function type (fn, constructor, instance, static, etc)
+;;
+;; 
+;; + call clojure fn (drop all args and replace w return val)
+;; * call java, drop passed in argument or return value
+;; ! call java, keep passed in argument or return value
+;; for java calls, the first char refers to the return value, 2nd is
+;; the object, 3rd and beyond are arguments
+;;
+;; Regarding argument order: it's the order in which they were put on
+;; the stack. last arg is at the top of stack.
+;;
+;; ++foo : clojure fn foo, consume 2 args, return 1 value (a b -> c)
+;; !Bar. : Java no-arg construct Bar instance ( -> b)
+;; !*Baz. : construct with one arg (a -> b)
+;; **quux : call void instance method quux for side effect (a -> )
+;; *!quux : call quux to mutate object (a -> a)
+;; *!*quux : call quux to mutate object with arg (a b -> a)
+;; !**quux ; call quux with arg, to get return value (a b -> c)
+;; !*Foo/bar : call static bar on class Foo. (a -> b)
+;; **Foo/blort : call static blort, side effect only (a ->)
+
+(declare nil->nothing) 
+
+(defn invoke*
+  [{[word & others] 'expression
+    :syms [dictionary stack]
+    :as env}]
+  {'stack
+   (let [[_ arity fn-name] (->> word
+                                str
+                                (re-find #"([\\+\\!\\*]*)(.*)\.?"))
+         java? (not (.contains arity "+"))
+         [args others] (split-at (cond-> (count arity)
+                                   java? (dec)) ;; has an extra marker for return val
+                                 stack)
+         args (reverse args) ;; due to stacking reversing the args previously
+         into-array (fn [args] ;; for java calls, turn byte seqs back into arrays
+                      (into-array Object
+                                  (for [arg args]
+                                    (cond-> arg
+                                      (bytes? arg) (byte-array)))))
+         ] 
+     (concat
+      (nil->nothing
+       (cond
+         (not (seq arity)) [word] ;; just a regular word
+
+         (or (.contains arity "!")
+             (.contains arity "*")) ;; java call
+         (let [[ret-flag & arity] (seq arity)
+               mutated-args (keep-indexed
+                             (fn [i arg]
+                               (when (= \! (nth arity i))
+                                 arg))
+                             args)
+               ret (cond
+                     (.endsWith fn-name ".") ;; java constructor
+                     (clojure.lang.Reflector/invokeConstructor
+                      (Class/forName (->> fn-name
+                                          count
+                                          dec
+                                          (subs fn-name 0)))
+                      (into-array args))
+
+                     (.contains fn-name "/") ;; static method
+                     (let [[clazz method] (string/split fn-name #"/")]
+                       (->> args
+                            into-array
+                            (clojure.lang.Reflector/invokeStaticMethod clazz method)))
+
+                     :else (->> args ;; instance method
+                                rest
+                                into-array
+                                (clojure.lang.Reflector/invokeInstanceMethod
+                                 (first args)
+                                 fn-name)))]
+           (cond-> mutated-args
+             (= ret-flag \!) ;; keep the return value
+             (conj ret)))
+
+         ;; clojure function
+         (some-> fn-name symbol resolve) (-> fn-name
+                                             symbol
+                                             resolve
+                                             (apply args)
+                                             vector)
+         :else (throw (Exception. (str "Cannot resolve platform word: " word)))))
+      others))
+   'expression others
+   'dictionary dictionary})
+#+end_src
+
+Where the real action happens is when we evaluate a word. Each defined
+word is either in terms of other words, or has a clojure function that
+will run when that word is evaluated. If it's not defined, then the
+word will act like everything else and just be put on the stack.
+
+Recall what =eval= does, it just keeps iterating =eval-step= until
+there's nothing left in the expression.
+
+#+begin_src clojure
+(defn onto-stack
+  "Move one item from the expression to the stack. "
+  [{[item & others] 'expression :syms [dictionary stack] :as env}]
+  (if (word? item)
+    (let [{:syms [dictionary] :as env} (cache-spec env item)
+          {f 'fn spec 'spec} (dictionary item)]
+      (validate-stack-spec-before spec item env)
+      (if f
+        (f (update env 'expression rest)) ;; drop this word now that we've used it
+        (invoke* env)))
+    (-> env
+        (assoc 'expression others)
+        (update 'stack conj item))))
+
+(defn definition
+  "Returns the definition of an item, if it's a word defined in terms
+  of other words"
+  [{:syms [dictionary] :as env} item]
+  (some-> dictionary (get item) (get 'definition)))
+
+(declare repr)
+
+(defn eval-step
+  "Evaluate one step in the environment."
+  [{[next-item & items :as expression] 'expression :syms [stack dictionary] :as env}]
+  (try
+    (if-let [d (definition env next-item)]
+      (assoc env 'expression (concat (list* d) items)) ;; replace item with definition
+      
+      ;; eval the thing onto the stack
+      (onto-stack env))
+    (catch Exception e
+      (throw (ex-info (str "Error during evaluation of " (repr next-item))
+                      {:environment (dissoc env 'dictionary)}
+                      e)))))
+ 
+(defn step-over
+  "Executes the next word in the expression completely, returning the
+  environment."
+  [{:syms [expression] :as env}]
+  (let [depth (count expression)]
+    (loop [{:syms [expression] :as env} env]
+     (if (< (count expression) depth)
+       env
+       (recur (eval-step env))))))
+#+end_src
+** Printing
+Printing out (or serializing) kcats data is mostly just printing the
+underlying clojure data structures, as-is. However we want to note the
+difference between raw data and data that's been put into an optimized
+structure for processing. A map (or mapping, dictionary etc) lets you
+look up a value given a key. The raw data is just a list of key/value
+pairs. Arranging it in a hashmap is a performance optimization. When
+we print out data, it's the raw format we want. In kcats there's no
+difference in raw data, between a list of pairs and a map. Under the
+covers though, it may actually be a hashmap. 
+
+We're going to define our representation of raw data that only uses
+square brackets and words (in clojure, those are vectors and
+symbols). Then we can just print out these representations and we have
+our serialized data format.
+#+begin_src clojure
+(defn repr
+  "The kcats canonical representation, in clojure data
+  structures. Converts clojure maps to vectors, keywords to symbols."
+  [x]
+  (cond
+    (map? x) (mapv (fn [[k v]] [(repr k) (repr v)]) x)
+    (keyword? x) (-> x name symbol)
+    (bytes? x) x
+    (coll? x) (mapv repr x)
+    :else x)) 
+
+(defn print-env
+  "Prints the expression/stack and then return env"
+  [{:syms [expression stack] :as env}]
+  (binding [*print-length* 10
+            *print-level* 8]
+    (apply clojure.core/pr (reverse (repr expression)))
+    (print " :. ")
+    (apply clojure.core/prn (repr stack)))
+  env)
+#+end_src
+** Concept of nothing/nil/null
+Kcats is not going to have a separate concept of =null= or =nil=. If
+we want to express "nothing" we will use an empty list =[]=. We'll
+need some functions to treat empty lists as clojure treats =nil=.
+
+#+begin_src clojure
+(def nothing [])
+
+(def nothing? (partial = nothing))
+
+(defn nothing->nil
+  "Returns argument unless it's a kcats 'nothing' (empty list), in
+  which case it returns nil"
+  [x]
+  (if (nothing? x)
+    nil
+    x))
+
+(defn nil->nothing
+  "Returns argument unless it's nil, in which case it returns empty list"
+  [x]
+  (if (nil? x)
+    nothing
+    x))
+#+end_src
+** Built-in words
+Eventually we'll want to define words in terms of other words. But
+right now we don't have any words! So we'll have to define some, not
+in terms of other words, but as clojure functions. Then we can build
+new words on top of those.
+
+We'll need some utility functions that help us define these axiom
+words.
+
+#+BEGIN_SRC clojure
+(in-ns 'kcats.core)
+
+(defn apply-stack
+  "Apply n items from stack to f, put result back on stack."
+  [stack n f]
+  (let [use (take n stack)
+        stack (drop n stack)]
+    ;; items are reversed so that we can write code with arguments in
+    ;; the same order as we'd use in other langs, eg so that [2 1 >]
+    ;; -> true
+    ;;
+    ;; The top item in the stack would normally be the first
+    ;; arg, but that was the LAST arg written in the code.
+    (conj stack (apply f (reverse use)))))
+
+(defn f-stack
+  [n f]
+  (fn [env]
+    (update env 'stack apply-stack n f)))
+
+(defn env-effect
+  "Calls f with nitems from stack, it should return a pair (items to
+  prepend to the expression, items to replace the nitems with)"
+  [nitems f]
+  (fn [{:syms [stack expression dictionary]}]
+    (let [[a b] (split-at nitems stack)
+          [new-expression-items new-stack-items] (apply f a)]
+          {'stack (into b (reverse new-stack-items))
+           'expression (into expression (reverse new-expression-items))
+           'dictionary dictionary})))
+
+(defn- strip-types
+  "stack specs will have inputs like [[string a]] but we just want [a]"
+  [spec]
+  (vec (for [s spec]
+         (if (vector? s) (second s) s))))
+
+(defmacro effect
+  "Constructs a fn with given in args, whose body is out. That
+  function body should return a pair (new-expression-items,
+  new-stack-items)"
+  [in out]
+  `(env-effect ~(count in) (fn ~(strip-types in) ~out)))
+
+(defmacro stack-effect
+  "Takes a stack effect notation and turns it into a call to
+  env-effect"
+  [in out]
+  `(env-effect ~(count in) (fn ~(strip-types in) [[] ~out])))
+
+(defmacro spec-effect
+  "Takes a spec and generates the function (only useful for words that
+  rearrange stack items but don't modify any single values)"
+  [in out]
+  `(stack-effect ~(strip-types in) ~(strip-types out)))
+#+END_SRC
+
+We're going to start adding definitions of words here, but only the
+actual functions that carry out the word's meaning. All the other data
+about the word (specs, docs, examples etc) will go in the lexicon
+later. We put this here because this has to be clojure code.
+#+BEGIN_SRC clojure
+(in-ns 'kcats.core)
+(import [java.io ByteArrayOutputStream])
+(require '[clojure.java.io :as io]
+         '[clojure.edn :as edn])
+
+;; some state to hold our core words, so we can build them up a chunk
+;; at a time.
+(defonce core-words (atom {}))
+
+;; math symbols are ok - non-programmers already know what they mean
+(def thin-wrappers
+  (into {} cat
+        [;; use autopromoting versions of arithmetic operators
+         (for [sym ['+' '-' '*']]
+           [(-> sym str (subs 0 1) symbol) ;; drop the '
+            {'fn (f-stack 2 (resolve sym))}])
+         (for [sym ['inc 'dec 'odd? 'even? 'sequential? 'zero? 'pos?
+                    'neg?  'number? 'int? 'true? 'false?  'string?
+                    'empty? 'first 'second 'string? 'bytes? 'count
+                    'word? 'reverse]]
+           [sym {'fn (f-stack 1 (resolve sym))}])
+         (for [sym ['/ 'min 'max 'quot 'rem 'mod '< '<= '> '>=
+                    'starts-with? 'ends-with? '= 'range]]
+           [sym {'fn (f-stack 2 (resolve sym))}])]))
+
+(defn from-spec
+  "Build a native function from the spec (in cases where the spec
+  completely describes it, like for stack motion words, eg swap)"
+  [{:syms [spec] :as dfn}]
+  (println "from spec" dfn)
+  (let [[in out] spec]
+    (assoc dfn
+           'fn (clojure.core/eval `(spec-effect ~in ~out))
+           'spec spec)))
+
+(defn inscribe [dictionary [word word-def]]
+  (let [existing (get dictionary word)
+        word-def (into {} word-def)] ;; support kcats data structure
+    (assoc dictionary
+           word
+           (if ('definition word-def)
+             word-def
+             (if ('fn existing)
+               ;; keep existing native fn
+               (merge word-def existing)
+               ;; no native fn and no definition
+               ;; means we generate the fn from spec
+               (from-spec word-def))))))
+
+;; add some functions to support immutable byte arrays
+(defn conj-byte
+  "adds another byte to ArraySeq bs"
+  [bs b]
+  (let [c (count bs)
+        bs (byte-array (inc c) bs)]
+    (seq (doto bs
+           (aset-byte c b)))))
+
+(defn concat-bytes
+  "joins two byte ArraySeqs"
+  [a b]
+  (seq (byte-array (concat a b))))
+
+(def bytes? (partial instance? clojure.lang.ArraySeq$ArraySeq_byte))
+
+(def axiom-words
+  {'execute (effect [p] [p []])
+   'wrap (stack-effect [a] [[a]])
+   ;; TODO: possible security issue with unwrap and bare words on the
+   ;; stack: It's possible for malicious code to squat on a word that
+   ;; was intended to be data, and not an action word, causing
+   ;; unexpected behavior. May want to reconsider whether undefined
+   ;; words should be placed onto the stack unquoted.
+   'unwrap (stack-effect [l] l)
+   'rest (stack-effect [l] [(vec (rest l))])
+   'fail (stack-effect [s] (throw (Exception. s)))
+   'dip (effect [p a] [(conj (vec p) [a] 'unwrap) []])
+   'dipdown (effect [p a b] [(conj (vec p) [a b] 'unwrap) []])
+   'list? (stack-effect [a] [(vector? a)])
+   'number? (stack-effect [a] [(number? a)])
+   'string (stack-effect [a] [(if (bytes? a)
+                                (-> a .array String.)
+                                (str a))])
+   'read (stack-effect [s] [(edn/read-string s)])
+   
+   ;; maybe this should be something likefirst
+   ;; timesfive [[definition [5 *]] [examples [...]]] inscribe
+   'inscribe (fn [{[word-def word & others] 'stack
+                   :syms [stack expression dictionary]}]
+               {'dictionary (inscribe dictionary [word word-def])
+                'stack others
+                'expression expression})
+   'branch (effect [f t b]
+                   [(if (nothing->nil b) t f) []])
+   'step (env-effect 2 (fn [p [agg-item & agg-rest :as agg]]
+                         (if (seq agg)
+                           [(cond-> ['execute]
+                              (seq agg-rest) (concat [(vec agg-rest) p 'step]))
+                            [p agg-item]]
+                           [[] []])))
+   'recur (effect [rec2 rec1 then pred]
+                  ['[if]
+                   [(vec (concat rec1 [[pred then rec1 rec2 'recur]] rec2))
+                    then pred]])
+   'loop (effect [p f]
+                 [(when (nothing->nil f)
+                    (concat p [p 'loop]))
+                  []])
+   
+   'unpack (env-effect 1 (fn [[l & others]]
+                           [[] [(nil->nothing l) (vec others)]]))
+   'evert (fn [{[l & others] 'stack :as env}]
+            (assoc env 'stack (apply list (vec others) l)))
+   'and (f-stack 2 (fn [a b]
+                     (and (nothing->nil a)
+                          (nothing->nil b))))
+   'or (f-stack 2 (fn [a b]
+                    (or (nothing->nil a)
+                        (nothing->nil b))))
+   'not (f-stack 1 (fn [a]
+                     (not (nothing->nil a))))
+   'dictionary (fn [{:syms [dictionary] :as env}]
+                 (update env 'stack conj dictionary)) 
+   'lexicon (fn [env]
+              ;; read one definition at a time from this file
+              ;; update the dictionary with each one
+              (let [rdr (-> "src/kcats/lexicon.kcats"
+                            io/file
+                            io/reader
+                            java.io.PushbackReader.)]
+                (reduce (fn [env dfn]
+                          (try
+                            (update env 'dictionary
+                                   inscribe dfn)
+                            (catch Exception e
+                              (throw (ex-info "Error updating dictionary"
+                                              {:definition dfn}
+                                              e)))))
+                        env
+                        (->> #(edn/read {:eof nil} rdr)
+                             repeatedly
+                             (take-while identity)))))})
+
+(swap! core-words merge
+       (into {} (for [[word dfn] axiom-words]
+                  [word {'fn dfn}]))
+       thin-wrappers)
+
+(defn default-env
+  ([expression]
+   {'stack '()
+    'dictionary @core-words
+    'expression (conj (list* expression) 'lexicon)})
+  ([]
+   (default-env '())))
+
+(defn exec
+  "Add p to the expression in env so that it executes when the env is
+  evaluated"
+  [env p]
+  (update env 'expression concat p))
+
+(defn k
+  "Run a program with the default env and return the result."
+  [p]
+  (-> (default-env)
+      (exec p)
+      eval
+      (get 'stack)
+      repr))
+
+(defn run
+  [env p]
+  (eval (exec env p)))
+
+#+END_SRC
+
+Next we can add a way to test that all the examples are working, so
+that we notice any bugs as we're developing.
+
+#+begin_src clojure
+(in-ns 'kcats.core)
+(require '[clojure.test :as test])
+(defn test
+  "Run through all the examples in the default env and make sure they
+  work. Takes optional list of words to test"
+  ([env words]
+   (let [env (eval env)
+         dict ('dictionary env)]
+     (doseq [[word {:syms [examples]}] (if words
+                                          (select-keys dict words)
+                                          dict)]
+       (test/testing (str word)
+         (doseq [[program exp-stack] examples]
+           (-> (->> program
+                    (update env 'expression concat)
+                    eval)
+               (get 'stack)
+               repr
+               (= exp-stack)
+               test/is))))))
+  ([env] (test env nil)))
+#+end_src
+
+Now that we have enough axiom words, we can define more words as a
+standard library, in native kcats. It will be a list of pairs (we'll
+go into more detail on this particular data type in [[*Maps/associations][Association Lists]]).
+
+#+begin_src kcats :tangle src/kcats/lexicon.kcats
+;; TODO: platform specific definitions shouldn't live here, but for
+;; now we'll allow it.
+
+
+;; axiom defs
+
+[= [[spec [[item item] [boolean]]]
+    [examples [[[1 2 =] [false]]
+              [[1 1 =] [true]]
+              [[[] [] =]  [true]]
+              [[[1] [] =]  [false]]
+              [[[1 [false]] [1 [false]] =]  [true]]
+              [[[1.0 ["foo"]] [1.0 ["foo"]] =]  [true]]
+              [[[1.0 ["foo"]] [1.0 ["bar"]] =]  [false]]]]]]
+
+[+ [[spec [[number number] [number]]]
+          [examples [[[1 2 +] [3]]
+                     [[1.1 2.2 +] [3.3]]
+                     [[1 2.2 +] [3.2]]]]]]
+
+[- [[spec [[number number] [number]]]
+          [examples [[[2 1 -] [1]]
+                     [[1.1 2.2 -] [-1.1]]
+                     [[2.2 1 -] [1.2]]]]]]
+
+[* [[spec [[number number] [number]]]]]
+[/ [[spec [[number number] [number]]]]]
+[min [[spec [[number number] [number]]]]]
+[max [[spec [[number number] [number]]]]]
+[quot [[spec [[number number] [number]]]]]
+[rem [[spec [[number number] [number]]]]]
+[mod [[spec [[number number] [number]]]]]
+[< [[spec [[number number] [boolean]]]]]
+[<= [[spec [[number number] [boolean]]]]]
+[>= [[spec [[number number] [boolean]]]]]
+
+
+[> [[spec [[number number] [boolean]]]
+          [examples [[[2 1 >] [true]]
+                     [[1.1 2.2 >] [false]]
+                     [[2.2 1 >] [true]]]]]]
+
+[inc [[spec [[number] [number]]]
+      [examples [[[1 inc] [2]]
+                     [[-1 inc] [0]]
+                     [[99 inc] [100]]]]]]
+
+[dec [[spec [[number] [number]]]]]
+
+[odd? [[spec [[number] [boolean]]]]]
+[even? [[spec [[number] [boolean]]]]]
+[pos? [[spec [[number] [boolean]]]]]
+[zero? [[spec [[number] [boolean]]]]]
+[neg? [[spec [[number] [boolean]]]]]
+
+
+[discard [[spec [[item] []]]
+          [examples [[[1 2 3 discard] [2 1]]
+                     [[1 2 3 [a b c] discard] [3 2 1]]]]]]
+
+[clone [[spec [[[item a]]
+               [[item a] [item a]]]]
+        [examples [[[1 2 3 clone] [3 3 2 1]]]]]]
+
+[swap [[spec [[[item a] [item b]]
+              [[item b] [item a]]]]
+       [examples [[[1 2 3 swap] [2 3 1]]]]]]
+
+[swapdown [[spec [[[item a] [item b] [item c]]
+                  [[item a] [item c] [item b]]]]
+           [examples [[[1 2 3 swapdown] [3 1 2]]]]]]
+
+[float [[spec [[[item a] [item b] [item c]]
+               [[item c] [item a] [item b]]]]
+        [examples [[[1 2 3 float] [1 3 2]]]]]]
+
+[sink [[spec [[[item a] [item b] [item c]]
+              [[item b] [item c] [item a]]]]
+       [examples [[[1 2 3 sink] [2 1 3]]]]]]
+
+[execute [[spec [[program] [*]]]
+          [examples [[[[1 2 +] execute] [3]]
+                     [[2 [+] 4 swap execute] [6]]]]]]
+
+[wrap [[spec [[item] [list]]]
+       [examples [[[1 wrap] [[1]]]
+                  [[[1 2] wrap] [[[1 2]]]]]]]]
+
+[unwrap [[spec [[list] [*]]]
+         [examples [[[[1] unwrap] [1]]]]]]
+
+[rest [[spec [[list] [list]]]
+       [examples [[[[1 2 3] rest] [[2 3]]]]]]]
+
+[reverse [[spec [[list] [list]]]
+          [examples [[[[1 2 3] reverse] [[3 2 1]]]]]]]
+
+[fail [[spec [[string] [*]]]]]
+
+[dip [[spec [[program [item a]] [[item a] *]]]
+      [examples [[[1 8 [inc] dip] [8 2]]
+                 [[1 2 [dec] unwrap
+                   [+] dip] [dec 3]]]]]]
+
+[list? [[spec [[item] [boolean]]]
+        [examples [[[[1] list?] [true]]
+                   [[[] list?] [true]]
+                   [[5 list?] [false]]]]]]
+
+[number? [[spec [[item] [boolean]]]
+          [examples [[[[1] number?] [false]]
+                     [[[] number?] [false]]
+                     [[5 number?] [true]]
+                     [[5.01 number?] [true]]]]]]
+
+[string [[spec [[item] [string]]]
+         [examples [[[1 string] ["1"]]
+                    [[[1 2 3] string] ["[1 2 3]"]]
+                    [[[] string] ["[]"]]]]]]
+
+[read [[spec [[string] [item]]]
+       [examples [[["[1 [2] 3]" read] [[1 [2] 3]]]]]]]
+
+[inscribe [[spec [[list word] []]]
+           [examples [[[[add3] unwrap [[definition [3 +]]
+                                       [spec [[number] [number]]]]
+                        inscribe
+                        5 add3] [8]]]]]]
+
+[branch [[spec [[[program false-branch]
+                 [program true-branch]
+                 [item condition]]
+                [*]]]
+         [examples [[[5 true [3 *] [4 +] branch] [15]]
+                    [[6 false [3 *] [4 +] branch] [10]]]]]]
+
+[step [[spec [[program list] [*]]]
+       [examples [[[1 [2 3 4] [*] step] [24]]
+                  [[1 [] [*] step] [1]]]]]]
+
+[recur [[spec [[[program rec2]
+                [program rec1]
+                [program true-branch]
+                [program pred]]
+               [*]]]
+        [examples [[[3
+                     [1 <=] [] [clone dec] [execute *]
+                     recur]
+                    [6]]]]]]
+
+[loop [[spec [[program [item flag]] [*]]]
+       [examples [[[10 true [-2 * clone 50 <] loop] [160]]]]]]
+
+[unpack [[spec [[list] [item list]]]
+         [examples [[[["a" "b" "c"] unpack] ["a" ["b" "c"]]]]]]]
+
+[join [[spec [[item item] [item]]]
+       [definition [[[[list?] [++concat +vec]]
+                     [[[string?] both?] [++str]]
+                     [[[bytes?] both?] [++concat-bytes]]]
+                    decide]]
+       [examples [[[["a" "b"] ["c" "d"] join] [["a" "b" "c" "d"]]]
+                  [["ab" "cd" join] ["abcd"]]
+                  [["ab" bytes "cd" bytes join "abcd" bytes =] [true]]]]]]
+
+[range [[spec [[integer integer] [list]]]
+        [examples [[[1 5 range] [[1 2 3 4]]]]]]]
+
+[evert [[spec [[list] [list *]]]
+        [examples [[[1 2 3 [4 5 6] evert] [[3 2 1] 4 5 6]]]]]]
+
+[and [[spec [[item item] [item]]]
+      [examples [[[1 odd? 2 even? and] [true]]]]]]
+
+[or [[spec [[item item] [item]]]
+     [examples [[[1 odd? 3 even? or] [true]]]]]]
+
+[not [[spec [[item] [boolean]]]
+      [examples [[[1 even? not] [true]]
+                 [[false not] [true]]
+                 [[true not] [false]]
+                 [[[] not] [true]]]]]]
+
+[lexicon [[spec [[] []]]]]
+
+[pack [[spec [[item list] [list]]]
+       [definition [[[[swap bytes?]
+                      [++conj-byte]]
+
+                     [[swap string?]
+                      [!*java.lang.String/valueOf !**concat]]                            
+
+                     [[true] [[+vec] dip ++conj]]]
+                    decide]]
+       [examples [[[[] 1 pack] [[1]]]
+                  [[[1 2 3] 4 pack] [[1 2 3 4]]]
+                  [["foo" \d pack] ["food"]]
+                  [["foo" bytes 32 pack string] ["foo "]]]]]]
+
+[shield [[spec [[program]
+                [item]]]
+         [doc "Runs program keeping top of stack produced but protects existing items from being consumed."]
+         [definition [[snapshot] dip inject first]]
+         [examples [[[1 2 3 [=] shield] [false 3 2 1]]]]]]
+
+[shielddown [[spec [[program item]
+                    [item]]]
+             [definition [shield swap discard]]
+             [examples [[[1 2 3 [=] shielddown] [false 2 1]]]]]]
+
+[shielddowndown [[spec [[[program p] [item consumed] [item consumed]]
+                        [[item result]]]]
+                 [definition [shield [discard discard] dip]]
+                 [examples [[[1 2 3 [+ +] shielddowndown] [6 1]]]]]]
+
+[if [[spec [[[program false-branch]
+             [program true-branch]
+             [program condition]]
+            [*]]]
+     [definition [[shield] dipdown branch]]
+     [examples [[[5 [5 =] [3 *] [4 +] if] [15]]
+                [[6 [5 =] [3 *] [4 +] if] [10]]]]]]
+
+[dipdown [[spec [[program
+                  [item a]
+                  [item b]]
+                 [[item a] [item b] *]]]
+          [examples [[[1 2 3 [inc] dipdown] [3 2 2]]]]]]
+
+[every? [[spec [[program list] boolean]]
+         [definition [[shielddown] swap prepend ;; building r1, run pred with unary
+                      [unpack swap] swap pack ;; add rest of dip program
+                      [dip swap not] join ;; add the rest of outer dip
+                      wrap [dip or] join ;; add rest of r1
+                      ;; put the other recur clauses under r1
+                      [false
+                       [[[nothing?] shield] dip
+                        swap [or] shielddown] ;; the 'if' 
+                       [not]] ;; then
+                      dip ;; underneath the r1
+                      [execute] recur ;; r2 and recur!
+                      swap discard]]
+         [examples [[[[2 4 6] [even?] every?] [true]]
+                    [[[2 4 5] [even?] every?] [false]]
+                    [[[] [even?] every?] [true]]
+                    [[[2 4 6] [] every?] [true]]
+                    [[11 [2 4 6] [+ odd?] every?] [true 11]]
+                    [[12 [[even?] [pos?] [3 rem 0 =]] [execute] every?] [true 12]]]]]]
+
+[any? [[spec [[program list] boolean]]
+       [definition [[shielddown] swap prepend ;; building r1, run pred with unary
+                    [unpack swap] swap pack ;; add rest of dip program
+                    [dip swap] join ;; add the rest of outer dip
+                    wrap [dip or] join ;; add rest of r1
+                    ;; put the other recur clauses under r1
+                    [false
+                     [[[nothing?] shield] dip
+                      swap [or] shielddown] ;; the 'if' 
+                     []] ;; then
+                    dip ;; underneath the r1
+                    [execute] recur ;; r2 and recur!
+                    swap discard]]
+       [examples [[[[2 4 6] [even?] any?] [true]]
+                  [[[3 5 7] [even?] any?] [false]]
+                  [[[] [even?] any?] [false]]
+                  [[[2 4 6] [] any?] [2]]
+                  [[11 [3 5 6] [+ odd?] any?] [true 11]]
+                  [[-15 [[even?] [pos?] [3 rem 0 =]] [execute] any?] [true -15]]]]]]
+
+[primrec [[spec [[[program rec1]
+                  [program exit]
+                  [number data]]
+                 [*]]]
+          [definition [[execute] swap join ;; add execute to rec1 to be recurs rec2
+                       [[discard] swap join] dip ;; add discard to exit condition
+                       [[zero?]] dipdown  ;; put the condition on bottom
+                       [[clone dec]] dip ;; add the r1
+                       recur]] ;; now its generic recur
+          [examples [[[5 [1] [*] primrec] [120]]]]]]
+
+[= [[spec [[item item]
+           [boolean]]]
+    [examples [[[1 1 =] [true]]
+               [["hi" "hi" =] [true]]
+               [["hi" "there" =] [false]]
+               [[[] false =] [false]]
+               [[1 "hi" "hi" =] [true 1]]]]]]
+
+[count [[spec [[list]
+               [number]]]
+        [examples [[[["a" "b" "c"] count] [3]]]]]]
+
+[prepend [[spec [[item list]
+                 [list]]]
+          [definition [wrap swap join]]
+          [examples [[[[1 2] 3 prepend] [[3 1 2]]]]]]]
+
+[assert [[spec [[program]
+                [*]]]
+         [definition [snapshot ;; save stack to print in err message
+                      [shield] dip swap ;; run the assertion under the saved stack
+                      [discard] ;; if passes, drop the saved stack, dont need
+                      [string ["assertion failed "] dip join fail] ;; else throw err
+                      branch]]]]
+
+[inject [[spec [[program list]
+                [list]]]
+         [doc "Inject the quoted program into the list below
+                   it (runs the program with the list as its
+                   stack).  Does not affect the rest of the stack."]
+         [definition [swap evert unpack dip evert]]
+         [examples [[[1 2 3 [4 5 6] [* +] inject] [[26] 3 2 1]]]]]]
+
+[snapshot [[spec [[] [list]]]
+           [doc "Save the whole stack as a list on the stack"]
+           [definition [[] evert clone evert unwrap]]
+           [examples [[[1 2 3 snapshot] [[3 2 1] 3 2 1]]
+                      [[snapshot] [[]]]]]]]
+
+[first [[spec [[list] [item]]]
+        [examples [[[[4 5 6] first] [4]]]]]]
+
+[second [[spec [[list] [item]]]
+         [examples [[[[4 5 6] second] [5]]]]]]
+
+[bytes? [[spec [[item] [boolean]]]]]
+
+[string? [[spec [[item] [boolean]]]
+         [examples [[["hi" string?] [true]]
+                    [["" string?] [true]]
+                    [[["hi"] string?] [false]]
+                    [[true string?] [false]]]]]]
+
+[word? [[spec [[item] [boolean]]]
+        [examples [[[foo word?] [true]]
+                   [[[foo] unwrap word?] [true]]
+                   [[true word?] [false]]]]]] ;; TODO: but arguably 'true' is a word
+
+[bytes [[spec [[item] [bytes]]]
+        [definition [[[[string?] [!*getBytes bytes]]
+                      [[+clojure.core/bytes?] [+seq]] ;; convert to immutable byte sequence
+                      [[list?] [+pr-str bytes]]] ;; if it's a list we want to serialize it
+                     decide]]]]
+
+[map [[spec [[program list] [list]]]
+      [definition [[snapshot [] swap] ;; save original stack, and
+                   ;; add an empty list to
+                   ;; hold results
+                   dipdown ;; do this underneath the program and list
+                   [wrap swap clone float] ;; program snippet a to
+                   ;; copy the original stack
+                   ;; that we saved, will make
+                   ;; new copy for each item
+                   ;; in the list
+
+                   swap pack ;; pack the map program into the
+                   ;; partial program a above
+
+                   ;; inject the map program into the stack copy,
+                   ;; take the first item and pack it into the
+                   ;; result list. the join here is to literally
+                   ;; add the list item to the stack copy,
+                   ;; without actually executing it, in case its
+                   ;; a bare word
+                   [[swap join] dip inject first swap [pack] dip]
+                   join ;; add the program snippet b above to the
+                   ;; snippet a, to get a program for step
+                   step ;; step through the above program, using
+                   ;; the list as data
+                   discard ;; we dont need the copy of the
+                   ;; original stack anymore
+                  ]]
+      [examples [[[[1 2 3] [inc] map] [[2 3 4]]]
+                 [[1 [1 2 3] [+] map] [[2 3 4] 1]]
+                 [[7 9 [1 2 3] [+ *] map] [[70 77 84] 9 7]]
+                 [[7 9 [+] [] map] [[+] 9 7]]]]]]
+
+[filter [[spec [[program list] [list]]]
+         [definition [[snapshot [] swap]
+                      dipdown
+                      ;; clone the original value so we can save it in results if needed
+                      [[clone] dip clone wrap swapdown]
+                      swap pack
+                      [join inject first
+                       ;; if passes filter, pack it into results
+                       [[pack]]
+                       ;; othewise discard it
+                       [[discard]]
+                       branch
+                       swapdown
+                       dip]
+                      join step discard]]
+         [examples [[[[1 2 3] [odd?] filter] [[1 3]]]
+                    [[[2 4 6] [odd?] filter] [[]]]
+                    [[33 [1 2 3] [+ odd?] filter] [[2] 33]]]]]]
+
+[nothing? [[spec [[item] [boolean]]]
+           [definition [[] =]]
+           [examples [[[[] nothing?] [true]]
+                      [[1 nothing?] [false]]
+                      [[false nothing?] [false]]]]]]
+
+[something? [[spec [[item] [boolean]]]
+             [definition [nothing? not]]
+             [examples [[[1 something?] [true]]
+                        [[false something?] [true]]
+                        [[[] something?] [false]]]]]]
+
+[while [[spec [[[program body]
+                [program pred]]
+               [*]]]
+        [definition [swap wrap [shield] join ;; add shield to the pred program
+                     clone dipdown ;; run it on the previous ToS
+                     join loop]]
+        [examples [[[3 [0 >] [clone dec] while] [0 1 2 3]]]]]]
+
+[times [[spec [[[program body]
+                [integer howmany]]
+               [*]]]
+        [definition [[dec] swap pack [dip] join ;; build [dec body dip]
+                     [0 >] swap
+                     while
+                     discard]]]]
+
+[pair [[spec [[item item] [list]]]
+       [definition [[wrap] dip pack]]
+       [examples [[[1 2 pair] [[1 2]]]
+                  [[["hi"] ["there" "foo"] pair] [[["hi"] ["there" "foo"]]]]]]]]
+
+[both? [[spec [[program item item] [boolean]]]
+        [definition [sink pair swap every?]]
+       [examples [[[1 2 [odd?] both?] [false]]
+                  [[1 3 [odd?] both?] [true]]]]]]
+
+[positive? [[spec [[number] [boolean]]]
+            [definition [0 >]]]]
+
+[negative? [[spec [[number] [boolean]]]
+            [definition [0 <]]]]
+
+[zero? [[spec [[number] [boolean]]]
+        [definition [0 =]]
+        [examples [[[0 zero?] [true]]
+                   [[0.0 zero?] [true]]
+                   [[-0.00001 zero?] [false]]
+                   [[1.1 zero?] [false]]]]]]
+#+end_src
+** The top level
+When we're working interactively it'd be nice to have a persistent
+state - you can run commands to add things to the stack and execute
+words, then examine the results, and repeat. We'll add top level
+state, and some functions we can call from the clojure repl to
+manipulate it. This will help with debugging.
+
+#+begin_src clojure
+(defonce state (atom nil))
+
+(defn clear! []
+  (get (reset! state (default-env)) 'stack))
+
+(defn push! [items]
+  (get (swap! state (fn [{:syms [expression] :as env}]
+                             (eval (assoc env 'expression (concat items expression)))))
+       'stack))
+
+;; some debug functions to make debugging less wordy in clojure
+
+(defn- nested-result [program]
+  (-> program push! first (dissoc 'dictionary)))
+
+(defn debug! [program]
+  (clear!)
+  (nested-result [program 'environment]))
+
+(defn step-into! []
+  (nested-result ['eval-step]))
+
+(defn step-over! []
+  (nested-result ['advance]))
+
+(defn break-when! [condition]
+  (nested-result [condition 'swap 'break]))
+#+end_src
+
+** Maps/associations
+A simple implementation that works well for small lists: specify
+associations as lists of pairs.
+
+Then include some words that depend on this functionality.
+
+#+BEGIN_SRC clojure
+(in-ns 'kcats.core)
+
+(defn lookup
+  [alist k]
+  (let [m? (map? alist)]
+    (get (if m?
+           alist
+           (into {} alist))
+         k
+         [])))
+
+(defn assoc-in
+  "Associates a value in a nested associative structure, where ks is a
+  sequence of keys and v is the new value and returns a new nested structure.
+  If any levels do not exist, hash-maps will be created."
+  {:added "1.0"
+   :static true}
+  [m [k & ks] v]
+  (let [m (into {} m)]
+    (if ks
+      (assoc m k (assoc-in (get m k) ks v))
+      (assoc m k v))))
+
+(def associative-words
+  {'associative? (stack-effect [x] [(spec/valid? ::association-list x)])
+   'assign (f-stack 3 #'assoc-in)
+   'unassign (f-stack 2 (fn [alist key]
+                          (vec (remove #(-> % first (= key)) alist))))
+   'decide (fn [{[[[test expr :as first-clause]
+                   & other-clauses]
+                  & others] 'stack
+                 :syms [dictionary expression]}]
+             {'expression (if first-clause
+                             (concat [[test 'shield] ;; run test resetting stack
+                                      expr ;; the then
+                                      [(vec other-clauses) 'decide] ;; the else
+                                      'if]
+                                     expression)
+                             expression)
+              'stack (cond-> others
+                        ;; if conditions are empty result is empty list
+                        (not first-clause) (conj []))
+              'dictionary dictionary})})
+
+(swap! core-words merge (into {}
+                              (for [[word f] associative-words]
+                                [word {'fn f}])))
+#+END_SRC
+
+The rest of the definitions can be added to the lexicon.
+
+#+begin_src kcats :tangle src/kcats/lexicon.kcats
+;; Associative words
+
+[associative? [[spec [[item] [boolean]]]]]
+
+[assign [[spec [[[item value]
+                 [list keys]
+                 association-list]
+                [association-list]]]
+         [examples [[[[[a b] [c d]] [a] 5 assign]
+                     [[[a 5] [c d]]]]
+
+                    [[[[a b] [c d]] [e] 5 assign]
+                     [[[a b] [c d] [e 5]]]]
+
+                    [[[[a b] [c [[d e]]]] [c d] 5 assign]
+                     [[[a b] [c [[d 5]]]]]]]]]]
+
+[update [[spec [[program [list keys] association-list]
+                [association-list]]]
+         [definition [[[lookup] shield] dip ;; m ks v p
+                      shielddown
+                      assign]]
+         [examples [[[[[a 1] [b 2]] [b] [inc] update]
+                     [[[a 1] [b 3]]]]
+
+                    [[[[a [[c 3] [d 5]]] [b 2]] [a c] [inc] update]
+                     [[[a [[c 4] [d 5]]] [b 2]]]]
+
+                    [[[[a [[c 3] [d 5]]] [b 2]] [a c] [discard 10 15] update]
+                     [[[a [[c 15] [d 5]]] [b 2]]]]
+
+                    [[[[a 1] [b 2]] [d] [5] update]
+                     [[[a 1] [b 2] [d 5]]]]
+
+                    [[[[a [[c 3] [d 5]]] [b 2]] [a e] [5 6 +] update]
+                     [[[a [[c 3] [d 5] [e 11]]] [b 2]]]]]]]]
+
+[lookup [[spec [[[list keys] association-list] [item]]]
+         [definition [[[[swap associative?] ;; it's a map
+                        ;; [swap something?] ;; it's not empty
+                        [something?]] ;; the keylist is not empty
+                       [execute]
+                       every?]
+                      [unpack swap [++lookup] dip] ;; extract the first key and lookup
+                      while
+
+                      [something?]
+                      ;; fail if we could not drill down all the way
+                      ["Lookup attempted on non associative value" fail]
+                      [discard]  ;; get rid of remaining keylist
+                      if]]
+         [examples [[[[[a b] [c d]] [a] lookup] [b]]
+                    [[[[a b] [c d]] [e] lookup] [[]]]
+                    [[[[outer [[a b] [c d]]]] [outer c] lookup] [d]]]]]]
+
+[unassign [[spec [[[item key] association-list] [association-list]]]
+           [examples [[[[[a b] [c d]] a unassign]
+                       [[[c d]]]]
+                      
+                      [[[[a b] [c d]] e unassign]
+                       [[[a b] [c d]]]]]]]]
+
+[decide [[spec [[[association-list test-expr-pairs]] [*]]]
+         [doc "Takes a list of choices (pairs of test, program) and
+                executes the first program whose test passes. if none
+                pass, returns 'nothing'. Stack is reset between
+                testing conditions."]
+         [examples [[[5 [[[3 =] ["three"]]
+                         [[5 =] ["five"]]
+                         [[7 =] ["seven"]]
+                         [[true] ["something else"]]]
+                      decide]
+                     ["five" 5]]
+                    
+                    [[9 [[[3 =] ["three"]]
+                         [[5 =] ["five"]]
+                         [[7 =] ["seven"]]
+                         [[true] ["something else"]]]
+                      decide]
+                     
+                     ["something else" 9]]
+                    [[9 [[[3 =] ["three"]]
+                         [[5 =] ["five"]]
+                         [[7 =] ["seven"]]]
+                      decide]
+                     [[] 9]]]]]]
+
+;; TODO: fix the case where you just want a value [[type foo]] - only
+;; one item but you want the value, not key
+[type [[spec [[association-list] [item]]]
+       [definition [[count 1 =] ;; if it's a single item
+                    [first first] ;; the type is the key of that first item
+                    [[type] lookup] ;; otherwise look up the key 'type'
+                    if]]
+       [examples [[[[[foo 1]] type] [foo]]
+                  [[[[type url] [value "http://foo.com"]] type] [url]]]]]]
+
+[value [[spec [[association-list] [item]]]
+        [definition [[count 1 =] ;; if it's a single item
+                     [first second] ;; the value is the value of that first item
+                     [[value] lookup] ;; otherwise look up the key 'value'
+                     if]]
+        [examples [[[[[foo 1]] value] [1]]
+                   
+                   [[[[type url] [value "http://foo.com"]] value]
+                    ["http://foo.com"]]]]]]
+[zip [[spec [[[list values] [list keys]] [association-list]]]
+      [definition [[[]] dipdown ;; add empty result below ToS
+                   [[unpack wrap] ;; unpack the next key, wrap it
+                    ;; to make a "pair" (adding
+                    ;; value later)
+                    dip ;; run that underneath the current value
+                    pack ;; the value into the "pair" we created earlier
+                    swap [pack] dip] ;; add the new pair to the results
+                   step ;; through all the values
+                   discard]] ;; the now-empty list of keys
+      [examples [[[[a b c] [1 2 3] zip] [[[a 1] [b 2] [c 3]]]]]]]]
+#+end_src
+** Methods
+We want a way of adding methods to a word that's already set up as a
+simple 'decide' form. This will add the method at the beginning -
+adding it at the end is not good because often there's a catchall
+condition at the end, and adding beyond that means the new condition
+is unreachable. Adding at the beginning is not always what the user
+wants either, though. So maybe this could be improved by taking
+another argument: a program to combine the item and the existing list
+(that defaults to =prepend= here).
+#+begin_src kcats :tangle src/kcats/lexicon.kcats
+[addmethod [[spec [[[pair condition] [program combinator] word] []]]
+            [definition [float ;; work with the word first to get definition: w c b
+                         [wrap dictionary swap lookup] shield ;; leave the word and put def on top: def w c b
+                         [wrap swap pack] dipdown float ;; [c b] def w 
+                         [  ;; b c decide cs
+                         float ;; decide b c cs
+                         [execute] dip] ;; run combinator which will work on c cs 
+                         join inject ;; join with [c b], the above program to run on the definition
+                         swap inscribe]]]] ;; redefine word
+#+end_src
+
+** Programmable Runtime
+*** Basics
+In kcats, the interpreter is a pure function of the environment data
+it's given (with some caveats). That environment data is representable
+as kcats data structures. That means that the kcats interpreter can
+take that environment data from anywhere, and do whatever arbitrary
+operations on it, including stepping through the execution of the
+environment and producing more environment values. In other words,
+kcats is its own debugger. I'm not sure if any other languages
+implement this feature, certainly it should be straightforward to do
+in many stack-based languages. For those familiar with lisp, you know
+that you can use lisp to manipulate lisp code at compile time. In
+kcats, you similarly have the power to manipulate code before it is
+executed. In addition you have the power to manipulate *how* the code
+is executed.
+
+Of course, most real programs are not purely functional (they refer to
+files on disk or network locations). So that must be taken into
+account as always.
+
+What we'll implement here is nested environments - where the outer
+environment's stack contains data for an inner environment. The outer
+environment can then use words like =eval-step= to step through the
+execution of the inner environment, or do whatever other arbitrary
+operations on it.
+*** Implementation
+Let's add some words that help us step through execution of an
+environment expressed as kcats data. First some core words to do low
+level operations (create an environment to execute a program in, and
+also step through the execution of that environment):
+#+begin_src clojure
+(in-ns 'kcats.core)
+
+(swap! core-words merge
+       {'eval-step {'spec '[[environment] [item]]
+                    'fn (f-stack 1
+                                 (comp eval-step
+                                       (partial into {})))} ;; turn kcats data into clj map
+        'environment {'spec '[[program] [environment]]
+                      'fn (f-stack 1 (comp default-env list*))}})
+#+end_src
+
+We can make some handy words to help debug programs.
+
+#+begin_src kcats :tangle src/kcats/lexicon.kcats
+[tos [[spec [[environment] [item]]]
+      [definition [[stack] lookup first]]
+      [examples [[[[[stack [1 2 3]]
+                    [expression [[+] step]]]
+                   tos]
+                  [1]]]]]]
+
+[toe [[spec [[environment] [item]]]
+      [definition [[expression] lookup first]]
+      [examples [[[[[stack [1 2 3]]
+                    [expression [[+] step]]]
+                   toe]
+                  [[+]]]]]]]
+
+[break [[spec [[environment [program condition]]
+               [environment [program condition]]]]
+        [definition [[[[[expression] lookup something?] ;; something still in the expression
+                       [swap execute not]] ;; check condition not true yet
+                      [execute]
+                      every?] ;; break?
+                     [eval-step]  ;; evaluate the environment one step
+                     while]]]]
+
+[advance [[spec [[environment environment]]]
+          [definition [[[expression] lookup count] shield swap ;; count up the expression length, we'll run until it's smaller than this
+                       
+                       [[expression] lookup count
+                        [[pos?] [<=]] [execute] every?] ;; only stop if expr empty or shorter than we started off
+                       [eval-step]  ;; evaluate the environment one step
+                       while]]]]
+#+end_src
+
+*** Other examples
+**** Count the number of times each word is executed while running a program.
+
+#+begin_src kcats
+[[] ;; empty list to put word counts in
+ [10 [0 >] [clone dec] while]  ;; the sample program to run
+ environment 
+ [[expression] lookup something?] ;; something still in the expression, keep running
+ [[[expression] lookup first] shield ;; get the item we're about to execute
+  swap ;; put it under the environment
+  [[word?] ; if it's a word
+   [wrap
+    [[something?] ;; if word count not empty
+     [inc] ;; increment the counter
+     [1] ;; if it is empty start the counter at 1
+     if]
+    update] ;; the results, the count for the word about to execute
+   [discard] ;; if it's not a word, do nothing
+   if] dip
+  eval-step] ;; evaluate the environment one step
+ while 
+ discard] ;; drop the environment and just report the word counts
+#+end_src
+
+**** TODO spec checking
+clojure spec check can be replaced with predicate programs, that will
+be run with =shield= before the actual word and if it returns false,
+will raise an error. 
+**** TODO Trace output
+#+begin_src kcats
+[[0 [1 2 3 4 5] [+] step]  ;; the sample program to run
+ environment
+ 
+ [[expression] lookup something?] ;; break?
+ [+print-env eval-step]  ;; evaluate the environment one step
+ while]
+
+#+end_src
+**** DONE Step count limiting
+When testing or debugging, limit the number of steps to avoid a
+possible infinite loop.
+#+begin_src kcats
+[200 ;; step count remaining
+ [10 [0 >] [clone dec] while]  ;; the sample program to run
+ environment
+ 
+ [[expression] lookup something? ;; something still in the expression
+  [pos?] dip and] ;; still step budget remaining
+ [eval-step ;; evaluate the environment one step
+  [dec] dip] ;; decrease the step budget 
+ while
+ 
+ [stack] lookup] ;; return the output
+#+end_src
+**** DONE Breakpoint
+#+begin_src kcats
+[[[[toe [+] unwrap =]
+   [tos 3 >]]
+  [execute]
+  every?] ;; when to stop - when we're about to add and tos already >3
+ [0 [1 2 3 4 5] [+] step]  ;; the sample program to run
+ environment
+ 
+ [[[[expression] lookup something?] ;; something still in the expression
+   [swap execute not]] ;; don't stop yet
+  [execute]
+  every?] ;; break?
+ [eval-step]  ;; evaluate the environment one step
+ while]
+#+end_src
+**** TODO Step over
+#+begin_src kcats
+[[0 [1 2 3 4 5] [+] step]  ;; the sample program to run
+ environment
+ 
+[[expression] lookup count] shield swap;; count up the expression length, we'll run until it's smaller than this
+ 
+ [[expression] lookup count
+  [[pos?] [<=]] [execute] every?] ;; only stop if expr empty or shorter than we started off
+ [eval-step]  ;; evaluate the environment one step
+ while]
+#+end_src
+** Pipes
+*** Basics
+Pipes help you coordinate - they give you a way to get values from
+here to there. You might know where the pipe comes out, but you don't
+know or care how it gets there. Pipes should be used for communicating
+rather than calculating. You can send or receive from the filesystem
+or the network via pipes. You can also use pipes to send or receive
+values to/from other environments.
+
+The interface is simple enough - we just need to be able to put values
+into a pipe at one end, and take them off at the other. It's also
+handy to know whether there's anything in the pipe or not, and whether
+the pipe is "full" (nothing more will fit until something at the other
+end is removed).
+
+The program doesn't necessarily have access to both ends of the
+pipe. For example, when sending data over a socket, the program has
+access to the "in" end, but not the "out" (that's on a remote
+machine - whatever you put in is sent over the network).
+
+Pipes can also contain infinite sequences, which are handy
+sometimes. For example, a pipe that contains 1, 2, 3 etc. Each time
+you take from it, you'll get a number one higher than the last. In
+reality the pipe doesn't have infinite stuff it it, it's just being
+put in as needed.
+#+begin_src clojure :tangle src/kcats/pipe.clj
+(ns kcats.pipe
+  (:require [kcats.core :as core]
+            [clojure.spec.alpha :as spec]
+            [expound.alpha :as expound])
+  (:refer-clojure :exclude [take empty?])
+  (:import [java.util.concurrent BlockingQueue ArrayBlockingQueue SynchronousQueue]
+           [java.util Queue]))
+
+(defprotocol Select
+  (poll [pipe] "Returns a value if available, otherwise nil"))
+
+(defprotocol In
+  (put [pipe value] "Puts a value into the pipe, blocks if the pipe is full, returns value on success"))
+
+(defprotocol Out
+  (take [pipe] "Takes a value from the pipe, blocks if pipe is empty, returns the value"))
+
+;; a protocol that just marks whether the pipe is generating values
+;; itself. The reason to differentiate is that a self-contained pipe
+;; can potentially be serialized and sent elsewhere without any loss
+(defprotocol SelfContained)
+#+end_src
+
+Now we can make some higher level functions that will actually be what
+kcats primitives will be defined in terms of.
+#+begin_src clojure :tangle src/kcats/pipe.clj
+(in-ns 'kcats.pipe)
+
+(def default-sleep 10)
+
+(defn select
+  "Takes a coll of pipes. Whichever one is non-empty first, return the
+  pipe and the value that was in it."
+  [pipes]
+  (loop [[this-pipe & remaining-pipes] pipes]
+    (if this-pipe
+      (if-let [item (poll this-pipe)]
+        ;; found it, return the pipe and value as a tuple
+        [this-pipe item]
+        (recur remaining-pipes))
+      ;; everything empty, start over
+      (do (Thread/sleep default-sleep)
+          (recur pipes)))))
+
+(defn put!
+  [pipe value]
+  (doto pipe (put value)))
+
+#+end_src
+
+#+begin_src clojure :tangle no
+;; TODO: I don't think it makes any sense to make a pipeline when the
+;; pipes don't alter the content. We need to really link up envs where
+;; each env takes from one pipe, does processing and puts into
+;; another.
+(defn pipeline
+  "Takes a coll of pipes, connects them together into a
+  pipeline (starting with the first item's `in` and ending with the
+  last item's `out`). Handles moving things through the pipeline
+  automatically so that they act as a single pipe."
+  [pipes]
+  ;; check that we can actually pipeline these pipes (no file/socket
+  ;; operations in the middle, etc)
+  (doseq [[in out] (partition 2 1 pipes)]
+    (if-not (satisfies? Out in)
+      (throw (ex-info "Trying to add pipe to pipeline, but we don't have access to the Out end"
+                      {:pipe in}))
+      (if-not (satisfies? In out)
+        (throw (ex-info "Trying to add pipe to pipeline, but we don't have access to the In end"
+                        {:pipe out})))))
+  ;; start from the end, siphoning things out
+  (future (loop [[in out & remaining] pipes]
+            (if (and in out)
+              (if-let [item (poll in)]
+                (if-not (empty )))
+              ))))
+
+#+end_src
+
+Now we can define a few different kinds of pipes, starting with simple
+"local" types.
+*** Closing
+When waiting at the end of a pipe for more items to emerge, it'd be
+nice to know if whoever's at the other end has gone away (doesn't
+intend to ever send anything else). It's also nice to know, when
+putting items into a pipe, that whoever is taking them out has gone
+away. We'll call that "closing" the pipe, regardless of which end does
+it.
+
+This can get a little complicated because often there is more than one
+process at one end of the pipe or the other. Imagine 3 people all
+standing at the end of a pipe, and all putting items into it, and then
+one person seals the pipe shut forever. The other two people might not
+appreciate that, if they weren't done with the pipe. Only close the
+pipe if you're sure that everyone's done with it.
+
+It may turn out that best practice is to never allow more than one
+process per pipe, instead joining pipes together, such that the joint
+only closes when all the input pipes close (or the output closes).
+
+This implementation provides no logic (yet) to automatically close a
+pipe when all its inputs or outputs close.
+#+begin_src clojure :tangle src/kcats/pipe.clj
+(in-ns 'kcats.pipe)
+
+(defprotocol Close
+  (close [pipe] "Closes the pipe from either end")
+  (closed? [pipe] "Returns true if the pipe has been closed"))
+
+;; Objects that don't implement the protocol can never be closed but
+;; we can still ask if they're closed (it'll always be false)
+
+(defn is-closed
+  [obj]
+  (and (instance? Close obj) (closed? obj)))
+
+;; or we could also just add a dummy protocol impl to Object
+
+(extend-type Object
+  Close
+  (close [obj])
+  (closed? [obj] false))
+#+end_src
+
+We can now implement this on some pipe types
+#+begin_src clojure :tangle src/kcats/pipe.clj
+(in-ns 'kcats.pipe)
+;; some pipes are thin veneers on java concurrent objects
+
+;; TODO: finish close impl
+(extend-type BlockingQueue
+  In
+  (put [q value] (.put q value))
+  Out
+  (take [q] (.take q))
+  Select
+  (poll [q] (.poll q)))
+
+(extend-type Queue
+  Out
+  (take [q] (.poll q))
+  Select
+  (poll [q] (take q))
+  Close
+  (close [q] nil)
+  (closed? [q] (-> q .peek nil?)))
+
+(defn ->handoff []
+  (SynchronousQueue.))
+#+end_src
+*** Tunnels (bi-directional pipes)
+Pipes are a nice construct to get things from here to there, but quite
+often we also want to have data flow in both directions. Instead of
+having to manually construct two pipes for this purpose, we'll have a
+tunnel concept which consists of two pipes, one that is in-only and
+other that is out-only. The primary example of this is a network
+socket to a remote machine or process.
+
+#+begin_src clojure :tangle src/kcats/pipe.clj
+(in-ns 'kcats.pipe)
+
+(defrecord Tunnel
+    [in out]
+  In
+  (put [tunnel obj]
+    (do (put in obj)
+        tunnel)) ;; leave the tunnel on the stack, not the in-pipe only
+  Select
+  (poll [tunnel] (poll out))
+  Out
+  (take [tunnel] (take out))
+  Close
+  (close [tunnel]
+    (doseq [t [in out]]
+      (close t)))
+  (closed? [tunnel]
+    (or (closed? in)
+        (closed? out))))
+#+end_src
+*** Standard Values
+Passes values from in to out - similar to core.async or golang
+channels.
+#+begin_src clojure :tangle src/kcats/pipe.clj
+(in-ns 'kcats.pipe)
+
+(defn ->buffered [buffer-size]
+  (ArrayBlockingQueue. buffer-size))
+
+(defn ->filled [coll]
+  (let [q (ArrayBlockingQueue. (count coll) false coll)]
+    (reify
+      Out
+      (take [this] (.take q))
+      Select
+      (poll [this] (.poll q))
+      Close
+      (close [this] (.clear q))
+      (closed? [this] (-> q .size (= 0))))))
+
+#+end_src
+*** Atoms
+This is a pipe that when you take, always returns the last value
+put. It's never full, whatever you put just overwrites what was there
+before. It has to be initialized with a value, therefore it's also
+never empty. It's functionally equivalent to a clojure atom and is
+implemented in terms of one.
+
+Note =swap!= is missing. This maybe could be implemented as =[take]
+dip shielddown put= (with the program on top, and the pipe
+underneath) - but that is not the same as =swap!= because it lacks the
+retry logic (if someone else changed the value while the update is
+happening). To fix this, a kcats-native atom is probably
+necessary. 
+
+Might be able to get the same sort of functionality from a 2pipe/env
+combo that you can send programs to: in-pipe takes programs that act
+as swap! fns, out-pipe returns current value. But that is more of a
+clojure ref than an atom. 
+
+The problem here is that clojure atoms actually return something when
+you =put= into them: the previous value. Pipes don't really have that
+swapping feature. They *could* but it seems a little forced since I
+can't think of anything else that would use it.
+
+Being able to get and set atomically is pretty hard to do without for
+an atom. Maybe atoms should not implement the =In= protocol at all,
+and instead have their own separate Atom protocol that has an
+=exchange= word (swap is already taken!)
+
+#+begin_src clojure
+
+#+end_src
+
+
+  For example:
+#+begin_src clojure :tangle no
+;; swap! is done with a program that replaces previous ToS
+;; note no stack items are consumed
+10 6 atom [inc +] put .
+=>  <Atom 17> 10
+
+;; equivalent of reset! is to just put another value on top
+10 6 atom [99] put .
+=> <Atom 99> 10
+
+#+end_src
+#+begin_src clojure :tangle src/kcats/pipe.clj
+(in-ns 'kcats.pipe)
+
+(extend-type clojure.lang.Atom
+  In
+  (put [a value] (reset! a value))
+  Out
+  (take [a] (deref a))
+  Select
+  (poll [a] (take a))
+  SelfContained)
+
+(defn ->atom
+  "Creates a new atom pipe with initial value v"
+  [v]
+  (atom v))
+#+end_src
+*** Timeout
+This is an (out) pipe that when you take, it will block for a
+predefined period of time (decided when the pipe is created), and then
+return the boolean value =true=.
+
+The purpose of this kind of pipe is to use with =select= - where you
+have a set of pipes and you want to take from whichever one is
+non-empty first. You can include a timeout pipe in there to guarantee
+that at least one of them will return something eventually.
+
+#+begin_src clojure :tangle src/kcats/pipe.clj
+(in-ns 'kcats.pipe)
+
+(deftype Timeout [until-timestamp]
+  Out
+  (take [this] (let [t (- until-timestamp (System/currentTimeMillis))]
+                 (when (pos? t)
+                   (Thread/sleep t))
+                 true))
+  Select
+  (poll [this] (or (> (System/currentTimeMillis) until-timestamp) nil)))
+
+(defn ->timeout
+  "Creates a new timeout pipe that waits t milliseconds and then
+  returns a single value (true) from the pipe"
+  [t]
+  (->Timeout (+ (System/currentTimeMillis) t)))
+#+end_src
+
+*** Input/Output streams
+#+begin_src clojure :tangle src/kcats/pipe.clj
+(in-ns 'kcats.pipe)
+
+(extend-type java.io.InputStream
+  Out
+  (take [is]
+    (let [buf (make-array Byte/TYPE 1024)
+          bytes-read (.read is buf)]
+      (if (= -1 bytes-read)
+        (throw (java.io.EOFException. "EOF on inputstream while reading"))
+        (let [retbuf (make-array Byte/TYPE bytes-read)]
+          (System/arraycopy #^bytes buf 0
+                            #^bytes retbuf 0 ^int (alength retbuf))
+          retbuf))))
+  Select
+  (poll [is] (take is))
+  Close
+  (close [is] (.close is))
+  (closed? [is] (try (-> is .available (= 0))
+                     (catch java.io.IOException ioe
+                       true))))
+
+;; add state to remember if InputStream is closed
+
+(defrecord InputStream [is closed?]
+  Out
+  (take [this]
+    (let [buf (make-array Byte/TYPE 1024)
+          bytes-read (.read is buf)]
+      (if (= -1 bytes-read)
+        (reset! closed? true)
+        (let [retbuf (make-array Byte/TYPE bytes-read)]
+          (System/arraycopy #^bytes buf 0
+                            #^bytes retbuf 0 ^int (alength retbuf))
+          retbuf))))
+  Select
+  (poll [this] (poll is))
+  Close
+  (close [is]
+    (.close is)
+    (reset! closed? true))
+  (closed? [is] @closed?))
+
+(defn make-inputstream [is]
+  (->InputStream is (atom false)))
+
+(extend-type java.io.OutputStream
+  In
+  (put [os bs] (doto os (.write bs) (.flush)))
+  Close
+  (close [os] (doto os (.flush) (.close)))
+  (closed? [os] false))
+#+end_src
+
+*** Reader/Writers
+Unfortunately java Readers (or Readables) don't have any mechanism to
+check whether the EOF has been reached without actually doing a
+read. So there's no direct way to implement =closed?= without keeping
+some extra state, namely of what the status of the last read was. If
+it returned -1, then we know EOF has been reached.
+#+begin_src clojure :tangle src/kcats/pipe.clj
+(in-ns 'kcats.pipe)
+
+;; Since java Readables can't be queried for closed stream (read just
+;; returns -1 but it doesn't keep track of that previous state itself),
+;; we'll wrap it in a record that adds a boolean for that state.
+(defrecord Reader [rdr closed?]
+  Out
+  (take [{:keys [rdr closed?]}]
+    (let [buf (java.nio.CharBuffer/allocate 1024)
+          chars-read (.read rdr buf)]
+      (if (= -1 chars-read)
+        (do (reset! closed? true)
+            (make-array Byte/TYPE 0))
+        (let [retbuf (make-array Byte/TYPE chars-read)]
+          (System/arraycopy #^bytes buf 0
+                            #^bytes retbuf 0 ^int (alength retbuf))
+          retbuf))))
+  Select
+  (poll [this] (take this))
+  Close
+  (close [{:keys [rdr closed?]}]
+    (.close rdr)
+    (reset! closed? true))
+  (closed? [{:keys [closed?]}] @closed?))
+
+(defn make-reader
+  [rdr]
+  (->Reader rdr (atom false)))
+
+(extend-type Readable
+  Out
+  (take [rdr]
+    (let [buf (java.nio.CharBuffer/allocate 1024)
+          chars-read (.read rdr buf)]
+      (if (= -1 chars-read)
+        (throw (java.io.EOFException. "EOF on reader while reading"))
+        (let [retbuf (make-array Byte/TYPE chars-read)]
+          (System/arraycopy #^bytes buf 0
+                            #^bytes retbuf 0 ^int (alength retbuf))
+          retbuf))))
+  Select
+  (poll [is] (take is))
+  Close
+  (close [is])
+  (closed? [is] (try (-> is .available (= 0))
+                     (catch java.io.IOException ioe
+                       true))))
+
+#+end_src
+
+*** Sockets
+A server socket creates a stream of sockets, 
+(one for each accepted connection from a client)
+
+Then a socket has both in and out, via the input/output streams.
+#+begin_src clojure :tangle src/kcats/pipe.clj
+(in-ns 'kcats.pipe)
+(extend-type java.net.Socket
+  Out
+  (take [s] (try
+              (-> s .getInputStream take)
+              (catch java.io.EOFException eofe
+                )))
+  Select
+  (poll [s] (-> s .getInputStream poll))
+  In
+  (put [s obj] (doto s
+                 (-> .getOutputStream (put obj))))
+  Close
+  (close [s] (.close s))
+  (closed? [s] (.isClosed s)))
+
+(extend-type java.net.ServerSocket
+  Out
+  (take [ss] (.accept ss))
+  Select
+  (poll [ss] (take ss))
+  Close
+  (close [ss] (.close ss))
+  (closed? [ss] (.isClosed ss)))
+#+end_src
+*** Words
+#+begin_src clojure :tangle src/kcats/pipe.clj
+(in-ns 'kcats.pipe)
+
+(expound/def ::in (partial satisfies? In))
+(expound/def ::out (partial satisfies? Out))
+(expound/def ::core/pipe (spec/or :in ::in
+                                  :out ::out))
+
+(->> (for [[w f] {'atom (core/stack-effect [v] [(->atom v)])
+                  'buffer (core/stack-effect [s] [(->buffered s)])
+                  'timeout (core/stack-effect [t] [(->timeout t)])
+                  'filled (core/stack-effect [l] [(->filled l)])
+                  'handoff (core/stack-effect [] [(->handoff)]) 
+                  'select (core/stack-effect [pipes]
+                                             (let [[p v] (select pipes)]
+                                               [v p pipes]))
+                  'take (core/stack-effect [p] [(take p) p])
+                  'put (core/f-stack 2 put)
+                  'close (core/stack-effect [p] (do (close p) [p]))
+                  'closed? (core/stack-effect [p] [(closed? p)]) 
+                  'spawn (fn [{:syms [stack] :as env}]
+                           (let [expr (first stack)]
+                             (->> expr
+                                  core/default-env
+                                  core/eval
+                                  future))
+                           (update env 'stack rest))
+                  'stdout (core/f-stack 0 (fn [] System/out))}]
+       [w {'fn f}])
+     (into {})
+     (swap! core/core-words merge))
+#+end_src
+
+#+begin_src kcats :tangle src/kcats/lexicon.kcats
+[atom [[spec [[item] [pipe]]]]]
+
+[buffer [[spec [[integer] [pipe]]]]]
+
+[timeout [[spec [[integer] [pipe]]]]]
+
+[filled [[spec [[list] [pipe]]]]]
+
+[handoff [[spec [[] [pipe]]]]]
+
+[select [[spec [[[list pipes]] [item pipe [list pipes]]]]]]
+
+[take [[spec [[[pipe out]] [item [pipe out]]]]]]
+
+[put [[spec [[item [pipe in]] [[pipe in]]]]]]
+
+[close [[spec [[[pipe p]] [[pipe p]]]]]]
+
+[closed? [[spec [[pipe] [boolean]]]]]
+
+[pipe-in [[spec [[item] [pipe]]]
+          [definition [[[[type [file] unwrap =]
+                         [value
+                          +clojure.java.io/file
+                          +clojure.java.io/output-stream]]
+                        [[type [stdout] unwrap =]
+                         [stdout]]]
+                       decide]]]]
+
+[tunnel [[spec [[item] [pipe]]]
+         [definition [[[[type [ip-port] unwrap =]
+                        [clone
+                         [port] lookup
+                         [[address] lookup] dip
+                         !**java.net.Socket.]]]
+                      decide]]]]
+
+[pipe-out [[spec [[item] [pipe]]]
+           [definition [[[[type [file] unwrap =]
+                          [value
+                           +clojure.java.io/file
+                           +clojure.java.io/input-stream
+                           +kcats.pipe/make-inputstream]]
+                         [[type [ip-port] unwrap =]
+                          [[port] lookup !*java.net.ServerSocket.]]
+                         [[list?]
+                          [+kcats.pipe/->filled]]]
+                        decide]]]]
+
+[assemble [[spec [[pipe program] [item]]]
+           [definition [swap
+                        [take swap] swap pack
+                        [dip] join
+                        [[closed? not]] dip
+                        while
+                        discard]]
+           [doc "Takes a large value out of a pipe by
+                 `take`ing it piece by piece, and assembling the
+                 pieces with `reducer`. `reducer` should take a
+                 piece, and the so-far assembled value and return a
+                 new value with the piece incorporated."]]]
+
+;; TODO: is there any point to this? If we already have a
+;; complex/large value in memory, we don't save any memory by
+;; breaking it down, we can just shove the whole thing into
+;; the pipe with a single put. For flat lists, we can just
+;; `[put] step`. Maybe doing the byte conversion piece-wise is
+;; useful, so I'm going to keep it for now.
+;; At least with the `assemble` we probably don't want to get
+;; a 1gb entire file with a single `take` if we end up
+;; throwing away most of the contents as we go.
+;;
+;; As a higher-level abstraction might be useful to have pipes
+;; with paired reducer/splitter so the other end knows how to
+;; assemble. Maybe send the reducer over the pipe first?
+[disassemble [[spec [[program item [pipe in]] [[pipe in]]]]
+              [doc "Puts a large value into a pipe by
+                    taking it apart with the `splitter`
+                    program. This program should take a large value
+                    and break it into two parts, such that the
+                    topmost will fit into the pipe."]
+              [definition [[swap [put] dip] join ;; build a while body that includes splitter
+                           [nothing? not] swap
+                           while
+                           discard]]]] ;; drop the 'nothing' value
+
+;; TODO: definition incomplete
+;; while neither pipe is closed, take from input, run
+;; program, put into output
+[pump [[spec [[program [pipe in] [pipe out]] [[pipe in] [pipe out]]]]
+       [definition [wrap [shield] join
+                    ;; create a list to use with any
+                    [[] sink [pack] dip swapdown [pack] dip
+                     [[closed?] any?] dip swap]]]]]
+
+[spit [[spec [[item [item target]] []]]
+       [definition [[pipe-in] dip bytes put close discard]]]]
+
+;;[slurp [[spec [[[item target]] [item pipe]]]]]
+
+[spawn [[spec [[program] []]]]]
+#+end_src
+*** Notes
+core.async has an out-of-band close message. Do we need that? Seems
+handy but also adds complexity as it becomes an error condition trying
+to put/take into a closed pipe, that would then need to be handled.
+
+Seems acceptable to me that pipes are just there and if you want to
+tell whoever's at the other end that you're done sending, just send
+something that tells them that.
+
+It might be nice for the receiver to be able to let the sender know
+he's "hanging up", but I think that function is better handled at a
+higher level of abstraction (something built on top of bidirectional
+pipes, which is just two pipes with the sender and receiver swapped)
+** Crypto
+We're going to need to call some platform crypto functions, so lets
+make them accessible.
+#+begin_src kcats :tangle src/kcats/lexicon.kcats
+[hash [[spec [[bytes] [bytes]]]
+       [definition [[[[bytes?] [["SHA-256"
+                                 !*java.security.MessageDigest/getInstance] dip
+                                !**digest +seq]]
+                     [[string?] [bytes hash]]
+                     [[list?] [string hash]]]
+                    decide]]]]
+
+[key [[spec [[item] [bytes]]]
+      [definition [bytes
+
+                   ["SHA1PRNG" !*java.security.SecureRandom/getInstance] dip
+                   ,*!*setSeed
+
+                   ["EC" !*java.security.KeyPairGenerator/getInstance 256] dip
+                   ,*!**initialize 
+                   
+                   !*generateKeyPair
+                   [!*getPublic] shield
+
+                   wrap [ec-keypair] join
+                   swap
+                   !*getPrivate pack
+                   [public type private] swap zip]]]]
+
+[encode [[spec [[[item as] [item data]] [item]]]
+         [definition [[[[type base64 =]
+                        [discard
+                         bytes
+                         [!java.util.Base64/getEncoder] dip
+                         !**encodeToString]]
+                       [[swap type ec-keypair =]
+                        [discard
+                         [public] lookup
+                         !*getEncoded]]]
+                      decide]]]]
+
+[decode [[spec [[[item as] [item data]] [item]]]
+         [definition [[[[type base64 =]
+                        [discard
+                         bytes
+                         [!java.util.Base64/getDecoder] dip
+                         !**decode]]
+                       [[type publickey =]
+                        [discard
+                         !*java.security.spec.X509EncodedKeySpec.
+                         "EC" !*java.security.KeyFactory/getInstance
+                         swap !**generatePublic]]]
+                      decide]]]]
+
+[sign [[spec [[[item message] [bytes key]] [bytes]]]
+       [definition [["SHA256withECDSA" !*java.security.Signature/getInstance] dipdown
+                    [*!*initSign] dip
+                    ,*!*update
+                    !*sign]]]]
+
+[verify [[spec [[[item signature] [item message] [item key]] [boolean]]]
+         [definition [float ;; key to top
+                      ["SHA256withECDSA" !*java.security.Signature/getInstance] dip ;; under key
+                      ,*!*initVerify
+                      float ;; message to top
+                      ,*!*update
+                      swap
+                      !**verify]]]]
+
+[scriptverify [[spec [[[bytes expected-scripthash]
+                       [bytes script]
+                       [bytes signature]
+                       [bytes message]]
+                      [[list failures]]]]
+               [definition [[[hash] dip =] ;; make sure the script is the one that is expected
+                            [discard ;; the hash
+                             execute ;; the script
+                             [[]] ;; no failure if script returns true
+                             [["Message forgery - script authentication rejected"]]
+                             branch] 
+                            [discard ;; the hash
+                             discard ;; the script
+                             discard ;; the sig
+                             discard ;; the message
+                             ["Message forgery - verification script doesn't match hash"]]
+                            if]]]]
+#+end_src
+
+#+begin_src clojure :tangle src/kcats/crypto.clj
+(ns kcats.crypto
+  (:require [kcats.core :as core])
+  (:import [java.security MessageDigest SecureRandom KeyPairGenerator Signature]))
+#+end_src
+#+begin_src kcats
+;; in progress example sign
+["foo" key [private] lookup
+ "We strike at dawn"
+ "SHA256withECDSA" .+java.security.Signature/getInstance
+ swap discard ;; drop the full key
+ [..+initSign] void
+ [..+update] void]
+
+;; next iteration
+["foo" key 
+ "We attack at dawn" bytes 
+ [[[private] lookup] dip sign] shield
+ ;[discard "bar" key] dipdown ;; try different key for verify
+ ;;20 pack ;; add another byte to the sig, to make it invalid
+ [[public] lookup] dipdown verify]
+#+end_src
+
+We're going to need a way of encoding the public keys. java has its
+own (you can call .getEncoded()), and decode like this (haven't tried yet):
+
+#+begin_src java
+KeyFactory kf = KeyFactory.getInstance("ECDSA");
+PublicKey pubKey2 = kf.generatePublic(new X509EncodedKeySpec(encodedPubKey));
+#+end_src
+
+kcats example of key encode/decode
+#+begin_src kcats
+["foo" key [public] lookup !*getEncoded
+ !*java.security.spec.X509EncodedKeySpec.
+ "EC" !*java.security.KeyFactory/getInstance
+ swap !**generatePublic]
+
+;; should make this part of the 'decode' word somehow
+#+end_src
+
+How to encode things like byte arrays. Have to be careful here as byte
+arrays are mutable, passing to a pipe can lead to concurrency
+issues. But that applies to all mutable objects.
+#+begin_src clojure
+; encode byte array as base64
+(defmethod print-method (Class/forName "[B") [b w]
+  (.write w "#bytes \"")
+  (.write w (String. (.encode (java.util.Base64/getEncoder) b)))
+  (.write w "\""))
+
+(defmethod print-method clojure.lang.ArraySeq$ArraySeq_byte [b w]
+  (.write w "#bytes \"")
+  (.write w (String. (.encode (java.util.Base64/getEncoder) (.array b))))
+  (.write w "\""))
+
+; reading the printed byte array back into bytes
+#_(prn (edn/read-string {:readers
+                              {'bytes (fn [s]
+                                            (.decode (java.util.Base64/getDecoder) s))}}
+                             "#bytes \"aGVsbG8gd29ybGQ=\""))
+
+#+end_src
+
+Example of message authenticity script and verification
+#+begin_src kcats
+["we attack at dawn" bytes ;; the message
+ "foo" key ;; create sender's keypair
+ [[private] lookup
+  swap sign] shield ;; add signature: s/k/m
+
+ ;; now make the verification script
+ swap
+ [] encode ;; the public key encoded as base64
+ wrap [[[publickey []]] decode sink verify] ;; the meat of the script that verifies the message
+ join ;; with the encoded pubkey
+
+ ;; get the script hash
+ [hash] shield ;; hash/scr/sig/msg
+ ;; now mess with the hash to cause failure (commenting out below should result in success)
+ ;"foo" bytes join
+ 
+ ;; the actual verify
+ ;; arrange as h/sc/si/m
+ [[hash] dip =] ;; make sure the script is the one that is expected
+ [discard ;; the hash
+  ;; mess with the message to make a bad sig
+  ;;[" friday" bytes join] dipdown
+  execute] ;; the script
+ ["Message forgery - verification script doesn't match hash" fail]
+ if]
+#+end_src
