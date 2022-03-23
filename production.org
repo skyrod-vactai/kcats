@@ -414,8 +414,15 @@ fn get_stdin() -> String {
 
 fn main() {
     let program = get_stdin();
-    let parsed = serialize::parse(program, &Some(axiom::standard_dictionary()));
-    print_result(eval(standard_env(Some(parsed))));
+    let parse_result = serialize::parse(program, &Some(axiom::standard_dictionary()));
+    match parse_result {
+        Ok(program) => {
+            print_result(eval(standard_env(Some(program))));
+        }
+        Err(e) => {
+            println!("Error parsing input: {:?}", e);
+        }
+    }
 }
 
 fn test_example(mut env: Environment, w: Word, program: List, expected: List) -> Option<Error> {
@@ -1260,7 +1267,7 @@ fn to_lexicon_entry(w: Word, def: HashMap<KeyItem, Item>) -> WordDef {
 
 pub fn lexicon(mut env: Environment) -> StepResult {
     if let Ok(s) = fs::read_to_string("src/kcats/lexicon.kcats") {
-        let items = serialize::parse(s, &Some(standard_dictionary()));
+        let items = serialize::parse(s, &Some(standard_dictionary()))?;
         let vitems = to_hash(List::from(items))?;
         for (k, def) in vitems.iter() {
             let h = to_hash(as_list(Some(def)).unwrap()).ok().unwrap();
@@ -1429,9 +1436,10 @@ Now we'll add the functions for parsing and emitting kcats source.
 #+begin_src rust :tangle src/serialize.rs
 extern crate edn_format;
 use crate::types::*;
+use base64;
+use internment::Intern;
 use std::collections::VecDeque;
 use std::fmt;
-use internment::Intern;
 
 fn lookup_builtin(w: Word, standard_dictionary: &Option<Dictionary>) -> Item {
     if let Some(dict) = standard_dictionary {
@@ -1439,24 +1447,48 @@ fn lookup_builtin(w: Word, standard_dictionary: &Option<Dictionary>) -> Item {
         if let Some(def) = dict.get(&w) {
             if let WordDef::Axiom(a) = def {
                 //println!("Compiled builtin! {}", w);
-                return Item::Builtin(BuiltinWord {word: w, f: a.f.clone()})
+                return Item::Builtin(BuiltinWord {
+                    word: w,
+                    f: a.f.clone(),
+                });
             }
         }
     }
-    return Item::Word(w)
+    return Item::Word(w);
 }
+const BYTE_TAG: &str = "b64";
 
-fn to_item(item: &edn_format::Value, standard_dictionary: &Option<Dictionary>) -> Item {
+fn to_item(
+    item: &edn_format::Value,
+    standard_dictionary: &Option<Dictionary>,
+) -> Result<Item, Error> {
     match item {
-        edn_format::Value::Integer(i) => Item::Int(*i),
-        edn_format::Value::Vector(v) => {
-            Item::List(v.iter().map(|i| to_item(i, standard_dictionary)).collect::<VecDeque<Item>>())
+        edn_format::Value::Integer(i) => Ok(Item::Int(*i)),
+        edn_format::Value::Vector(v) => Ok(Item::List(
+            v.iter()
+                .map(|i| to_item(i, standard_dictionary))
+                .collect::<Result<VecDeque<Item>, Error>>()?,
+        )),
+        edn_format::Value::Symbol(s) => Ok(lookup_builtin(
+            Intern::new(s.name().to_string()),
+            standard_dictionary,
+        )),
+        edn_format::Value::Boolean(b) => Ok(Item::Boolean(*b)),
+        edn_format::Value::String(s) => Ok(Item::String(s.to_string())),
+        edn_format::Value::Float(f) => Ok(Item::Float(f.into_inner())),
+        edn_format::Value::TaggedElement(tag, e) => {
+            if *tag == edn_format::Symbol::from_name(BYTE_TAG) {
+                if let edn_format::Value::String(s) = &**e {
+                    Ok(Item::Bytes(base64::decode(s).unwrap()))
+                } else {
+                    Err(Error::from("Invalid tag datatype for byte literal"))
+                }
+            }
+            else {
+                Err(Error::from(format!("Unsupported tag: {}", tag)))
+            }
         }
-        edn_format::Value::Symbol(s) => lookup_builtin(Intern::new(s.name().to_string()), standard_dictionary),
-        edn_format::Value::Boolean(b) => Item::Boolean(*b),
-        edn_format::Value::String(s) => Item::String(s.to_string()),
-        edn_format::Value::Float(f) => Item::Float(f.into_inner()),
-        _ => Item::Int(9999),
+        _ => Err(Error::from("Invalid syntax")),
     }
 }
 
@@ -1473,22 +1505,33 @@ fn from_item(item: &Item) -> edn_format::Value {
         Item::Boolean(b) => edn_format::Value::Boolean(*b),
         Item::String(s) => edn_format::Value::String(s.to_string()),
         Item::Float(f) => edn_format::Value::from(*f),
+        Item::Bytes(bs) => edn_format::Value::TaggedElement(
+            edn_format::Symbol::from_name("b64"),
+            Box::new(edn_format::Value::String(base64::encode(bs))),
+        ),
         Item::Assoc(h) => edn_format::Value::Vector(
-            h.iter().map(|(k, v)| {
-                edn_format::Value::Vector(vec![from_item(&to_value_item(k.clone())), from_item(v)])
-            }).collect()
+            h.iter()
+                .map(|(k, v)| {
+                    edn_format::Value::Vector(vec![
+                        from_item(&to_value_item(k.clone())),
+                        from_item(v),
+                    ])
+                })
+                .collect(),
         ),
         _ => edn_format::Value::Integer(999),
     }
 }
 
-pub fn parse(s: String, standard_dictionary: &Option<Dictionary>) -> List {
+pub fn parse(s: String, standard_dictionary: &Option<Dictionary>) -> Result<List, Error> {
     let parser = edn_format::Parser::from_iter(s.chars(), edn_format::ParserOptions::default());
     parser
-        .map(move |r| to_item(&r.expect("expected valid element"), standard_dictionary))
+        .map(move |r| match r {
+            Ok(expr) => Ok(to_item(&expr, standard_dictionary)?),
+            Err(e) => Err(Error::from("Invalid edn")),
+        })
         .collect()
 }
-
 
 pub fn emit(item: &Item) -> String {
     edn_format::emit_str(&from_item(item))
@@ -1505,15 +1548,26 @@ pub fn emit_all(items: &VecDeque<Item>) -> String {
 // print out envs in error messages
 impl fmt::Debug for Environment {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{{ stack: {}, expression: {} }}",
-               emit(&Item::List(self.stack.clone())),
-               emit(&Item::List(self.expression.clone())),
+        write!(
+            f,
+            "{{ stack: {}, expression: {} }}",
+            emit(&Item::List(self.stack.clone())),
+            emit(&Item::List(self.expression.clone())),
         )
     }
 }
 #+end_src
 
+#+RESULTS:
+: error: Could not compile `cargo2te10b`.
+
 ** Issues
+*** TODO Serialization treats any tagged literal as byte string
+*** TODO Serialization panics on reading invalid data
+Should return Result objects from to_item. I don't think it is
+necessary for from_item - since we're using a subset of edn, all Items
+should be convertible to valid edn. But not all valid edn is
+convertible to an Item.
 *** TODO Interactive mode
 run with =kcats -i= for interactive, where you get a repl-like
 prompt. Each prompt accepts kcats items as input, and updates the
