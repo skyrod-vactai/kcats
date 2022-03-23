@@ -1432,6 +1432,7 @@ use crate::types::*;
 use std::collections::VecDeque;
 use std::fmt;
 use internment::Intern;
+use base64;
 
 fn lookup_builtin(w: Word, standard_dictionary: &Option<Dictionary>) -> Item {
     if let Some(dict) = standard_dictionary {
@@ -1456,6 +1457,12 @@ fn to_item(item: &edn_format::Value, standard_dictionary: &Option<Dictionary>) -
         edn_format::Value::Boolean(b) => Item::Boolean(*b),
         edn_format::Value::String(s) => Item::String(s.to_string()),
         edn_format::Value::Float(f) => Item::Float(f.into_inner()),
+        edn_format::Value::TaggedElement(t, e) => {
+            if let edn_format::Value::String(s) = &**e {
+                Item::Bytes(base64::decode(s).unwrap())
+            }
+            else {Item::Int(9998)}
+        }
         _ => Item::Int(9999),
     }
 }
@@ -1473,6 +1480,10 @@ fn from_item(item: &Item) -> edn_format::Value {
         Item::Boolean(b) => edn_format::Value::Boolean(*b),
         Item::String(s) => edn_format::Value::String(s.to_string()),
         Item::Float(f) => edn_format::Value::from(*f),
+        Item::Bytes(bs) => edn_format::Value::TaggedElement(
+            edn_format::Symbol::from_name("b64"),
+            Box::new(edn_format::Value::String(base64::encode(bs)))
+        ),
         Item::Assoc(h) => edn_format::Value::Vector(
             h.iter().map(|(k, v)| {
                 edn_format::Value::Vector(vec![from_item(&to_value_item(k.clone())), from_item(v)])
@@ -1482,10 +1493,17 @@ fn from_item(item: &Item) -> edn_format::Value {
     }
 }
 
-pub fn parse(s: String, standard_dictionary: &Option<Dictionary>) -> List {
+pub fn parse(s: String, standard_dictionary: &Option<Dictionary>) -> Result<List, Error> {
     let parser = edn_format::Parser::from_iter(s.chars(), edn_format::ParserOptions::default());
     parser
-        .map(move |r| to_item(&r.expect("expected valid element"), standard_dictionary))
+        .map(move |r|
+             {
+                 if let Ok(r) = r {
+                     to_item(&r, standard_dictionary)
+                 }
+                 else Err(Error::from("invalid edn"))
+             }
+             )
         .collect()
 }
 
@@ -1513,7 +1531,16 @@ impl fmt::Debug for Environment {
 }
 #+end_src
 
+#+RESULTS:
+: error: Could not compile `cargo2te10b`.
+
 ** Issues
+*** TODO Serialization treats any tagged literal as byte string
+*** TODO Serialization panics on reading invalid data
+Should return Result objects from to_item. I don't think it is
+necessary for from_item - since we're using a subset of edn, all Items
+should be convertible to valid edn. But not all valid edn is
+convertible to an Item.
 *** TODO Interactive mode
 run with =kcats -i= for interactive, where you get a repl-like
 prompt. Each prompt accepts kcats items as input, and updates the
