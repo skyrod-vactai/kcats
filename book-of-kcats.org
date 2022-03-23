@@ -2772,7 +2772,7 @@ test-case = "2.0.0"
 ** Code
 Let's start by defining some data structures in a separate module
 #+begin_src rust :tangle src/types.rs
-use std::collections::{VecDeque, HashMap, BTreeMap};
+use std::collections::{VecDeque, HashMap};
 use std::fmt;
 use std::rc::Rc;
 use internment::Intern;
@@ -3013,7 +3013,7 @@ pub fn to_value_item(i: KeyItem) -> Item {
     }
 }
 
-pub fn to_entry(mut i: Item) -> Result<(KeyItem, Item), Error> {
+pub fn to_entry(i: Item) -> Result<(KeyItem, Item), Error> {
     match i {
         Item::List(mut l) => {
             let v = l.pop_back();
@@ -3028,7 +3028,7 @@ pub fn to_entry(mut i: Item) -> Result<(KeyItem, Item), Error> {
     }
 }
 
-pub fn to_hash(mut l: List) -> Result<Associative, Error> {
+pub fn to_hash(l: List) -> Result<Associative, Error> {
     l.iter()
         .map(|i| to_entry(i.clone()))
         .collect::<Result<HashMap<KeyItem, Item>, Error>>()
@@ -3196,7 +3196,9 @@ mod tests {
     #[test_case("-" ; "minus")]
     #[test_case("=" ; "eq")]
     #[test_case(">" ; "gt")]
+    #[test_case("and")]
     #[test_case("assign")]
+    #[test_case("associative?")]
     #[test_case("branch")]
     #[test_case("clone")]
     #[test_case("count")]
@@ -3212,8 +3214,13 @@ mod tests {
     #[test_case("inject")]
     #[test_case("join")]
     #[test_case("list?" ; "is_list")]
+    #[test_case("lookup")]
     #[test_case("loop")]
+    #[test_case("not")]
+    #[test_case("odd?" ; "is_odd")]
+    #[test_case("even?" ; "is_even")]
     #[test_case("number?" ; "is_number")]
+    #[test_case("or")]
     #[test_case("pack")]
     #[test_case("range")]
     #[test_case("recur")]
@@ -3341,6 +3348,7 @@ pub fn standard_dictionary() -> Dictionary {
         axiom_entry(">", Rc::new(f_stack2(gt))),
         axiom_entry(">=", Rc::new(f_stack2(gte))),
         axiom_entry("assign", Rc::new(f_stack3(assign))),
+        axiom_entry("associative?", Rc::new(f_stack1(is_associative))),
         axiom_entry("branch", Rc::new(branch)),
         axiom_entry("clone", Rc::new(clone)),
         axiom_entry("count", Rc::new(env_effect1(count))),
@@ -3356,9 +3364,15 @@ pub fn standard_dictionary() -> Dictionary {
         axiom_entry("join", Rc::new(f_stack2(join))),
         axiom_entry("lexicon", Rc::new(lexicon)),
         axiom_entry("list?", Rc::new(env_effect1(is_list))),
+        axiom_entry("++lookup", Rc::new(f_stack2(lookup))),
         axiom_entry("loop", Rc::new(env_effect2(loop_))),
         axiom_entry("mod", Rc::new(f_stack2(mod_))),
+        axiom_entry("not", Rc::new(f_stack1(not))),
+        axiom_entry("even?", Rc::new(f_stack1(is_even))),
+        axiom_entry("odd?", Rc::new(f_stack1(is_odd))),
         axiom_entry("number?", Rc::new(env_effect1(is_number))),
+        axiom_entry("or", Rc::new(f_stack2(or))),
+        axiom_entry("and", Rc::new(f_stack2(and))),
         axiom_entry("pack", Rc::new(f_stack2(pack))),
         axiom_entry("range", Rc::new(range)),
         axiom_entry("recur", Rc::new(recur)),
@@ -3999,15 +4013,13 @@ fn assoc_in(i: Item, ks: &[KeyItem], v: Item) -> Result<Associative, Error> {
             if let [k, ks @ ..] = ks {
                 if ks.is_empty() {
                     h.insert(k.clone(), v);
-                    Ok(h)
                 } else {
                     let inner = h.get(&k.clone()).unwrap_or(&Item::Nothing).clone();
                     h.insert(k.clone(), Item::Assoc(assoc_in(inner, ks, v)?));
-                    Ok(h)
                 }
-            } else {
-                Ok(h)
+
             }
+            Ok(h)
         }
         Item::Nothing => assoc_in(Item::Assoc(Associative::new()), ks, v),
         Item::List(l) => assoc_in(Item::Assoc(to_hash(l.clone())?), ks, v),
@@ -4029,6 +4041,60 @@ pub fn assign(m: Item, ks: Item, v: Item) -> ItemResult {
         _ => Err(invalid_type("assign")),
     }
 }
+
+pub fn lookup(m: Item, k: Item) -> ItemResult {
+    let k = to_key_item(k)?;
+    match (m, k) {
+        (Item::Assoc(m), k) => {
+            Ok(m.get(&k).unwrap_or(&Item::Nothing).clone())
+        },
+        (Item::List(l), k) => {
+            Ok(lookup(Item::Assoc(to_hash(l)?), to_value_item(k))?)
+        },
+        _ => Err(invalid_type("lookup"))
+    }
+}
+
+pub fn or(i: Item, j: Item) -> ItemResult {
+    Ok(Item::Boolean(is_truthy(i) || is_truthy(j)))
+}
+
+pub fn and(i: Item, j: Item) -> ItemResult {
+    Ok(Item::Boolean(is_truthy(i) && is_truthy(j)))
+}
+
+pub fn not(i: Item) -> ItemResult {
+    Ok(Item::Boolean(!is_truthy(i)))
+}
+
+
+pub fn is_associative(i: Item) -> ItemResult {
+    Ok(Item::Boolean(
+        match i {
+            Item::Assoc(_) => { true },
+            Item::List(l) => { to_hash(l).is_ok() },
+            _ => { false }
+        }
+    ))
+}
+
+pub fn is_odd(i: Item) -> ItemResult {
+    if let Item::Int(i) = i {
+        Ok(Item::Boolean(i & 1 == 1))
+    } else {
+        Err(invalid_type("odd?"))
+    }
+}
+
+pub fn is_even(i: Item) -> ItemResult {
+    if let Item::Int(i) = i {
+        Ok(Item::Boolean(i & 1 == 0))
+    } else {
+        Err(invalid_type("even?"))
+    }
+}
+
+
 #+end_src
 
 #+RESULTS:
@@ -4067,7 +4133,7 @@ fn to_item(item: &edn_format::Value, standard_dictionary: &Option<Dictionary>) -
         edn_format::Value::Boolean(b) => Item::Boolean(*b),
         edn_format::Value::String(s) => Item::String(s.to_string()),
         edn_format::Value::Float(f) => Item::Float(f.into_inner()),
-        _ => Item::Int(0),
+        _ => Item::Int(9999),
     }
 }
 
@@ -4080,15 +4146,16 @@ fn from_item(item: &Item) -> edn_format::Value {
                 .collect::<Vec<edn_format::Value>>(),
         ),
         Item::Word(w) => edn_format::Value::Symbol(edn_format::Symbol::from_name(w)),
+        Item::Builtin(w) => edn_format::Value::Symbol(edn_format::Symbol::from_name(&w.word)),
         Item::Boolean(b) => edn_format::Value::Boolean(*b),
         Item::String(s) => edn_format::Value::String(s.to_string()),
         Item::Float(f) => edn_format::Value::from(*f),
         Item::Assoc(h) => edn_format::Value::Vector(
             h.iter().map(|(k, v)| {
-                vec![from_item(&k), from_item(&v)]
+                edn_format::Value::Vector(vec![from_item(&to_value_item(k.clone())), from_item(v)])
             }).collect()
         ),
-        _ => edn_format::Value::Integer(0),
+        _ => edn_format::Value::Integer(999),
     }
 }
 
