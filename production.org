@@ -36,6 +36,7 @@ edition = "2021"
 edn-format = "3.2.3"
 base64 = "0.13.0"
 internment = "0.6.0" 
+thiserror = "1.0.30"
 
 [dev-dependencies]
 test-case = "2.0.0"
@@ -43,12 +44,13 @@ test-case = "2.0.0"
 ** Code
 Let's start by defining some data structures in a separate module
 #+begin_src rust :tangle src/types.rs
-use std::collections::{VecDeque, HashMap};
-use std::fmt;
-use std::rc::Rc;
 use internment::Intern;
-use std::ptr;
+use std::collections::{HashMap, VecDeque};
+use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::ptr;
+use std::rc::Rc;
+extern crate thiserror;
 
 pub type Word = Intern<String>;
 
@@ -69,7 +71,7 @@ pub type Associative = HashMap<KeyItem, Item>;
 #[derive(Clone)]
 pub struct BuiltinWord {
     pub word: Word,
-    pub f: Rc<StepFn>
+    pub f: Rc<StepFn>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -111,14 +113,14 @@ pub type AxiomWords = HashMap<Word, StepFn>;
 #[derive(Clone)]
 pub struct AxiomDef {
     pub docs: WordDocs,
-    pub f: Rc<StepFn>
+    pub f: Rc<StepFn>,
 }
 
 // dictionary entries are equal if they have the same function reference,
 // no need to compare the function values
 impl PartialEq for AxiomDef {
     fn eq(&self, other: &Self) -> bool {
-        self.docs == other.docs && ptr::eq(self.f.as_ref(), other.f.as_ref())        
+        self.docs == other.docs && ptr::eq(self.f.as_ref(), other.f.as_ref())
     }
 }
 
@@ -131,7 +133,6 @@ impl PartialEq for BuiltinWord {
 impl Eq for BuiltinWord {}
 
 impl Hash for BuiltinWord {
-
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.word.hash(state);
     }
@@ -176,25 +177,62 @@ pub struct Environment {
     pub dictionary: Dictionary,
 }
 
-#[derive(PartialEq)]
-pub struct Error {
-    pub environment: Option<Environment>,
-    pub message: String,
-}
+// #[derive(PartialEq)]
+// pub struct Error {
+//     pub environment: Option<Environment>,
+//     pub message: String,
+// }
 
-impl From<String> for Error {
-    fn from(s: String) -> Self {
-        Error {
-            environment: None,
-            message: s,
-        }
-    }
-}
+#[derive(thiserror::Error, Debug)]
+pub enum Error {
+    #[error("expected at least {expected} stack items but found {actual}: {context:?}")]
+    StackUnderflow {
+        expected: usize,
+        actual: usize,
+        context: Option<Box<dyn std::fmt::Debug>>,
+    },
 
-impl From<&str> for Error {
-    fn from(s: &str) -> Self {
-        Error::from(s.to_string())
-    }
+    #[error("expected {expected} items but found {actual}: {context:?}")]
+    Count {
+        expected: usize,
+        actual: usize,
+        context: Option<Box<dyn std::fmt::Debug>>,
+    },
+
+    #[error("type mismatch - expected {expected_types:?} and got {actual_values:?}: {context:?}")]
+    TypeMismatch {
+        expected_types: Vec<String>,
+        actual_values: Vec<Box<dyn std::fmt::Debug>>,
+        context: Option<Box<dyn std::fmt::Debug>>,
+    },
+
+    #[error("word has no implementation: {word}")]
+    Unimplemented {
+        word: String,
+        source: Option<Box<dyn std::error::Error>>,
+        context: Option<Environment>,
+    },
+
+    #[error("invalid syntax, {message}: {context:?}")]
+    Parser { message: String,
+             source: Option<Box<dyn std::error::Error>>,
+             context: Option<Box<dyn std::fmt::Debug>> },
+
+    #[error("Unknown word: {word}: {context:?}")]
+    UnknownWord {
+        word: String,
+        context: Option<Box<dyn std::fmt::Debug>>,
+    },
+
+    #[error("example failed - expected {program} to produce {expected} but got {actual}")]
+    ExampleTest {
+        expected: String,
+        actual: String,
+        program: String,
+    },
+
+    //#[error("error")]
+    
 }
 
 impl TryFrom<Item> for List {
@@ -207,7 +245,11 @@ impl TryFrom<Item> for List {
 
             Ok(l)
         } else {
-            Err(Error::from("Expected item to be list, but it wasn't"))
+            Err(Error::TypeMismatch {
+                expected_types: vec!["List".to_string()],
+                actual_values: vec![Box::new(i)],
+                context: None,
+            })
         }
     }
 }
@@ -220,18 +262,6 @@ pub fn get_item(i: Item, index: usize) -> Option<Item> {
         }
     } else {
         None
-    }
-}
-
-// print out envs in error messages
-impl fmt::Debug for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let mut ds = f.debug_struct("Error");
-        ds.field("message", &self.message);
-        if let Some(env) = &self.environment {
-            ds.field("environment", &env);
-        }
-        ds.finish()
     }
 }
 
@@ -265,7 +295,11 @@ pub fn to_key_item(i: Item) -> Result<KeyItem, Error> {
         Item::Boolean(b) => Ok(KeyItem::Boolean(b)),
         Item::Bytes(bs) => Ok(KeyItem::Bytes(bs)),
         Item::Nothing => Ok(KeyItem::Nothing),
-        _ => Err(Error::from("item is not allowed as a hashmap key")),
+        _ => Err(Error::TypeMismatch {
+            expected_types: vec!["KeyItem".to_string()],
+            actual_values: vec![Box::new(i)],
+            context: None,
+        }),
     }
 }
 
@@ -287,15 +321,31 @@ pub fn to_value_item(i: KeyItem) -> Item {
 pub fn to_entry(i: Item) -> Result<(KeyItem, Item), Error> {
     match i {
         Item::List(mut l) => {
-            let v = l.pop_back();
-            let k = l.pop_back();
-            let e = l.pop_back();
-            match (k, v, e) {
-                (Some(k), Some(v), None) => Ok((to_key_item(k)?, v)),
-                _ => Err(Error::from("Item must be a duple")),
+            if l.len() != 2 {
+                Err(Error::TypeMismatch {
+                    expected_types: vec!["List[2]".to_string()],
+                    actual_values: vec![Box::new(l)],
+                    context: None,
+                })
+            } else {
+                let v = l.pop_back();
+                let k = l.pop_back();
+                let e = l.pop_back();
+                match (k, v, e) {
+                    (Some(k), Some(v), None) => Ok((to_key_item(k)?, v)),
+                    (k, v, _) => Err(Error::TypeMismatch {
+                        expected_types: vec!["List[2]".to_string()],
+                        actual_values: vec![Box::new(v), Box::new(k)],
+                        context: None,
+                    }),
+                }
             }
         }
-        _ => Err(Error::from("Hash entry must be a list (of length 2)")),
+        _ => Err(Error::TypeMismatch {
+            expected_types: vec!["List".to_string()],
+            actual_values: vec![Box::new(i)],
+            context: None,
+        }),
     }
 }
 
@@ -340,9 +390,9 @@ fn eval_step(mut env: Environment) -> StepResult {
                         }
                     }
                 } else {
-                    Err(Error {
-                        environment: Some(env),
-                        message: format!("Unknown word: {}", word),
+                    Err(Error::UnknownWord {
+                        word: word.to_string(),
+                        context: Some(Box::new(env)),
                     })
                 }
             }
@@ -354,7 +404,11 @@ fn eval_step(mut env: Environment) -> StepResult {
             }
         }
     } else {
-        Err(Error::from("Expression is empty"))
+        Err(Error::Count {
+            expected: 1,
+            actual: 0,
+            context: Some(Box::new("Expression is empty".to_string())),
+        })
     }
 }
 
@@ -376,10 +430,10 @@ fn eval(env: Environment) -> StepResult {
 fn print_result(r: StepResult) {
     match r {
         Err(e) => {
-            println!("{:#?}", e)
+            println!("\n{}", e)
         }
         Ok(env) => {
-            println!("{}", serialize::emit(&Item::List(env.stack)));
+            println!("\n{}", serialize::emit(&Item::List(env.stack)));
         }
     }
 }
@@ -435,14 +489,10 @@ fn test_example(mut env: Environment, w: Word, program: List, expected: List) ->
             if res.stack == expected {
                 None
             } else {
-                Some(Error {
-                    environment: Some(res.clone()),
-                    message: format!(
-                        "Result for {} did not match expected: \n{}\n{}",
-                        w,
-                        serialize::emit(&Item::List(expected)),
-                        serialize::emit(&Item::List(p))
-                    ),
+                Some(Error::ExampleTest {
+                    expected: serialize::emit(&Item::List(expected)),
+                    actual: serialize::emit(&Item::List(res.stack)),
+                    program: serialize::emit(&Item::List(p)),
                 })
             }
         }
@@ -463,12 +513,14 @@ mod tests {
                 .iter()
                 .filter_map(|ex| {
                     let x = ex.get(0).unwrap().clone();
-                    if let (Item::List(p), Item::List(exp)) =
-                        (get_item(x.clone(), 0).unwrap(), get_item(x, 1).unwrap())
-                    {
-                        test_example(standard_env.clone(), w.clone(), p.clone(), exp.clone())
-                    } else {
-                        Some(Error::from("Invalid example"))
+                    match (get_item(x.clone(), 0).unwrap(), get_item(x, 1).unwrap()) {
+                        (Item::List(p), Item::List(exp)) => {
+                            test_example(standard_env.clone(), w.clone(), p.clone(), exp.clone())
+                        }
+                        (p, exp) => Some(axiom::invalid_type_error(
+                            vec![&p, &exp],
+                            vec!["List", "List"],
+                        )),
                     }
                 })
                 .collect::<Vec<Error>>()
@@ -525,10 +577,8 @@ mod tests {
     #[test_case("wrap")]
     fn test_lexicon(word: &str) {
         let e = standard_env(None);
-        assert_eq!(
-            test_word(e.clone(), Intern::new(word.to_string())),
-            Vec::<Error>::new()
-        );
+        let r = test_word(e.clone(), Intern::new(word.to_string()));
+        assert!(r.is_empty(), "{:?}", r);
     }
 }
 
@@ -561,44 +611,47 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::mem;
 use std::rc::Rc;
+use std::iter;
+use std::fmt::Debug;
+
+fn check_stack_depth(env: &Environment, min_depth: usize) -> Result<(), Error> {
+    if env.stack.len() < min_depth {
+        Err(Error::StackUnderflow{actual: env.stack.len(),
+                                   expected: min_depth,
+                                   context: Some(Box::new(env.clone()))})
+    } else { Ok(()) }
+}
+
+
 
 fn f_stack1(f: fn(Item) -> ItemResult) -> impl Fn(Environment) -> StepResult {
     move |mut env: Environment| {
-        if let Some(x) = env.stack.pop_front() {
-            env.stack.push_front(f(x)?);
-            Ok(env)
-        } else {
-            stack_underflow()
-        }
+        check_stack_depth(&env, 1)?;
+        let x = env.stack.pop_front().unwrap();
+        env.stack.push_front(f(x)?);
+        Ok(env)
+            
     }
 }
 
 fn f_stack2(f: fn(Item, Item) -> ItemResult) -> impl Fn(Environment) -> StepResult {
     move |mut env: Environment| {
-        let i = env.stack.pop_front();
-        let j = env.stack.pop_front();
-        match (i, j) {
-            (Some(i), Some(j)) => {
-                env.stack.push_front(f(j, i)?);
-                Ok(env)
-            }
-            _ => stack_underflow(),
-        }
+        check_stack_depth(&env, 2)?;
+        let x = env.stack.pop_front().unwrap();
+        let y = env.stack.pop_front().unwrap();
+        env.stack.push_front(f(y, x)?);
+        Ok(env)        
     }
 }
 
 fn f_stack3(f: fn(Item, Item, Item) -> ItemResult) -> impl Fn(Environment) -> StepResult {
     move |mut env: Environment| {
-        let i = env.stack.pop_front();
-        let j = env.stack.pop_front();
-        let k = env.stack.pop_front();
-        match (i, j, k) {
-            (Some(i), Some(j), Some(k)) => {
-                env.stack.push_front(f(k, j, i)?);
-                Ok(env)
-            }
-            _ => stack_underflow(),
-        }
+        check_stack_depth(&env, 3)?;
+        let x = env.stack.pop_front().unwrap();
+        let y = env.stack.pop_front().unwrap();
+        let z = env.stack.pop_front().unwrap();
+        env.stack.push_front(f(z, y, x)?);
+        Ok(env)        
     }
 }
 
@@ -618,7 +671,9 @@ fn axiom_entry<'a>(s: &str, f: Rc<StepFn>) -> (Word, WordDef) {
 fn unimplemented(s: &'static str) -> (Word, WordDef) {
     axiom_entry(
         s,
-        Rc::new(move |_: Environment| Err(Error::from(format!("Unimplemented word: {}", s)))),
+        Rc::new(move |_: Environment| Err(Error::Unimplemented{word: s.to_string(),
+                                                               context: None,
+                                                               source: None})),
     )
 }
 
@@ -674,12 +729,15 @@ pub fn standard_dictionary() -> Dictionary {
     ])
 }
 
-pub fn stack_underflow() -> StepResult {
-    Err(Error::from("Stack underflow"))
+
+pub fn invalid_type_error(items: Vec<&Item>, expected_types: Vec<&str>) -> Error {
+    Error::TypeMismatch { expected_types: expected_types.iter().map(|x| x.to_string()).collect(),
+                          actual_values: items.into_iter().map(|i| Box::new(i.clone()) as Box<dyn Debug>).collect(),
+                          context: None } 
 }
 
-pub fn invalid_type(w: &str) -> Error {
-    Error::from(format!("Invalid type for {}", w))
+fn number_type_error(items: Vec<&Item>) -> Error {
+   invalid_type_error(items.clone(), iter::repeat("Number").take(items.len()).collect())
 }
 
 pub fn plus(i: Item, j: Item) -> ItemResult {
@@ -688,7 +746,7 @@ pub fn plus(i: Item, j: Item) -> ItemResult {
         (Item::Float(i), Item::Float(j)) => Ok(Item::Float(i + j)),
         (Item::Int(i), Item::Float(j)) => Ok(Item::Float(i as Float + j)),
         (Item::Float(i), Item::Int(j)) => Ok(Item::Float(i + j as Float)),
-        _ => Err(invalid_type("+")),
+        (i, j) => Err(number_type_error(vec![&i,&j])),
     }
 }
 
@@ -698,7 +756,7 @@ pub fn minus(i: Item, j: Item) -> ItemResult {
         (Item::Float(i), Item::Float(j)) => Ok(Item::Float(i - j)),
         (Item::Int(i), Item::Float(j)) => Ok(Item::Float(i as Float - j)),
         (Item::Float(i), Item::Int(j)) => Ok(Item::Float(i - j as Float)),
-        _ => Err(invalid_type("-")),
+        (i, j) => Err(number_type_error(vec![&i,&j])),
     }
 }
 
@@ -708,7 +766,7 @@ pub fn mult(i: Item, j: Item) -> ItemResult {
         (Item::Float(i), Item::Float(j)) => Ok(Item::Float(i * j)),
         (Item::Int(i), Item::Float(j)) => Ok(Item::Float(i as Float * j)),
         (Item::Float(i), Item::Int(j)) => Ok(Item::Float(i * j as Float)),
-        _ => Err(invalid_type("*")),
+        (i, j) => Err(number_type_error(vec![&i,&j])),
     }
 }
 
@@ -718,14 +776,14 @@ pub fn div(i: Item, j: Item) -> ItemResult {
         (Item::Float(i), Item::Float(j)) => Ok(Item::Float(i / j)),
         (Item::Int(i), Item::Float(j)) => Ok(Item::Float(i as Float / j)),
         (Item::Float(i), Item::Int(j)) => Ok(Item::Float(i / j as Float)),
-        _ => Err(invalid_type("/")),
+        (i, j) => Err(number_type_error(vec![&i,&j])),
     }
 }
 
 pub fn mod_(i: Item, j: Item) -> ItemResult {
     match (i, j) {
         (Item::Int(i), Item::Int(j)) => Ok(Item::Int(i % j)),
-        _ => Err(invalid_type("mod")),
+        (i, j) => Err(number_type_error(vec![&i,&j])),
     }
 }
 
@@ -733,7 +791,7 @@ pub fn inc(i: Item) -> ItemResult {
     if let Item::Int(i) = i {
         Ok(Item::Int(i + 1))
     } else {
-        Err(invalid_type("inc"))
+        Err(number_type_error(vec![&i]))
     }
 }
 
@@ -741,7 +799,7 @@ pub fn dec(i: Item) -> ItemResult {
     if let Item::Int(i) = i {
         Ok(Item::Int(i - 1))
     } else {
-        Err(invalid_type("dec"))
+        Err(number_type_error(vec![&i]))
     }
 }
 
@@ -752,7 +810,7 @@ pub fn gt(i: Item, j: Item) -> ItemResult {
         (Item::Int(i), Item::Float(j)) => Ok(Item::Boolean(i as Float > j)),
         (Item::Float(i), Item::Int(j)) => Ok(Item::Boolean(i > j as Float)),
 
-        _ => Err(invalid_type(">")),
+        (i, j) => Err(number_type_error(vec![&i,&j])),
     }
 }
 
@@ -763,7 +821,7 @@ pub fn lt(i: Item, j: Item) -> ItemResult {
         (Item::Int(i), Item::Float(j)) => Ok(Item::Boolean((i as Float) < j)),
         (Item::Float(i), Item::Int(j)) => Ok(Item::Boolean(i < j as Float)),
 
-        _ => Err(invalid_type("<")),
+        (i, j) => Err(number_type_error(vec![&i,&j])),
     }
 }
 
@@ -774,7 +832,7 @@ pub fn gte(i: Item, j: Item) -> ItemResult {
         (Item::Int(i), Item::Float(j)) => Ok(Item::Boolean(i as Float >= j)),
         (Item::Float(i), Item::Int(j)) => Ok(Item::Boolean(i >= j as Float)),
 
-        _ => Err(invalid_type(">=")),
+        (i, j) => Err(number_type_error(vec![&i,&j])),
     }
 }
 
@@ -785,7 +843,7 @@ pub fn lte(i: Item, j: Item) -> ItemResult {
         (Item::Int(i), Item::Float(j)) => Ok(Item::Boolean((i as Float).le(&j))),
         (Item::Float(i), Item::Int(j)) => Ok(Item::Boolean(i <= j as Float)),
 
-        _ => Err(invalid_type("<=")),
+        (i, j) => Err(number_type_error(vec![&i,&j])),
     }
 }
 
@@ -799,7 +857,7 @@ pub fn join(i: Item, j: Item) -> ItemResult {
             i.push_str(&j);
             Ok(Item::String(i))
         }
-        _ => Err(invalid_type("join")),
+        (i, j) => Err(invalid_type_error(vec![&i, &j], vec!["List|String", "List|String"])),
     }
 }
 
@@ -809,7 +867,7 @@ pub fn pack(i: Item, j: Item) -> ItemResult {
             i.push_back(j);
             Ok(Item::List(i))
         }
-        _ => Err(invalid_type("pack")),
+        i => Err(invalid_type_error(vec![&i], vec!["List"])),
     }
 }
 
@@ -818,7 +876,7 @@ pub fn clone(mut env: Environment) -> StepResult {
         env.stack.push_front(last);
         Ok(env)
     } else {
-        stack_underflow()
+        Err(Error::StackUnderflow{actual: 1, expected: 1, context: None})
     }
 }
 
@@ -828,7 +886,7 @@ fn swap2(mut env: Environment, offset: usize) -> StepResult {
         env.stack.swap(offset, offset + 1);
         Ok(env)
     } else {
-        stack_underflow()
+        Err(Error::StackUnderflow{actual: 1, expected: 1, context: None})
     }
 }
 
@@ -846,7 +904,7 @@ pub fn sink(mut env: Environment) -> StepResult {
         env.stack.swap(0, 1);
         Ok(env)
     } else {
-        stack_underflow()
+        Err(Error::StackUnderflow{actual: 1, expected: 1, context: None})
     }
 }
 
@@ -856,7 +914,7 @@ pub fn float(mut env: Environment) -> StepResult {
         env.stack.swap(1, 2);
         Ok(env)
     } else {
-        stack_underflow()
+        Err(Error::StackUnderflow{actual: 1, expected: 1, context: None})
     }
 }
 
@@ -864,7 +922,7 @@ pub fn discard(mut env: Environment) -> StepResult {
     if let Some(_) = env.stack.pop_front() {
         Ok(env)
     } else {
-        stack_underflow()
+        Err(Error::StackUnderflow{actual: 1, expected: 1, context: None})
     }
 }
 
@@ -893,7 +951,7 @@ pub fn env_effect1(f: fn(Item) -> EffectResult) -> impl Fn(Environment) -> StepR
 
             Ok(env)
         } else {
-            stack_underflow()
+            Err(Error::StackUnderflow{actual: 1, expected: 1, context: None})
         }
     }
 }
@@ -913,7 +971,7 @@ pub fn env_effect2(f: fn(Item, Item) -> EffectResult) -> impl Fn(Environment) ->
 
             Ok(env)
         } else {
-            stack_underflow()
+            Err(Error::StackUnderflow{actual: 1, expected: 1, context: None})
         }
     }
 }
@@ -929,7 +987,7 @@ pub fn count(i: Item) -> EffectResult {
             Some(List::from(vec![Item::Int(l.len().try_into().unwrap())])),
         ))
     } else {
-        Err(invalid_type("count"))
+        Err(invalid_type_error(vec![&i], vec!["List"]))
     }
 }
 
@@ -977,7 +1035,7 @@ pub fn first(i: Item) -> EffectResult {
         }]);
         Ok((None, Some(x)))
     } else {
-        Err(invalid_type("first"))
+        Err(invalid_type_error(vec![&i], vec!["List"]))
     }
 }
 
@@ -994,7 +1052,7 @@ pub fn loop_(p: Item, f: Item) -> EffectResult {
             }
         })
     } else {
-        Err(invalid_type("loop"))
+        Err(invalid_type_error(vec![&p, &f], vec!["List", "Item"]))
     }
 }
 
@@ -1002,10 +1060,10 @@ pub fn execute(mut env: Environment) -> StepResult {
     if let Some(item) = env.stack.pop_front() {
         match item {
             Item::List(program) => append_expression(env, program),
-            _ => Err(invalid_type("+")),
+            _ => Err(invalid_type_error(vec![&item], vec!["List"])),
         }
     } else {
-        stack_underflow()
+        Err(Error::StackUnderflow{actual: 1, expected: 1, context: None})
     }
 }
 
@@ -1016,7 +1074,7 @@ pub fn wrap(mut env: Environment) -> StepResult {
         env.stack.push_front(Item::List(v));
         Ok(env)
     } else {
-        stack_underflow()
+        Err(Error::StackUnderflow{actual: 1, expected: 1, context: None})
     }
 }
 
@@ -1028,13 +1086,10 @@ pub fn unwrap(mut env: Environment) -> StepResult {
             }
             Ok(env)
         } else {
-            Err(Error::from(format!(
-                "Can only unwrap on list, found {:?}",
-                item
-            )))
+            Err(invalid_type_error(vec![&item], vec!["List"]))
         }
     } else {
-        stack_underflow()
+        Err(Error::StackUnderflow{actual: 1, expected: 1, context: None})
     }
 }
 
@@ -1052,9 +1107,9 @@ pub fn dip(mut env: Environment) -> StepResult {
                 env.expression.push_front(Item::List(v));
                 append_expression(env, program)
             }
-            _ => Err(invalid_type("dip")),
+            _ => Err(invalid_type_error(vec![&item1], vec!["List"])),
         },
-        _ => stack_underflow(),
+        _ => Err(Error::StackUnderflow{actual: 1, expected: 1, context: None}),
     }
 }
 
@@ -1073,9 +1128,9 @@ pub fn dipdown(mut env: Environment) -> StepResult {
                 env.expression.push_front(Item::List(v));
                 append_expression(env, program)
             }
-            _ => Err(invalid_type("+")),
+            _ => Err(invalid_type_error(vec![&item1], vec!["List"])),
         },
-        _ => stack_underflow(),
+        _ => Err(Error::StackUnderflow{actual: 1, expected: 1, context: None}),
     }
 }
 
@@ -1087,10 +1142,10 @@ pub fn unpack(mut env: Environment) -> StepResult {
             }
             Ok(env)
         } else {
-            Err(invalid_type("+"))
+            Err(invalid_type_error(vec![&s1], vec!["List"]))
         }
     } else {
-        stack_underflow()
+        Err(Error::StackUnderflow{actual: 1, expected: 1, context: None})
     }
 }
 
@@ -1117,9 +1172,9 @@ pub fn branch(mut env: Environment) -> StepResult {
                     false_branch
                 },
             ),
-            _ => Err(invalid_type("+")),
+            (f, t) => Err(invalid_type_error(vec![&f, &t], vec!["List", "List"])),
         },
-        _ => stack_underflow(),
+        _ => Err(Error::StackUnderflow{actual: 1, expected: 1, context: None}),
     }
 }
 
@@ -1141,9 +1196,9 @@ pub fn step(mut env: Environment) -> StepResult {
                 }
                 Ok(env)
             }
-            _ => Err(invalid_type("+")),
+            (p, l) => Err(invalid_type_error(vec![&p, &l], vec!["List", "List"])),
         },
-        _ => stack_underflow(),
+        _ => Err(Error::StackUnderflow{actual: 1, expected: 1, context: None}),
     }
 }
 
@@ -1158,9 +1213,9 @@ pub fn range(mut env: Environment) -> StepResult {
                 ));
                 return Ok(env);
             }
-            _ => Err(invalid_type("+")),
+            (from, to) => Err(invalid_type_error(vec![&from, &to], vec!["Integer", "Integer"])),
         },
-        _ => stack_underflow(),
+        _ => Err(Error::StackUnderflow{actual: 1, expected: 1, context: None}),
     }
 }
 
@@ -1196,9 +1251,10 @@ pub fn recur(mut env: Environment) -> StepResult {
                 env.stack.push_front(Item::List(e));
                 Ok(env)
             }
-            _ => Err(invalid_type("+")),
+            (rec2, rec1, then, pred) => Err(invalid_type_error(vec![&pred, &then, &rec1, &rec2],
+                                                               vec!["List", "List", "List", "List"])),
         },
-        _ => stack_underflow(),
+        _ => Err(Error::StackUnderflow{actual: 1, expected: 1, context: None}),
     }
 }
 
@@ -1213,10 +1269,11 @@ pub fn evert(mut env: Environment) -> StepResult {
                 mem::swap(&mut env.stack, &mut l);
                 env.stack.push_front(Item::List(l));
                 Ok(env)
-            }
-            _ => Err(invalid_type("+")),
+            },
+            
+            _ => Err(invalid_type_error(vec![&l], vec!["List"])),
         },
-        _ => stack_underflow(),
+        _ => Err(Error::StackUnderflow{actual: 1, expected: 1, context: None}),
     }
 }
 
@@ -1259,39 +1316,42 @@ fn to_lexicon_entry(w: Word, def: HashMap<KeyItem, Item>) -> WordDef {
         WordDef::Axiom(AxiomDef {
             docs: docs,
             f: Rc::new(move |_: Environment| {
-                Err(Error::from(format!("Unimplemented word: {}", w)))
+                Err(Error::Unimplemented{word: w.to_string(), context: None, source: None})
             }),
         })
     }
 }
 
 pub fn lexicon(mut env: Environment) -> StepResult {
-    if let Ok(s) = fs::read_to_string("src/kcats/lexicon.kcats") {
-        let items = serialize::parse(s, &Some(standard_dictionary()))?;
-        let vitems = to_hash(List::from(items))?;
-        for (k, def) in vitems.iter() {
-            let h = to_hash(as_list(Some(def)).unwrap()).ok().unwrap();
-            let word = as_word(k).unwrap();
-            let newdef = to_lexicon_entry(word, h);
-            let newdef2 = newdef.clone();
-            env.dictionary
-                .entry(word)
-                .and_modify(|e| match (e, newdef) {
-                    (WordDef::Axiom(a), WordDef::Axiom(new_a)) => {
-                        a.docs = new_a.docs;
-                    }
-                    (WordDef::Derived(d), WordDef::Derived(new_d)) => {
-                        d.docs = new_d.docs;
-                        d.definition = new_d.definition;
-                    }
-                    _ => {}
-                })
-                .or_insert(newdef2);
+    match fs::read_to_string("src/kcats/lexicon.kcats") {
+        Ok(s) => {
+            let items = serialize::parse(s, &Some(standard_dictionary()))?;
+            let vitems = to_hash(List::from(items))?;
+            for (k, def) in vitems.iter() {
+                let h = to_hash(as_list(Some(def)).unwrap()).ok().unwrap();
+                let word = as_word(k).unwrap();
+                let newdef = to_lexicon_entry(word, h);
+                let newdef2 = newdef.clone();
+                env.dictionary
+                    .entry(word)
+                    .and_modify(|e| match (e, newdef) {
+                        (WordDef::Axiom(a), WordDef::Axiom(new_a)) => {
+                            a.docs = new_a.docs;
+                        }
+                        (WordDef::Derived(d), WordDef::Derived(new_d)) => {
+                            d.docs = new_d.docs;
+                            d.definition = new_d.definition;
+                        }
+                        _ => {}
+                    })
+                    .or_insert(newdef2);
+            }
+            Ok(env)
+        },
+        Err(e) => {
+            Err(Error::Unimplemented { word: "lexicon".to_string(), source: Some(Box::new(e)), context: Some(env)})
         }
-        Ok(env)
-    } else {
-        Err(Error::from("Could not read from lexicon file"))
-    }
+    } 
 }
 
 fn assoc_in(i: Item, ks: &[KeyItem], v: Item) -> Result<Associative, Error> {
@@ -1309,7 +1369,7 @@ fn assoc_in(i: Item, ks: &[KeyItem], v: Item) -> Result<Associative, Error> {
         }
         Item::Nothing => assoc_in(Item::Assoc(Associative::new()), ks, v),
         Item::List(l) => assoc_in(Item::Assoc(to_hash(l.clone())?), ks, v),
-        _ => Err(Error::from("Invalid type for assign")),
+        _ => Err(invalid_type_error(vec![&i], vec!["List"])),
     }
 }
 
@@ -1324,7 +1384,7 @@ pub fn assign(m: Item, ks: Item, v: Item) -> ItemResult {
             let (ks, _) = ksvec.as_slices();
             Ok(Item::Assoc(assoc_in(m, ks, v)?))
         }
-        _ => Err(invalid_type("assign")),
+        _ => Err(invalid_type_error(vec![&ks], vec!["List"])),
     }
 }
 
@@ -1334,16 +1394,16 @@ pub fn unassign(m: Item, k: Item) -> ItemResult {
         Item::List(m) => { unassign(Item::Assoc(to_hash(m)?), k)}
         Item::Assoc(mut m) => { m.remove(&to_key_item(k)?);
                             Ok(Item::Assoc(m))}
-        _ => Err(invalid_type("unassign")),
+        _ => Err(invalid_type_error(vec![&m], vec!["List"])),
     }
 }
 
 pub fn lookup(m: Item, k: Item) -> ItemResult {
     let k = to_key_item(k)?;
-    match (m, k) {
-        (Item::Assoc(m), k) => Ok(m.get(&k).unwrap_or(&Item::Nothing).clone()),
-        (Item::List(l), k) => Ok(lookup(Item::Assoc(to_hash(l)?), to_value_item(k))?),
-        _ => Err(invalid_type("lookup")),
+    match m {
+        Item::Assoc(m) => Ok(m.get(&k).unwrap_or(&Item::Nothing).clone()),
+        Item::List(l) => Ok(lookup(Item::Assoc(to_hash(l)?), to_value_item(k))?),
+        _ => Err(invalid_type_error(vec![&m], vec!["List"])),
     }
 }
 
@@ -1371,7 +1431,7 @@ pub fn is_odd(i: Item) -> ItemResult {
     if let Item::Int(i) = i {
         Ok(Item::Boolean(i & 1 == 1))
     } else {
-        Err(invalid_type("odd?"))
+        Err(invalid_type_error(vec![&i], vec!["Integer"]))
     }
 }
 
@@ -1379,7 +1439,7 @@ pub fn is_even(i: Item) -> ItemResult {
     if let Item::Int(i) = i {
         Ok(Item::Boolean(i & 1 == 0))
     } else {
-        Err(invalid_type("even?"))
+        Err(invalid_type_error(vec![&i], vec!["Integer"]))
     }
 }
 
@@ -1391,13 +1451,16 @@ pub fn decide(mut env: Environment) -> StepResult {
             if let Some(clause) = clause {
                 if let Item::List(mut clause) = clause {
                     if clause.len() != 2 {
-                        Err(Error::from("Clauses in 'decide' must have exactly 2 items"))
+                        Err(Error::Count { expected: 2,
+                                           actual: clause.len(),
+                                           context: Some(Box::new(clause))})
                     } else {
                         let test = clause.pop_front().unwrap();
                         let expr = clause.pop_front().unwrap();
 
-                        if let (Item::List(test), Item::List(expr)) = (test, expr) {
-                            // construct if
+                        match (test, expr) {
+                            (Item::List(test), Item::List(expr)) => {
+                                // construct if
                             let testp = List::from(vec![Item::List(test), word("shield")]);
                             let elsep = List::from(vec![Item::List(clauses), word("decide")]);
                             let newexpr = List::from(vec![
@@ -1407,12 +1470,14 @@ pub fn decide(mut env: Environment) -> StepResult {
                                 word("if"),
                             ]);
                             append_expression(env, newexpr)
-                        } else {
-                            Err(invalid_type("decide clause test or expr"))
+                            },
+                            (test, expr) => {
+                                Err(invalid_type_error(vec![&test, &expr], vec!["List", "List"]))
+                            }
                         }
                     }
                 } else {
-                    Err(invalid_type("decide clause"))
+                    Err(invalid_type_error(vec![&clause], vec!["List"]))
                 }
             } else {
                 // clauses empty, return nothing
@@ -1420,10 +1485,10 @@ pub fn decide(mut env: Environment) -> StepResult {
                 Ok(env)
             }
         } else {
-            Err(invalid_type("decide"))
+            Err(invalid_type_error(vec![&clauses], vec!["List"]))
         }
     } else {
-        stack_underflow()
+        Err(Error::StackUnderflow{actual: 1, expected: 1, context: None})
     }
 }
 #+end_src
@@ -1462,6 +1527,7 @@ fn to_item(
     item: &edn_format::Value,
     standard_dictionary: &Option<Dictionary>,
 ) -> Result<Item, Error> {
+    //println!("to item {:?}", item);
     match item {
         edn_format::Value::Integer(i) => Ok(Item::Int(*i)),
         edn_format::Value::Vector(v) => Ok(Item::List(
@@ -1481,14 +1547,20 @@ fn to_item(
                 if let edn_format::Value::String(s) = &**e {
                     Ok(Item::Bytes(base64::decode(s).unwrap()))
                 } else {
-                    Err(Error::from("Invalid tag datatype for byte literal"))
+                    Err(Error::Parser {message: "Invalid tag datatype for byte literal".to_string(),
+                                       context: Some(Box::new((*tag).clone())),
+                                       source: None})
                 }
             }
             else {
-                Err(Error::from(format!("Unsupported tag: {}", tag)))
+                Err(Error::Parser {message: "Unsupported tag".to_string(),
+                                   context: Some(Box::new((*item).clone())),
+                                   source: None})
             }
         }
-        _ => Err(Error::from("Invalid syntax")),
+        _ => Err(Error::Parser{ message: "Unsupported data literal".to_string(),
+                                context: Some(Box::new((*item).clone())),
+                                source: None }),
     }
 }
 
@@ -1528,7 +1600,9 @@ pub fn parse(s: String, standard_dictionary: &Option<Dictionary>) -> Result<List
     parser
         .map(move |r| match r {
             Ok(expr) => Ok(to_item(&expr, standard_dictionary)?),
-            Err(e) => Err(Error::from("Invalid edn")),
+            Err(e) => Err(Error::Parser{message: "Invalid edn".to_string(),
+                                        source: Some(Box::new(e)),
+                                        context: None}),
         })
         .collect()
 }
@@ -1568,6 +1642,10 @@ Should return Result objects from to_item. I don't think it is
 necessary for from_item - since we're using a subset of edn, all Items
 should be convertible to valid edn. But not all valid edn is
 convertible to an Item.
+*** TODO Association list and list of equal content don't compare equal
+Probably need a custom PartialEq impl for Item here that converts the
+list to a hash before comparing. Return false if the item doesn't
+convert. 
 *** TODO Interactive mode
 run with =kcats -i= for interactive, where you get a repl-like
 prompt. Each prompt accepts kcats items as input, and updates the
@@ -2041,3 +2119,9 @@ fn main(){
 #+RESULTS:
 : Err("Key is wrong type")
 
+testing type checking dynamic?
+#+begin_src rust
+enum Item {
+
+}
+#+end_src
