@@ -37,7 +37,7 @@ edn-format = "3.2.3"
 base64 = "0.13.0"
 internment = "0.6.0" 
 thiserror = "1.0.30"
-
+lazy-static = "1.4.0"
 [dev-dependencies]
 test-case = "2.0.0"
 #+end_src
@@ -45,6 +45,7 @@ test-case = "2.0.0"
 Let's start by defining some data structures in a separate module
 #+begin_src rust :tangle src/types.rs
 use internment::Intern;
+use lazy_static::lazy_static;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -67,6 +68,19 @@ pub type Int = i64;
 pub type Float = f64;
 
 pub type Associative = HashMap<KeyItem, Item>;
+
+lazy_static! {
+    pub static ref S_INTEGER: Intern<String> = Intern::new("integer".to_string());
+    pub static ref S_NUMBER: Intern<String> = Intern::new("number".to_string());
+    pub static ref S_LIST: Intern<String> = Intern::new("list".to_string());
+    pub static ref S_BOOLEAN: Intern<String> = Intern::new("boolean".to_string());
+    pub static ref S_ASSOC: Intern<String> = Intern::new("association-list".to_string());
+    pub static ref S_WORD: Intern<String> = Intern::new("word".to_string());
+    pub static ref S_PROGRAM: Intern<String> = Intern::new("program".to_string());
+    pub static ref S_ITEM: Intern<String> = Intern::new("item".to_string());
+    pub static ref S_STRING: Intern<String> = Intern::new("string".to_string());
+    pub static ref S_BYTES: Intern<String> = Intern::new("bytes".to_string());
+}
 
 #[derive(Clone)]
 pub struct BuiltinWord {
@@ -214,9 +228,11 @@ pub enum Error {
     },
 
     #[error("invalid syntax, {message}: {context:?}")]
-    Parser { message: String,
-             source: Option<Box<dyn std::error::Error>>,
-             context: Option<Box<dyn std::fmt::Debug>> },
+    Parser {
+        message: String,
+        source: Option<Box<dyn std::error::Error>>,
+        context: Option<Box<dyn std::fmt::Debug>>,
+    },
 
     #[error("Unknown word: {word}: {context:?}")]
     UnknownWord {
@@ -230,9 +246,7 @@ pub enum Error {
         actual: String,
         program: String,
     },
-
     //#[error("error")]
-    
 }
 
 impl TryFrom<Item> for List {
@@ -367,21 +381,123 @@ mod types;
 use crate::types::*;
 mod axiom;
 mod serialize;
+use internment::Intern;
 use std::io;
 use std::io::BufRead;
 use std::mem;
+use std::ops::Range;
+
+fn check_type(env: &Environment, i: &Item, w: Word) -> Result<(), Error> {
+    match i {
+        Item::Int(i) => {
+            if w == *S_INTEGER || w == *S_NUMBER || w == *S_ITEM {
+                Ok(())
+            } else {
+                Err(Error::TypeMismatch {
+                    expected_types: vec![w.to_string()],
+                    actual_values: vec![Box::new(i.clone())],
+                    context: Some(Box::new(env.clone())),
+                })
+            }
+        }
+        Item::List(i) => {
+            if w == *S_LIST || w == *S_ITEM || w == *S_ASSOC || w == *S_PROGRAM {
+                Ok(())
+            } else {
+                Err(Error::TypeMismatch {
+                    expected_types: vec![w.to_string()],
+                    actual_values: vec![Box::new(i.clone())],
+                    context: Some(Box::new(env.clone())),
+                })
+            }
+        }
+        _ => Ok(()),
+    }
+}
+
+fn check_stack_depth(env: &Environment, min_depth: usize) -> Result<(), Error> {
+    println!("Checking stack has at least {} items", min_depth);
+    if env.stack.len() < min_depth {
+        Err(Error::StackUnderflow {
+            actual: env.stack.len(),
+            expected: min_depth,
+            context: Some(Box::new(env.clone())),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn check_input_spec(spec: &List, env: &Environment) -> Result<(), Error> {
+    let input_spec = spec.front().unwrap();
+
+    if let Item::List(specs) = input_spec {
+        check_stack_depth(env, specs.len())?;
+        let indexes = Range {
+            start: 0,
+            end: specs.len(),
+        };
+
+        indexes
+            .into_iter()
+            .map(|i| {
+                let item = env.stack.get(i).unwrap();
+                let spec = specs.get(i).unwrap();
+                match spec {
+                    Item::List(named) => {
+                        if let Item::Word(w) = named.get(0).unwrap() {
+                            check_type(env, item, *w)
+                        } else {
+                            Err(Error::TypeMismatch {
+                                expected_types: vec!["List".to_string()],
+                                actual_values: vec![Box::new(named.clone())],
+                                context: Some(Box::new(env.clone())),
+                            })
+                        }
+                    }
+                    Item::Word(w) => check_type(env, item, *w),
+                    _ => Err(Error::TypeMismatch {
+                        expected_types: vec!["List".to_string()],
+                        actual_values: vec![Box::new(spec.clone())],
+                        context: Some(Box::new(spec.clone())),
+                    }),
+                }
+            })
+            .collect::<Result<(), Error>>()
+    } else {
+        Err(Error::TypeMismatch {
+            expected_types: vec!["List".to_string()],
+            actual_values: vec![Box::new(spec.clone())],
+            context: Some(Box::new(env.clone())),
+        })
+    }
+}
 
 fn eval_step(mut env: Environment) -> StepResult {
-    //println!("{:?}", env);
-    let next_item = env.expression.pop_front();
+    println!("{:?}", env);
+    let next_item = env.expression.front();
 
     if let Some(val) = next_item {
         match val {
             Item::Word(word) => {
-                if let Some(dfn) = env.dictionary.get(&word) {
+                if let Some(dfn) = env.dictionary.get(word) {
                     match dfn {
-                        WordDef::Axiom(d) => (d.f.clone())(env),
+                        WordDef::Axiom(d) => {
+                            if let Some(spec) = &d.docs.spec {
+                                check_input_spec(&spec, &env)?
+                            } else {
+                                println!("No spec for {}!", word);
+                            }
+                            env.expression.pop_front();
+                            (d.f.clone())(env)
+                        }
                         WordDef::Derived(d) => {
+                            if let Some(spec) = &d.docs.spec {
+                                check_input_spec(&spec, &env)?
+                            } else {
+                                println!("No spec for {}!", word);
+                            }
+                            env.expression.pop_front();
                             let mut items = d.definition.clone();
                             mem::swap(&mut items, &mut env.expression);
                             env.expression.extend(items);
@@ -396,11 +512,20 @@ fn eval_step(mut env: Environment) -> StepResult {
                     })
                 }
             }
-            Item::Builtin(builtin) => Ok((builtin.f)(env)?),
             _ => {
-                // not a word, just push onto stack
-                env.stack.push_front(val);
-                Ok(env)
+                // handle the case where it's a builtin and we want to use
+                // the owned value, so we pop it
+                let item = env.expression.pop_front().unwrap();
+                if let Item::Builtin(builtin) = item {
+                    if let Some(spec) = &d.docs.spec {
+                        check_input_spec(&spec, &env)?
+                    }
+                    Ok((builtin.f)(env)?)
+                } else {
+                    // not a word, just push onto stack
+                    env.stack.push_front(item);
+                    Ok(env)
+                }
             }
         }
     } else {
@@ -608,21 +733,23 @@ use super::serialize;
 use crate::types::*;
 use internment::Intern;
 use std::collections::{HashMap, VecDeque};
+use std::fmt::Debug;
 use std::fs;
+use std::iter;
 use std::mem;
 use std::rc::Rc;
-use std::iter;
-use std::fmt::Debug;
 
 fn check_stack_depth(env: &Environment, min_depth: usize) -> Result<(), Error> {
     if env.stack.len() < min_depth {
-        Err(Error::StackUnderflow{actual: env.stack.len(),
-                                   expected: min_depth,
-                                   context: Some(Box::new(env.clone()))})
-    } else { Ok(()) }
+        Err(Error::StackUnderflow {
+            actual: env.stack.len(),
+            expected: min_depth,
+            context: Some(Box::new(env.clone())),
+        })
+    } else {
+        Ok(())
+    }
 }
-
-
 
 fn f_stack1(f: fn(Item) -> ItemResult) -> impl Fn(Environment) -> StepResult {
     move |mut env: Environment| {
@@ -630,7 +757,6 @@ fn f_stack1(f: fn(Item) -> ItemResult) -> impl Fn(Environment) -> StepResult {
         let x = env.stack.pop_front().unwrap();
         env.stack.push_front(f(x)?);
         Ok(env)
-            
     }
 }
 
@@ -640,7 +766,7 @@ fn f_stack2(f: fn(Item, Item) -> ItemResult) -> impl Fn(Environment) -> StepResu
         let x = env.stack.pop_front().unwrap();
         let y = env.stack.pop_front().unwrap();
         env.stack.push_front(f(y, x)?);
-        Ok(env)        
+        Ok(env)
     }
 }
 
@@ -651,7 +777,7 @@ fn f_stack3(f: fn(Item, Item, Item) -> ItemResult) -> impl Fn(Environment) -> St
         let y = env.stack.pop_front().unwrap();
         let z = env.stack.pop_front().unwrap();
         env.stack.push_front(f(z, y, x)?);
-        Ok(env)        
+        Ok(env)
     }
 }
 
@@ -671,9 +797,13 @@ fn axiom_entry<'a>(s: &str, f: Rc<StepFn>) -> (Word, WordDef) {
 fn unimplemented(s: &'static str) -> (Word, WordDef) {
     axiom_entry(
         s,
-        Rc::new(move |_: Environment| Err(Error::Unimplemented{word: s.to_string(),
-                                                               context: None,
-                                                               source: None})),
+        Rc::new(move |_: Environment| {
+            Err(Error::Unimplemented {
+                word: s.to_string(),
+                context: None,
+                source: None,
+            })
+        }),
     )
 }
 
@@ -729,15 +859,22 @@ pub fn standard_dictionary() -> Dictionary {
     ])
 }
 
-
 pub fn invalid_type_error(items: Vec<&Item>, expected_types: Vec<&str>) -> Error {
-    Error::TypeMismatch { expected_types: expected_types.iter().map(|x| x.to_string()).collect(),
-                          actual_values: items.into_iter().map(|i| Box::new(i.clone()) as Box<dyn Debug>).collect(),
-                          context: None } 
+    Error::TypeMismatch {
+        expected_types: expected_types.iter().map(|x| x.to_string()).collect(),
+        actual_values: items
+            .into_iter()
+            .map(|i| Box::new(i.clone()) as Box<dyn Debug>)
+            .collect(),
+        context: None,
+    }
 }
 
 fn number_type_error(items: Vec<&Item>) -> Error {
-   invalid_type_error(items.clone(), iter::repeat("Number").take(items.len()).collect())
+    invalid_type_error(
+        items.clone(),
+        iter::repeat("Number").take(items.len()).collect(),
+    )
 }
 
 pub fn plus(i: Item, j: Item) -> ItemResult {
@@ -746,7 +883,7 @@ pub fn plus(i: Item, j: Item) -> ItemResult {
         (Item::Float(i), Item::Float(j)) => Ok(Item::Float(i + j)),
         (Item::Int(i), Item::Float(j)) => Ok(Item::Float(i as Float + j)),
         (Item::Float(i), Item::Int(j)) => Ok(Item::Float(i + j as Float)),
-        (i, j) => Err(number_type_error(vec![&i,&j])),
+        (i, j) => Err(number_type_error(vec![&i, &j])),
     }
 }
 
@@ -756,7 +893,7 @@ pub fn minus(i: Item, j: Item) -> ItemResult {
         (Item::Float(i), Item::Float(j)) => Ok(Item::Float(i - j)),
         (Item::Int(i), Item::Float(j)) => Ok(Item::Float(i as Float - j)),
         (Item::Float(i), Item::Int(j)) => Ok(Item::Float(i - j as Float)),
-        (i, j) => Err(number_type_error(vec![&i,&j])),
+        (i, j) => Err(number_type_error(vec![&i, &j])),
     }
 }
 
@@ -766,7 +903,7 @@ pub fn mult(i: Item, j: Item) -> ItemResult {
         (Item::Float(i), Item::Float(j)) => Ok(Item::Float(i * j)),
         (Item::Int(i), Item::Float(j)) => Ok(Item::Float(i as Float * j)),
         (Item::Float(i), Item::Int(j)) => Ok(Item::Float(i * j as Float)),
-        (i, j) => Err(number_type_error(vec![&i,&j])),
+        (i, j) => Err(number_type_error(vec![&i, &j])),
     }
 }
 
@@ -776,14 +913,14 @@ pub fn div(i: Item, j: Item) -> ItemResult {
         (Item::Float(i), Item::Float(j)) => Ok(Item::Float(i / j)),
         (Item::Int(i), Item::Float(j)) => Ok(Item::Float(i as Float / j)),
         (Item::Float(i), Item::Int(j)) => Ok(Item::Float(i / j as Float)),
-        (i, j) => Err(number_type_error(vec![&i,&j])),
+        (i, j) => Err(number_type_error(vec![&i, &j])),
     }
 }
 
 pub fn mod_(i: Item, j: Item) -> ItemResult {
     match (i, j) {
         (Item::Int(i), Item::Int(j)) => Ok(Item::Int(i % j)),
-        (i, j) => Err(number_type_error(vec![&i,&j])),
+        (i, j) => Err(number_type_error(vec![&i, &j])),
     }
 }
 
@@ -810,7 +947,7 @@ pub fn gt(i: Item, j: Item) -> ItemResult {
         (Item::Int(i), Item::Float(j)) => Ok(Item::Boolean(i as Float > j)),
         (Item::Float(i), Item::Int(j)) => Ok(Item::Boolean(i > j as Float)),
 
-        (i, j) => Err(number_type_error(vec![&i,&j])),
+        (i, j) => Err(number_type_error(vec![&i, &j])),
     }
 }
 
@@ -821,7 +958,7 @@ pub fn lt(i: Item, j: Item) -> ItemResult {
         (Item::Int(i), Item::Float(j)) => Ok(Item::Boolean((i as Float) < j)),
         (Item::Float(i), Item::Int(j)) => Ok(Item::Boolean(i < j as Float)),
 
-        (i, j) => Err(number_type_error(vec![&i,&j])),
+        (i, j) => Err(number_type_error(vec![&i, &j])),
     }
 }
 
@@ -832,7 +969,7 @@ pub fn gte(i: Item, j: Item) -> ItemResult {
         (Item::Int(i), Item::Float(j)) => Ok(Item::Boolean(i as Float >= j)),
         (Item::Float(i), Item::Int(j)) => Ok(Item::Boolean(i >= j as Float)),
 
-        (i, j) => Err(number_type_error(vec![&i,&j])),
+        (i, j) => Err(number_type_error(vec![&i, &j])),
     }
 }
 
@@ -843,7 +980,7 @@ pub fn lte(i: Item, j: Item) -> ItemResult {
         (Item::Int(i), Item::Float(j)) => Ok(Item::Boolean((i as Float).le(&j))),
         (Item::Float(i), Item::Int(j)) => Ok(Item::Boolean(i <= j as Float)),
 
-        (i, j) => Err(number_type_error(vec![&i,&j])),
+        (i, j) => Err(number_type_error(vec![&i, &j])),
     }
 }
 
@@ -857,7 +994,10 @@ pub fn join(i: Item, j: Item) -> ItemResult {
             i.push_str(&j);
             Ok(Item::String(i))
         }
-        (i, j) => Err(invalid_type_error(vec![&i, &j], vec!["List|String", "List|String"])),
+        (i, j) => Err(invalid_type_error(
+            vec![&i, &j],
+            vec!["List|String", "List|String"],
+        )),
     }
 }
 
@@ -876,7 +1016,11 @@ pub fn clone(mut env: Environment) -> StepResult {
         env.stack.push_front(last);
         Ok(env)
     } else {
-        Err(Error::StackUnderflow{actual: 1, expected: 1, context: None})
+        Err(Error::StackUnderflow {
+            actual: 1,
+            expected: 1,
+            context: None,
+        })
     }
 }
 
@@ -886,7 +1030,11 @@ fn swap2(mut env: Environment, offset: usize) -> StepResult {
         env.stack.swap(offset, offset + 1);
         Ok(env)
     } else {
-        Err(Error::StackUnderflow{actual: 1, expected: 1, context: None})
+        Err(Error::StackUnderflow {
+            actual: 1,
+            expected: 1,
+            context: None,
+        })
     }
 }
 
@@ -904,7 +1052,11 @@ pub fn sink(mut env: Environment) -> StepResult {
         env.stack.swap(0, 1);
         Ok(env)
     } else {
-        Err(Error::StackUnderflow{actual: 1, expected: 1, context: None})
+        Err(Error::StackUnderflow {
+            actual: 1,
+            expected: 1,
+            context: None,
+        })
     }
 }
 
@@ -914,7 +1066,11 @@ pub fn float(mut env: Environment) -> StepResult {
         env.stack.swap(1, 2);
         Ok(env)
     } else {
-        Err(Error::StackUnderflow{actual: 1, expected: 1, context: None})
+        Err(Error::StackUnderflow {
+            actual: 1,
+            expected: 1,
+            context: None,
+        })
     }
 }
 
@@ -922,7 +1078,11 @@ pub fn discard(mut env: Environment) -> StepResult {
     if let Some(_) = env.stack.pop_front() {
         Ok(env)
     } else {
-        Err(Error::StackUnderflow{actual: 1, expected: 1, context: None})
+        Err(Error::StackUnderflow {
+            actual: 1,
+            expected: 1,
+            context: None,
+        })
     }
 }
 
@@ -951,7 +1111,11 @@ pub fn env_effect1(f: fn(Item) -> EffectResult) -> impl Fn(Environment) -> StepR
 
             Ok(env)
         } else {
-            Err(Error::StackUnderflow{actual: 1, expected: 1, context: None})
+            Err(Error::StackUnderflow {
+                actual: 1,
+                expected: 1,
+                context: None,
+            })
         }
     }
 }
@@ -971,7 +1135,11 @@ pub fn env_effect2(f: fn(Item, Item) -> EffectResult) -> impl Fn(Environment) ->
 
             Ok(env)
         } else {
-            Err(Error::StackUnderflow{actual: 1, expected: 1, context: None})
+            Err(Error::StackUnderflow {
+                actual: 1,
+                expected: 1,
+                context: None,
+            })
         }
     }
 }
@@ -1063,7 +1231,11 @@ pub fn execute(mut env: Environment) -> StepResult {
             _ => Err(invalid_type_error(vec![&item], vec!["List"])),
         }
     } else {
-        Err(Error::StackUnderflow{actual: 1, expected: 1, context: None})
+        Err(Error::StackUnderflow {
+            actual: 1,
+            expected: 1,
+            context: None,
+        })
     }
 }
 
@@ -1074,7 +1246,11 @@ pub fn wrap(mut env: Environment) -> StepResult {
         env.stack.push_front(Item::List(v));
         Ok(env)
     } else {
-        Err(Error::StackUnderflow{actual: 1, expected: 1, context: None})
+        Err(Error::StackUnderflow {
+            actual: 1,
+            expected: 1,
+            context: None,
+        })
     }
 }
 
@@ -1089,7 +1265,11 @@ pub fn unwrap(mut env: Environment) -> StepResult {
             Err(invalid_type_error(vec![&item], vec!["List"]))
         }
     } else {
-        Err(Error::StackUnderflow{actual: 1, expected: 1, context: None})
+        Err(Error::StackUnderflow {
+            actual: 1,
+            expected: 1,
+            context: None,
+        })
     }
 }
 
@@ -1109,7 +1289,11 @@ pub fn dip(mut env: Environment) -> StepResult {
             }
             _ => Err(invalid_type_error(vec![&item1], vec!["List"])),
         },
-        _ => Err(Error::StackUnderflow{actual: 1, expected: 1, context: None}),
+        _ => Err(Error::StackUnderflow {
+            actual: 1,
+            expected: 1,
+            context: None,
+        }),
     }
 }
 
@@ -1130,7 +1314,11 @@ pub fn dipdown(mut env: Environment) -> StepResult {
             }
             _ => Err(invalid_type_error(vec![&item1], vec!["List"])),
         },
-        _ => Err(Error::StackUnderflow{actual: 1, expected: 1, context: None}),
+        _ => Err(Error::StackUnderflow {
+            actual: 1,
+            expected: 1,
+            context: None,
+        }),
     }
 }
 
@@ -1145,7 +1333,11 @@ pub fn unpack(mut env: Environment) -> StepResult {
             Err(invalid_type_error(vec![&s1], vec!["List"]))
         }
     } else {
-        Err(Error::StackUnderflow{actual: 1, expected: 1, context: None})
+        Err(Error::StackUnderflow {
+            actual: 1,
+            expected: 1,
+            context: None,
+        })
     }
 }
 
@@ -1174,7 +1366,11 @@ pub fn branch(mut env: Environment) -> StepResult {
             ),
             (f, t) => Err(invalid_type_error(vec![&f, &t], vec!["List", "List"])),
         },
-        _ => Err(Error::StackUnderflow{actual: 1, expected: 1, context: None}),
+        _ => Err(Error::StackUnderflow {
+            actual: 1,
+            expected: 1,
+            context: None,
+        }),
     }
 }
 
@@ -1198,7 +1394,11 @@ pub fn step(mut env: Environment) -> StepResult {
             }
             (p, l) => Err(invalid_type_error(vec![&p, &l], vec!["List", "List"])),
         },
-        _ => Err(Error::StackUnderflow{actual: 1, expected: 1, context: None}),
+        _ => Err(Error::StackUnderflow {
+            actual: 1,
+            expected: 1,
+            context: None,
+        }),
     }
 }
 
@@ -1213,9 +1413,16 @@ pub fn range(mut env: Environment) -> StepResult {
                 ));
                 return Ok(env);
             }
-            (from, to) => Err(invalid_type_error(vec![&from, &to], vec!["Integer", "Integer"])),
+            (from, to) => Err(invalid_type_error(
+                vec![&from, &to],
+                vec!["Integer", "Integer"],
+            )),
         },
-        _ => Err(Error::StackUnderflow{actual: 1, expected: 1, context: None}),
+        _ => Err(Error::StackUnderflow {
+            actual: 1,
+            expected: 1,
+            context: None,
+        }),
     }
 }
 
@@ -1251,10 +1458,16 @@ pub fn recur(mut env: Environment) -> StepResult {
                 env.stack.push_front(Item::List(e));
                 Ok(env)
             }
-            (rec2, rec1, then, pred) => Err(invalid_type_error(vec![&pred, &then, &rec1, &rec2],
-                                                               vec!["List", "List", "List", "List"])),
+            (rec2, rec1, then, pred) => Err(invalid_type_error(
+                vec![&pred, &then, &rec1, &rec2],
+                vec!["List", "List", "List", "List"],
+            )),
         },
-        _ => Err(Error::StackUnderflow{actual: 1, expected: 1, context: None}),
+        _ => Err(Error::StackUnderflow {
+            actual: 1,
+            expected: 1,
+            context: None,
+        }),
     }
 }
 
@@ -1269,11 +1482,15 @@ pub fn evert(mut env: Environment) -> StepResult {
                 mem::swap(&mut env.stack, &mut l);
                 env.stack.push_front(Item::List(l));
                 Ok(env)
-            },
-            
+            }
+
             _ => Err(invalid_type_error(vec![&l], vec!["List"])),
         },
-        _ => Err(Error::StackUnderflow{actual: 1, expected: 1, context: None}),
+        _ => Err(Error::StackUnderflow {
+            actual: 1,
+            expected: 1,
+            context: None,
+        }),
     }
 }
 
@@ -1316,7 +1533,11 @@ fn to_lexicon_entry(w: Word, def: HashMap<KeyItem, Item>) -> WordDef {
         WordDef::Axiom(AxiomDef {
             docs: docs,
             f: Rc::new(move |_: Environment| {
-                Err(Error::Unimplemented{word: w.to_string(), context: None, source: None})
+                Err(Error::Unimplemented {
+                    word: w.to_string(),
+                    context: None,
+                    source: None,
+                })
             }),
         })
     }
@@ -1347,11 +1568,13 @@ pub fn lexicon(mut env: Environment) -> StepResult {
                     .or_insert(newdef2);
             }
             Ok(env)
-        },
-        Err(e) => {
-            Err(Error::Unimplemented { word: "lexicon".to_string(), source: Some(Box::new(e)), context: Some(env)})
         }
-    } 
+        Err(e) => Err(Error::Unimplemented {
+            word: "lexicon".to_string(),
+            source: Some(Box::new(e)),
+            context: Some(env),
+        }),
+    }
 }
 
 fn assoc_in(i: Item, ks: &[KeyItem], v: Item) -> Result<Associative, Error> {
@@ -1391,9 +1614,11 @@ pub fn assign(m: Item, ks: Item, v: Item) -> ItemResult {
 //TODO: this should really take a keylist like assign and lookup
 pub fn unassign(m: Item, k: Item) -> ItemResult {
     match m {
-        Item::List(m) => { unassign(Item::Assoc(to_hash(m)?), k)}
-        Item::Assoc(mut m) => { m.remove(&to_key_item(k)?);
-                            Ok(Item::Assoc(m))}
+        Item::List(m) => unassign(Item::Assoc(to_hash(m)?), k),
+        Item::Assoc(mut m) => {
+            m.remove(&to_key_item(k)?);
+            Ok(Item::Assoc(m))
+        }
         _ => Err(invalid_type_error(vec![&m], vec!["List"])),
     }
 }
@@ -1451,9 +1676,11 @@ pub fn decide(mut env: Environment) -> StepResult {
             if let Some(clause) = clause {
                 if let Item::List(mut clause) = clause {
                     if clause.len() != 2 {
-                        Err(Error::Count { expected: 2,
-                                           actual: clause.len(),
-                                           context: Some(Box::new(clause))})
+                        Err(Error::Count {
+                            expected: 2,
+                            actual: clause.len(),
+                            context: Some(Box::new(clause)),
+                        })
                     } else {
                         let test = clause.pop_front().unwrap();
                         let expr = clause.pop_front().unwrap();
@@ -1461,16 +1688,16 @@ pub fn decide(mut env: Environment) -> StepResult {
                         match (test, expr) {
                             (Item::List(test), Item::List(expr)) => {
                                 // construct if
-                            let testp = List::from(vec![Item::List(test), word("shield")]);
-                            let elsep = List::from(vec![Item::List(clauses), word("decide")]);
-                            let newexpr = List::from(vec![
-                                Item::List(testp),
-                                Item::List(expr),
-                                Item::List(elsep),
-                                word("if"),
-                            ]);
-                            append_expression(env, newexpr)
-                            },
+                                let testp = List::from(vec![Item::List(test), word("shield")]);
+                                let elsep = List::from(vec![Item::List(clauses), word("decide")]);
+                                let newexpr = List::from(vec![
+                                    Item::List(testp),
+                                    Item::List(expr),
+                                    Item::List(elsep),
+                                    word("if"),
+                                ]);
+                                append_expression(env, newexpr)
+                            }
                             (test, expr) => {
                                 Err(invalid_type_error(vec![&test, &expr], vec!["List", "List"]))
                             }
@@ -1488,7 +1715,11 @@ pub fn decide(mut env: Environment) -> StepResult {
             Err(invalid_type_error(vec![&clauses], vec!["List"]))
         }
     } else {
-        Err(Error::StackUnderflow{actual: 1, expected: 1, context: None})
+        Err(Error::StackUnderflow {
+            actual: 1,
+            expected: 1,
+            context: None,
+        })
     }
 }
 #+end_src
@@ -1547,20 +1778,25 @@ fn to_item(
                 if let edn_format::Value::String(s) = &**e {
                     Ok(Item::Bytes(base64::decode(s).unwrap()))
                 } else {
-                    Err(Error::Parser {message: "Invalid tag datatype for byte literal".to_string(),
-                                       context: Some(Box::new((*tag).clone())),
-                                       source: None})
+                    Err(Error::Parser {
+                        message: "Invalid tag datatype for byte literal".to_string(),
+                        context: Some(Box::new((*tag).clone())),
+                        source: None,
+                    })
                 }
-            }
-            else {
-                Err(Error::Parser {message: "Unsupported tag".to_string(),
-                                   context: Some(Box::new((*item).clone())),
-                                   source: None})
+            } else {
+                Err(Error::Parser {
+                    message: "Unsupported tag".to_string(),
+                    context: Some(Box::new((*item).clone())),
+                    source: None,
+                })
             }
         }
-        _ => Err(Error::Parser{ message: "Unsupported data literal".to_string(),
-                                context: Some(Box::new((*item).clone())),
-                                source: None }),
+        _ => Err(Error::Parser {
+            message: "Unsupported data literal".to_string(),
+            context: Some(Box::new((*item).clone())),
+            source: None,
+        }),
     }
 }
 
@@ -1600,9 +1836,11 @@ pub fn parse(s: String, standard_dictionary: &Option<Dictionary>) -> Result<List
     parser
         .map(move |r| match r {
             Ok(expr) => Ok(to_item(&expr, standard_dictionary)?),
-            Err(e) => Err(Error::Parser{message: "Invalid edn".to_string(),
-                                        source: Some(Box::new(e)),
-                                        context: None}),
+            Err(e) => Err(Error::Parser {
+                message: "Invalid edn".to_string(),
+                source: Some(Box::new(e)),
+                context: None,
+            }),
         })
         .collect()
 }
@@ -2121,7 +2359,13 @@ fn main(){
 
 testing type checking dynamic?
 #+begin_src rust
-enum Item {
+use std::ops::Range;
+let r = Range { start: 0, end: 5 };
+let x: Vec<i32> = r.into_iter().map(|i| i+1).collect();
 
-}
+println!("{:?}", x)
+    
 #+end_src
+
+#+RESULTS:
+: [1, 2, 3, 4, 5]
