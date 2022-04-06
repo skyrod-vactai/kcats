@@ -71,16 +71,17 @@ pub type Float = f64;
 pub type Associative = HashMap<KeyItem, Item>;
 
 lazy_static! {
-    pub static ref S_INTEGER: Intern<String> = Intern::new("integer".to_string());
-    pub static ref S_NUMBER: Intern<String> = Intern::new("number".to_string());
-    pub static ref S_LIST: Intern<String> = Intern::new("list".to_string());
-    pub static ref S_BOOLEAN: Intern<String> = Intern::new("boolean".to_string());
     pub static ref S_ASSOC: Intern<String> = Intern::new("association-list".to_string());
-    pub static ref S_WORD: Intern<String> = Intern::new("word".to_string());
-    pub static ref S_PROGRAM: Intern<String> = Intern::new("program".to_string());
-    pub static ref S_ITEM: Intern<String> = Intern::new("item".to_string());
-    pub static ref S_STRING: Intern<String> = Intern::new("string".to_string());
+    pub static ref S_BOOLEAN: Intern<String> = Intern::new("boolean".to_string());
     pub static ref S_BYTES: Intern<String> = Intern::new("bytes".to_string());
+    pub static ref S_FLOAT: Intern<String> = Intern::new("float".to_string());
+    pub static ref S_INTEGER: Intern<String> = Intern::new("integer".to_string());
+    pub static ref S_ITEM: Intern<String> = Intern::new("item".to_string());
+    pub static ref S_LIST: Intern<String> = Intern::new("list".to_string());
+    pub static ref S_NUMBER: Intern<String> = Intern::new("number".to_string());
+    pub static ref S_PROGRAM: Intern<String> = Intern::new("program".to_string());
+    pub static ref S_STRING: Intern<String> = Intern::new("string".to_string());
+    pub static ref S_WORD: Intern<String> = Intern::new("word".to_string());
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -91,7 +92,6 @@ pub enum Item {
     Bytes(Bytes),
     String(String),
     Word(Word),
-    Builtin(AxiomDef),
     Assoc(Associative),
     List(List),
     Env(Environment),
@@ -107,7 +107,7 @@ pub enum KeyItem {
     Bytes(Bytes),
     String(String),
     Word(Word),
-    Builtin(AxiomDef),
+    AxiomDef(AxiomDef),
     List(VecDeque<KeyItem>),
     Nothing,
 }
@@ -132,13 +132,6 @@ pub type StepResult = Result<Environment, Error>;
 pub type ItemResult = Result<Item, Error>;
 
 pub type StepFn = dyn Fn(Environment) -> StepResult;
-
-#[derive(Clone)]
-pub struct BuiltinWord {
-    pub word: Word,
-    pub f: Rc<StepFn>,
-    pub docs: WordDocs,
-}
 
 pub type AxiomWords = HashMap<Word, StepFn>;
 
@@ -257,7 +250,7 @@ impl TryFrom<Item> for List {
 impl TryFrom<Item> for AxiomDef {
     type Error = Error;
     fn try_from(i: Item) -> Result<Self, Self::Error> {
-        if let Item::Builtin(b) = i {
+        if let Item::AxiomDef(b) = i {
             Ok(b)
         } else {
             Err(Error::TypeMismatch {
@@ -386,7 +379,7 @@ pub fn to_key_item(i: Item) -> Result<KeyItem, Error> {
                 .collect::<Result<KeyList, Error>>()?,
         )),
         Item::Word(w) => Ok(KeyItem::Word(w)),
-        Item::Builtin(w) => Ok(KeyItem::Builtin(w)),
+        Item::AxiomDef(w) => Ok(KeyItem::AxiomDef(w)),
         Item::Boolean(b) => Ok(KeyItem::Boolean(b)),
         Item::Bytes(bs) => Ok(KeyItem::Bytes(bs)),
         Item::Nothing => Ok(KeyItem::Nothing),
@@ -406,7 +399,7 @@ pub fn to_value_item(i: KeyItem) -> Item {
             Item::List(l.iter().map(|i| to_value_item(i.clone())).collect::<List>())
         }
         KeyItem::Word(w) => Item::Word(w),
-        KeyItem::Builtin(b) => Item::Builtin(b),
+        KeyItem::AxiomDef(b) => Item::AxiomDef(b),
         KeyItem::Boolean(b) => Item::Boolean(b),
         KeyItem::Bytes(bs) => Item::Bytes(bs),
         KeyItem::Nothing => Item::Nothing,
@@ -722,6 +715,7 @@ pub fn add_builtins(d: Dictionary) -> Dictionary {
             ("dip", Rc::new(dip)),
             ("dipdown", Rc::new(dipdown)),
             ("discard", Rc::new(discard)),
+            ("eval-step", Rc::new(eval_step)),
             ("evert", Rc::new(evert)),
             ("execute", Rc::new(execute)),
             ("first", Rc::new(f_stack1(first))),
@@ -1245,7 +1239,7 @@ fn as_list(i: Option<&Item>) -> Option<List> {
 fn as_word(i: &KeyItem) -> Option<Word> {
     match i {
         KeyItem::Word(w) => Some(w.clone()),
-        KeyItem::Builtin(b) => Some(b.word.clone()),
+        KeyItem::AxiomDef(b) => Some(b.word.clone()),
         _ => None,
     }
 }
@@ -1420,6 +1414,122 @@ fn check_type(env: &Environment, i: &Item, w: Word) -> Result<(), Error> {
                 })
             }
         }
+        Item::Boolean(i) => {
+            if w == *S_BOOLEAN {
+                Ok(())
+            } else {
+                Err(Error::TypeMismatch {
+                    expected_types: vec![w.to_string()],
+                    actual_values: vec![Box::new(i.clone())],
+                    context: Some(Box::new(env.clone())),
+                })
+            }
+        }
+        Item::Float(i) => {
+            if w == *S_FLOAT || w == *S_NUMBER {
+                Ok(())
+            } else {
+                Err(Error::TypeMismatch {
+                    expected_types: vec![w.to_string()],
+                    actual_values: vec![Box::new(i.clone())],
+                    context: Some(Box::new(env.clone())),
+                })
+            }
+        }
+        Item::Bytes(i) => {
+            if w == *S_BYTES {
+                Ok(())
+            } else {
+                Err(Error::TypeMismatch {
+                    expected_types: vec![w.to_string()],
+                    actual_values: vec![Box::new(i.clone())],
+                    context: Some(Box::new(env.clone())),
+                })
+            }
+        }
+        Item::String(i) => {
+            if w == *S_STRING {
+                Ok(())
+            } else {
+                Err(Error::TypeMismatch {
+                    expected_types: vec![w.to_string()],
+                    actual_values: vec![Box::new(i.clone())],
+                    context: Some(Box::new(env.clone())),
+                })
+            }
+        }
+        Item::Word(i) => {
+            if w == *S_WORD {
+                Ok(())
+            } else {
+                Err(Error::TypeMismatch {
+                    expected_types: vec![w.to_string()],
+                    actual_values: vec![Box::new(i.clone())],
+                    context: Some(Box::new(env.clone())),
+                })
+            }
+
+        }
+        Item::AxiomDef(i) => {
+            if w == *S_WORD {
+                Ok(())
+            } else {
+                Err(Error::TypeMismatch {
+                    expected_types: vec![w.to_string()],
+                    actual_values: vec![Box::new(i.clone())],
+                    context: Some(Box::new(env.clone())),
+                })
+            }
+
+        }
+
+        Item::DerivedDef(i) => {
+            if w == *S_WORD {
+                Ok(())
+            } else {
+                Err(Error::TypeMismatch {
+                    expected_types: vec![w.to_string()],
+                    actual_values: vec![Box::new(i.clone())],
+                    context: Some(Box::new(env.clone())),
+                })
+            }
+        }        
+        Item::Assoc(i)  => {
+            if w == *S_ASSOC || w == *S_LIST {
+                Ok(())
+            } else {
+                Err(Error::TypeMismatch {
+                    expected_types: vec![w.to_string()],
+                    actual_values: vec![Box::new(i.clone())],
+                    context: Some(Box::new(env.clone())),
+                })
+            }
+
+        }
+        Item::Env(i) => {
+            if w == *S_ASSOC || w == *S_LIST {
+                Ok(())
+            } else {
+                Err(Error::TypeMismatch {
+                    expected_types: vec![w.to_string()],
+                    actual_values: vec![Box::new(i.clone())],
+                    context: Some(Box::new(env.clone())),
+                })
+            }
+
+        }
+        Item::Nothing  => {
+            if w == *S_LIST {
+                Ok(())
+            } else {
+                Err(Error::TypeMismatch {
+                    expected_types: vec![w.to_string()],
+                    actual_values: vec![Box::new(i.clone())],
+                    context: Some(Box::new(env.clone())),
+                })
+            }
+
+        }
         _ => Ok(()),
     }
 }
@@ -1529,7 +1639,7 @@ pub fn eval_step(mut env: Environment) -> StepResult {
             _ => {
                 // handle the case where it's a builtin and we want to use
                 // the owned value, so we pop it
-                if let Item::Builtin(builtin) = val {
+                if let Item::AxiomDef(builtin) = val {
                     if let Some(spec) = &builtin.docs.spec {
                         check_input_spec(&spec, &env)?
                     }
@@ -1566,8 +1676,10 @@ pub fn eval(env: Environment) -> StepResult {
     }
 }
 
-pub fn eval_step_inner(mut env: Environment) -> StepResult {
+pub fn eval_step_outer(mut env: Environment) -> StepResult {
+    let mut inner_env = Environment::try_from(env.stack.pop_front().unwrap())?;
     Ok(env)
+        
 }
 #+end_src
 
@@ -1589,7 +1701,7 @@ fn lookup_builtin(w: Word, standard_dictionary: Option<&Dictionary>) -> Item {
         //println!("Looking up {} in dict of {} words", w, dict.len());
         if let Some(def) = dict.get(&KeyItem::Word(w)) {
             if let Item::AxiomDef(a) = def {
-                return Item::Builtin(a.clone());
+                return Item::AxiomDef(a.clone());
             };
         }
     }
@@ -1652,7 +1764,7 @@ fn from_item(item: &Item) -> edn_format::Value {
                 .collect::<Vec<edn_format::Value>>(),
         ),
         Item::Word(w) => edn_format::Value::Symbol(edn_format::Symbol::from_name(w)),
-        Item::Builtin(w) => edn_format::Value::Symbol(edn_format::Symbol::from_name(&w.word)),
+        Item::AxiomDef(w) => edn_format::Value::Symbol(edn_format::Symbol::from_name(&w.word)),
         Item::Boolean(b) => edn_format::Value::Boolean(*b),
         Item::String(s) => edn_format::Value::String(s.to_string()),
         Item::Float(f) => edn_format::Value::from(*f),
