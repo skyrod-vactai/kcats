@@ -26,7 +26,7 @@ from stdin and execute it, then print the resulting stack.
 #+begin_src toml :tangle Cargo.toml
 [package]
 name = "kcats"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -94,6 +94,9 @@ pub enum Item {
     Builtin(AxiomDef),
     Assoc(Associative),
     List(List),
+    Env(Environment),
+    AxiomDef(AxiomDef),
+    DerivedDef(DerivedDef),
     Nothing,
 }
 
@@ -115,7 +118,7 @@ pub struct WordDocs {
     pub spec: Option<List>,
 }
 
-pub type Dictionary = HashMap<Word, WordDef>;
+pub type Dictionary = Associative;
 
 #[derive(Clone, PartialEq)]
 pub struct Environment {
@@ -152,12 +155,6 @@ pub struct DerivedDef {
     pub definition: List,
 }
 
-#[derive(Clone, PartialEq)]
-pub enum WordDef {
-    Axiom(AxiomDef),
-    Derived(DerivedDef),
-}
-
 // dictionary entries are equal if they have the same function reference,
 // no need to compare the function values
 impl PartialEq for AxiomDef {
@@ -177,21 +174,16 @@ impl Hash for AxiomDef {
 }
 
 pub trait Doc {
-    fn examples(self) -> Option<List>;
+    fn docs(self) -> Option<WordDocs>;
 }
 
-impl Doc for WordDef {
-    fn examples(self) -> Option<List> {
+impl Doc for Item {
+    fn docs(self) -> Option<WordDocs> {
         match self {
-            WordDef::Axiom(a) => a.docs.examples,
-            WordDef::Derived(a) => a.docs.examples,
+            Item::AxiomDef(a) => Some(a.docs),
+            Item::DerivedDef(a) => Some(a.docs),
+            _ => None
         }
-    }
-}
-
-impl Doc for DerivedDef {
-    fn examples(self) -> Option<List> {
-        self.docs.examples
     }
 }
 
@@ -291,6 +283,75 @@ impl TryFrom<Item> for Int {
         }
     }
 }
+
+impl TryFrom<Item> for String {
+    type Error = Error;
+    fn try_from(i: Item) -> Result<Self, Self::Error> {
+        if let Item::String(i) = i {
+            Ok(i)
+        } else {
+            Err(Error::TypeMismatch {
+                expected_types: vec!["String".to_string()],
+                actual_values: vec![Box::new(i)],
+                context: None,
+            })
+        }
+    }
+}
+
+impl TryFrom<Item> for Associative {
+    type Error = Error;
+    fn try_from(i: Item) -> Result<Self, Self::Error> {
+        match i {
+            Item::Assoc(a) => Ok(a),
+            Item::List(l) => Ok(to_hash(l)?),
+            Item::Nothing => Ok(Associative::new()),
+            _ => Err(Error::TypeMismatch {
+                expected_types: vec!["Associative".to_string()],
+                actual_values: vec![Box::new(i)],
+                context: None,
+            }),
+        }
+    }
+}
+
+impl TryFrom<Item> for Environment {
+    type Error = Error;
+    fn try_from(i: Item) -> Result<Self, Self::Error> {
+        if let Item::Env(i) = i {
+            Ok(i)
+        } else {
+            Err(Error::TypeMismatch {
+                expected_types: vec!["Environment".to_string()],
+                actual_values: vec![Box::new(i)],
+                context: None,
+            })
+        }
+    }
+}
+// impl TryFrom<Associative> for Environment {
+//     type Error = Error;
+//     fn try_from(i: Item) -> Result<Self, Self::Error> {
+//         let 
+//     }
+// }
+
+// impl TryFrom<Item> for Environment {
+//     type Error = Error;
+//     fn try_from(i: Item) -> Result<Self, Self::Error> {
+//         let h = 
+//         match i {
+//             Item::Assoc(a) => Ok(a),
+//             Item::List(l) => Ok(to_hash(l)?),
+//             Item::Nothing => Ok(Associative::new()),
+//             _ => Err(Error::TypeMismatch {
+//                 expected_types: vec!["Associative".to_string()],
+//                 actual_values: vec![Box::new(i)],
+//                 context: None,
+//             }),
+//         }
+//     }
+// }
 
 pub fn get_item(i: Item, index: usize) -> Option<Item> {
     if let Item::List(l) = i {
@@ -405,173 +466,6 @@ use internment::Intern;
 use std::io;
 use std::io::BufRead;
 use std::mem;
-use std::ops::Range;
-
-fn check_type(env: &Environment, i: &Item, w: Word) -> Result<(), Error> {
-    match i {
-        Item::Int(i) => {
-            if w == *S_INTEGER || w == *S_NUMBER || w == *S_ITEM {
-                Ok(())
-            } else {
-                Err(Error::TypeMismatch {
-                    expected_types: vec![w.to_string()],
-                    actual_values: vec![Box::new(i.clone())],
-                    context: Some(Box::new(env.clone())),
-                })
-            }
-        }
-        Item::List(i) => {
-            if w == *S_LIST || w == *S_ITEM || w == *S_ASSOC || w == *S_PROGRAM {
-                Ok(())
-            } else {
-                Err(Error::TypeMismatch {
-                    expected_types: vec![w.to_string()],
-                    actual_values: vec![Box::new(i.clone())],
-                    context: Some(Box::new(env.clone())),
-                })
-            }
-        }
-        _ => Ok(()),
-    }
-}
-
-fn check_stack_depth(env: &Environment, min_depth: usize) -> Result<(), Error> {
-    //println!("Checking stack has at least {} items", min_depth);
-    if env.stack.len() < min_depth {
-        Err(Error::StackUnderflow {
-            actual: env.stack.len(),
-            expected: min_depth,
-            context: Some(Box::new(env.clone())),
-        })
-    } else {
-        Ok(())
-    }
-}
-
-fn check_input_spec(spec: &List, env: &Environment) -> Result<(), Error> {
-    let input_spec = spec.front().unwrap();
-    if let Item::List(specs) = input_spec {
-        check_stack_depth(env, specs.len())?;
-        let indexes = Range {
-            start: 0,
-            end: specs.len(),
-        };
-
-        indexes
-            .into_iter()
-            .map(|i| {
-                let item = env.stack.get(i).unwrap();
-                let spec = specs.get(i).unwrap();
-                match spec {
-                    Item::List(named) => {
-                        if let Item::Word(w) = named.get(0).unwrap() {
-                            check_type(env, item, *w)
-                        } else {
-                            Err(Error::TypeMismatch {
-                                expected_types: vec!["List".to_string()],
-                                actual_values: vec![Box::new(named.clone())],
-                                context: Some(Box::new(env.clone())),
-                            })
-                        }
-                    }
-                    Item::Word(w) => check_type(env, item, *w),
-                    _ => Err(Error::TypeMismatch {
-                        expected_types: vec!["List".to_string()],
-                        actual_values: vec![Box::new(spec.clone())],
-                        context: Some(Box::new(spec.clone())),
-                    }),
-                }
-            })
-            .collect::<Result<(), Error>>()
-    } else {
-        Err(Error::TypeMismatch {
-            expected_types: vec!["List".to_string()],
-            actual_values: vec![Box::new(spec.clone())],
-            context: Some(Box::new(env.clone())),
-        })
-    }
-}
-
-fn eval_step(mut env: Environment) -> StepResult {
-    //println!("{:?}", env);
-    let next_item = env.expression.front();
-
-    if let Some(val) = next_item {
-        match val {
-            Item::Word(word) => {
-                if let Some(dfn) = env.dictionary.get(word) {
-                    match dfn {
-                        WordDef::Axiom(d) => {
-                            if let Some(spec) = &d.docs.spec {
-                                check_input_spec(&spec, &env)?
-                            } else {
-                                println!("No spec for {}!", word);
-                            }
-                            env.expression.pop_front();
-                            let f = d.f.clone();
-
-                            (f)(env)
-                        }
-                        WordDef::Derived(d) => {
-                            if let Some(spec) = &d.docs.spec {
-                                check_input_spec(&spec, &env)?
-                            } else {
-                                println!("No spec for {}!", word);
-                            }
-                            env.expression.pop_front();
-                            let mut items = d.definition.clone();
-                            mem::swap(&mut items, &mut env.expression);
-                            env.expression.extend(items);
-
-                            Ok(env)
-                        }
-                    }
-                } else {
-                    Err(Error::UnknownWord {
-                        word: word.to_string(),
-                        context: Some(Box::new(env)),
-                    })
-                }
-            }
-            _ => {
-                // handle the case where it's a builtin and we want to use
-                // the owned value, so we pop it
-                if let Item::Builtin(builtin) = val {
-                    if let Some(spec) = &builtin.docs.spec {
-                        check_input_spec(&spec, &env)?
-                    }
-                    let b = AxiomDef::try_from(env.expression.pop_front().unwrap())?;
-                    Ok((b.f)(env)?)
-                } else {
-                    // not a word, just push onto stack
-                    env.stack.push_front(env.expression.pop_front().unwrap());
-                    Ok(env)
-                }
-            }
-        }
-    } else {
-        Err(Error::Count {
-            expected: 1,
-            actual: 0,
-            context: Some(Box::new("Expression is empty".to_string())),
-        })
-    }
-}
-
-fn eval(env: Environment) -> StepResult {
-    let mut result: StepResult = Result::Ok(env);
-    loop {
-        if let Ok(env) = result {
-            if !env.expression.is_empty() {
-                result = eval_step(env);
-            } else {
-                break Ok(env);
-            }
-        } else {
-            break result;
-        }
-    }
-}
 
 fn print_result(r: StepResult) {
     match r {
@@ -616,7 +510,7 @@ fn main() {
     match parse_result {
         Ok(program) => {
             env.expression.extend(program);
-            print_result(eval(env));
+            print_result(axiom::eval(env));
         }
         Err(e) => {
             println!("Error parsing input: {:?}", e);
@@ -628,7 +522,7 @@ fn test_example(mut env: Environment, w: Word, program: List, expected: List) ->
     let p = program.clone();
     env.expression.extend(program);
     //let res = eval(env).ok()?;
-    match eval(env) {
+    match axiom::eval(env) {
         Err(e) => Some(e),
         Ok(res) => {
             if res.stack == expected {
@@ -652,9 +546,11 @@ mod tests {
     use test_case::test_case;
 
     fn test_word(standard_env: Environment, w: Word) -> Vec<Error> {
-        if let Some(d) = standard_env.dictionary.get(&w) {
+        if let Some(d) = standard_env.dictionary.get(&KeyItem::Word(w)) {
             d.clone()
-                .examples()
+                .docs()
+                .unwrap()
+                .examples
                 .iter()
                 .filter_map(|ex| {
                     let x = ex.get(0).unwrap().clone();
@@ -757,19 +653,8 @@ use std::fmt::Debug;
 use std::fs;
 use std::iter;
 use std::mem;
+use std::ops::Range;
 use std::rc::Rc;
-
-fn check_stack_depth(env: &Environment, min_depth: usize) -> Result<(), Error> {
-    if env.stack.len() < min_depth {
-        Err(Error::StackUnderflow {
-            actual: env.stack.len(),
-            expected: min_depth,
-            context: Some(Box::new(env.clone())),
-        })
-    } else {
-        Ok(())
-    }
-}
 
 fn f_stack1(f: fn(Item) -> ItemResult) -> impl Fn(Environment) -> StepResult {
     move |mut env: Environment| {
@@ -803,12 +688,13 @@ fn f_stack3(f: fn(Item, Item, Item) -> ItemResult) -> impl Fn(Environment) -> St
 
 fn update_axiom_entries<'a>(mut d: Dictionary, updates: Vec<(&str, Rc<StepFn>)>) -> Dictionary {
     for (w, f) in updates {
-        d.entry(Word::from(w)).and_modify(|e| match e {
-            WordDef::Axiom(a) => {
-                a.f = f;
-            }
-            _ => {}
-        });
+        d.entry(KeyItem::Word(Word::from(w)))
+            .and_modify(|e| match e {
+                Item::AxiomDef(a) => {
+                    a.f = f;
+                }
+                _ => {}
+            });
     }
     d
 }
@@ -854,6 +740,7 @@ pub fn add_builtins(d: Dictionary) -> Dictionary {
             ("and", Rc::new(f_stack2(and))),
             ("pack", Rc::new(f_stack2(pack))),
             ("range", Rc::new(range)),
+            ("read", Rc::new(read)),
             ("recur", Rc::new(recur)),
             ("sink", Rc::new(sink)),
             ("step", Rc::new(step)),
@@ -878,12 +765,12 @@ pub fn read_lexicon_file(filename: &str, mut env: Environment) -> StepResult {
                 let newdef = to_lexicon_entry(word, h);
                 let newdef2 = newdef.clone();
                 env.dictionary
-                    .entry(word)
+                    .entry(KeyItem::Word(word))
                     .and_modify(|e| match (e, newdef) {
-                        (WordDef::Axiom(a), WordDef::Axiom(new_a)) => {
+                        (Item::AxiomDef(a), Item::AxiomDef(new_a)) => {
                             a.docs = new_a.docs;
                         }
-                        (WordDef::Derived(d), WordDef::Derived(new_d)) => {
+                        (Item::DerivedDef(d), Item::DerivedDef(new_d)) => {
                             d.docs = new_d.docs;
                             d.definition = new_d.definition;
                         }
@@ -1363,19 +1250,19 @@ fn as_word(i: &KeyItem) -> Option<Word> {
     }
 }
 
-fn to_lexicon_entry(w: Word, def: HashMap<KeyItem, Item>) -> WordDef {
+fn to_lexicon_entry(w: Word, def: HashMap<KeyItem, Item>) -> Item {
     //println!("{:?}", def);
     let docs = WordDocs {
         examples: as_list(def.get(&key_item("examples"))),
         spec: as_list(def.get(&key_item("spec"))),
     };
     if let Some(d) = as_list(def.get(&key_item("definition"))) {
-        WordDef::Derived(DerivedDef {
+        Item::DerivedDef(DerivedDef {
             definition: d,
             docs: docs,
         })
     } else {
-        WordDef::Axiom(AxiomDef {
+        Item::AxiomDef(AxiomDef {
             word: w,
             docs: docs,
             f: Rc::new(move |_: Environment| {
@@ -1390,22 +1277,16 @@ fn to_lexicon_entry(w: Word, def: HashMap<KeyItem, Item>) -> WordDef {
 }
 
 fn assoc_in(i: Item, ks: &[KeyItem], v: Item) -> Result<Associative, Error> {
-    match i {
-        Item::Assoc(mut h) => {
-            if let [k, ks @ ..] = ks {
-                if ks.is_empty() {
-                    h.insert(k.clone(), v);
-                } else {
-                    let inner = h.get(&k.clone()).unwrap_or(&Item::Nothing).clone();
-                    h.insert(k.clone(), Item::Assoc(assoc_in(inner, ks, v)?));
-                }
-            }
-            Ok(h)
+    let mut h = Associative::try_from(i)?;
+    if let [k, ks @ ..] = ks {
+        if ks.is_empty() {
+            h.insert(k.clone(), v);
+        } else {
+            let inner = h.get(&k.clone()).unwrap_or(&Item::Nothing).clone();
+            h.insert(k.clone(), Item::Assoc(assoc_in(inner, ks, v)?));
         }
-        Item::Nothing => assoc_in(Item::Assoc(Associative::new()), ks, v),
-        Item::List(l) => assoc_in(Item::Assoc(to_hash(l.clone())?), ks, v),
-        _ => Err(invalid_type_error(vec![&i], vec!["List"])),
     }
+    Ok(h)
 }
 
 pub fn assign(m: Item, ks: Item, v: Item) -> ItemResult {
@@ -1421,14 +1302,9 @@ pub fn assign(m: Item, ks: Item, v: Item) -> ItemResult {
 
 //TODO: this should really take a keylist like assign and lookup
 pub fn unassign(m: Item, k: Item) -> ItemResult {
-    match m {
-        Item::List(m) => unassign(Item::Assoc(to_hash(m)?), k),
-        Item::Assoc(mut m) => {
-            m.remove(&to_key_item(k)?);
-            Ok(Item::Assoc(m))
-        }
-        _ => Err(invalid_type_error(vec![&m], vec!["List"])),
-    }
+    let mut m = Associative::try_from(m)?;
+    m.remove(&to_key_item(k)?);
+    Ok(Item::Assoc(m))
 }
 
 pub fn lookup(m: Item, k: Item) -> ItemResult {
@@ -1512,6 +1388,187 @@ pub fn decide(mut env: Environment) -> StepResult {
         Ok(env)
     }
 }
+
+pub fn read(mut env: Environment) -> StepResult {
+    let s = String::try_from(env.stack.pop_front().unwrap())?;
+    let parsed = serialize::parse(s, Some(&env.dictionary))?;
+    env.stack.push_front(Item::List(parsed));
+    Ok(env)
+}
+
+fn check_type(env: &Environment, i: &Item, w: Word) -> Result<(), Error> {
+    match i {
+        Item::Int(i) => {
+            if w == *S_INTEGER || w == *S_NUMBER || w == *S_ITEM {
+                Ok(())
+            } else {
+                Err(Error::TypeMismatch {
+                    expected_types: vec![w.to_string()],
+                    actual_values: vec![Box::new(i.clone())],
+                    context: Some(Box::new(env.clone())),
+                })
+            }
+        }
+        Item::List(i) => {
+            if w == *S_LIST || w == *S_ITEM || w == *S_ASSOC || w == *S_PROGRAM {
+                Ok(())
+            } else {
+                Err(Error::TypeMismatch {
+                    expected_types: vec![w.to_string()],
+                    actual_values: vec![Box::new(i.clone())],
+                    context: Some(Box::new(env.clone())),
+                })
+            }
+        }
+        _ => Ok(()),
+    }
+}
+
+fn check_stack_depth(env: &Environment, min_depth: usize) -> Result<(), Error> {
+    //println!("Checking stack has at least {} items", min_depth);
+    if env.stack.len() < min_depth {
+        Err(Error::StackUnderflow {
+            actual: env.stack.len(),
+            expected: min_depth,
+            context: Some(Box::new(env.clone())),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn check_input_spec(spec: &List, env: &Environment) -> Result<(), Error> {
+    let input_spec = spec.front().unwrap();
+    if let Item::List(specs) = input_spec {
+        check_stack_depth(env, specs.len())?;
+        let indexes = Range {
+            start: 0,
+            end: specs.len(),
+        };
+
+        indexes
+            .into_iter()
+            .map(|i| {
+                let item = env.stack.get(i).unwrap();
+                let spec = specs.get(i).unwrap();
+                match spec {
+                    Item::List(named) => {
+                        if let Item::Word(w) = named.get(0).unwrap() {
+                            check_type(env, item, *w)
+                        } else {
+                            Err(Error::TypeMismatch {
+                                expected_types: vec!["List".to_string()],
+                                actual_values: vec![Box::new(named.clone())],
+                                context: Some(Box::new(env.clone())),
+                            })
+                        }
+                    }
+                    Item::Word(w) => check_type(env, item, *w),
+                    _ => Err(Error::TypeMismatch {
+                        expected_types: vec!["List".to_string()],
+                        actual_values: vec![Box::new(spec.clone())],
+                        context: Some(Box::new(spec.clone())),
+                    }),
+                }
+            })
+            .collect::<Result<(), Error>>()
+    } else {
+        Err(Error::TypeMismatch {
+            expected_types: vec!["List".to_string()],
+            actual_values: vec![Box::new(spec.clone())],
+            context: Some(Box::new(env.clone())),
+        })
+    }
+}
+
+pub fn eval_step(mut env: Environment) -> StepResult {
+    //println!("{:?}", env);
+    let next_item = env.expression.front();
+
+    if let Some(val) = next_item {
+        match val {
+            Item::Word(word) => {
+                if let Some(dfn) = env.dictionary.get(&KeyItem::Word(*word)) {
+                    match dfn {
+                        Item::AxiomDef(d) => {
+                            if let Some(spec) = &d.docs.spec {
+                                check_input_spec(&spec, &env)?
+                            } else {
+                                println!("No spec for {}!", word);
+                            }
+                            env.expression.pop_front();
+                            let f = d.f.clone();
+
+                            (f)(env)
+                        }
+                        Item::DerivedDef(d) => {
+                            if let Some(spec) = &d.docs.spec {
+                                check_input_spec(&spec, &env)?
+                            } else {
+                                println!("No spec for {}!", word);
+                            }
+                            env.expression.pop_front();
+                            let mut items = d.definition.clone();
+                            mem::swap(&mut items, &mut env.expression);
+                            env.expression.extend(items);
+
+                            Ok(env)
+                        }
+                        _ => Err(Error::UnknownWord {
+                            word: word.to_string(),
+                            context: Some(Box::new(env)),
+                        }),
+                    }
+                } else {
+                    Err(Error::UnknownWord {
+                        word: word.to_string(),
+                        context: Some(Box::new(env)),
+                    })
+                }
+            }
+            _ => {
+                // handle the case where it's a builtin and we want to use
+                // the owned value, so we pop it
+                if let Item::Builtin(builtin) = val {
+                    if let Some(spec) = &builtin.docs.spec {
+                        check_input_spec(&spec, &env)?
+                    }
+                    let b = AxiomDef::try_from(env.expression.pop_front().unwrap())?;
+                    Ok((b.f)(env)?)
+                } else {
+                    // not a word, just push onto stack
+                    env.stack.push_front(env.expression.pop_front().unwrap());
+                    Ok(env)
+                }
+            }
+        }
+    } else {
+        Err(Error::Count {
+            expected: 1,
+            actual: 0,
+            context: Some(Box::new("Expression is empty".to_string())),
+        })
+    }
+}
+
+pub fn eval(env: Environment) -> StepResult {
+    let mut result: StepResult = Result::Ok(env);
+    loop {
+        if let Ok(env) = result {
+            if !env.expression.is_empty() {
+                result = eval_step(env);
+            } else {
+                break Ok(env);
+            }
+        } else {
+            break result;
+        }
+    }
+}
+
+pub fn eval_step_inner(mut env: Environment) -> StepResult {
+    Ok(env)
+}
 #+end_src
 
 #+RESULTS:
@@ -1530,8 +1587,8 @@ use std::fmt;
 fn lookup_builtin(w: Word, standard_dictionary: Option<&Dictionary>) -> Item {
     if let Some(dict) = standard_dictionary {
         //println!("Looking up {} in dict of {} words", w, dict.len());
-        if let Some(def) = dict.get(&w) {
-            if let WordDef::Axiom(a) = def {
+        if let Some(def) = dict.get(&KeyItem::Word(w)) {
+            if let Item::AxiomDef(a) = def {
                 return Item::Builtin(a.clone());
             };
         }
