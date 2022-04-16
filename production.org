@@ -2342,3 +2342,113 @@ println!("{:?}", x)
 
 #+RESULTS:
 : [1, 2, 3, 4, 5]
+
+error recovery
+
+#+begin_src kcats
+2 [1 4 0] [[/] [discard 0] recover] map
+
+[1 0 /] [discard 0] recover
+1 [0 /] [discard 0] . recover
+1 . snapshot
+    [0 /] inject first
+    [error?] [discard 0] [] if
+    resume  
+err [error?]  
+
+; inject the program into a snapshot. If there's an error on top
+; afterward, inject the recovery in there too. It'll have access to
+; the whole context. If there's no error, evert and drop the ToS.
+
+;; wait why is there even a snapshot? to let the recovery access the
+;; stack without having to guess what's on it.
+
+[1 0 /] . execute
+. 1 0 /
+err . [discard 0] execute resume
+                        ;; ^ this is in the expression so keep going, actual word doesn't do anything
+
+
+;; when the ToS is err, how do we know whether to stop?  we can look
+;; at the expression to see what's coming. We can't do that at every
+;; step of the entire execution but we don't have to. Just when ToS =
+;; err. The challenge is to encode this just with the stack/expr and
+;; no extra state. We can put a word like "continue" in the expr, but
+;; at some point we actually have to have an err on ToS and do
+;; something with it. The only place we can put some kind of flag not
+;; to abort, is in the expression (or maybe the dictionary).
+
+;; another approach is to explicitly continue unless halt is called,
+;; but the error-producer doesn't know whether the error can be
+;; handled or not.
+
+
+;; how to unwind. can we just naively unwind to the next instance of
+;; 'recover' in the expression? or will quoted programs mess this up?
+;; Let's work through it
+
+;; here the recover is quoted, but by the time an error occurs and we
+;; look at the expression, it'll be there:
+2 [1 4 0] [[/ 12 +] [discard 0] recover] map
+
+2 err . 12 + resume [error?] [discard 0] if
+2 err . [error?] [discard 0] [] if 
+
+;; so the problem is even after we've unwound the expression to
+;; 'resume', the error is still on the ToS! Now we want to actually do
+;; the recovery, but we've already gotten rid of the flag that tells
+;; us we're doing that. Maybe we can modify the error object itself to
+;; note that it's been flagged for processing. Maybe [[type error]
+;; [detected? true] [message "oops"]]. Or maybe we can convert it from
+;; the error object to a richer object that contains the whole
+;; stack/expr at the time it happened.
+
+;; maybe we need a primitive here: fail, which will put a new item on
+;; ToS which includes the whole env field plus a message field to
+;; describe what is wrong.
+
+;; eg
+
+1 0 /
+
+[environment [[stack [1 0]]
+              [expression [/]]
+              [error "division by zero"]]]
+
+1 0 . "division by zero" capture /
+
+[environment [[stack [1 0]]
+              [expression [/]]
+              [error "division by zero"]]] . /
+
+;; ok what's the best we got so far?
+
+;; i think it's recover/resume, without requiring nested env. Have the
+;; error type with a flag detected?. Eval will do the following: if
+;; there's an error on top, and there is no 'detected?' field, unwind
+;; the expression to 'resume' (if there is one, otherwise clean the
+;; expression). Set the detected field and continue. presumably what's
+;; next is the error handler if there's anything left in the
+;; expression.
+
+;; ok this is good but it'd be nice to know what the expression was
+;; before it gets unwound. For example what if the handler wants to
+;; log the error? By the time it can do that, the original word that
+;; errored is not in the expression anymore. The error object would
+;; have to contain a snapshot (not just of the stack, but the
+;; expression too). what about snapshotting the stack and cherry
+;; picking the error object before the recovery? How does the recovery
+;; distinguish different types of errors (java's catch-by-class is
+;; kind of weak)
+
+;;eg
+
+1 "foo" + 0 /
+
+;; there's 2 things wrong here, what if we only want to recover from
+;; division by zero? well, we can only wrap / in a recover. ok waht about this
+
+"foo" 0 /
+
+;; this will actually error with type mismatch
+#+end_src
