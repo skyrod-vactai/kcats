@@ -1854,10 +1854,130 @@ Should return Result objects from to_item. I don't think it is
 necessary for from_item - since we're using a subset of edn, all Items
 should be convertible to valid edn. But not all valid edn is
 convertible to an Item.
-*** TODO Association list and list of equal content don't compare equal
+*** INPROGRESS Association list and list of equal content don't compare equal
+**** Description
 Probably need a custom PartialEq impl for Item here that converts the
 list to a hash before comparing. Return false if the item doesn't
-convert. 
+convert.
+
+The sticky issue here is that when we read a literal like =[[type
+foo][value bar] ]=, how do we know whether it should be compared to
+something else as a hashmap (that ignores order) or a plain list (that
+doesn't). We can probably deduce that if one of the arguments is a
+hashmap, then the other should be treated as one. However what if both
+are plain lists? It's still possible the intent was hashmap.
+**** Hacky Solution
+what if you execute =[[a b][c d] ] [[c d][a b] ] == ? It's impossible
+to know the intent. I think maybe the best way out is to treat
+anything associative-shaped as associative, and if the user wants
+ordered comparison, let him use a different operator, =ordered== or
+something.
+
+So the comparison of two items that are either List or Assoc goes like this:
+
+If either item is Assoc, then convert the other to Assoc (if
+necessary) and do straight =.
+
+If they're both List, compare lengths. If not equal, return
+false. Otherwise, examine items- If they're all pairs, convert both to
+assoc. finally do straight =.
+**** Better solution
+Add a word =associative=. If that follows a list, it's converted to a
+hashmap and then it's easy to compare to another hashmap. The
+representation is unchanged of course. But it lets the programmer
+specify the intent of how === should behave.
+
+This does reveal a problem with the unit tests that are specified as
+examples in the lexicon. Those tests will execute the program and then
+compare the representation of the resulting stack, with the
+representation given. As we now can see, comparing representations is
+insufficient, we need to be able to compare actual implementations.
+
+That means, the unit test's expected value should be calculated and
+not just read in. For most tests, no changes will be required (it's
+just putting values on the stack and no further calculation needed).
+
+But in the end we'll need to compare actual stack to expected stack,
+not a stack to a representation. So the unit test logic will need to
+run two environments, the actual and the expected, and then compare them.
+
+The previous solution just isn't going to cut it - when we go to
+implement sets it's going to be completely impossible to use a
+heuristic to figure out what the intent was. Lists and sets will look
+the same. So in the case of sets we'll have to specify the word =set=.
+
+Do we have to be explicit when comparing list to associative?  we
+could either always return false (they're different types), or we
+could compare them as lists or as maps.
+
+The question then is if the two intents don't match, what do we do?  I
+can't think of a reasonable answer- does order matter? We have
+conflicting answer with no way to resolve it. Maybe it's safest to
+just return false.
+
+You can argue maybe even if order matters, maybe the two lists are in
+the same order and should therefore compare equal. But associatives
+don't have a defined order, so that would be just leaving it up to
+chance and it wouldn't even be consistent across time. So that doesn't
+seem wise.
+
+So here's the plan: 
+Examples:
+#+begin_src kcats
+[[a b] [c d]] associative
+[[c d] [a b]] associative
+=
+=> true
+
+[[a b] [c d]]
+[[c d] [a b]] associative
+=
+=> false
+
+[[a b] [c d]]
+[[a b] [c d]] associative
+=
+=> false
+
+[[a b] [c d]]
+[[a b] [c d]]
+=
+=> true
+
+[a a b c]
+[a b c]
+=
+=> false
+
+[a b c] set
+[a b c]
+=
+=> false
+
+[a b c] set
+[b a c] set
+=
+=> true
+#+end_src
+*** TODO Change unit tests to make the expected take a program and eval it
+This is to fix the cases that result in associatives or sets where
+order doesn't matter but we don't have a way to declare how the values
+should be conmpared. We can't just compare representations, we need to
+compare two actual stacks.
+
+So instead of
+#+begin_src kcats
+[[[[a b] [c d]] [a] 5 assign]
+ [[[a 5] [c d]]]]
+#+end_src
+
+We should write
+#+begin_src kcats
+[[[[a b] [c d]] [a] 5 assign]
+ [[[a 5] [c d]] associative]]
+#+end_src
+
+So that the two stacks will compare equal.
 *** TODO Interactive mode
 run with =kcats -i= for interactive, where you get a repl-like
 prompt. Each prompt accepts kcats items as input, and updates the
@@ -1872,6 +1992,8 @@ normally does this sort of thing.
 *** TODO Package the binary for various platforms
 Would be nice to build rpms/debs etc so users can skip the nasty build
 process.
+*** TODO 'read' on invalid edn consumes the string argument
+It should attempt to parse before popping the item off the stack.
 * Notes
 ** Bootstrapping
 + Builtin words need to exist *before* the derived words are read from
