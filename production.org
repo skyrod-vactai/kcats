@@ -71,13 +71,13 @@ pub type Float = f64;
 
 pub type Associative = HashMap<KeyItem, Item>;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct Error {
     pub data: Associative,
 }
 
 lazy_static! {
-    pub static ref S_ASSOC: Intern<String> = Intern::new("association-list".to_string());
+    pub static ref S_ASSOC: Intern<String> = Intern::new("association".to_string());
     pub static ref S_BOOLEAN: Intern<String> = Intern::new("boolean".to_string());
     pub static ref S_BYTES: Intern<String> = Intern::new("bytes".to_string());
     pub static ref S_FLOAT: Intern<String> = Intern::new("float".to_string());
@@ -240,18 +240,12 @@ impl Error {
         Error {
             data: HashMap::from([
                 (word_key("type"), word("error")),
-                (
-                    word_key("asked"),
-                    Item::List(asked),
-                ),
-                (
-                    word_key("reason"),
-                    Item::String(reason.to_string()),
-                ),
+                (word_key("asked"), Item::List(asked)),
+                (word_key("reason"), Item::String(reason.to_string())),
             ]),
         }
     }
-    
+
     pub fn stack_underflow() -> Error {
         Error::create(wrap(word("consume")), "not enough items on stack")
     }
@@ -269,23 +263,28 @@ impl Error {
     }
 
     pub fn short_list(expected: Int) -> Error {
-        Error::create(List::from_iter([
-            word("count"),
-            Item::Int(expected),
-            word(">=")
-        ]), "list had too few items")
+        Error::create(
+            List::from_iter([word("count"), Item::Int(expected), word(">=")]),
+            "list had too few items",
+        )
     }
 
     pub fn list_count(expected: Int) -> Error {
-        Error::create(List::from_iter([
-            word("count"),
-            Item::Int(expected),
-            word("=")
-        ]), "list had wrong number of items")
+        Error::create(
+            List::from_iter([word("count"), Item::Int(expected), word("=")]),
+            "list had wrong number of items",
+        )
     }
 
     pub fn parse(reason: &str) -> Error {
-        Error::create(wrap(word("read")), reason)       
+        Error::create(wrap(word("read")), reason)
+    }
+
+    pub fn test_assertion(program: List, expected: List, actual: List) -> Error {
+        let mut e = Error::create(program, "assertion failed");
+        e.data.insert(word_key("expected"), Item::List(expected));
+        e.data.insert(word_key("actual"), Item::List(actual));
+        return e;
     }
 }
 
@@ -344,7 +343,7 @@ impl TryFrom<Item> for Associative {
             Item::Assoc(a) => Ok(a),
             Item::List(l) => Ok(to_hash(l)?),
             Item::Nothing => Ok(Associative::new()),
-            _ => Err(Error::expected("associative")),
+            _ => Err(Error::expected("association"))
         }
     }
 }
@@ -557,32 +556,24 @@ mod tests {
     use internment::Intern;
     use test_case::test_case;
 
-    #[derive(Debug)]
-    struct TestError {
-        expected: String,
-        actual: String,
-        program: String
-    }
-    
-    fn test_example(mut env: Environment, w: Word, program: List, expected: List) -> Option<TestError> {
-        let p = program.clone();
-        env.expression.extend(program);
+    fn test_example(
+        mut prog_env: Environment,
+        w: Word,
+        program: List,
+        expected: List,
+    ) -> Option<Error> {
+        let mut exp_env = prog_env.clone();
+        prog_env.expression.extend(program.clone());
+        exp_env.expression.extend(expected.clone());
+
         //let res = eval(env).ok()?;
-        env = axiom::eval(env);
-        let tos = env.stack.front().unwrap();
-        match tos {
-            Item::Error(e) => Some(*e),
-            _ => {
-                if env.stack == expected {
-                    None
-                } else {
-                    Some(TestError {
-                        expected: serialize::emit(&Item::List(expected)),
-                        actual: serialize::emit(&Item::List(env.stack)),
-                        program: serialize::emit(&Item::List(p)),
-                    })
-                }
-            }
+        prog_env = axiom::eval(prog_env);
+        exp_env = axiom::eval(exp_env);
+        if prog_env.stack == exp_env.stack {
+            None
+        } else {
+            println!("uh oh expected {:?} got {:?}", exp_env.stack, prog_env.stack);
+            Some(Error::test_assertion(program, expected, prog_env.stack))
         }
     }
 
@@ -599,9 +590,7 @@ mod tests {
                         (Item::List(p), Item::List(exp)) => {
                             test_example(standard_env.clone(), w.clone(), p.clone(), exp.clone())
                         }
-                        (p, exp) => {
-                            axiom::invalid_type_error(vec![&p, &exp], vec!["List", "List"]).err()
-                        }
+                        (p, exp) => Some(Error::expected("list")),
                     }
                 })
                 .collect::<Vec<Error>>()
@@ -617,7 +606,7 @@ mod tests {
     #[test_case("and")]
     #[test_case("any?" ; "is_any")]
     #[test_case("assign")]
-    #[test_case("associative?")]
+    #[test_case("association?" ; "is_association")]
     #[test_case("branch")]
     #[test_case("clone")]
     #[test_case("count")]
@@ -772,7 +761,8 @@ pub fn add_builtins(d: Dictionary) -> Dictionary {
             (">", Rc::new(f_stack2(gt))),
             (">=", Rc::new(f_stack2(gte))),
             ("assign", Rc::new(f_stack3(assign))),
-            ("associative?", Rc::new(f_stack1(is_associative))),
+            ("association?", Rc::new(f_stack1(is_association))),
+            ("association", Rc::new(f_stack1(association))),
             ("branch", Rc::new(branch)),
             ("clone", Rc::new(clone)),
             ("count", Rc::new(f_stack1(count))),
@@ -978,9 +968,7 @@ pub fn join(i: Item, j: Item) -> ItemResult {
             i.push_str(&j);
             Ok(Item::String(i))
         }
-        (i, j) => invalid_type_error(serialize::to_list(
-            "[[list?] [string?]] [execute] any?",
-        )),
+        (i, j) => invalid_type_error(serialize::to_list("[[list?] [string?]] [execute] any?")),
     }
 }
 
@@ -1081,7 +1069,7 @@ pub fn is_number(i: Item) -> ItemResult {
 }
 
 pub fn is_list(i: Item) -> ItemResult {
-    Ok(Item::Boolean(if let Item::List(_) | Item::Nothing = i {
+    Ok(Item::Boolean(if let Item::List(_) | Item::Nothing | Item::Assoc(_) = i {
         true
     } else {
         false
@@ -1333,9 +1321,7 @@ fn to_lexicon_entry(w: Word, def: HashMap<KeyItem, Item>) -> Item {
         Item::AxiomDef(AxiomDef {
             word: w,
             docs: docs,
-            f: Rc::new(move |env: Environment| {
-                env.push(Item::Error(Error::undefined(w)))
-            }),
+            f: Rc::new(move |env: Environment| env.push(Item::Error(Error::undefined(w)))),
         })
     }
 }
@@ -1372,13 +1358,19 @@ pub fn unassign(m: Item, k: Item) -> ItemResult {
     Ok(Item::Assoc(m))
 }
 
+pub fn association(m: Item) -> ItemResult {
+    match Associative::try_from(m) {
+        Ok(m) => Ok(Item::Assoc(m)),
+        Err(e) => Err(e),
+    }
+}
+
 pub fn lookup(m: Item, k: Item) -> ItemResult {
     let k = to_key_item(k)?;
     match m {
         Item::Assoc(m) => Ok(m.get(&k).unwrap_or(&Item::Nothing).clone()),
         Item::List(l) => Ok(lookup(Item::Assoc(to_hash(l)?), to_value_item(k)))?,
-        _ =>
-            invalid_type_error(crate::types::wrap(word("list"))),
+        _ => invalid_type_error(crate::types::wrap(word("list"))),
     }
 }
 
@@ -1394,7 +1386,7 @@ pub fn not(i: Item) -> ItemResult {
     Ok(Item::Boolean(!is_truthy(i)))
 }
 
-pub fn is_associative(i: Item) -> ItemResult {
+pub fn is_association(i: Item) -> ItemResult {
     Ok(Item::Boolean(match i {
         Item::Assoc(_) => true,
         Item::List(l) => to_hash(l).is_ok(),
@@ -1436,9 +1428,9 @@ pub fn decide(mut env: Environment) -> Environment {
                         ]);
                         env.append_expression(newexpr)
                     }
-                    (test, expr) => env.push(Item::from(invalid_type_error(
-                        serialize::to_list("[list?] both")
-                    ))),
+                    (test, expr) => env.push(Item::from(invalid_type_error(serialize::to_list(
+                        "[list?] both",
+                    )))),
                 }
             }
         } else {
@@ -1582,6 +1574,9 @@ fn check_input_spec(spec: &List, env: &Environment) -> Result<(), Error> {
                         }
                     }
                     Item::Word(w) => check_type(item, *w),
+                    // the type might happen to also be a defined
+                    // word, like 'association'
+                    Item::AxiomDef(a) => check_type(item, a.word),
                     _ => Err(Error::expected("list")),
                 }
             })
@@ -1842,6 +1837,12 @@ impl fmt::Debug for Environment {
         )
     }
 }
+
+impl fmt::Debug for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", emit(&Item::Assoc(self.data.clone())))
+    }
+}
 #+end_src
 
 #+RESULTS:
@@ -1854,7 +1855,7 @@ Should return Result objects from to_item. I don't think it is
 necessary for from_item - since we're using a subset of edn, all Items
 should be convertible to valid edn. But not all valid edn is
 convertible to an Item.
-*** INPROGRESS Association list and list of equal content don't compare equal
+*** DONE Association list and list of equal content don't compare equal
 **** Description
 Probably need a custom PartialEq impl for Item here that converts the
 list to a hash before comparing. Return false if the item doesn't
@@ -1869,7 +1870,7 @@ are plain lists? It's still possible the intent was hashmap.
 **** Hacky Solution
 what if you execute =[[a b][c d] ] [[c d][a b] ] == ? It's impossible
 to know the intent. I think maybe the best way out is to treat
-anything associative-shaped as associative, and if the user wants
+anything associative-shaped as association, and if the user wants
 ordered comparison, let him use a different operator, =ordered== or
 something.
 
@@ -1906,7 +1907,7 @@ implement sets it's going to be completely impossible to use a
 heuristic to figure out what the intent was. Lists and sets will look
 the same. So in the case of sets we'll have to specify the word =set=.
 
-Do we have to be explicit when comparing list to associative?  we
+Do we have to be explicit when comparing list to association?  we
 could either always return false (they're different types), or we
 could compare them as lists or as maps.
 
@@ -1924,18 +1925,18 @@ seem wise.
 So here's the plan: 
 Examples:
 #+begin_src kcats
-[[a b] [c d]] associative
-[[c d] [a b]] associative
+[[a b] [c d]] association
+[[c d] [a b]] association
 =
 => true
 
 [[a b] [c d]]
-[[c d] [a b]] associative
+[[c d] [a b]] association
 =
 => false
 
 [[a b] [c d]]
-[[a b] [c d]] associative
+[[a b] [c d]] association
 =
 => false
 
@@ -1959,7 +1960,7 @@ Examples:
 =
 => true
 #+end_src
-*** TODO Change unit tests to make the expected take a program and eval it
+*** DONE Change unit tests to make the expected take a program and eval it
 This is to fix the cases that result in associatives or sets where
 order doesn't matter but we don't have a way to declare how the values
 should be conmpared. We can't just compare representations, we need to
@@ -1974,7 +1975,7 @@ So instead of
 We should write
 #+begin_src kcats
 [[[[a b] [c d]] [a] 5 assign]
- [[[a 5] [c d]] associative]]
+ [[[a 5] [c d]] association]]
 #+end_src
 
 So that the two stacks will compare equal.
@@ -1994,6 +1995,14 @@ Would be nice to build rpms/debs etc so users can skip the nasty build
 process.
 *** TODO 'read' on invalid edn consumes the string argument
 It should attempt to parse before popping the item off the stack.
+*** TODO assign doesn't overwrite a nested value properly
+#+begin_src kcats
+[[a b] [c d]] association
+[a e] "foo!" assign
+#+end_src
+
+This errors out because =b= isn't an association. But we want it to
+overwrite =b= with =[[d "foo!"] ]=.
 * Notes
 ** Bootstrapping
 + Builtin words need to exist *before* the derived words are read from
