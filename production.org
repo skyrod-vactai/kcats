@@ -80,6 +80,7 @@ lazy_static! {
     pub static ref S_ASSOC: Intern<String> = Intern::new("association".to_string());
     pub static ref S_BOOLEAN: Intern<String> = Intern::new("boolean".to_string());
     pub static ref S_BYTES: Intern<String> = Intern::new("bytes".to_string());
+    pub static ref S_ENVIRONMENT: Intern<String> = Intern::new("environment".to_string());
     pub static ref S_FLOAT: Intern<String> = Intern::new("float".to_string());
     pub static ref S_INTEGER: Intern<String> = Intern::new("integer".to_string());
     pub static ref S_ITEM: Intern<String> = Intern::new("item".to_string());
@@ -145,6 +146,7 @@ pub struct AxiomDef {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DerivedDef {
+    pub word: Word,
     pub docs: WordDocs,
     pub definition: List,
 }
@@ -467,19 +469,6 @@ fn print_result(env: Environment) {
     }
 }
 
-fn standard_env(program: Option<List>) -> Environment {
-    let prog_expr = match program {
-        Some(p) => Stack::from(p),
-        _ => Stack::new(),
-    };
-
-    let env = Environment {
-        stack: Stack::new(),
-        expression: prog_expr,
-        dictionary: Dictionary::new(),
-    };
-    axiom::add_standard_dictionary(env)
-}
 
 fn get_stdin() -> String {
     let mut buf = String::new();
@@ -492,7 +481,7 @@ fn get_stdin() -> String {
 
 fn main() {
     let program = get_stdin();
-    let mut env = standard_env(None);
+    let mut env = axiom::standard_env(None, None);
     let parse_result = serialize::parse(program, Some(&env.dictionary));
     match parse_result {
         Ok(program) => {
@@ -620,7 +609,7 @@ mod tests {
     #[test_case("zero?" ; "is_zero")]
     #[test_case("zip")]
     fn test_lexicon(word: &str) {
-        let e = standard_env(None);
+        let e = axiom::standard_env(None);
         let r = test_word(e.clone(), Intern::new(word.to_string()));
         assert!(r.is_empty(), "{:?}", r);
     }
@@ -637,7 +626,7 @@ mod tests {
 //             let p = List::try_from(*e.get(0).unwrap()).ok().unwrap();
 //             let exp = List::try_from(*e.get(1).unwrap()).ok().unwrap();
 
-//             test_example(standard_env.clone(), w, p,exp)
+//             test_example(axiom::standard_env.clone(), w, p,exp)
 //         }.retain(|i| i.is_some()).collect::<Vec<Error>>()
 #+end_src
 
@@ -735,6 +724,9 @@ pub fn add_builtins(d: Dictionary) -> Dictionary {
             ("dip", Rc::new(dip)),
             ("dipdown", Rc::new(dipdown)),
             ("discard", Rc::new(discard)),
+            ("environment", Rc::new(f_stack1(environment))),
+            ("eval-step", Rc::new(f_stack1(eval_step_outer))),
+            ("evaluate", Rc::new(f_stack1(evaluate))),
             ("even?", Rc::new(f_stack1(is_even))),
             ("evert", Rc::new(evert)),
             ("execute", Rc::new(execute)),
@@ -1034,11 +1026,13 @@ pub fn is_number(i: Item) -> ItemResult {
 }
 
 pub fn is_list(i: Item) -> ItemResult {
-    Ok(Item::Boolean(if let Item::List(_) | Item::Nothing | Item::Assoc(_) = i {
-        true
-    } else {
-        false
-    }))
+    Ok(Item::Boolean(
+        if let Item::List(_) | Item::Nothing | Item::Assoc(_) = i {
+            true
+        } else {
+            false
+        },
+    ))
 }
 
 pub fn first(i: Item) -> ItemResult {
@@ -1279,6 +1273,7 @@ fn to_lexicon_entry(w: Word, def: HashMap<KeyItem, Item>) -> Item {
     };
     if let Some(d) = as_list(def.get(&key_item("definition"))) {
         Item::DerivedDef(DerivedDef {
+            word: w,
             definition: d,
             docs: docs,
         })
@@ -1296,20 +1291,22 @@ fn assoc_in(i: Item, ks: &[KeyItem], v: Item) -> Result<Associative, Error> {
     if let [k, ks @ ..] = ks {
         if ks.is_empty() {
             h.insert(k.clone(), v);
-            
-        }
-        else {
+        } else {
             let inner = h.get(&k.clone()).unwrap_or(&Item::Nothing).clone();
             // if the inner value isn't a map, we're just overwriting whatever it
             // is with a new map.
-            
-            h.insert(k.clone(), Item::Assoc(assoc_in(
-                Item::Assoc(
-                    match inner {
+
+            h.insert(
+                k.clone(),
+                Item::Assoc(assoc_in(
+                    Item::Assoc(match inner {
                         Item::Assoc(inner) => inner,
-                        item => Associative::new()
-                    })
-                    , ks, v)?));
+                        _ => Associative::new(),
+                    }),
+                    ks,
+                    v,
+                )?),
+            );
         }
     }
     Ok(h)
@@ -1346,6 +1343,21 @@ pub fn lookup(m: Item, k: Item) -> ItemResult {
     match m {
         Item::Assoc(m) => Ok(m.get(&k).unwrap_or(&Item::Nothing).clone()),
         Item::List(l) => Ok(lookup(Item::Assoc(to_hash(l)?), to_value_item(k)))?,
+        Item::Env(e) => {
+            if let KeyItem::Word(w) = k {
+                if w == Intern::new("stack".to_string()) {
+                    Ok(Item::List(e.stack))
+                } else if w == Intern::new("expression".to_string()) {
+                    Ok(Item::List(e.expression))
+                }
+                //TODO: be able to fetch dictionary
+                else {
+                    Ok(Item::Nothing)
+                }
+            } else {
+                Err(Error::expected("word"))
+            }
+        }
         _ => invalid_type_error(crate::types::wrap(word("list"))),
     }
 }
@@ -1365,6 +1377,7 @@ pub fn not(i: Item) -> ItemResult {
 pub fn is_association(i: Item) -> ItemResult {
     Ok(Item::Boolean(match i {
         Item::Assoc(_) => true,
+        Item::Env(_) => true,
         Item::List(l) => to_hash(l).is_ok(),
         _ => false,
     }))
@@ -1636,22 +1649,21 @@ pub fn eval_step(mut env: Environment) -> Environment {
 fn reverse(i: Item) -> ItemResult {
     let l = List::try_from(i).unwrap();
     //l.make_contiguous().reverse();
-    
+
     Ok(Item::List(l.into_iter().rev().collect()))
 }
 
 fn bytes(i: Item) -> ItemResult {
     match i {
         Item::String(s) => Ok(Item::Bytes(Bytes::from(s.as_bytes()))),
-        i =>  Ok(Item::Bytes(Bytes::from(serialize::emit(&i)))),
+        i => Ok(Item::Bytes(Bytes::from(serialize::emit(&i)))),
     }
 }
 
 fn string(i: Item) -> ItemResult {
     match i {
         Item::Bytes(b) => Ok(Item::String(std::str::from_utf8(&b).unwrap().to_string())),
-        i => Ok(Item::String(serialize::emit(&i)))
-            
+        i => Ok(Item::String(serialize::emit(&i))),
     }
 }
 
@@ -1693,9 +1705,39 @@ pub fn eval(mut env: Environment) -> Environment {
     env
 }
 
-pub fn eval_step_outer(env: Environment) -> Environment {
-    //let mut inner_env = Environment::try_from(env.pop())?;
-    env
+pub fn standard_env(program: Option<List>, stack: Option<List>) -> Environment {
+    let prog_expr = match program {
+        Some(p) => Stack::from(p),
+        _ => Stack::new(),
+    };
+
+    let env = Environment {
+        stack: stack.unwrap_or(Stack::new()),
+        expression: prog_expr,
+        dictionary: Dictionary::new(),
+    };
+    add_standard_dictionary(env)
+}
+
+fn environment(p: Item) -> ItemResult {
+    let env = Associative::try_from(p).unwrap();
+    let stack = env
+        .get(&to_key_item(word("stack")).unwrap())
+        .and_then(|s| List::try_from(s.clone()).ok());
+    let expression = env
+        .get(&to_key_item(word("expression")).unwrap())
+        .and_then(|s| List::try_from(s.clone()).ok());
+    Ok(Item::Env(standard_env(expression, stack)))
+}
+
+pub fn eval_step_outer(env: Item) -> ItemResult {
+    let inner_env = Environment::try_from(env)?;
+    Ok(Item::Env(eval_step(inner_env)))
+}
+
+pub fn evaluate(env: Item) -> ItemResult {
+    let inner_env = Environment::try_from(env)?;
+    Ok(Item::Env(eval(inner_env)))
 }
 
 pub fn identity(env: Environment) -> Environment {
@@ -1791,7 +1833,8 @@ fn from_item(item: &Item) -> edn_format::Value {
                 .collect(),
         ),
         Item::Error(h) => edn_format::Value::Vector(
-            h.data.iter()
+            h.data
+                .iter()
                 .map(|(k, v)| {
                     edn_format::Value::Vector(vec![
                         from_item(&to_value_item(k.clone())),
@@ -1800,7 +1843,19 @@ fn from_item(item: &Item) -> edn_format::Value {
                 })
                 .collect(),
         ),
-        _ => edn_format::Value::Integer(999),
+        Item::Env(e) => edn_format::Value::Vector(vec![
+            edn_format::Value::Vector(vec![
+                from_item(&word("stack")),
+                from_item(&Item::List(e.stack.clone())),
+            ]),
+            edn_format::Value::Vector(vec![
+                from_item(&word("expression")),
+                from_item(&Item::List(e.expression.clone())),
+            ]),
+            // TODO emit the non-builtin words of the dictionary
+        ]),
+        Item::Nothing => edn_format::Value::Vector(Vec::new()),
+        Item::DerivedDef(d) => from_item(&Item::Word(d.word))
     }
 }
 
@@ -1815,7 +1870,7 @@ pub fn parse(s: String, standard_dictionary: Option<&Dictionary>) -> Result<List
 }
 
 pub fn to_list(s: &str) -> List {
-    parse(s.to_string(), None).unwrap() 
+    parse(s.to_string(), None).unwrap()
 }
 
 pub fn emit(item: &Item) -> String {
@@ -2011,7 +2066,7 @@ It should attempt to parse before popping the item off the stack.
 
 This errors out because =b= isn't an association. But we want it to
 overwrite =b= with =[[d "foo!"] ]=.
-*** TODO create an environment from data (including an existing stack)
+*** INPROGRESS create an environment from data (including an existing stack)
 It'd be nice to copy paste the output of one execution and have it pick up again eg
 #+begin_src kcats
 [[stack [1 2 3]]
@@ -2035,6 +2090,39 @@ serialization (eg stateful things like pipes).
 
 If it's important to compare as associative, then make that part of
 the expression.
+
+What should =environment= take as an argument? Seems like it should
+take an association (or assoc-shaped list).
+
+#+begin_src kcats
+[] environment
+#+end_src
+should give the default env.
+
+#+begin_src kcats
+[[expression [1 2 +]]] environment evaluate
+#+end_src
+
+#+RESULTS:
+: 
+: [[[stack [3]] [expression []]]]
+
+should give the unexecuted env
+
+#+begin_src kcats
+[[expression [+]] [stack [1 2]]] environment evaluate
+#+end_src
+
+#+RESULTS:
+: 
+: [[[stack [3]] [expression []]]]
+
+should give the partially executed env with default dictionary
+
+#+begin_src kcats
+[[dictionary [[foo [[definition [inc +]]]]]] [expression [1 2 foo]]] environment 
+#+end_src
+should give the default env with the additional dict entries
 * Notes
 ** Bootstrapping
 + Builtin words need to exist *before* the derived words are read from
