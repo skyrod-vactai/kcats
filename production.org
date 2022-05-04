@@ -38,6 +38,7 @@ base64 = "0.13.0"
 internment = "0.6.0" 
 thiserror = "1.0.30"
 lazy_static = "1.4.0"
+num-integer = "0.1.44"
 
 [dev-dependencies]
 test-case = "2.0.0"
@@ -323,6 +324,17 @@ impl TryFrom<Item> for Int {
     }
 }
 
+impl TryFrom<Item> for Float {
+    type Error = Error;
+    fn try_from(i: Item) -> Result<Self, Self::Error> {
+        if let Item::Float(f) = i {
+            Ok(f)
+        } else {
+            Err(Error::expected("float"))
+        }
+    }
+}
+
 impl TryFrom<Item> for String {
     type Error = Error;
     fn try_from(i: Item) -> Result<Self, Self::Error> {
@@ -354,17 +366,6 @@ impl TryFrom<Item> for Environment {
         } else {
             Err(Error::expected("environment"))
         }
-    }
-}
-
-pub fn get_item(i: Item, index: usize) -> Option<Item> {
-    if let Item::List(l) = i {
-        match l.get(index) {
-            Some(x) => Some(x.clone()),
-            None => None,
-        }
-    } else {
-        None
     }
 }
 
@@ -469,7 +470,6 @@ fn print_result(env: Environment) {
     }
 }
 
-
 fn get_stdin() -> String {
     let mut buf = String::new();
     for line in io::stdin().lock().lines() {
@@ -501,9 +501,19 @@ mod tests {
     use internment::Intern;
     use test_case::test_case;
 
+    pub fn get_item(i: Item, index: usize) -> Option<Item> {
+        if let Item::List(l) = i {
+            match l.get(index) {
+                Some(x) => Some(x.clone()),
+                None => None,
+            }
+        } else {
+            None
+        }
+    }
+
     fn test_example(
         mut prog_env: Environment,
-        w: Word,
         program: List,
         expected: List,
     ) -> Option<Error> {
@@ -517,7 +527,10 @@ mod tests {
         if prog_env.stack == exp_env.stack {
             None
         } else {
-            println!("uh oh expected {:?} got {:?}", exp_env.stack, prog_env.stack);
+            println!(
+                "uh oh expected {:?} got {:?}",
+                exp_env.stack, prog_env.stack
+            );
             Some(Error::test_assertion(program, expected, prog_env.stack))
         }
     }
@@ -533,9 +546,9 @@ mod tests {
                     let x = ex.get(0).unwrap().clone();
                     match (get_item(x.clone(), 0).unwrap(), get_item(x, 1).unwrap()) {
                         (Item::List(p), Item::List(exp)) => {
-                            test_example(standard_env.clone(), w.clone(), p.clone(), exp.clone())
+                            test_example(standard_env.clone(), p.clone(), exp.clone())
                         }
-                        (p, exp) => Some(Error::expected("list")),
+                        _ => Some(Error::expected("list")),
                     }
                 })
                 .collect::<Vec<Error>>()
@@ -609,7 +622,7 @@ mod tests {
     #[test_case("zero?" ; "is_zero")]
     #[test_case("zip")]
     fn test_lexicon(word: &str) {
-        let e = axiom::standard_env(None);
+        let e = axiom::standard_env(None, None);
         let r = test_word(e.clone(), Intern::new(word.to_string()));
         assert!(r.is_empty(), "{:?}", r);
     }
@@ -735,7 +748,7 @@ pub fn add_builtins(d: Dictionary) -> Dictionary {
             ("inc", Rc::new(f_stack1(inc))),
             ("join", Rc::new(f_stack2(join))),
             ("list?", Rc::new(f_stack1(is_list))),
-            ("loop", Rc::new(env_effect2(loop_))),
+            ("loop", Rc::new(loop_)),
             ("mod", Rc::new(f_stack2(mod_))),
             ("not", Rc::new(f_stack1(not))),
             ("number?", Rc::new(f_stack1(is_number))),
@@ -970,37 +983,6 @@ pub fn discard(mut env: Environment) -> Environment {
     env
 }
 
-type Effects = (Option<List>, Option<List>);
-
-pub fn env_effect1(f: fn(Item) -> Effects) -> impl Fn(Environment) -> Environment {
-    move |mut env: Environment| {
-        let i = env.pop();
-        let (expr_items, stack_items) = f(i);
-        if expr_items.is_some() {
-            extend_front(&mut env.expression, expr_items.unwrap());
-        }
-        if stack_items.is_some() {
-            extend_front(&mut env.stack, stack_items.unwrap());
-        }
-        env
-    }
-}
-
-pub fn env_effect2(f: fn(Item, Item) -> Effects) -> impl Fn(Environment) -> Environment {
-    move |mut env: Environment| {
-        let i = env.pop();
-        let j = env.pop();
-        let (expr_items, stack_items) = f(i, j);
-        if expr_items.is_some() {
-            extend_front(&mut env.expression, expr_items.unwrap());
-        }
-        if stack_items.is_some() {
-            extend_front(&mut env.stack, stack_items.unwrap());
-        }
-        env
-    }
-}
-
 pub fn eq(i: Item, j: Item) -> ItemResult {
     Ok(Item::Boolean(i == j))
 }
@@ -1054,25 +1036,21 @@ pub fn second(i: Item) -> ItemResult {
     })
 }
 
-pub fn loop_(p: Item, f: Item) -> Effects {
-    if let Item::List(mut p) = p {
-        {
+pub fn loop_(mut env: Environment) -> Environment {
+    let p = List::try_from(env.pop());
+    match p {
+        Ok(mut p) => {
+            let f = env.pop();
             if is_truthy(f) {
                 let p2 = p.clone();
                 p.push_back(Item::List(p2));
                 p.push_back(word("loop"));
-                (Some(p), None)
+                env.append_expression(p)
             } else {
-                (None, None)
+                env
             }
-        }
-    } else {
-        (
-            None,
-            Some(List::from_iter([Item::from(invalid_type_error(
-                List::from_iter([Item::Word(*S_PROGRAM)]),
-            ))])),
-        )
+        },
+        Err(e) => env.push(Item::Error(e))
     }
 }
 
@@ -1875,14 +1853,6 @@ pub fn to_list(s: &str) -> List {
 
 pub fn emit(item: &Item) -> String {
     edn_format::emit_str(&from_item(item))
-}
-
-pub fn emit_all(items: &VecDeque<Item>) -> String {
-    let mut s: String = String::new();
-    for i in items {
-        s.push_str(&emit(&i));
-    }
-    return s;
 }
 
 // print out envs in error messages
