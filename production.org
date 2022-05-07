@@ -357,7 +357,9 @@ impl TryFrom<Item> for Associative {
             Item::Assoc(a) => Ok(a),
             Item::List(l) => Ok(to_hash(l)?),
             Item::Nothing => Ok(Associative::new()),
-            _ => Err(Error::expected("association"))
+            Item::DerivedDef(d) => Ok(Associative::from(d)),
+            Item::AxiomDef(a) => Ok(Associative::from(a)),
+            _ => Err(Error::expected("association")),
         }
     }
 }
@@ -370,6 +372,70 @@ impl TryFrom<Item> for Environment {
         } else {
             Err(Error::expected("environment"))
         }
+    }
+}
+
+impl From<WordDocs> for Associative {
+    fn from(wd: WordDocs) -> Associative {
+        let mut docs = Associative::new();
+        wd.examples
+            .as_ref()
+            .and_then(|e| docs.insert(word_key("examples"), Item::List(e.clone())));
+        wd.spec
+            .as_ref()
+            .and_then(|s| docs.insert(word_key("spec"), Item::List(s.clone())));
+        docs
+    }
+}
+
+impl From<WordDocs> for Item {
+    fn from(wd: WordDocs) -> Item {
+        Item::Assoc(Associative::from(wd))
+    }
+}
+
+impl From<DerivedDef> for Associative {
+    fn from(d: DerivedDef) -> Associative {
+        let mut a = Associative::new();
+        a.insert(word_key("definition"), Item::List(d.definition.clone()));
+        a.insert(word_key("docs"), Item::from(d.docs.clone()));
+        a
+    }
+}
+
+impl From<DerivedDef> for Item {
+    fn from(dd: DerivedDef) -> Item {
+        Item::Assoc(Associative::from(dd))
+    }
+}
+
+impl From<AxiomDef> for Associative {
+    fn from(d: AxiomDef) -> Associative {
+        let mut a = Associative::new();
+        a.insert(word_key("docs"), Item::from(d.docs.clone()));
+        a
+    }
+}
+
+impl From<AxiomDef> for Item {
+    fn from(ad: AxiomDef) -> Item {
+        Item::Assoc(Associative::from(ad))
+    }
+}
+
+impl From<Environment> for Associative {
+    fn from(env: Environment) -> Associative {
+        let mut a = Associative::new();
+        a.insert(word_key("stack"), Item::List(env.stack.clone()));
+        a.insert(word_key("expression"), Item::List(env.expression.clone()));
+        a.insert(word_key("dictionary"), Item::Assoc(env.dictionary.clone()));
+        a
+    }
+}
+
+impl From<Environment> for Item {
+    fn from(env: Environment) -> Item {
+        Item::Env(Environment::from(env))
     }
 }
 
@@ -1057,8 +1123,8 @@ pub fn loop_(mut env: Environment) -> Environment {
             } else {
                 env
             }
-        },
-        Err(e) => env.push(Item::Error(e))
+        }
+        Err(e) => env.push(Item::Error(e)),
     }
 }
 
@@ -1327,27 +1393,10 @@ pub fn association(m: Item) -> ItemResult {
 }
 
 pub fn lookup(m: Item, k: Item) -> ItemResult {
+    //println!("lookup {:?} \n {:?}", m, k);
     let k = to_key_item(k)?;
-    match m {
-        Item::Assoc(m) => Ok(m.get(&k).unwrap_or(&Item::Nothing).clone()),
-        Item::List(l) => Ok(lookup(Item::Assoc(to_hash(l)?), to_value_item(k)))?,
-        Item::Env(e) => {
-            if let KeyItem::Word(w) = k {
-                if w == Intern::new("stack".to_string()) {
-                    Ok(Item::List(e.stack))
-                } else if w == Intern::new("expression".to_string()) {
-                    Ok(Item::List(e.expression))
-                }
-                //TODO: be able to fetch dictionary
-                else {
-                    Ok(Item::Nothing)
-                }
-            } else {
-                Err(Error::expected("word"))
-            }
-        }
-        _ => invalid_type_error(crate::types::wrap(word("list"))),
-    }
+    let m = Associative::try_from(m)?;
+    Ok(m.get(&k).unwrap_or(&Item::Nothing).clone())
 }
 
 pub fn or(i: Item, j: Item) -> ItemResult {
@@ -1363,11 +1412,11 @@ pub fn not(i: Item) -> ItemResult {
 }
 
 pub fn is_association(i: Item) -> ItemResult {
-    Ok(Item::Boolean(match i {
-        Item::Assoc(_) => true,
-        Item::Env(_) => true,
-        Item::List(l) => to_hash(l).is_ok(),
-        _ => false,
+    //println!("assocation? {:?}", i);
+    Ok(Item::Boolean(if let Ok(_) = Associative::try_from(i) {
+        true
+    } else {
+        false
     }))
 }
 
@@ -1480,7 +1529,7 @@ fn check_type(i: &Item, w: Word) -> Result<(), Error> {
             }
         }
         Item::AxiomDef(_) => {
-            if w == *S_WORD || w == *S_ITEM {
+            if w == *S_WORD || w == *S_ITEM || w == *S_ASSOC {
                 Ok(())
             } else {
                 Err(Error::expected(&w))
@@ -1488,7 +1537,7 @@ fn check_type(i: &Item, w: Word) -> Result<(), Error> {
         }
 
         Item::DerivedDef(_) => {
-            if w == *S_WORD || w == *S_ITEM {
+            if w == *S_WORD || w == *S_ITEM || w == *S_ASSOC {
                 Ok(())
             } else {
                 Err(Error::expected(&w))
@@ -1509,7 +1558,7 @@ fn check_type(i: &Item, w: Word) -> Result<(), Error> {
             }
         }
         Item::Nothing => {
-            if w == *S_LIST || w == *S_ITEM {
+            if w == *S_LIST || w == *S_ITEM || w == *S_ASSOC {
                 Ok(())
             } else {
                 Err(Error::expected(&w))
@@ -1867,13 +1916,7 @@ fn from_item(item: &Item) -> edn_format::Value {
         Item::Nothing => edn_format::Value::Vector(Vec::new()),
         Item::DerivedDef(d) => {
             if d.serialize {
-                let mut a = Associative::new();
-                let mut docs = Associative::new();
-                d.docs.examples.as_ref().and_then(|e| docs.insert(word_key("examples"), Item::List(e.clone())));
-                d.docs.spec.as_ref().and_then(|s| docs.insert(word_key("spec"), Item::List(s.clone())));
-                a.insert(word_key("definition"), Item::List(d.definition.clone()));
-                a.insert(word_key("docs"), Item::Assoc(docs));
-                from_item(&Item::Assoc(a))
+                from_item(&Item::from(d.clone()))
             } else {
                 from_item(&Item::Word(d.word))
             }
@@ -2170,12 +2213,12 @@ eval-step
 : expression: [[[expression] lookup count] shield swap [[expression] lookup count [[positive?] [<=]] [execute] every?] [eval-step] while advance advance advance advance advance eval-step]
 
 #+begin_src kcats
-dictionary [loop] lookup
+dictionary [pipe-in definition] lookup
 #+end_src
 
 #+RESULTS:
 : 
-: [[]]
+: [[[[[type [file] unwrap =] [value file output-stream]] [[type [stdout] unwrap =] [stdout]]] decide]]
 
 * Notes
 ** Bootstrapping
