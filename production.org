@@ -116,7 +116,6 @@ pub enum KeyItem {
     Bytes(Bytes),
     String(String),
     Word(Word),
-    AxiomDef(AxiomDef),
     List(VecDeque<KeyItem>),
     Nothing,
 }
@@ -191,35 +190,6 @@ impl Environment {
         self
     }
 }
-
-//#[derive(thiserror::Error, Debug, Clone, PartialEq)]
-// pub enum OldError {
-//     #[error("expected at least {expected} stack items")]
-//     StackUnderflow { expected: usize },
-
-//     #[error("expected {expected} items")]
-//     Count { expected: usize },
-
-//     #[error("type mismatch - expected {expected_types:?}")]
-//     TypeMismatch { expected_types: Vec<String> },
-
-//     #[error("word has no implementation: {word}")]
-//     Unimplemented { word: String },
-
-//     #[error("invalid syntax, {message}")]
-//     Parser { message: String },
-
-//     #[error("Unknown word: {word}")]
-//     UnknownWord { word: String },
-
-//     #[error("example failed - expected {program} to produce {expected} but got {actual}")]
-//     ExampleTest {
-//         expected: String,
-//         actual: String,
-//         program: String,
-//     },
-//     //#[error("error")]
-// }
 
 impl Error {
     fn create(asked: List, reason: &str) -> Error {
@@ -382,13 +352,31 @@ impl From<DerivedDef> for Item {
 
 impl From<AxiomDef> for Association {
     fn from(d: AxiomDef) -> Association {
-        println!("from ad to assoc {:?}", d);
         let mut a = Association::new();
         d.examples
             .and_then(|l| a.insert(word_key("examples"), Item::List(l.clone())));
         d.spec
             .and_then(|l| a.insert(word_key("spec"), Item::List(l.clone())));
         a
+    }
+}
+
+impl From<Association> for DerivedDef {
+    fn from(mut d: Association) -> DerivedDef {
+        DerivedDef {
+            word: Intern::new("".to_string()),
+            serialize: true,
+            definition: d
+                .remove(&key_item("definition"))
+                .and_then(|i| List::try_from(i).ok())
+                .unwrap_or(List::new()),
+            examples: d
+                .remove(&key_item("examples"))
+                .and_then(|i| List::try_from(i).ok()),
+            spec: d
+                .remove(&key_item("spec"))
+                .and_then(|i| List::try_from(i).ok()),
+        }
     }
 }
 
@@ -440,10 +428,11 @@ pub fn to_key_item(i: Item) -> Result<KeyItem, Error> {
                 .collect::<Result<KeyList, Error>>()?,
         )),
         Item::Word(w) => Ok(KeyItem::Word(w)),
-        Item::AxiomDef(w) => Ok(KeyItem::AxiomDef(w)),
+        Item::AxiomDef(w) => Ok(KeyItem::Word(w.word)),
         Item::Boolean(b) => Ok(KeyItem::Boolean(b)),
         Item::Bytes(bs) => Ok(KeyItem::Bytes(bs)),
         Item::Nothing => Ok(KeyItem::Nothing),
+        Item::DerivedDef(d) => Ok(KeyItem::Word(d.word)),
         _ => Err(Error::expected("KeyItem")),
     }
 }
@@ -456,11 +445,14 @@ pub fn to_value_item(i: KeyItem) -> Item {
             Item::List(l.iter().map(|i| to_value_item(i.clone())).collect::<List>())
         }
         KeyItem::Word(w) => Item::Word(w),
-        KeyItem::AxiomDef(b) => Item::AxiomDef(b),
         KeyItem::Boolean(b) => Item::Boolean(b),
         KeyItem::Bytes(bs) => Item::Bytes(bs),
         KeyItem::Nothing => Item::Nothing,
     }
+}
+
+pub fn key_item(s: &str) -> KeyItem {
+    to_key_item(word(s)).unwrap()
 }
 
 pub fn to_entry(i: Item) -> Result<(KeyItem, Item), Error> {
@@ -695,7 +687,7 @@ use super::serialize;
 use crate::types::*;
 use internment::Intern;
 use num_integer::Roots;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::fs;
 use std::mem;
 use std::ops::Range;
@@ -827,8 +819,8 @@ pub fn read_lexicon_file(filename: &str, mut env: Environment) -> Environment {
         Ok(s) => {
             let items = serialize::parse(s, Some(&env.dictionary)).unwrap();
             let vitems = to_hash(List::from(items)).unwrap();
-            for (k, def) in vitems.iter() {
-                let h = to_hash(as_list(Some(def)).unwrap()).ok().unwrap();
+            for (k, def) in vitems.into_iter() {
+                let h = to_hash(List::try_from(def).unwrap()).unwrap();
                 let word = as_word(k).unwrap();
                 let newdef = to_lexicon_entry(word, h);
                 let newdef2 = newdef.clone();
@@ -1266,46 +1258,29 @@ pub fn evert(mut env: Environment) -> Environment {
     env.push(Item::List(l))
 }
 
-fn key_item(s: &str) -> KeyItem {
-    to_key_item(word(s)).unwrap()
-}
-
-fn as_list(i: Option<&Item>) -> Option<List> {
-    if let Some(i) = i {
-        if let Item::List(l) = i {
-            Some(l.clone())
-        } else {
-            None
-        }
-    } else {
-        None
-    }
-}
-
-fn as_word(i: &KeyItem) -> Option<Word> {
+fn as_word(i: KeyItem) -> Option<Word> {
     match i {
         KeyItem::Word(w) => Some(w.clone()),
-        KeyItem::AxiomDef(b) => Some(b.word.clone()),
         _ => None,
     }
 }
 
-fn to_lexicon_entry(w: Word, def: HashMap<KeyItem, Item>) -> Item {
+fn to_lexicon_entry(w: Word, mut def: Association) -> Item {
     //println!("{:?}", def);
-    if let Some(d) = as_list(def.get(&key_item("definition"))) {
-        Item::DerivedDef(DerivedDef {
-            word: w,
-            serialize: true,
-            definition: d,
-            examples: as_list(def.get(&key_item("examples"))),
-            spec: as_list(def.get(&key_item("spec"))),
-        })
+    if def.get(&key_item("definition")).is_some() {
+        let mut d = DerivedDef::from(def);
+        d.word = w;
+        Item::DerivedDef(d)
     } else {
         Item::AxiomDef(AxiomDef {
             word: w,
             serialize: true,
-            examples: as_list(def.get(&key_item("examples"))),
-            spec: as_list(def.get(&key_item("spec"))),
+            examples: def
+                .remove(&key_item("examples"))
+                .and_then(|i| List::try_from(i).ok()),
+            spec: def
+                .remove(&key_item("spec"))
+                .and_then(|i| List::try_from(i).ok()),
             f: Rc::new(move |env: Environment| env.push(Item::Error(Error::undefined(w)))),
         })
     }
@@ -1522,7 +1497,7 @@ fn check_type(i: &Item, w: Word) -> Result<(), Error> {
             }
         }
         Item::Env(_) => {
-            if w == *S_ASSOC || w == *S_LIST || w == *S_ITEM {
+            if w == *S_ASSOC || w == *S_LIST || w == *S_ITEM || w == *S_ENVIRONMENT {
                 Ok(())
             } else {
                 Err(Error::expected(&w))
@@ -1728,14 +1703,30 @@ pub fn standard_env(program: Option<List>, stack: Option<List>) -> Environment {
 }
 
 fn environment(p: Item) -> ItemResult {
-    let env = Association::try_from(p).unwrap();
+    let mut env = Association::try_from(p).unwrap();
     let stack = env
-        .get(&to_key_item(word("stack")).unwrap())
-        .and_then(|s| List::try_from(s.clone()).ok());
+        .remove(&to_key_item(word("stack")).unwrap())
+        .and_then(|s| List::try_from(s).ok())
+        .or(Some(List::new()));
     let expression = env
-        .get(&to_key_item(word("expression")).unwrap())
-        .and_then(|s| List::try_from(s.clone()).ok());
-    Ok(Item::Env(standard_env(expression, stack)))
+        .remove(&to_key_item(word("expression")).unwrap())
+        .and_then(|s| List::try_from(s).ok())
+        .or(Some(List::new()));
+    let dictionary = env
+        .remove(&to_key_item(word("dictionary")).unwrap())
+        .and_then(|d| Association::try_from(d).ok());
+    let mut env = standard_env(expression, stack);
+    for (k, v) in dictionary.into_iter().flatten() {
+        List::try_from(v)
+            .and_then(to_hash)
+            .and_then(|h| {
+                env.dictionary
+                    .insert(k, Item::DerivedDef(DerivedDef::from(h)));
+                Ok(())
+            })
+            .ok();
+    }
+    Ok(Item::Env(env))
 }
 
 pub fn eval_step_outer(env: Item) -> ItemResult {
@@ -2088,7 +2079,7 @@ It should attempt to parse before popping the item off the stack.
 
 This errors out because =b= isn't an association. But we want it to
 overwrite =b= with =[[d "foo!"] ]=.
-*** INPROGRESS create an environment from data (including an existing stack)
+*** DONE create an environment from data (including an existing stack)
 It'd be nice to copy paste the output of one execution and have it pick up again eg
 #+begin_src kcats
 [[stack [1 2 3]]
@@ -2145,16 +2136,21 @@ should give the unexecuted env
 : [5]
 
 
-TODO:
-should give the partially executed env with default dictionary
+should execute env with default dictionary plus whatever we add
 
 #+begin_src kcats
-[[dictionary [[foo [[definition [inc +]]]]]] [expression [1 2 foo]]] environment 
+[[dictionary [[foo [[definition [inc +]]
+                    [spec [[number] [number]]]]]
+              [bar [[definition [foo 5 *]]
+                    [spec [[number] [number]]]]]]]
+ [expression [1 2 bar]]]
+
+environment evaluate
 #+end_src
 
 #+RESULTS:
 : 
-: [[[stack []] [expression [1 2 foo]]]]
+: [[[stack [20]] [expression []]]]
 
 should give the default env with the additional dict entries
 
