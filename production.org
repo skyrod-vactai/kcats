@@ -316,6 +316,7 @@ impl TryFrom<Item> for Association {
             Item::DerivedDef(d) => Ok(Association::from(d)),
             Item::AxiomDef(a) => Ok(Association::from(a)),
             Item::Env(e) => Ok(Association::from(e)),
+            Item::Error(e) => Ok(Association::from(e)),
             _ => Err(Error::expected("association")),
         }
     }
@@ -341,6 +342,12 @@ impl From<DerivedDef> for Association {
         d.spec
             .and_then(|l| a.insert(word_key("spec"), Item::List(l.clone())));
         a
+    }
+}
+
+impl From<Error> for Association {
+    fn from(e: Error) -> Association {
+        e.data
     }
 }
 
@@ -1661,10 +1668,10 @@ fn is_uncaught_error(env: &Environment) -> bool {
         if let Item::Error(_) = *i {
             // if the top of stack is an error we're done unless
             // there's a recovery coming. we know recovery is
-            // coming if the 5th item in the expression is resume
+            // coming if the expression has a resume
             // (after an if statement that checks whether there's
             // an error and recovers)
-            env.stack.get(4) != Some(&word("resume"))
+            !env.expression.contains(&word("resume"))
         } else {
             false
         }
@@ -2196,6 +2203,225 @@ dictionary count
 : 
 : [118]
 
+*** DONE In-thread error handling
+**** DONE Error structs
+**** DONE Stop on unrecoverable error
+**** DONE Be able to resume execution after an error
+***** Notes
+
+#+begin_src kcats
+2 [1 4 0] [[/] [discard 0] recover] map
+
+[1 0 /] [discard 0] recover
+1 [0 /] [discard 0] . recover
+1 . snapshot
+    [0 /] inject first
+    [error?] [discard 0] [] if
+    resume
+err [error?]  
+
+t r recover
+[snapshot] dipdown ;; rec test ss
+[inject] dip swap ;; res rec
+[first error?] ;; err? res rec
+discard execute;; drop the snapshot and run recovery
+evert discard ;; use snapshot as stack
+
+
+; inject the program into a snapshot. If there's an error on top
+; afterward, inject the recovery in there too. It'll have access to
+; the whole context. If there's no error, evert and drop the ToS.
+
+;; the execution will stop after injecting into the snapshot, so
+;; "first" won't even get executed here.
+
+[discard] [discard] recover
+
+;; here we recover from underflow by just dropping the error
+
+
+[1 0 /] . execute
+. 1 0 /
+err . [discard 0] execute resume
+                        ;; ^ this is in the expression so keep going, actual word doesn't do anything
+
+
+;; when the ToS is err, how do we know whether to stop?  we can look
+;; at the expression to see what's coming. We can't do that at every
+;; step of the entire execution but we don't have to. Just when ToS =
+;; err. The challenge is to encode this just with the stack/expr and
+;; no extra state. We can put a word like "continue" in the expr, but
+;; at some point we actually have to have an err on ToS and do
+;; something with it. The only place we can put some kind of flag not
+;; to abort, is in the expression (or maybe the dictionary).
+
+;; another approach is to explicitly continue unless halt is called,
+;; but the error-producer doesn't know whether the error can be
+;; handled or not.
+
+
+;; how to unwind. can we just naively unwind to the next instance of
+;; 'recover' in the expression? or will quoted programs mess this up?
+;; Let's work through it
+
+;; here the recover is quoted, but by the time an error occurs and we
+;; look at the expression, it'll be there:
+2 [1 4 0] [[/ 12 +] [discard 0] recover] map
+
+2 err . 12 + resume [error?] [discard 0] if
+2 err . [error?] [discard 0] [] if 
+
+;; so the problem is even after we've unwound the expression to
+;; 'resume', the error is still on the ToS! Now we want to actually do
+;; the recovery, but we've already gotten rid of the flag that tells
+;; us we're doing that. Maybe we can modify the error object itself to
+;; note that it's been flagged for processing. Maybe [[type error]
+;; [detected? true] [message "oops"]]. Or maybe we can convert it from
+;; the error object to a richer object that contains the whole
+;; stack/expr at the time it happened.
+
+;; maybe we need a primitive here: fail, which will put a new item on
+;; ToS which includes the whole env field plus a message field to
+;; describe what is wrong.
+
+;; eg
+
+1 0 /
+
+[environment [[stack [1 0]]
+              [expression [/]]
+              [error "division by zero"]]]
+
+1 0 . "division by zero" capture /
+
+[environment [[stack [1 0]]
+              [expression [/]]
+              [error "division by zero"]]] . /
+
+;; ok what's the best we got so far?
+
+;; i think it's recover/resume, without requiring nested env. Have the
+;; error type with a flag detected?. Eval will do the following: if
+;; there's an error on top, and there is no 'detected?' field, unwind
+;; the expression to 'resume' (if there is one, otherwise clean the
+;; expression). Set the detected field and continue. presumably what's
+;; next is the error handler if there's anything left in the
+;; expression.
+
+;; ok this is good but it'd be nice to know what the expression was
+;; before it gets unwound. For example what if the handler wants to
+;; log the error? By the time it can do that, the original word that
+;; errored is not in the expression anymore. The error object would
+;; have to contain a snapshot (not just of the stack, but the
+;; expression too). what about snapshotting the stack and cherry
+;; picking the error object before the recovery? How does the recovery
+;; distinguish different types of errors (java's catch-by-class is
+;; kind of weak)
+
+;;eg
+
+1 "foo" + 0 /
+
+;; there's 2 things wrong here, what if we only want to recover from
+;; division by zero? well, we can only wrap / in a recover. ok waht about this
+
+"foo" 0 /
+
+;; this will actually error with type mismatch
+
+;; how are we supposed to serialize these things? This makes me think
+;; the rust structs need to be easily representable as kcats. And then
+;; what are we supposed to do with error literals (the reader would
+;; need to convert them). What would error literals look like,
+;; especially user-defined errors?
+
+[[error "oh noes"]]
+
+;; but then how to subtype them? Here we have a sort of pseudoprogram
+;; that demonstrates what the interpreter couldn't do. for example [0
+;; /] means it can't divide by zero. And then there's a string that
+;; just says what the program can't do. eg 'number' is a word that may
+;; or may not exist (I suppose it should, to do parseInt type stuff)
+;; but the point is it's pseudocode that in many cases will work as
+;; real code, but not guaranteed.
+
+[[type error]
+ [asked [0 /]]
+ [reason "cannot divide by zero"]]
+
+[[type error]
+ [asked [number]]
+ [reason "not a number"]]
+
+[[type error]
+ [asked [consume]]
+ [reason "not enough items on stack"]]
+
+[[type error]
+ [asked [2 get]]
+ [reason "not enough items in the list"]]
+
+[[type error]
+ [asked [bloop]]
+ [reason "word is not defined"]]
+#+end_src
+
+
+#+begin_src kcats
+[] [discard] [inject] dip
+#+end_src
+
+#+RESULTS:
+: 
+: stack: [[[type error] [asked [consume]] [reason "not enough items on stack"]] []]
+: expression: [swap evert unpack dip evert [[discard]] unwrap]
+
+#+begin_src kcats
+
+[+]
+[ "hello"]
+
+           [snapshot] dipdown ;; rec test ss
+           [inject] dip swap ;; res rec
+           first error? ;; err? res rec
+        ;;   [discard execute];; drop the snapshot and run recovery
+        ;;   [evert discard] ;; use snapshot as stack
+        ;;   if
+          resume
+#+end_src
+
+#+RESULTS:
+: 
+: [false "Lookup attempted on non association value" [type] [[reason "type mismatch"] [type error] [asked [number]]] ["hello"]]
+
+
+#+begin_src kcats
+5 [1 2 0] [[/] [discard 0]
+
+           [snapshot] dipdown ;; rec test ss
+           [inject] dip swap ;; res rec
+           [first error?] ;; err? res rec
+           [discard execute];; drop the snapshot and run recovery
+           [evert discard] ;; use snapshot as stack
+           if
+           
+          ] map
+
+
+#+end_src
+
+#+RESULTS:
+: 
+: stack: [[[asked [association]] [type error] [reason "type mismatch"]] 5 [discard 0] 1 5]
+: expression: [[count 1 =] [first first] [[type] lookup] if [error] unwrap = [[[5] [discard 0] 1 5]] unwrap evert first [[discard execute] [evert discard]] unwrap branch [[[5] [] 5]] unwrap evert first swap [pack] dip [2 0] [wrap swap clone float [[/] [discard 0] [snapshot] dipdown [inject] dip swap [first error?] [discard execute] [evert discard] if] [swap join] dip inject first swap [pack] dip] step discard]
+
+**** Another approach
+Another way to trick the interpreter into continuing execution is to
+put something else on top of the stack, and then have the recovery
+discard it.
+
+This is no good because we need to actually examine the error and so
+it needs to be on top.
 * Notes
 ** Bootstrapping
 + Builtin words need to exist *before* the derived words are read from
@@ -2685,152 +2911,6 @@ println!("{:?}", x)
 
 #+RESULTS:
 : [1, 2, 3, 4, 5]
-
-error recovery
-
-#+begin_src kcats
-2 [1 4 0] [[/] [discard 0] recover] map
-
-[1 0 /] [discard 0] recover
-1 [0 /] [discard 0] . recover
-1 . snapshot
-    [0 /] inject first
-    [error?] [discard 0] [] if
-    resume  
-err [error?]  
-
-; inject the program into a snapshot. If there's an error on top
-; afterward, inject the recovery in there too. It'll have access to
-; the whole context. If there's no error, evert and drop the ToS.
-
-;; wait why is there even a snapshot? to let the recovery access the
-;; stack without having to guess what's on it.
-
-[1 0 /] . execute
-. 1 0 /
-err . [discard 0] execute resume
-                        ;; ^ this is in the expression so keep going, actual word doesn't do anything
-
-
-;; when the ToS is err, how do we know whether to stop?  we can look
-;; at the expression to see what's coming. We can't do that at every
-;; step of the entire execution but we don't have to. Just when ToS =
-;; err. The challenge is to encode this just with the stack/expr and
-;; no extra state. We can put a word like "continue" in the expr, but
-;; at some point we actually have to have an err on ToS and do
-;; something with it. The only place we can put some kind of flag not
-;; to abort, is in the expression (or maybe the dictionary).
-
-;; another approach is to explicitly continue unless halt is called,
-;; but the error-producer doesn't know whether the error can be
-;; handled or not.
-
-
-;; how to unwind. can we just naively unwind to the next instance of
-;; 'recover' in the expression? or will quoted programs mess this up?
-;; Let's work through it
-
-;; here the recover is quoted, but by the time an error occurs and we
-;; look at the expression, it'll be there:
-2 [1 4 0] [[/ 12 +] [discard 0] recover] map
-
-2 err . 12 + resume [error?] [discard 0] if
-2 err . [error?] [discard 0] [] if 
-
-;; so the problem is even after we've unwound the expression to
-;; 'resume', the error is still on the ToS! Now we want to actually do
-;; the recovery, but we've already gotten rid of the flag that tells
-;; us we're doing that. Maybe we can modify the error object itself to
-;; note that it's been flagged for processing. Maybe [[type error]
-;; [detected? true] [message "oops"]]. Or maybe we can convert it from
-;; the error object to a richer object that contains the whole
-;; stack/expr at the time it happened.
-
-;; maybe we need a primitive here: fail, which will put a new item on
-;; ToS which includes the whole env field plus a message field to
-;; describe what is wrong.
-
-;; eg
-
-1 0 /
-
-[environment [[stack [1 0]]
-              [expression [/]]
-              [error "division by zero"]]]
-
-1 0 . "division by zero" capture /
-
-[environment [[stack [1 0]]
-              [expression [/]]
-              [error "division by zero"]]] . /
-
-;; ok what's the best we got so far?
-
-;; i think it's recover/resume, without requiring nested env. Have the
-;; error type with a flag detected?. Eval will do the following: if
-;; there's an error on top, and there is no 'detected?' field, unwind
-;; the expression to 'resume' (if there is one, otherwise clean the
-;; expression). Set the detected field and continue. presumably what's
-;; next is the error handler if there's anything left in the
-;; expression.
-
-;; ok this is good but it'd be nice to know what the expression was
-;; before it gets unwound. For example what if the handler wants to
-;; log the error? By the time it can do that, the original word that
-;; errored is not in the expression anymore. The error object would
-;; have to contain a snapshot (not just of the stack, but the
-;; expression too). what about snapshotting the stack and cherry
-;; picking the error object before the recovery? How does the recovery
-;; distinguish different types of errors (java's catch-by-class is
-;; kind of weak)
-
-;;eg
-
-1 "foo" + 0 /
-
-;; there's 2 things wrong here, what if we only want to recover from
-;; division by zero? well, we can only wrap / in a recover. ok waht about this
-
-"foo" 0 /
-
-;; this will actually error with type mismatch
-
-;; how are we supposed to serialize these things? This makes me think
-;; the rust structs need to be easily representable as kcats. And then
-;; what are we supposed to do with error literals (the reader would
-;; need to convert them). What would error literals look like,
-;; especially user-defined errors?
-
-[[error "oh noes"]]
-
-;; but then how to subtype them? Here we have a sort of pseudoprogram
-;; that demonstrates what the interpreter couldn't do. for example [0
-;; /] means it can't divide by zero. And then there's a string that
-;; just says what the program can't do. eg 'number' is a word that may
-;; or may not exist (I suppose it should, to do parseInt type stuff)
-;; but the point is it's pseudocode that in many cases will work as
-;; real code, but not guaranteed.
-
-[[type error]
- [asked [0 /]]
- [reason "cannot divide by zero"]]
-
-[[type error]
- [asked [number]]
- [reason "not a number"]]
-
-[[type error]
- [asked [consume]]
- [reason "not enough items on stack"]]
-
-[[type error]
- [asked [2 get]]
- [reason "not enough items in the list"]]
-
-[[type error]
- [asked [bloop]]
- [reason "word is not defined"]]
-#+end_src
 
 #+begin_src rust
 use std::any::Any;
