@@ -75,6 +75,7 @@ pub type Association = HashMap<KeyItem, Item>;
 #[derive(Clone, PartialEq)]
 pub struct Error {
     pub data: Association,
+    pub is_handled: bool
 }
 
 lazy_static! {
@@ -82,6 +83,7 @@ lazy_static! {
     pub static ref S_BOOLEAN: Intern<String> = Intern::new("boolean".to_string());
     pub static ref S_BYTES: Intern<String> = Intern::new("bytes".to_string());
     pub static ref S_ENVIRONMENT: Intern<String> = Intern::new("environment".to_string());
+    pub static ref S_ERROR: Intern<String> = Intern::new("error".to_string());
     pub static ref S_FLOAT: Intern<String> = Intern::new("float".to_string());
     pub static ref S_INTEGER: Intern<String> = Intern::new("integer".to_string());
     pub static ref S_ITEM: Intern<String> = Intern::new("item".to_string());
@@ -194,6 +196,7 @@ impl Environment {
 impl Error {
     fn create(asked: List, reason: &str) -> Error {
         Error {
+            is_handled: false,
             data: HashMap::from([
                 (word_key("type"), word("error")),
                 (word_key("asked"), Item::List(asked)),
@@ -256,7 +259,8 @@ impl TryFrom<Item> for List {
             Item::Assoc(a) => Ok(a
                 .into_iter()
                 .map(|(k, v)| Item::List(List::from(vec![to_value_item(k), Item::from(v)])))
-                .collect::<List>()),
+                                 .collect::<List>()),
+            Item::Error(e) => List::try_from(Item::Assoc(e.data)),
             _ => Err(Error::expected("list")),
         }
     }
@@ -640,6 +644,7 @@ mod tests {
     #[test_case("prepend")]
     #[test_case("primrec")]
     #[test_case("range")]
+    #[test_case("recover")]
     #[test_case("recur")]
     #[test_case("rest")]
     #[test_case("reverse")]
@@ -788,6 +793,7 @@ pub fn add_builtins(d: Dictionary) -> Dictionary {
             ("execute", Rc::new(execute)),
             ("first", Rc::new(f_stack1(first))),
             ("float", Rc::new(float)),
+            ("handle", Rc::new(f_stack1(handle))),
             ("inc", Rc::new(f_stack1(inc))),
             ("join", Rc::new(f_stack2(join))),
             ("list?", Rc::new(f_stack1(is_list))),
@@ -1517,7 +1523,13 @@ fn check_type(i: &Item, w: Word) -> Result<(), Error> {
                 Err(Error::expected(&w))
             }
         }
-        _ => Ok(()),
+        Item::Error(_) => {
+            if w == *S_LIST || w == *S_ITEM || w == *S_ASSOC || w == *S_ERROR {
+                Ok(())
+            } else {
+                Err(Error::expected(&w))
+            }
+        }
     }
 }
 
@@ -1665,13 +1677,11 @@ fn rest(i: Item) -> ItemResult {
 
 fn is_uncaught_error(env: &Environment) -> bool {
     if let Some(i) = env.stack.front() {
-        if let Item::Error(_) = *i {
+        if let Item::Error(e) = i {
             // if the top of stack is an error we're done unless
             // there's a recovery coming. we know recovery is
-            // coming if the expression has a resume
-            // (after an if statement that checks whether there's
-            // an error and recovers)
-            !env.expression.contains(&word("resume"))
+            // coming if the expression has a handle word
+            !e.is_handled
         } else {
             false
         }
@@ -1680,11 +1690,30 @@ fn is_uncaught_error(env: &Environment) -> bool {
     }
 }
 
+fn unwind(mut env: Environment) -> (Environment, bool) {
+    //TODO: This is messy, word and axiomdef for that word should
+    // compare equal
+    let w = env.dictionary.get(&word_key("handle")).unwrap();
+    let can_handle = env.expression.contains(w);
+    if can_handle {
+        let mut next = env.expression.front();
+        while next.is_some() && next.unwrap() != w {
+            env.expression.pop_front();
+            next = env.expression.front();
+        }
+    }
+    (env, can_handle)
+}
+
 pub fn eval(mut env: Environment) -> Environment {
     loop {
         //check for error
         if is_uncaught_error(&env) {
-            break;
+            let (e, handled) = unwind(env);
+            env = e;
+            if !handled {
+                break;
+            }
         }
         if !env.expression.is_empty() {
             env = eval_step(env);
@@ -1766,6 +1795,16 @@ fn sqrt(i: Item) -> ItemResult {
         Item::Int(i) => Ok(Item::Int(i.sqrt())),
         Item::Float(f) => Ok(Item::Float(f.sqrt())),
         _ => Err(Error::expected("number")),
+    }
+}
+
+fn handle(i: Item) -> ItemResult {
+    match i {
+        Item::Error(mut e) => Ok(Item::Error({
+            e.is_handled = true;
+            e
+        })),
+        i => Ok(i)
     }
 }
 #+end_src
@@ -2366,62 +2405,108 @@ err . [discard 0] execute resume
  [reason "word is not defined"]]
 #+end_src
 
-
 #+begin_src kcats
-[] [discard] [inject] dip
-#+end_src
-
-#+RESULTS:
-: 
-: stack: [[[type error] [asked [consume]] [reason "not enough items on stack"]] []]
-: expression: [swap evert unpack dip evert [[discard]] unwrap]
-
-#+begin_src kcats
-
+17
 [+]
-[ "hello"]
+[discard 5 +]
 
-           [snapshot] dipdown ;; rec test ss
-           [inject] dip swap ;; res rec
-           first error? ;; err? res rec
-        ;;   [discard execute];; drop the snapshot and run recovery
-        ;;   [evert discard] ;; use snapshot as stack
-        ;;   if
-          resume
+[[handle] join] dip ;; add handle to the end of test
+[snapshot] dipdown ;; rec test ss
+sink inject ;; res rec
+[first error?] ;; err? res rec
+[first swap execute];; drop the snapshot and run recovery
+[evert discard] ;; use snapshot as stack
+if
+
 #+end_src
 
 #+RESULTS:
 : 
-: [false "Lookup attempted on non association value" [type] [[reason "type mismatch"] [type error] [asked [number]]] ["hello"]]
+: [22]
 
 
 #+begin_src kcats
-5 [1 2 0] [[/] [discard 0]
+5
+[1 2 "oh fudge"]
+[[+]
+ [discard discard]
+ recover]
+map
+#+end_src
 
-           [snapshot] dipdown ;; rec test ss
-           [inject] dip swap ;; res rec
-           [first error?] ;; err? res rec
-           [discard execute];; drop the snapshot and run recovery
-           [evert discard] ;; use snapshot as stack
-           if
-           
-          ] map
+#+RESULTS:
+: 
+: [[6 7 5] 5]
 
+#+begin_src kcats
+ [+]
+[discard 1
+ [+] [discard 2 +]
+ recover]
+recover
+#+end_src
+
+#+RESULTS:
+: 
+: [3]
+
+#+begin_src kcats
+5 handle 
 
 #+end_src
 
 #+RESULTS:
 : 
-: stack: [[[asked [association]] [type error] [reason "type mismatch"]] 5 [discard 0] 1 5]
-: expression: [[count 1 =] [first first] [[type] lookup] if [error] unwrap = [[[5] [discard 0] 1 5]] unwrap evert first [[discard execute] [evert discard]] unwrap branch [[[5] [] 5]] unwrap evert first swap [pack] dip [2 0] [wrap swap clone float [[/] [discard 0] [snapshot] dipdown [inject] dip swap [first error?] [discard execute] [evert discard] if] [swap join] dip inject first swap [pack] dip] step discard]
+: [5]
 
-**** Another approach
-Another way to trick the interpreter into continuing execution is to
-put something else on top of the stack, and then have the recovery
-discard it.
+**** DONE Errors during recovery are improperly caught
+The current implementation cannot tell the difference between an error
+that was put on the stack during the "test" program, vs one that was
+put there during the recovery. So if the recovery throws an error, it
+*should* halt the execution, but it won't. Instead the program will
+continue executing and words will be invoked with errors on the stack
+that shouldn't be invoked.
 
-This is no good because we need to actually examine the error and so
-it needs to be on top.
+I think I have a solution, but it does require modifying the error
+object by setting a =handled?= flag (note the plan is for this to be
+an implementation detail and from kcats point of view the error object
+will not be visibly modified). The recovery program will have a word
+=handle= inserted in the first position. The word =handle= will set
+the flag on the error to =true=. Then =eval= can stop when a) there's
+an error on the stack with no =handled? = true= AND the word =handle=
+isn't in the expression. If =handle= *is* in the expression, we need
+to unwind the expression up to but not including the =handle= word.
+
+The word =handle= has to be an atomic operation (an axiom word that
+sets the flag in one evaluation step, otherwise the progam would halt
+before the flag could be set.)
+
+We can delete the word =resume=.
+
+#+begin_src kcats
+ discard 1 2 + handle discard 3 4 +
+#+end_src
+
+#+RESULTS:
+: 
+: [7]
+
+#+begin_src kcats
+1 [[zero?] [pos?]] [execute] every?
+#+end_src
+
+#+RESULTS:
+: 
+: [false 1]
+
+#+begin_src kcats
+1 [[zero?] [positive?]] [execute] any?
+#+end_src
+
+#+RESULTS:
+: 
+: [true 1]
+
 * Notes
 ** Bootstrapping
 + Builtin words need to exist *before* the derived words are read from
