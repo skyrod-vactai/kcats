@@ -50,9 +50,8 @@ use internment::Intern;
 use lazy_static::lazy_static;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::mem;
-use std::ptr;
 use std::rc::Rc;
 //extern crate thiserror;
 
@@ -75,7 +74,7 @@ pub type Association = HashMap<KeyItem, Item>;
 #[derive(Clone, PartialEq)]
 pub struct Error {
     pub data: Association,
-    pub is_handled: bool
+    pub is_handled: bool,
 }
 
 lazy_static! {
@@ -94,7 +93,7 @@ lazy_static! {
     pub static ref S_WORD: Intern<String> = Intern::new("word".to_string());
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Item {
     Int(Int),
     Float(Float),
@@ -153,24 +152,53 @@ pub struct DerivedDef {
     pub definition: List,
 }
 
+impl PartialEq for Item {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            // same types, just use their own eq
+            (Item::Int(i), Item::Int(j)) => i == j,
+            (Item::Float(i), Item::Float(j)) => i == j,
+            (Item::Boolean(i), Item::Boolean(j)) => i == j,
+            (Item::String(i), Item::String(j)) => i == j,
+            (Item::Bytes(i), Item::Bytes(j)) => i == j,
+            (Item::Word(i), Item::Word(j)) => i == j,
+            (Item::Assoc(i), Item::Assoc(j)) => i == j,
+            (Item::Env(i), Item::Env(j)) => i == j,
+            (Item::AxiomDef(i), Item::AxiomDef(j)) => i == j,
+            (Item::DerivedDef(i), Item::DerivedDef(j)) => i == j,
+            (Item::List(i), Item::List(j)) => i == j,
+            (Item::Error(i), Item::Error(j)) => i == j,
+
+            (Item::Nothing, Item::List(l)) => l.is_empty(),
+            (Item::List(l), Item::Nothing) => l.is_empty(),
+
+            (Item::Nothing, Item::Assoc(l)) => l.is_empty(),
+            (Item::Assoc(l), Item::Nothing) => l.is_empty(),
+
+            (Item::List(l), Item::Assoc(a)) => a.is_empty() && l.is_empty(),
+            (Item::Assoc(a), Item::List(l)) => a.is_empty() && l.is_empty(),
+
+            (Item::Error(i), Item::Assoc(j)) => (*i).data == *j,
+            (Item::Assoc(i), Item::Error(j)) => (*j).data == *i,
+
+            (Item::Word(i), Item::AxiomDef(j)) => j.word == *i,
+            (Item::AxiomDef(i), Item::Word(j)) => i.word == *j,
+
+            //TODO env to assoc
+            _ => false,
+        }
+    }
+}
+
 // dictionary entries are equal if they have the same function reference,
 // no need to compare the function values
 impl PartialEq for AxiomDef {
     fn eq(&self, other: &Self) -> bool {
-        self.word == other.word
-            && self.examples == other.examples
-            && self.spec == other.spec
-            && ptr::eq(self.f.as_ref(), other.f.as_ref())
+        self.word == other.word && self.examples == other.examples && self.spec == other.spec
     }
 }
 
 impl Eq for AxiomDef {}
-
-impl Hash for AxiomDef {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.word.hash(state);
-    }
-}
 
 pub fn extend_front(l: &mut List, mut to_prepend: List) {
     mem::swap(l, &mut to_prepend);
@@ -259,7 +287,7 @@ impl TryFrom<Item> for List {
             Item::Assoc(a) => Ok(a
                 .into_iter()
                 .map(|(k, v)| Item::List(List::from(vec![to_value_item(k), Item::from(v)])))
-                                 .collect::<List>()),
+                .collect::<List>()),
             Item::Error(e) => List::try_from(Item::Assoc(e.data)),
             _ => Err(Error::expected("list")),
         }
@@ -1693,7 +1721,7 @@ fn is_uncaught_error(env: &Environment) -> bool {
 fn unwind(mut env: Environment) -> (Environment, bool) {
     //TODO: This is messy, word and axiomdef for that word should
     // compare equal
-    let w = env.dictionary.get(&word_key("handle")).unwrap();
+    let w = &word("handle");
     let can_handle = env.expression.contains(w);
     if can_handle {
         let mut next = env.expression.front();
@@ -2078,6 +2106,56 @@ Examples:
 =
 => true
 #+end_src
+*** DONE Items of equal content don't compare equal
+#+begin_src kcats
++ handle [[type error] [asked [consume]] [reason "not enough items on stack"]] association =
+#+end_src
+
+#+RESULTS:
+: 
+: [true]
+
+#+begin_src kcats
+dictionary [swap] lookup [swap] unwrap = 
+#+end_src
+
+#+RESULTS:
+: 
+: [true]
+
+#+begin_src kcats
+[] environment [dictionary swap] lookup [swap] unwrap = 
+#+end_src
+
+#+RESULTS:
+: 
+: [true]
+
+This matches clojure
+#+begin_src kcats
+1 1.0 =
+#+end_src
+
+#+RESULTS:
+: 
+: [false]
+
+#+begin_src kcats
+[] [] association =
+#+end_src
+
+#+RESULTS:
+: 
+: [true]
+
+#+begin_src kcats
+"foo" bytes "foo" bytes =
+#+end_src
+
+#+RESULTS:
+: 
+: [true]
+
 *** DONE Change unit tests to make the expected take a program and eval it
 This is to fix the cases that result in associatives or sets where
 order doesn't matter but we don't have a way to declare how the values
