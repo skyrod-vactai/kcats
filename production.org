@@ -90,6 +90,7 @@ lazy_static! {
     pub static ref S_ITEM: Intern<String> = Intern::new("item".to_string());
     pub static ref S_LIST: Intern<String> = Intern::new("list".to_string());
     pub static ref S_NUMBER: Intern<String> = Intern::new("number".to_string());
+    pub static ref S_PIPE: Intern<String> = Intern::new("pipe".to_string());
     pub static ref S_PROGRAM: Intern<String> = Intern::new("program".to_string());
     pub static ref S_STRING: Intern<String> = Intern::new("string".to_string());
     pub static ref S_WORD: Intern<String> = Intern::new("word".to_string());
@@ -370,6 +371,17 @@ impl TryFrom<Item> for Environment {
     }
 }
 
+impl TryFrom<Item> for Box<dyn In> {
+    type Error = Error;
+    fn try_from(i: Item) -> Result<Self, Self::Error> {
+        if let Item::In(i) = i {
+            Ok(i)
+        } else {
+            Err(Error::expected("pipe"))
+        }
+    }
+}
+
 impl From<DerivedDef> for Association {
     fn from(d: DerivedDef) -> Association {
         let mut a = Association::new();
@@ -443,6 +455,13 @@ impl From<Environment> for Association {
 impl From<Environment> for Item {
     fn from(env: Environment) -> Item {
         Item::Env(Environment::from(env))
+    }
+}
+
+
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Error {
+        Error::create(wrap(word("io")), &err.to_string())
     }
 }
 
@@ -534,6 +553,7 @@ mod types;
 use crate::types::*;
 mod axiom;
 mod serialize;
+mod pipes;
 use std::io;
 use std::io::BufRead;
 
@@ -739,7 +759,7 @@ use std::mem;
 use std::ops::Range;
 use std::rc::Rc;
 
-type ItemResult = Result<Item, Error>;
+pub type ItemResult = Result<Item, Error>;
 
 impl From<ItemResult> for Item {
     fn from(i: ItemResult) -> Self {
@@ -824,6 +844,7 @@ pub fn add_builtins(d: Dictionary) -> Dictionary {
             ("evaluate", Rc::new(f_stack1(evaluate))),
             ("even?", Rc::new(f_stack1(is_even))),
             ("evert", Rc::new(evert)),
+            ("file", Rc::new(f_stack1(crate::pipes::file))),
             ("execute", Rc::new(execute)),
             ("first", Rc::new(f_stack1(first))),
             ("float", Rc::new(float)),
@@ -838,6 +859,7 @@ pub fn add_builtins(d: Dictionary) -> Dictionary {
             ("odd?", Rc::new(f_stack1(is_odd))),
             ("or", Rc::new(f_stack2(or))),
             ("pack", Rc::new(f_stack2(pack))),
+            ("put", Rc::new(crate::pipes::put_)),
             ("range", Rc::new(range)),
             ("read", Rc::new(read)),
             ("recur", Rc::new(recur)),
@@ -1564,6 +1586,14 @@ fn check_type(i: &Item, w: Word) -> Result<(), Error> {
                 Err(Error::expected(&w))
             }
         }
+        Item::In(_) => {
+            if w == *S_ITEM || w == *S_PIPE {
+                Ok(())
+            }
+            else {
+                Err(Error::expected(&w))
+            }
+        } 
     }
 }
 
@@ -2003,20 +2033,113 @@ impl fmt::Debug for Error {
 Now we'll add the functions that do input/output (pipes)
 
 #+begin_src rust :tangle src/pipes.rs
-use std::fmt;
+use crate::axiom::ItemResult;
+use crate::types::{Environment, Error, Item};
 use dyn_clone::DynClone;
-pub trait In: fmt::Debug + DynClone  {
+use std::fmt;
+use std::fmt::Debug;
+use std::fs::File;
+use std::io::Write;
 
+pub trait Writable: Write + Debug + DynClone {}
+
+pub trait In: Writable {
+    fn put(&mut self, i: Item) -> Result<(), Error>;
+}
+
+pub trait Out: fmt::Debug + DynClone {
+    fn take(self) -> Result<Item, Error>;
 }
 
 dyn_clone::clone_trait_object!(In);
+dyn_clone::clone_trait_object!(Out);
 
+// trait Cloneable {
+//     fn clone(&self) -> Self;
+// }
 
-pub trait Out {
+// impl Cloneable for File {
+//     fn clone(&self) -> Self {
+//         self.try_clone().unwrap()
+//     }
+// }
+#[derive(Debug)]
+struct FileWrap(File);
 
+use std::ops::Deref;
+
+impl Deref for FileWrap {
+    type Target = File;
+    fn deref(&self) -> &Self::Target {
+        //self.0.write(&[]);
+        &self.0
+    }
 }
 
- 
+impl Clone for FileWrap {
+    fn clone(&self) -> Self {
+        FileWrap(self.try_clone().unwrap())
+    }
+}
+
+impl Write for FileWrap {
+    fn write(&mut self, buf: &[u8]) -> Result<usize, std::io::Error> {
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> Result<(), std::io::Error> {
+        self.0.flush()
+    }
+}
+
+impl Writable for FileWrap {}
+
+impl In for FileWrap {
+    fn put(&mut self, i: Item) -> Result<(), Error> {
+        match i {
+            Item::Bytes(bs) => {
+                let mut pos = 0;
+                while pos < bs.len() {
+                    let bytes_written = self.write(&bs[pos..])?;
+                    pos += bytes_written;
+                }
+                self.flush()?;
+                Ok(())
+            }
+            _ => Err(Error::expected("bytes")),
+        }
+    }
+}
+
+pub fn file(i: Item) -> ItemResult {
+    // FileWrap(File::create(
+    //     String::try_from(i)?,
+    // )?).write(&[]);
+    Ok(Item::In(Box::new(FileWrap(File::create(
+        String::try_from(i)?,
+    )?))))
+}
+
+pub fn put_(mut env: Environment) -> Environment {
+    let item = env.pop();
+    let pipe = env.pop();
+    let r = Box::<dyn In>::try_from(pipe);
+    match r {
+        Ok(mut p) => {
+            match p.put(item) {
+                Ok(_) => {}
+                Err(e) => {
+                    env.stack.push_front(Item::Error(e));
+                }
+            }
+            env.stack.push_front(Item::In(p));
+        }
+        Err(e) => {
+            env.stack.push_front(Item::Error(e));
+        }
+    }
+    env
+}
 #+end_src
 ** Issues
 *** DONE Serialization treats any tagged literal as byte string
@@ -2615,6 +2738,22 @@ Make a stream of something
 #+begin_src rust
 
 #+end_src
+**** INPROGRESS Write to a file
+#+begin_src kcats
+[[file "/tmp/foo"]] pipe-in
+
+["hello world!"
+ "Nice to meet you!"
+ "My name is kcats"]
+
+["\n" join bytes put]
+
+step
+#+end_src
+
+#+RESULTS:
+: 
+: [999]
 
 * Notes
 ** Bootstrapping
