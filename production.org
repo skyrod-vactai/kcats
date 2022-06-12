@@ -54,7 +54,7 @@ use std::fmt;
 use std::hash::Hash;
 use std::mem;
 use std::rc::Rc;
-use crate::pipes::In;
+use crate::pipes::{In, Out, InOut};
 //extern crate thiserror;
 
 pub type Word = Intern<String>;
@@ -111,6 +111,8 @@ pub enum Item {
     DerivedDef(DerivedDef),
     Error(Error),
     In(Box<dyn In>),
+    Out(Box<dyn Out>),
+    InOut(Box<dyn InOut>),
     Nothing,
 }
 
@@ -378,6 +380,26 @@ impl TryFrom<Item> for Box<dyn In> {
             Ok(i)
         } else {
             Err(Error::expected("pipe"))
+        }
+    }
+}
+
+impl TryFrom<Item> for Box<dyn Out> {
+    type Error = Error;
+    fn try_from(i: Item) -> Result<Self, Self::Error> {
+        match i {
+            Item::Out(o) => Ok(o),
+            _ => Err(Error::expected("pipe"))
+        }
+    }
+}
+
+impl TryFrom<Item> for Box<dyn InOut> {
+    type Error = Error;
+    fn try_from(i: Item) -> Result<Self, Self::Error> {
+        match i {
+            Item::InOut(io) => Ok(io),
+            _ => Err(Error::expected("pipe"))
         }
     }
 }
@@ -874,6 +896,7 @@ pub fn add_builtins(d: Dictionary) -> Dictionary {
             ("string?", Rc::new(f_stack1(is_string))),
             ("swap", Rc::new(swap)),
             ("swapdown", Rc::new(swapdown)),
+            ("take", Rc::new(crate::pipes::take_)),
             ("unassign", Rc::new(f_stack2(unassign))),
             ("unpack", Rc::new(unpack)),
             ("unwrap", Rc::new(unwrap)),
@@ -1593,6 +1616,22 @@ fn check_type(i: &Item, w: Word) -> Result<(), Error> {
             else {
                 Err(Error::expected(&w))
             }
+        }
+        Item::Out(_) => {
+            if w == *S_ITEM || w == *S_PIPE {
+                Ok(())
+            }
+            else {
+                Err(Error::expected(&w))
+            }
+        }
+        Item::InOut(_) => {
+            if w == *S_ITEM || w == *S_PIPE {
+                Ok(())
+            }
+            else {
+                Err(Error::expected(&w))
+            }
         } 
     }
 }
@@ -1989,7 +2028,11 @@ fn from_item(item: &Item) -> edn_format::Value {
             } else {
                 from_item(&Item::Word(d.word))
             }
-        }
+        },
+        Item::In(_) => edn_format::Value::Integer(999),
+        Item::Out(_) => edn_format::Value::Integer(999),
+        Item::InOut(_) => edn_format::Value::Integer(999),
+        
     }
 }
 
@@ -2039,20 +2082,23 @@ use dyn_clone::DynClone;
 use std::fmt;
 use std::fmt::Debug;
 use std::fs::File;
-use std::io::Write;
-
+use std::io::{Read, Write};
 pub trait Writable: Write + Debug + DynClone {}
+pub trait Readable: Read + Debug + DynClone {}
 
 pub trait In: Writable {
     fn put(&mut self, i: Item) -> Result<(), Error>;
 }
 
 pub trait Out: fmt::Debug + DynClone {
-    fn take(self) -> Result<Item, Error>;
+    fn take(&mut self) -> Result<Item, Error>;
 }
+
+pub trait InOut: In + Out {}
 
 dyn_clone::clone_trait_object!(In);
 dyn_clone::clone_trait_object!(Out);
+dyn_clone::clone_trait_object!(InOut);
 
 // trait Cloneable {
 //     fn clone(&self) -> Self;
@@ -2092,7 +2138,14 @@ impl Write for FileWrap {
     }
 }
 
+impl Read for FileWrap {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
+        self.0.read(buf)
+    }
+}
+
 impl Writable for FileWrap {}
+impl Readable for FileWrap {}
 
 impl In for FileWrap {
     fn put(&mut self, i: Item) -> Result<(), Error> {
@@ -2111,11 +2164,21 @@ impl In for FileWrap {
     }
 }
 
+impl Out for FileWrap {
+    fn take(&mut self) -> Result<Item, Error> {
+        let mut bs = [0u8; 1024];
+        let ct = self.read(&mut bs)?;
+        Ok(Item::Bytes(bs[0..ct].to_vec()))
+    }
+}
+
+impl InOut for FileWrap {}
+
 pub fn file(i: Item) -> ItemResult {
     // FileWrap(File::create(
     //     String::try_from(i)?,
     // )?).write(&[]);
-    Ok(Item::In(Box::new(FileWrap(File::create(
+    Ok(Item::InOut(Box::new(FileWrap(File::create(
         String::try_from(i)?,
     )?))))
 }
@@ -2123,9 +2186,10 @@ pub fn file(i: Item) -> ItemResult {
 pub fn put_(mut env: Environment) -> Environment {
     let item = env.pop();
     let pipe = env.pop();
-    let r = Box::<dyn In>::try_from(pipe);
-    match r {
-        Ok(mut p) => {
+
+    match pipe
+    {
+        Item::In(mut p) => {
             match p.put(item) {
                 Ok(_) => {}
                 Err(e) => {
@@ -2133,9 +2197,51 @@ pub fn put_(mut env: Environment) -> Environment {
                 }
             }
             env.stack.push_front(Item::In(p));
+        },
+        Item::InOut(mut p) => {
+            match p.put(item) {
+                Ok(_) => {}
+                Err(e) => {
+                    env.stack.push_front(Item::Error(e));
+                }
+            }
+            env.stack.push_front(Item::InOut(p));
+        },
+        _ => {             env.stack.push_front(Item::Error(Error::expected("pipe")));
         }
-        Err(e) => {
-            env.stack.push_front(Item::Error(e));
+        
+    }
+    
+    env
+}
+
+pub fn take_(mut env: Environment) -> Environment {
+    let pipe = env.pop();
+    match pipe {
+        Item::Out(mut p) => {
+            let i = p.take();
+            env.stack.push_front(Item::Out(p));
+
+            match i {
+                Ok(i) => env.stack.push_front(i),
+                Err(e) => {
+                    env.stack.push_front(Item::Error(e));
+                }
+            }
+        }
+        Item::InOut(mut p) => {
+            let i = p.take();
+            env.stack.push_front(Item::InOut(p));
+
+            match i {
+                Ok(i) => env.stack.push_front(i),
+                Err(e) => {
+                    env.stack.push_front(Item::Error(e));
+                }
+            }
+        }
+        _ => {
+            env.stack.push_front(Item::Error(Error::expected("pipe")));
         }
     }
     env
@@ -2732,12 +2838,7 @@ We can delete the word =resume=.
 : 
 : [true 1]
 
-*** TODO Implement pipes
-**** INPROGRESS Prototyping
-Make a stream of something
-#+begin_src rust
-
-#+end_src
+*** INPROGRESS Implement pipes
 **** INPROGRESS Write to a file
 #+begin_src kcats
 [[file "/tmp/foo"]] pipe-in
@@ -2754,6 +2855,17 @@ step
 #+RESULTS:
 : 
 : [999]
+**** INPROGRESS Read from a file
+#+begin_src kcats
+[[file "/tmp/foo"]] pipe-out
+
+take
+#+end_src
+
+#+RESULTS:
+: 
+: [[[asked [io]] [type error] [reason "Bad file descriptor (os error 9)"]] 999]
+
 
 * Notes
 ** Bootstrapping
