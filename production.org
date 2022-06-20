@@ -54,7 +54,7 @@ use std::fmt;
 use std::hash::Hash;
 use std::mem;
 use std::rc::Rc;
-use crate::pipes::{In, Out, InOut};
+use crate::pipes::{In, Out};
 //extern crate thiserror;
 
 pub type Word = Intern<String>;
@@ -112,7 +112,6 @@ pub enum Item {
     Error(Error),
     In(Box<dyn In>),
     Out(Box<dyn Out>),
-    InOut(Box<dyn InOut>),
     Nothing,
 }
 
@@ -389,16 +388,6 @@ impl TryFrom<Item> for Box<dyn Out> {
     fn try_from(i: Item) -> Result<Self, Self::Error> {
         match i {
             Item::Out(o) => Ok(o),
-            _ => Err(Error::expected("pipe"))
-        }
-    }
-}
-
-impl TryFrom<Item> for Box<dyn InOut> {
-    type Error = Error;
-    fn try_from(i: Item) -> Result<Self, Self::Error> {
-        match i {
-            Item::InOut(io) => Ok(io),
             _ => Err(Error::expected("pipe"))
         }
     }
@@ -866,7 +855,8 @@ pub fn add_builtins(d: Dictionary) -> Dictionary {
             ("evaluate", Rc::new(f_stack1(evaluate))),
             ("even?", Rc::new(f_stack1(is_even))),
             ("evert", Rc::new(evert)),
-            ("file", Rc::new(f_stack1(crate::pipes::file))),
+            ("file-in", Rc::new(f_stack1(crate::pipes::file_in))),
+            ("file-out", Rc::new(f_stack1(crate::pipes::file_out))),
             ("execute", Rc::new(execute)),
             ("first", Rc::new(f_stack1(first))),
             ("float", Rc::new(float)),
@@ -1612,27 +1602,17 @@ fn check_type(i: &Item, w: Word) -> Result<(), Error> {
         Item::In(_) => {
             if w == *S_ITEM || w == *S_PIPE {
                 Ok(())
-            }
-            else {
+            } else {
                 Err(Error::expected(&w))
             }
         }
         Item::Out(_) => {
             if w == *S_ITEM || w == *S_PIPE {
                 Ok(())
-            }
-            else {
+            } else {
                 Err(Error::expected(&w))
             }
         }
-        Item::InOut(_) => {
-            if w == *S_ITEM || w == *S_PIPE {
-                Ok(())
-            }
-            else {
-                Err(Error::expected(&w))
-            }
-        } 
     }
 }
 
@@ -1907,7 +1887,7 @@ fn handle(i: Item) -> ItemResult {
             e.is_handled = true;
             e
         })),
-        i => Ok(i)
+        i => Ok(i),
     }
 }
 #+end_src
@@ -1936,7 +1916,6 @@ fn lookup_builtin(w: Word, standard_dictionary: Option<&Dictionary>) -> Item {
     return Item::Word(w);
 }
 const BYTE_TAG: &str = "b64";
-
 
 fn to_item(
     item: &edn_format::Value,
@@ -2028,11 +2007,9 @@ fn from_item(item: &Item) -> edn_format::Value {
             } else {
                 from_item(&Item::Word(d.word))
             }
-        },
+        }
         Item::In(_) => edn_format::Value::Integer(999),
         Item::Out(_) => edn_format::Value::Integer(999),
-        Item::InOut(_) => edn_format::Value::Integer(999),
-        
     }
 }
 
@@ -2079,75 +2056,120 @@ Now we'll add the functions that do input/output (pipes)
 use crate::axiom::ItemResult;
 use crate::types::{Environment, Error, Item};
 use dyn_clone::DynClone;
-use std::fmt;
 use std::fmt::Debug;
 use std::fs::File;
 use std::io::{Read, Write};
-pub trait Writable: Write + Debug + DynClone {}
-pub trait Readable: Read + Debug + DynClone {}
+
+pub trait Writable: Write + Close + Debug + DynClone {}
+pub trait Readable: Read + Close + Debug + DynClone {}
 
 pub trait In: Writable {
     fn put(&mut self, i: Item) -> Result<(), Error>;
 }
 
-pub trait Out: fmt::Debug + DynClone {
+pub trait Out: Readable {
     fn take(&mut self) -> Result<Item, Error>;
 }
 
-pub trait InOut: In + Out {}
+/* Pipes can be "closed", from either end to signal that either the
+ ,* putter or taker has gone away. Sometimes the type of pipe
+ ,* may not really support this concept but an implementation is
+ ,* required.  For example, files. When you open a file for writing and
+ ,* then "close" it, that doesn't really do anything. Rust doesn't have
+ ,* an explicit file close. You have to drop the reference to it, which
+ ,* in kcats you can do by popping the pipe off the stack. Rust will
+ ,* clean up automatically, other impls might have to reference count.
+ ,*
+ ,* The contract here is as follows:
+ ,* 1. After calling close, put on the pipe returns an error
+ ,*
+ ,* 2. After calling close, take on the pipe will return still-buffered
+ ,* items (if the pipe has a buffer), but once buffer is exhausted it
+ ,* will return error.
+ ,*
+ ,* 2. Errors cannot be put into a pipe (the taker can't distinguish
+ ,* between io error and an error value). To work around this, wrap the
+ ,* error value in a list to quote it. Putting error into a pipe will
+ ,* return an io error.
+ ,*
+ ,* 3. Once closed pipes cannot be ever be put into again. closed? will always
+ ,* return true thereafter.
+ ,*
+ ,* One use case that has to be handled specially is a file we've fully
+ ,* read but later someone else might write more bytes to the end. Does
+ ,* the pipe close when we reach EOF? I think we might need to support
+ ,* both types (a type that closes when hitting eof and one that
+ ,* doesn't). The former is the "normal" use case, which will be the
+ ,* default.
+ ,*
+ ,* These two types are basically static vs dynamic content. Either all
+ ,* the content is known now, or it isn't.
+ ,*
+,*/
+pub trait Close: Debug + DynClone {
+    fn close(&mut self) -> Result<(), Error>;
+    fn is_closed(&self) -> bool;
+}
 
 dyn_clone::clone_trait_object!(In);
 dyn_clone::clone_trait_object!(Out);
-dyn_clone::clone_trait_object!(InOut);
+dyn_clone::clone_trait_object!(Close);
 
-// trait Cloneable {
-//     fn clone(&self) -> Self;
-// }
-
-// impl Cloneable for File {
-//     fn clone(&self) -> Self {
-//         self.try_clone().unwrap()
-//     }
-// }
 #[derive(Debug)]
-struct FileWrap(File);
+struct StaticFile {
+    pub file: File,
+    pub closed: bool,
+}
 
 use std::ops::Deref;
 
-impl Deref for FileWrap {
+impl Deref for StaticFile {
     type Target = File;
     fn deref(&self) -> &Self::Target {
         //self.0.write(&[]);
-        &self.0
+        &self.file
     }
 }
 
-impl Clone for FileWrap {
+impl Clone for StaticFile {
     fn clone(&self) -> Self {
-        FileWrap(self.try_clone().unwrap())
+        StaticFile{
+            file: self.try_clone().unwrap(),
+            closed: false,
+        }
     }
 }
 
-impl Write for FileWrap {
+impl Write for StaticFile {
     fn write(&mut self, buf: &[u8]) -> Result<usize, std::io::Error> {
-        self.0.write(buf)
+        self.file.write(buf)
     }
 
     fn flush(&mut self) -> Result<(), std::io::Error> {
-        self.0.flush()
+        self.file.flush()
     }
 }
 
-impl Read for FileWrap {
+impl Read for StaticFile {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
-        self.0.read(buf)
+        self.file.read(buf)
     }
 }
 
-impl Writable for FileWrap {}
-impl Readable for FileWrap {}
+impl Close for StaticFile {
+    fn close(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
 
-impl In for FileWrap {
+    fn is_closed(&self) -> bool {
+        self.closed
+    }
+}
+
+impl Writable for StaticFile {}
+impl Readable for StaticFile {}
+
+impl In for StaticFile {
     fn put(&mut self, i: Item) -> Result<(), Error> {
         match i {
             Item::Bytes(bs) => {
@@ -2164,7 +2186,7 @@ impl In for FileWrap {
     }
 }
 
-impl Out for FileWrap {
+impl Out for StaticFile {
     fn take(&mut self) -> Result<Item, Error> {
         let mut bs = [0u8; 1024];
         let ct = self.read(&mut bs)?;
@@ -2172,23 +2194,28 @@ impl Out for FileWrap {
     }
 }
 
-impl InOut for FileWrap {}
+pub fn file_in(i: Item) -> ItemResult {
+    Ok(Item::In(Box::new(StaticFile {
+        file: File::options()
+            .read(true)
+            .write(true)
+            .open(String::try_from(i)?)?,
+        closed: false,
+    })))
+}
 
-pub fn file(i: Item) -> ItemResult {
-    // FileWrap(File::create(
-    //     String::try_from(i)?,
-    // )?).write(&[]);
-    Ok(Item::InOut(Box::new(FileWrap(File::create(
-        String::try_from(i)?,
-    )?))))
+pub fn file_out(i: Item) -> ItemResult {
+    Ok(Item::Out(Box::new(StaticFile {
+        file: File::open(String::try_from(i)?)?,
+        closed: false,
+    })))
 }
 
 pub fn put_(mut env: Environment) -> Environment {
     let item = env.pop();
     let pipe = env.pop();
 
-    match pipe
-    {
+    match pipe {
         Item::In(mut p) => {
             match p.put(item) {
                 Ok(_) => {}
@@ -2197,21 +2224,12 @@ pub fn put_(mut env: Environment) -> Environment {
                 }
             }
             env.stack.push_front(Item::In(p));
-        },
-        Item::InOut(mut p) => {
-            match p.put(item) {
-                Ok(_) => {}
-                Err(e) => {
-                    env.stack.push_front(Item::Error(e));
-                }
-            }
-            env.stack.push_front(Item::InOut(p));
-        },
-        _ => {             env.stack.push_front(Item::Error(Error::expected("pipe")));
         }
-        
+        _ => {
+            env.stack.push_front(Item::Error(Error::expected("pipe")));
+        }
     }
-    
+
     env
 }
 
@@ -2219,19 +2237,8 @@ pub fn take_(mut env: Environment) -> Environment {
     let pipe = env.pop();
     match pipe {
         Item::Out(mut p) => {
-            let i = p.take();
+            let i = Out::take(&mut *p);
             env.stack.push_front(Item::Out(p));
-
-            match i {
-                Ok(i) => env.stack.push_front(i),
-                Err(e) => {
-                    env.stack.push_front(Item::Error(e));
-                }
-            }
-        }
-        Item::InOut(mut p) => {
-            let i = p.take();
-            env.stack.push_front(Item::InOut(p));
 
             match i {
                 Ok(i) => env.stack.push_front(i),
@@ -2245,6 +2252,14 @@ pub fn take_(mut env: Environment) -> Environment {
         }
     }
     env
+}
+
+pub fn is_closed(i: Item) -> ItemResult {
+    match i {
+        Item::In(p) => { Ok(Item::Boolean(p.is_closed())) },
+        Item::Out(p) => { Ok(Item::Boolean(p.is_closed())) },
+        _ => Err(Error::expected("pipe"))
+    }
 }
 #+end_src
 ** Issues
@@ -2857,14 +2872,15 @@ step
 : [999]
 **** INPROGRESS Read from a file
 #+begin_src kcats
-[[file "/tmp/foo"]] pipe-out
+[join] [[file "/tmp/foo"]] pipe-out
 
-take
+assemble 
 #+end_src
 
 #+RESULTS:
 : 
-: [[[asked [io]] [type error] [reason "Bad file descriptor (os error 9)"]] 999]
+: stack: [[[reason "word is not defined"] [asked [closed?]] [type error]] 999]
+: expression: [not [[999]] unwrap evert first [[take swap [join] dip] [[closed? not] shield]] unwrap join loop discard]
 
 
 * Notes
