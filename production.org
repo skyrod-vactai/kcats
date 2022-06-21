@@ -229,7 +229,7 @@ impl Environment {
 }
 
 impl Error {
-    fn create(asked: List, reason: &str) -> Error {
+    pub fn create(asked: List, reason: &str) -> Error {
         Error {
             is_handled: false,
             data: HashMap::from([
@@ -842,7 +842,9 @@ pub fn add_builtins(d: Dictionary) -> Dictionary {
             ("branch", Rc::new(branch)),
             ("bytes", Rc::new(f_stack1(bytes))),
             ("clone", Rc::new(clone)),
+            ("close", Rc::new(f_stack1(crate::pipes::close))),
             ("ceil", Rc::new(f_stack1(ceil))),
+            ("closed?", Rc::new(f_stack1(crate::pipes::is_closed))),
             ("count", Rc::new(f_stack1(count))),
             ("dec", Rc::new(f_stack1(dec))),
             ("decide", Rc::new(decide)),
@@ -2055,6 +2057,7 @@ Now we'll add the functions that do input/output (pipes)
 #+begin_src rust :tangle src/pipes.rs
 use crate::axiom::ItemResult;
 use crate::types::{Environment, Error, Item};
+use crate::{word, List};
 use dyn_clone::DynClone;
 use std::fmt::Debug;
 use std::fs::File;
@@ -2133,7 +2136,7 @@ impl Deref for StaticFile {
 
 impl Clone for StaticFile {
     fn clone(&self) -> Self {
-        StaticFile{
+        StaticFile {
             file: self.try_clone().unwrap(),
             closed: false,
         }
@@ -2186,10 +2189,23 @@ impl In for StaticFile {
     }
 }
 
+fn closed_error(on_take: bool) -> Error {
+    Error::create(
+        List::from_iter([word("close"), word(if on_take { "take" } else { "put" })]),
+        "attempt to use closed pipe",
+    )
+}
 impl Out for StaticFile {
     fn take(&mut self) -> Result<Item, Error> {
+        if self.is_closed() {
+            return Err(closed_error(true));
+        }
         let mut bs = [0u8; 1024];
         let ct = self.read(&mut bs)?;
+        if ct == 0 {
+            // EOF, no more takes since it's static
+            self.closed = true;
+        }
         Ok(Item::Bytes(bs[0..ct].to_vec()))
     }
 }
@@ -2199,6 +2215,7 @@ pub fn file_in(i: Item) -> ItemResult {
         file: File::options()
             .read(true)
             .write(true)
+            .create_new(true)
             .open(String::try_from(i)?)?,
         closed: false,
     })))
@@ -2256,9 +2273,23 @@ pub fn take_(mut env: Environment) -> Environment {
 
 pub fn is_closed(i: Item) -> ItemResult {
     match i {
-        Item::In(p) => { Ok(Item::Boolean(p.is_closed())) },
-        Item::Out(p) => { Ok(Item::Boolean(p.is_closed())) },
-        _ => Err(Error::expected("pipe"))
+        Item::In(p) => Ok(Item::Boolean(p.is_closed())),
+        Item::Out(p) => Ok(Item::Boolean(p.is_closed())),
+        _ => Err(Error::expected("pipe")),
+    }
+}
+
+pub fn close(i: Item) -> ItemResult {
+    match i {
+        Item::In(mut p) => Ok({
+            p.close()?;
+            Item::In(p)
+        }),
+        Item::Out(mut p) => Ok({
+            p.close()?;
+            Item::Out(p)
+        }),
+        _ => Err(Error::expected("pipe")),
     }
 }
 #+end_src
@@ -2771,7 +2802,7 @@ if
 : [22]
 
 
-#+begin_src kcats
+#+begin_src kcats :results code
 5
 [1 2 "oh fudge"]
 [[+]
@@ -2781,8 +2812,10 @@ map
 #+end_src
 
 #+RESULTS:
-: 
-: [[6 7 5] 5]
+#+begin_src kcats
+
+[[6 7 5] 5]
+#+end_src
 
 #+begin_src kcats
  [+]
@@ -2829,13 +2862,15 @@ before the flag could be set.)
 
 We can delete the word =resume=.
 
-#+begin_src kcats
+#+begin_src kcats :results code
  discard 1 2 + handle discard 3 4 +
 #+end_src
 
 #+RESULTS:
-: 
-: [7]
+#+begin_src kcats
+
+[7]
+#+end_src
 
 #+begin_src kcats
 1 [[zero?] [pos?]] [execute] every?
@@ -2854,7 +2889,7 @@ We can delete the word =resume=.
 : [true 1]
 
 *** INPROGRESS Implement pipes
-**** INPROGRESS Write to a file
+**** DONE Write to a file
 #+begin_src kcats
 [[file "/tmp/foo"]] pipe-in
 
@@ -2870,17 +2905,42 @@ step
 #+RESULTS:
 : 
 : [999]
-**** INPROGRESS Read from a file
-#+begin_src kcats
-[join] [[file "/tmp/foo"]] pipe-out
+**** DONE Read from a file
+#+begin_src kcats :results code
+"" [string join] [[file "/tmp/foop"]] pipe-out
 
 assemble 
 #+end_src
 
 #+RESULTS:
-: 
-: stack: [[[reason "word is not defined"] [asked [closed?]] [type error]] 999]
-: expression: [not [[999]] unwrap evert first [[take swap [join] dip] [[closed? not] shield]] unwrap join loop discard]
+#+begin_src kcats
+
+stack: [[[type error] [reason "No such file or directory (os error 2)"] [asked [io]]] [string join] ""]
+expression: [assemble]
+#+end_src
+
+#+begin_src kcats :results code
+dictionary [assemble definition] lookup
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+
+[[swap [take swap] swap pack [dip] join [[closed? not]] dip while discard]]
+#+end_src
+**** INPROGRESS Close a pipe
+#+begin_src kcats :results code
+[[file "/tmp/foopy"]] pipe-in "foo" bytes put close "bar" bytes put
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+
+[999]
+#+end_src
+**** TODO Serialize pipes with something sane
+Maybe they can't be easily round-tripped, but at least we can print
+something reasonable that will tell human eyes what it is.
 
 
 * Notes
