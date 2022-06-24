@@ -844,7 +844,7 @@ pub fn add_builtins(d: Dictionary) -> Dictionary {
             ("clone", Rc::new(clone)),
             ("close", Rc::new(f_stack1(crate::pipes::close))),
             ("ceil", Rc::new(f_stack1(ceil))),
-            ("closed?", Rc::new(f_stack1(crate::pipes::is_closed))),
+            ("closed?", Rc::new(f_stack1(crate::pipes::is_closed))),            
             ("count", Rc::new(f_stack1(count))),
             ("dec", Rc::new(f_stack1(dec))),
             ("decide", Rc::new(decide)),
@@ -1904,6 +1904,10 @@ use internment::Intern;
 use std::collections::VecDeque;
 use std::fmt;
 
+pub trait Display {
+    fn representation(&self) -> Item;
+}
+
 fn lookup_builtin(w: Word, standard_dictionary: Option<&Dictionary>) -> Item {
     if let Some(dict) = standard_dictionary {
         //println!("Looking up {} in dict of {} words", w, dict.len());
@@ -1953,7 +1957,15 @@ fn to_item(
     }
 }
 
-fn from_item(item: &Item) -> edn_format::Value {
+pub fn vectorize(a: &Association) -> Vec<edn_format::Value> {
+    a.iter()
+        .map(|(k, v)| {
+            edn_format::Value::Vector(vec![from_item(&to_value_item(k.clone())), from_item(v)])
+        })
+        .collect()
+}
+
+pub fn from_item(item: &Item) -> edn_format::Value {
     match item {
         Item::Int(i) => edn_format::Value::Integer(*i),
         Item::List(v) => edn_format::Value::Vector(
@@ -1971,25 +1983,10 @@ fn from_item(item: &Item) -> edn_format::Value {
             Box::new(edn_format::Value::String(base64::encode(bs))),
         ),
         Item::Assoc(h) => edn_format::Value::Vector(
-            h.iter()
-                .map(|(k, v)| {
-                    edn_format::Value::Vector(vec![
-                        from_item(&to_value_item(k.clone())),
-                        from_item(v),
-                    ])
-                })
-                .collect(),
+            vectorize(h)
         ),
         Item::Error(h) => edn_format::Value::Vector(
-            h.data
-                .iter()
-                .map(|(k, v)| {
-                    edn_format::Value::Vector(vec![
-                        from_item(&to_value_item(k.clone())),
-                        from_item(v),
-                    ])
-                })
-                .collect(),
+            vectorize(&h.data)
         ),
         Item::Env(e) => edn_format::Value::Vector(vec![
             edn_format::Value::Vector(vec![
@@ -2010,7 +2007,7 @@ fn from_item(item: &Item) -> edn_format::Value {
                 from_item(&Item::Word(d.word))
             }
         }
-        Item::In(_) => edn_format::Value::Integer(999),
+        Item::In(i) => from_item(&i.representation()),
         Item::Out(_) => edn_format::Value::Integer(999),
     }
 }
@@ -2056,15 +2053,15 @@ Now we'll add the functions that do input/output (pipes)
 
 #+begin_src rust :tangle src/pipes.rs
 use crate::axiom::ItemResult;
-use crate::types::{Environment, Error, Item};
+use crate::types::{word_key, Association, Environment, Error, Item};
 use crate::{word, List};
 use dyn_clone::DynClone;
 use std::fmt::Debug;
 use std::fs::File;
 use std::io::{Read, Write};
 
-pub trait Writable: Write + Close + Debug + DynClone {}
-pub trait Readable: Read + Close + Debug + DynClone {}
+pub trait Writable: Write + Close + Debug + crate::serialize::Display + DynClone {}
+pub trait Readable: Read + Close + Debug + crate::serialize::Display + DynClone {}
 
 pub trait In: Writable {
     fn put(&mut self, i: Item) -> Result<(), Error>;
@@ -2122,6 +2119,7 @@ dyn_clone::clone_trait_object!(Close);
 struct StaticFile {
     pub file: File,
     pub closed: bool,
+    pub path: String
 }
 
 use std::ops::Deref;
@@ -2139,6 +2137,7 @@ impl Clone for StaticFile {
         StaticFile {
             file: self.try_clone().unwrap(),
             closed: false,
+            path: self.path.clone()
         }
     }
 }
@@ -2189,6 +2188,20 @@ impl In for StaticFile {
     }
 }
 
+impl crate::serialize::Display for StaticFile {
+    fn representation(&self) -> Item {
+        Item::Assoc(Association::from([(
+            word_key("type"),
+            word("pipe"),
+        ),
+(
+            word_key("file"),
+            Item::String(self.path.clone())
+        )
+        ]))
+    }
+}
+
 fn closed_error(on_take: bool) -> Error {
     Error::create(
         List::from_iter([word("close"), word(if on_take { "take" } else { "put" })]),
@@ -2211,20 +2224,24 @@ impl Out for StaticFile {
 }
 
 pub fn file_in(i: Item) -> ItemResult {
+    let path = String::try_from(i)?;
     Ok(Item::In(Box::new(StaticFile {
         file: File::options()
             .read(true)
             .write(true)
             .create_new(true)
-            .open(String::try_from(i)?)?,
+            .open(path.clone())?,
         closed: false,
+        path
     })))
 }
 
 pub fn file_out(i: Item) -> ItemResult {
+    let path = String::try_from(i)?;
     Ok(Item::Out(Box::new(StaticFile {
-        file: File::open(String::try_from(i)?)?,
+        file: File::open(path.clone())?,
         closed: false,
+        path
     })))
 }
 
@@ -2891,7 +2908,7 @@ We can delete the word =resume=.
 *** INPROGRESS Implement pipes
 **** DONE Write to a file
 #+begin_src kcats
-[[file "/tmp/foo"]] pipe-in
+[[file "/tmp/bar2"]] pipe-in
 
 ["hello world!"
  "Nice to meet you!"
@@ -2904,10 +2921,10 @@ step
 
 #+RESULTS:
 : 
-: [999]
+: [[[file "/tmp/bar2"] [type pipe]]]
 **** DONE Read from a file
 #+begin_src kcats :results code
-"" [string join] [[file "/tmp/foop"]] pipe-out
+"" [string join] [[file "/tmp/bar2"]] pipe-out
 
 assemble 
 #+end_src
@@ -2915,8 +2932,7 @@ assemble
 #+RESULTS:
 #+begin_src kcats
 
-stack: [[[type error] [reason "No such file or directory (os error 2)"] [asked [io]]] [string join] ""]
-expression: [assemble]
+["hello world!\nNice to meet you!\nMy name is kcats\n"]
 #+end_src
 
 #+begin_src kcats :results code
@@ -2930,7 +2946,7 @@ dictionary [assemble definition] lookup
 #+end_src
 **** INPROGRESS Close a pipe
 #+begin_src kcats :results code
-[[file "/tmp/foopy"]] pipe-in "foo" bytes put close "bar" bytes put
+[[file "/tmp/foopytoop"]] pipe-in "foo" bytes put close "bar" bytes put
 #+end_src
 
 #+RESULTS:
@@ -2942,7 +2958,8 @@ dictionary [assemble definition] lookup
 Maybe they can't be easily round-tripped, but at least we can print
 something reasonable that will tell human eyes what it is.
 
-
+something like[[type pipe-in] [file "/tmp/foo"]]
+#+end_src
 * Notes
 ** Bootstrapping
 + Builtin words need to exist *before* the derived words are read from
