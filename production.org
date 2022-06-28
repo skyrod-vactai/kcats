@@ -54,7 +54,7 @@ use std::fmt;
 use std::hash::Hash;
 use std::mem;
 use std::rc::Rc;
-use crate::pipes::{In, Out};
+use crate::pipes::{In, Out, Tunnel};
 //extern crate thiserror;
 
 pub type Word = Intern<String>;
@@ -112,6 +112,7 @@ pub enum Item {
     Error(Error),
     In(Box<dyn In>),
     Out(Box<dyn Out>),
+    Tunnel(Box<dyn Tunnel>),
     Nothing,
 }
 
@@ -881,6 +882,7 @@ pub fn add_builtins(d: Dictionary) -> Dictionary {
             ("resume", Rc::new(identity)),
             ("reverse", Rc::new(f_stack1(reverse))),
             ("second", Rc::new(f_stack1(second))),
+            ("serversocket", Rc::new(f_stack2(crate::pipes::net::server_socket))),
             ("sink", Rc::new(sink)),
             ("sqrt", Rc::new(f_stack1(sqrt))),
             ("step", Rc::new(step)),
@@ -1615,6 +1617,13 @@ fn check_type(i: &Item, w: Word) -> Result<(), Error> {
                 Err(Error::expected(&w))
             }
         }
+        Item::Tunnel(_) => {
+            if w == *S_ITEM || w == *S_PIPE {
+                Ok(())
+            } else {
+                Err(Error::expected(&w))
+            }
+        }
     }
 }
 
@@ -2008,7 +2017,8 @@ pub fn from_item(item: &Item) -> edn_format::Value {
             }
         }
         Item::In(i) => from_item(&i.representation()),
-        Item::Out(_) => edn_format::Value::Integer(999),
+        Item::Out(i) => from_item(&i.representation()),
+        Item::Tunnel(i) => from_item(&i.representation()),
     }
 }
 
@@ -2188,6 +2198,7 @@ pub fn close(i: Item) -> ItemResult {
 }
 #+end_src
 
+Now some specific types of pipes. These are for reading/writing data to files.
 #+begin_src rust :tangle src/pipes/fs.rs
 use crate::pipes::{Readable, Writable, Close, In, Out, closed_error};
 use std::fs::File;
@@ -2289,12 +2300,91 @@ pub fn file_out(i: Item) -> ItemResult {
 }
 #+end_src
 
+These are for reading/writing data over tcp/ip sockets.
 #+begin_src rust :tangle src/pipes/net.rs
-use crate::pipes::{Readable, Close};
-use crate::types::{Association, Item, word_key, word};
+use crate::axiom::ItemResult;
+use crate::pipes::{closed_error, Close, In, Out, Readable, Tunnel, Writable};
+use crate::types::{word, word_key, wrap, Association, Int, Item};
 use crate::Error;
-use std::net::TcpListener;
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
+use std::str::FromStr;
 
+#[derive(Debug)]
+struct Socket {
+    pub socket: TcpStream,
+    pub addr: SocketAddr,
+    pub closed: bool,
+}
+
+impl Clone for Socket {
+    fn clone(&self) -> Self {
+        Socket {
+            socket: self.socket.try_clone().unwrap(),
+            addr: self.addr.clone(),
+            closed: false,
+        }
+    }
+}
+
+impl Close for Socket {
+    fn close(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed
+    }
+}
+
+impl Readable for Socket {}
+impl Writable for Socket {}
+
+impl crate::serialize::Display for Socket {
+    fn representation(&self) -> Item {
+        Item::Assoc(Association::from([
+            (word_key("type"), word("tunnel")),
+            (word_key("realm"), word("tcp")),
+            (word_key("address"), Item::String(self.addr.to_string())),
+        ]))
+    }
+}
+
+impl Out for Socket {
+    fn take(&mut self) -> Result<Item, Error> {
+        if self.is_closed() {
+            return Err(closed_error(true));
+        }
+        let mut bs = [0u8; 1024];
+        let ct = self.socket.read(&mut bs)?;
+        if ct == 0 {
+            // EOF, no more takes since it's static
+            self.closed = true;
+        }
+        Ok(Item::Bytes(bs[0..ct].to_vec()))
+    }
+}
+
+impl In for Socket {
+    fn put(&mut self, i: Item) -> Result<(), Error> {
+        match i {
+            Item::Bytes(bs) => {
+                let mut pos = 0;
+                while pos < bs.len() {
+                    let bytes_written = self.socket.write(&bs[pos..])?;
+                    pos += bytes_written;
+                }
+                self.socket.flush()?;
+                Ok(())
+            }
+            _ => Err(Error::expected("bytes")),
+        }
+    }
+}
+
+impl Tunnel for Socket {}
+
+// Server sockets
 #[derive(Debug)]
 struct ServerSocket {
     pub socket: TcpListener,
@@ -2326,8 +2416,41 @@ impl crate::serialize::Display for ServerSocket {
     fn representation(&self) -> Item {
         Item::Assoc(Association::from([
             (word_key("type"), word("pipe")),
-            (word_key("serversocket"), Item::String(self.socket.local_addr().unwrap().to_string())),
+            (
+                word_key("serversocket"),
+                Item::String(self.socket.local_addr().unwrap().to_string()),
+            ),
         ]))
+    }
+}
+
+impl Out for ServerSocket {
+    fn take(&mut self) -> Result<Item, Error> {
+        if self.is_closed() {
+            return Err(closed_error(true));
+        }
+        let (socket, addr) = self.socket.accept()?;
+
+        Ok(Item::Tunnel(Box::new(Socket {
+            socket,
+            addr,
+            closed: false,
+        })))
+    }
+}
+
+pub fn server_socket(i: Item, j: Item) -> ItemResult {
+    let addr = Ipv4Addr::from_str(String::try_from(j)?.as_str())?;
+    let port = Int::try_from(i)? as u16;
+    Ok(Item::Out(Box::new(ServerSocket {
+        socket: TcpListener::bind(SocketAddrV4::new(addr, port))?,
+        closed: false,
+    })))
+}
+
+impl From<std::net::AddrParseError> for Error {
+    fn from(err: std::net::AddrParseError) -> Error {
+        Error::create(wrap(word("addrparse")), &err.to_string())
     }
 }
 #+end_src
@@ -2965,7 +3088,7 @@ dictionary [assemble definition] lookup
 
 [[swap [take swap] swap pack [dip] join [[closed? not]] dip while discard]]
 #+end_src
-**** INPROGRESS Close a pipe
+**** DONE Close a pipe
 #+begin_src kcats :results code
 [[file "/tmp/foopytoop"]] pipe-in "foo" bytes put close "bar" bytes put
 #+end_src
@@ -2975,12 +3098,38 @@ dictionary [assemble definition] lookup
 
 [999]
 #+end_src
-**** TODO Serialize pipes with something sane
+**** DONE Serialize pipes with something sane
 Maybe they can't be easily round-tripped, but at least we can print
 something reasonable that will tell human eyes what it is.
-
 something like[[type pipe-in] [file "/tmp/foo"]]
+**** DONE Sockets
+***** DONE Server Sockets
+#+begin_src kcats :results code
+[[type ip-port] [address "127.0.0.1"] [port 11211]] pipe-out take take string
 #+end_src
+
+#+RESULTS:
+#+begin_src kcats
+
+["hello world!\n" [[realm tcp] [type tunnel] [address "127.0.0.1:52212"]] [[type pipe] [serversocket "127.0.0.1:11211"]]]
+#+end_src
+
+#+begin_src kcats :results code
+[[type ip-port] [address "127.0.0.1"] [port 11211]] pipe-out ;; server socket
+take ;; accept connection by taking a socket out of the pipe
+"foo\n" bytes put ;; write a message to the socket
+take string ;; get a message from the socket
+[discard ;; close the socket
+ discard] ;; close the server socket
+dip
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+["bar\n"]
+#+end_src
+
+***** DONE Sockets
 * Notes
 ** Bootstrapping
 + Builtin words need to exist *before* the derived words are read from
