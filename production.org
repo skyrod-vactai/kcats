@@ -212,6 +212,10 @@ impl Environment {
         Rc::make_mut(&mut self.stack).pop_front().unwrap()
     }
 
+    pub fn pop_expr(&mut self) -> Item {
+        Rc::make_mut(&mut self.expression).pop_front().unwrap()
+    }
+
     pub fn append_expression(mut self, items: List) -> Environment {
         let expr = Rc::make_mut(&mut self.expression);
         let ct = expr.len();
@@ -455,6 +459,12 @@ impl From<Environment> for Item {
     }
 }
 
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Error {
+        Error::create(wrap(word("io")), &err.to_string())
+    }
+}
+
 impl fmt::Debug for AxiomDef {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let mut ds = f.debug_struct("AxiomDef");
@@ -543,6 +553,7 @@ kcats ASTs, later we'll put command line options here.
 #+begin_src rust :tangle src/main.rs
 mod types;
 use crate::types::*;
+use std::rc::Rc;
 mod axiom;
 mod serialize;
 use std::io;
@@ -574,8 +585,9 @@ fn main() {
     let mut env = axiom::standard_env(None, None);
     let parse_result = serialize::parse(program, Some(&env.dictionary));
     match parse_result {
-        Ok(program) => {
-            env.expression.extend(program);
+        Ok(mut program) => {
+            let expr = Rc::make_mut(&mut env.expression);
+            expr.extend(Rc::make_mut(&mut program).drain(..));
             print_result(axiom::eval(env));
         }
         Err(e) => {
@@ -608,8 +620,8 @@ mod tests {
         expected: List,
     ) -> Option<Error> {
         let mut exp_env = prog_env.clone();
-        prog_env.expression.extend(program.clone());
-        exp_env.expression.extend(expected.clone());
+        prog_env = prog_env.append_expression(program.clone());
+        exp_env = exp_env.append_expression(expected.clone());
 
         //let res = eval(env).ok()?;
         prog_env = axiom::eval(prog_env);
@@ -742,7 +754,6 @@ modify the expression or dictionary and are functions of the environment.
 #+begin_src rust :tangle src/axiom.rs
 use super::serialize;
 use crate::types::*;
-use internment::Intern;
 use num_integer::Roots;
 use std::collections::VecDeque;
 use std::fs;
@@ -1297,11 +1308,11 @@ pub fn range(mut env: Environment) -> Environment {
 // then pred]])
 
 pub fn recur(mut env: Environment) -> Environment {
-    let rec2 = List::try_from(env.pop()).unwrap();
-    let rec1 = List::try_from(env.pop()).unwrap();
+    let mut rec2 = List::try_from(env.pop()).unwrap();
+    let mut rec1 = List::try_from(env.pop()).unwrap();
     let then = List::try_from(env.pop()).unwrap();
     let pred = List::try_from(env.pop()).unwrap();
-    env.expression.push_front(word("if"));
+    env = env.push(word("if"));
     let r = Item::List(Rc::new(ListContent::from([
         Item::List(pred.clone()),
         Item::List(then.clone()),
@@ -1310,9 +1321,9 @@ pub fn recur(mut env: Environment) -> Environment {
         word("recur"),
     ])));
     let mut e = ListContent::new();
-    e.extend(*rec1);
+    e.extend(Rc::make_mut(&mut rec1).drain(..));
     e.push_back(r);
-    e.extend(*rec2);
+    e.extend(Rc::make_mut(&mut rec2).drain(..));
 
     env.push(Item::List(pred))
         .push(Item::List(then))
@@ -1383,7 +1394,8 @@ fn assoc_in(i: Item, ks: &[KeyItem], v: Item) -> Result<Association, Error> {
 }
 
 pub fn assign(m: Item, ks: Item, v: Item) -> ItemResult {
-    let ks = List::try_from(ks).unwrap();
+    let mut kit = List::try_from(ks).unwrap();
+    let ks = Rc::make_mut(&mut kit).drain(..);
     let mut ksvec = ks
         .into_iter()
         .map(|k| to_key_item(k))
@@ -1448,14 +1460,17 @@ pub fn is_even(i: Item) -> ItemResult {
 
 pub fn decide(mut env: Environment) -> Environment {
     let mut clauses = List::try_from(env.pop()).unwrap();
-    let clause = clauses.pop_front();
+    let clauses_data = Rc::make_mut(&mut clauses);
+    let clause = clauses_data.pop_front();
+    
     if let Some(clause) = clause {
         if let Item::List(mut clause) = clause {
             if clause.len() != 2 {
                 env.push(Item::Error(Error::list_count(2)))
             } else {
-                let test = clause.pop_front().unwrap();
-                let expr = clause.pop_front().unwrap();
+                let clause_data = Rc::make_mut(&mut clause);
+                let test = clause_data.pop_front().unwrap();
+                let expr = clause_data.pop_front().unwrap();
 
                 match (test, expr) {
                     (Item::List(test), Item::List(expr)) => {
@@ -1648,13 +1663,14 @@ pub fn eval_step(mut env: Environment) -> Environment {
                         Item::AxiomDef(d) => {
                             if let Some(spec) = &d.spec {
                                 if let Err(e) = check_input_spec(&spec, &env) {
-                                    env.stack.push_front(Item::Error(e));
+                                    env = env.push(Item::Error(e));
                                     return env;
                                 }
                             } else {
                                 println!("No spec for {}!", word);
                             }
-                            env.expression.pop_front();
+                            let expr = Rc::make_mut(&mut env.expression);
+                            expr.pop_front();
                             let f = d.f.clone();
 
                             (f)(env)
@@ -1662,25 +1678,26 @@ pub fn eval_step(mut env: Environment) -> Environment {
                         Item::DerivedDef(d) => {
                             if let Some(spec) = &d.spec {
                                 if let Err(e) = check_input_spec(&spec, &env) {
-                                    env.stack.push_front(Item::Error(e));
+                                    let stack = Rc::make_mut(&mut env.stack);
+                                    stack.push_front(Item::Error(e));
                                 }
                             } else {
                                 println!("No spec for {}!", word);
                             }
-                            env.expression.pop_front();
-                            let mut items = d.definition.clone();
-                            mem::swap(&mut items, &mut env.expression);
-                            env.expression.extend(*items);
-                            env
+                            let expr = Rc::make_mut(&mut env.expression);
+
+                            expr.pop_front();
+                            let items = d.definition.clone();
+                            env.append_expression(items)
                         }
                         _ => {
-                            env.stack.push_front(Item::Error(Error::undefined(*word)));
-                            env
+                            let w = *word;
+                            env.push(Item::Error(Error::undefined(w)))
                         }
                     }
                 } else {
-                    env.stack.push_front(Item::Error(Error::undefined(*word)));
-                    env
+                    let w = *word;
+                    env.push(Item::Error(Error::undefined(w)))
                 }
             }
             _ => {
@@ -1693,12 +1710,12 @@ pub fn eval_step(mut env: Environment) -> Environment {
                             return env;
                         }
                     }
-                    let b = AxiomDef::try_from(env.expression.pop_front().unwrap()).unwrap();
+                    let b = AxiomDef::try_from(env.pop_expr()).unwrap();
                     (b.f)(env)
                 } else {
                     // not a word, just push onto stack
-                    env.stack.push_front(env.expression.pop_front().unwrap());
-                    env
+                    let i = env.pop_expr();
+                    env.push(i)
                 }
             }
         }
@@ -1708,10 +1725,10 @@ pub fn eval_step(mut env: Environment) -> Environment {
 }
 
 fn reverse(i: Item) -> ItemResult {
-    let l = List::try_from(i).unwrap();
+    let mut l = List::try_from(i).unwrap();
     //l.make_contiguous().reverse();
-    let mut lmut = Rc::make_mut(&mut l);
-    Ok(Item::List(Rc::new((*lmut).into_iter().rev().collect())))
+    let lmut = Rc::make_mut(&mut l);
+    Ok(Item::List(Rc::new(lmut.drain(..).rev().collect())))
 }
 
 fn bytes(i: Item) -> ItemResult {
@@ -1730,7 +1747,8 @@ fn string(i: Item) -> ItemResult {
 
 fn rest(i: Item) -> ItemResult {
     let mut l = List::try_from(i).unwrap();
-    l.pop_front();
+    let ld = Rc::make_mut(&mut l);
+    ld.pop_front();
     Ok(Item::List(l))
 }
 
@@ -1757,7 +1775,7 @@ fn unwind(mut env: Environment) -> (Environment, bool) {
     if can_handle {
         let mut next = env.expression.front();
         while next.is_some() && next.unwrap() != w {
-            env.expression.pop_front();
+            env.pop_expr();
             next = env.expression.front();
         }
     }
@@ -1838,10 +1856,9 @@ pub fn identity(env: Environment) -> Environment {
     env
 }
 
-pub fn dictionary(mut env: Environment) -> Environment {
+pub fn dictionary(env: Environment) -> Environment {
     let d = env.dictionary.clone();
-    env.stack.push_front(Item::Assoc(d));
-    env
+    env.push(Item::Assoc(d))
 }
 
 fn ceil(i: Item) -> ItemResult {
@@ -1879,6 +1896,9 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::rc::Rc;
 
+pub trait Display {
+    fn representation(&self) -> Item;
+}
 
 fn lookup_builtin(w: Word, standard_dictionary: Option<&Dictionary>) -> Item {
     if let Some(dict) = standard_dictionary {
@@ -1929,7 +1949,15 @@ fn to_item(
     }
 }
 
-fn from_item(item: &Item) -> edn_format::Value {
+pub fn vectorize(a: &Association) -> Vec<edn_format::Value> {
+    a.iter()
+        .map(|(k, v)| {
+            edn_format::Value::Vector(vec![from_item(&to_value_item(k.clone())), from_item(v)])
+        })
+        .collect()
+}
+
+pub fn from_item(item: &Item) -> edn_format::Value {
     match item {
         Item::Int(i) => edn_format::Value::Integer(*i),
         Item::List(v) => edn_format::Value::Vector(
@@ -1946,27 +1974,8 @@ fn from_item(item: &Item) -> edn_format::Value {
             edn_format::Symbol::from_name("b64"),
             Box::new(edn_format::Value::String(base64::encode(bs))),
         ),
-        Item::Assoc(h) => edn_format::Value::Vector(
-            h.iter()
-                .map(|(k, v)| {
-                    edn_format::Value::Vector(vec![
-                        from_item(&to_value_item(k.clone())),
-                        from_item(v),
-                    ])
-                })
-                .collect(),
-        ),
-        Item::Error(h) => edn_format::Value::Vector(
-            h.data
-                .iter()
-                .map(|(k, v)| {
-                    edn_format::Value::Vector(vec![
-                        from_item(&to_value_item(k.clone())),
-                        from_item(v),
-                    ])
-                })
-                .collect(),
-        ),
+        Item::Assoc(h) => edn_format::Value::Vector(vectorize(h)),
+        Item::Error(h) => edn_format::Value::Vector(vectorize(&h.data)),
         Item::Env(e) => edn_format::Value::Vector(vec![
             edn_format::Value::Vector(vec![
                 from_item(&word("stack")),
@@ -1991,12 +2000,14 @@ fn from_item(item: &Item) -> edn_format::Value {
 
 pub fn parse(s: String, standard_dictionary: Option<&Dictionary>) -> Result<List, Error> {
     let parser = edn_format::Parser::from_iter(s.chars(), edn_format::ParserOptions::default());
-    parser
-        .map(move |r| match r {
-            Ok(expr) => Ok(to_item(&expr, standard_dictionary)?),
-            Err(_) => Err(Error::parse("Invalid edn")),
-        })
-        .collect()
+    Ok(Rc::new(
+        parser
+            .map(move |r| match r {
+                Ok(expr) => Ok(to_item(&expr, standard_dictionary)?),
+                Err(_) => Err(Error::parse("Invalid edn")),
+            })
+            .collect::<Result<ListContent, Error>>()?,
+    ))
 }
 
 pub fn to_list(s: &str) -> List {
