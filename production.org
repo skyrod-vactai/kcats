@@ -51,13 +51,14 @@ use lazy_static::lazy_static;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::hash::Hash;
-use std::mem;
 use std::rc::Rc;
 //extern crate thiserror;
 
 pub type Word = Intern<String>;
 
-pub type List = VecDeque<Item>;
+pub type ListContent = VecDeque<Item>;
+
+pub type List = Rc<ListContent>;
 
 pub type KeyList = VecDeque<KeyItem>;
 
@@ -200,29 +201,28 @@ impl PartialEq for AxiomDef {
 
 impl Eq for AxiomDef {}
 
-pub fn extend_front(l: &mut List, mut to_prepend: List) {
-    mem::swap(l, &mut to_prepend);
-    l.extend(to_prepend);
-}
 
 impl Environment {
     pub fn push(mut self, i: Item) -> Environment {
-        self.stack.push_front(i);
+        Rc::make_mut(&mut self.stack).push_front(i);
         self
     }
 
     pub fn pop(&mut self) -> Item {
-        self.stack.pop_front().unwrap()
+        Rc::make_mut(&mut self.stack).pop_front().unwrap()
     }
 
-    pub fn append_expression(mut self, items: VecDeque<Item>) -> Environment {
-        extend_front(&mut self.expression, items);
+    pub fn append_expression(mut self, items: List) -> Environment {
+        let expr = Rc::make_mut(&mut self.expression);
+        let ct = expr.len();
+        expr.append(Rc::make_mut(&mut items.clone()));
+        expr.rotate_left(ct);
         self
     }
 }
 
 impl Error {
-    fn create(asked: List, reason: &str) -> Error {
+    pub fn create(asked: List, reason: &str) -> Error {
         Error {
             is_handled: false,
             data: HashMap::from([
@@ -251,14 +251,22 @@ impl Error {
 
     pub fn short_list(expected: Int) -> Error {
         Error::create(
-            List::from_iter([word("count"), Item::Int(expected), word(">=")]),
+            Rc::new(ListContent::from_iter([
+                word("count"),
+                Item::Int(expected),
+                word(">="),
+            ])),
             "list had too few items",
         )
     }
 
     pub fn list_count(expected: Int) -> Error {
         Error::create(
-            List::from_iter([word("count"), Item::Int(expected), word("=")]),
+            Rc::new(ListContent::from_iter([
+                word("count"),
+                Item::Int(expected),
+                word("="),
+            ])),
             "list had wrong number of items",
         )
     }
@@ -276,7 +284,7 @@ impl Error {
 }
 
 pub fn wrap(i: Item) -> List {
-    List::from_iter([i])
+    Rc::new(ListContent::from_iter([i]))
 }
 
 impl TryFrom<Item> for List {
@@ -284,10 +292,16 @@ impl TryFrom<Item> for List {
     fn try_from(i: Item) -> Result<Self, Self::Error> {
         match i {
             Item::List(l) => Ok(l),
-            Item::Assoc(a) => Ok(a
-                .into_iter()
-                .map(|(k, v)| Item::List(List::from(vec![to_value_item(k), Item::from(v)])))
-                .collect::<List>()),
+            Item::Assoc(a) => Ok(Rc::new(
+                a.into_iter()
+                    .map(|(k, v)| {
+                        Item::List(Rc::new(ListContent::from(vec![
+                            to_value_item(k),
+                            Item::from(v),
+                        ])))
+                    })
+                    .collect::<ListContent>(),
+            )),
             Item::Error(e) => List::try_from(Item::Assoc(e.data)),
             _ => Err(Error::expected("list")),
         }
@@ -408,7 +422,7 @@ impl From<Association> for DerivedDef {
             definition: d
                 .remove(&key_item("definition"))
                 .and_then(|i| List::try_from(i).ok())
-                .unwrap_or(List::new()),
+                .unwrap_or(Rc::new(ListContent::new())),
             examples: d
                 .remove(&key_item("examples"))
                 .and_then(|i| List::try_from(i).ok()),
@@ -480,9 +494,11 @@ pub fn to_value_item(i: KeyItem) -> Item {
     match i {
         KeyItem::Int(i) => Item::Int(i),
         KeyItem::String(i) => Item::String(i),
-        KeyItem::List(l) => {
-            Item::List(l.iter().map(|i| to_value_item(i.clone())).collect::<List>())
-        }
+        KeyItem::List(l) => Item::List(Rc::new(
+            l.iter()
+                .map(|i| to_value_item(i.clone()))
+                .collect::<ListContent>(),
+        )),
         KeyItem::Word(w) => Item::Word(w),
         KeyItem::Boolean(b) => Item::Boolean(b),
         KeyItem::Bytes(bs) => Item::Bytes(bs),
@@ -500,9 +516,10 @@ pub fn to_entry(i: Item) -> Result<(KeyItem, Item), Error> {
             if l.len() != 2 {
                 Err(Error::expected("List[2]"))
             } else {
-                let v = l.pop_back();
-                let k = l.pop_back();
-                let e = l.pop_back();
+                let lm = Rc::make_mut(&mut l);
+                let v = lm.pop_back();
+                let k = lm.pop_back();
+                let e = lm.pop_back();
                 match (k, v, e) {
                     (Some(k), Some(v), None) => Ok((to_key_item(k)?, v)),
                     _ => Err(Error::expected("List[2]")),
@@ -733,7 +750,7 @@ use std::mem;
 use std::ops::Range;
 use std::rc::Rc;
 
-type ItemResult = Result<Item, Error>;
+pub type ItemResult = Result<Item, Error>;
 
 impl From<ItemResult> for Item {
     fn from(i: ItemResult) -> Self {
@@ -1010,8 +1027,10 @@ pub fn lte(i: Item, j: Item) -> ItemResult {
 
 pub fn join(i: Item, j: Item) -> ItemResult {
     match (i, j) {
-        (Item::List(mut i), Item::List(j)) => {
-            i.extend(j);
+        (Item::List(mut i), Item::List(mut j)) => {
+            let imut = Rc::make_mut(&mut i);
+
+            imut.append(Rc::make_mut(&mut j));
             Ok(Item::List(i))
         }
         (Item::String(mut i), Item::String(j)) => {
@@ -1024,7 +1043,7 @@ pub fn join(i: Item, j: Item) -> ItemResult {
 
 pub fn pack(i: Item, j: Item) -> ItemResult {
     let mut l = List::try_from(i)?;
-    l.push_back(j);
+    Rc::make_mut(&mut l).push_back(j);
     Ok(Item::List(l))
 }
 
@@ -1034,7 +1053,7 @@ pub fn clone(env: Environment) -> Environment {
 }
 
 fn swap2(mut env: Environment, offset: usize) -> Environment {
-    env.stack.swap(offset, offset + 1);
+    Rc::make_mut(&mut env.stack).swap(offset, offset + 1);
     env
 }
 
@@ -1047,14 +1066,16 @@ pub fn swapdown(env: Environment) -> Environment {
 }
 
 pub fn sink(mut env: Environment) -> Environment {
-    env.stack.swap(0, 2);
-    env.stack.swap(0, 1);
+    let s = Rc::make_mut(&mut env.stack);
+    s.swap(0, 2);
+    s.swap(0, 1);
     env
 }
 
 pub fn float(mut env: Environment) -> Environment {
-    env.stack.swap(0, 2);
-    env.stack.swap(1, 2);
+    let s = Rc::make_mut(&mut env.stack);
+    s.swap(0, 2);
+    s.swap(1, 2);
     env
 }
 
@@ -1098,19 +1119,18 @@ pub fn is_list(i: Item) -> ItemResult {
 }
 
 pub fn first(i: Item) -> ItemResult {
-    let mut l = List::try_from(i)?;
-    Ok(if let Some(i) = l.pop_front() {
-        i
+    let l = List::try_from(i)?;
+    Ok(if let Some(i) = l.front() {
+        i.clone()
     } else {
         Item::Nothing
     })
 }
 
 pub fn second(i: Item) -> ItemResult {
-    let mut l = List::try_from(i)?;
-    l.pop_front();
-    Ok(if let Some(i) = l.pop_front() {
-        i
+    let l = List::try_from(i)?;
+    Ok(if let Some(i) = l.get(1) {
+        i.clone()
     } else {
         Item::Nothing
     })
@@ -1123,8 +1143,9 @@ pub fn loop_(mut env: Environment) -> Environment {
             let f = env.pop();
             if is_truthy(f) {
                 let p2 = p.clone();
-                p.push_back(Item::List(p2));
-                p.push_back(word("loop"));
+                let pm = Rc::make_mut(&mut p);
+                pm.push_back(Item::List(p2));
+                pm.push_back(word("loop"));
                 env.append_expression(p)
             } else {
                 env
@@ -1143,15 +1164,17 @@ pub fn execute(mut env: Environment) -> Environment {
 
 pub fn wrap(mut env: Environment) -> Environment {
     let item = env.pop();
-    let mut v = List::new();
-    v.push_front(item);
-    env.push(Item::List(v))
+    let mut lc = ListContent::new();
+    lc.push_front(item);
+    env.push(Item::List(Rc::new(lc)))
 }
 
 pub fn unwrap(mut env: Environment) -> Environment {
     match List::try_from(env.pop()) {
         Ok(l) => {
-            for i in l {
+            let len = l.len();
+            let l2 = (0..len).map(move |i| l[i].clone());
+            for i in l2 {
                 env = env.push(i);
             }
             env
@@ -1164,12 +1187,12 @@ pub fn dip(mut env: Environment) -> Environment {
     match List::try_from(env.pop()) {
         Ok(program) => {
             let item = env.pop();
-            env.expression
-                .push_front(Item::Word(Intern::new("unwrap".to_string())));
-            let mut v = List::new();
-            v.push_front(item);
-
-            env.expression.push_front(Item::List(v));
+            let mut lc = ListContent::new();
+            lc.push_front(item);
+            let v = Rc::new(lc);
+            let expr = Rc::make_mut(&mut env.expression);
+            expr.push_front(word("unwrap"));
+            expr.push_front(Item::List(v));
             env.append_expression(program)
         }
         Err(e) => env.push(Item::Error(e)),
@@ -1179,14 +1202,15 @@ pub fn dip(mut env: Environment) -> Environment {
 pub fn dipdown(mut env: Environment) -> Environment {
     match List::try_from(env.pop()) {
         Ok(program) => {
+            let item1 = env.pop();
             let item2 = env.pop();
-            let item3 = env.pop();
-            env.expression
-                .push_front(Item::Word(Intern::new("unwrap".to_string())));
-            let mut v = List::new();
-            v.push_front(item2);
-            v.push_front(item3);
-            env.expression.push_front(Item::List(v));
+            let mut lc = ListContent::new();
+            lc.push_front(item1);
+            lc.push_front(item2);
+            let v = Rc::new(lc);
+            let expr = Rc::make_mut(&mut env.expression);
+            expr.push_front(word("unwrap"));
+            expr.push_front(Item::List(v));
             env.append_expression(program)
         }
         Err(e) => env.push(Item::Error(e)),
@@ -1195,21 +1219,24 @@ pub fn dipdown(mut env: Environment) -> Environment {
 
 pub fn unpack(mut env: Environment) -> Environment {
     // TODO: handle Nothing case
-
-    let i = if let Some(s1) = env.stack.front_mut() {
-        if let Item::List(l) = s1 {
-            if let Some(i) = l.pop_front() {
+    let stack = Rc::make_mut(&mut env.stack);
+    let i = if let Some(s) = stack.front_mut() {
+        if let Item::List(ref mut l) = s {
+            if let Some(i) = Rc::make_mut(l).pop_front() {
                 i
             } else {
                 Item::Nothing
             }
         } else {
-            Item::from(invalid_type_error(List::from_iter([Item::Word(*S_LIST)])))
+            Item::from(invalid_type_error(Rc::new(ListContent::from_iter([
+                Item::Word(*S_LIST),
+            ]))))
         }
     } else {
         Item::Error(Error::stack_underflow())
     };
-    env.push(i)
+    stack.push_front(i);
+    env
 }
 
 fn is_truthy(i: Item) -> bool {
@@ -1240,13 +1267,15 @@ pub fn branch(mut env: Environment) -> Environment {
 pub fn step(mut env: Environment) -> Environment {
     let p = List::try_from(env.pop()).unwrap();
     let mut l = List::try_from(env.pop()).unwrap();
-    if let Some(litem) = l.pop_front() {
+    let lm = Rc::make_mut(&mut l);
+    if let Some(litem) = lm.pop_front() {
+        let expr = Rc::make_mut(&mut env.expression);
         if !l.is_empty() {
-            env.expression.push_front(word("step"));
-            env.expression.push_front(Item::List(p.clone()));
-            env.expression.push_front(Item::List(l));
+            expr.push_front(word("step"));
+            expr.push_front(Item::List(p.clone()));
+            expr.push_front(Item::List(l));
         }
-        env.expression.push_front(word("execute"));
+        expr.push_front(word("execute"));
         env.push(litem).push(Item::List(p))
     } else {
         env
@@ -1256,9 +1285,9 @@ pub fn step(mut env: Environment) -> Environment {
 pub fn range(mut env: Environment) -> Environment {
     let to = Int::try_from(env.pop()).unwrap();
     let from = Int::try_from(env.pop()).unwrap();
-    env.push(Item::List(
+    env.push(Item::List(Rc::new(
         (from..to).map(|i| Item::Int(i)).collect::<VecDeque<Item>>(),
-    ))
+    )))
 }
 
 // (effect [rec2 rec1 then pred]
@@ -1273,21 +1302,21 @@ pub fn recur(mut env: Environment) -> Environment {
     let then = List::try_from(env.pop()).unwrap();
     let pred = List::try_from(env.pop()).unwrap();
     env.expression.push_front(word("if"));
-    let r = Item::List(List::from([
+    let r = Item::List(Rc::new(ListContent::from([
         Item::List(pred.clone()),
         Item::List(then.clone()),
         Item::List(rec1.clone()),
         Item::List(rec2.clone()),
         word("recur"),
-    ]));
-    let mut e = List::new();
-    e.extend(rec1);
+    ])));
+    let mut e = ListContent::new();
+    e.extend(*rec1);
     e.push_back(r);
-    e.extend(rec2);
+    e.extend(*rec2);
 
     env.push(Item::List(pred))
         .push(Item::List(then))
-        .push(Item::List(e))
+        .push(Item::List(Rc::new(e)))
 }
 
 //(fn [{[l & others] 'stack :as env}]
@@ -1431,14 +1460,16 @@ pub fn decide(mut env: Environment) -> Environment {
                 match (test, expr) {
                     (Item::List(test), Item::List(expr)) => {
                         // construct if
-                        let testp = List::from(vec![Item::List(test), word("shield")]);
-                        let elsep = List::from(vec![Item::List(clauses), word("decide")]);
-                        let newexpr = List::from(vec![
+                        let testp =
+                            Rc::new(ListContent::from(vec![Item::List(test), word("shield")]));
+                        let elsep =
+                            Rc::new(ListContent::from(vec![Item::List(clauses), word("decide")]));
+                        let newexpr = Rc::new(ListContent::from(vec![
                             Item::List(testp),
                             Item::List(expr),
                             Item::List(elsep),
                             word("if"),
-                        ]);
+                        ]));
                         env.append_expression(newexpr)
                     }
                     _ => env.push(Item::from(invalid_type_error(serialize::to_list(
@@ -1639,7 +1670,7 @@ pub fn eval_step(mut env: Environment) -> Environment {
                             env.expression.pop_front();
                             let mut items = d.definition.clone();
                             mem::swap(&mut items, &mut env.expression);
-                            env.expression.extend(items);
+                            env.expression.extend(*items);
                             env
                         }
                         _ => {
@@ -1679,8 +1710,8 @@ pub fn eval_step(mut env: Environment) -> Environment {
 fn reverse(i: Item) -> ItemResult {
     let l = List::try_from(i).unwrap();
     //l.make_contiguous().reverse();
-
-    Ok(Item::List(l.into_iter().rev().collect()))
+    let mut lmut = Rc::make_mut(&mut l);
+    Ok(Item::List(Rc::new((*lmut).into_iter().rev().collect())))
 }
 
 fn bytes(i: Item) -> ItemResult {
@@ -1755,11 +1786,11 @@ pub fn eval(mut env: Environment) -> Environment {
 pub fn standard_env(program: Option<List>, stack: Option<List>) -> Environment {
     let prog_expr = match program {
         Some(p) => Stack::from(p),
-        _ => Stack::new(),
+        _ => Stack::new(ListContent::new()),
     };
 
     let env = Environment {
-        stack: stack.unwrap_or(Stack::new()),
+        stack: stack.unwrap_or(Stack::new(ListContent::new())),
         expression: prog_expr,
         dictionary: Dictionary::new(),
     };
@@ -1771,11 +1802,11 @@ fn environment(p: Item) -> ItemResult {
     let stack = env
         .remove(&to_key_item(word("stack")).unwrap())
         .and_then(|s| List::try_from(s).ok())
-        .or(Some(List::new()));
+        .or(Some(List::new(ListContent::new())));
     let expression = env
         .remove(&to_key_item(word("expression")).unwrap())
         .and_then(|s| List::try_from(s).ok())
-        .or(Some(List::new()));
+        .or(Some(List::new(ListContent::new())));
     let dictionary = env
         .remove(&to_key_item(word("dictionary")).unwrap())
         .and_then(|d| Association::try_from(d).ok());
@@ -1832,7 +1863,7 @@ fn handle(i: Item) -> ItemResult {
             e.is_handled = true;
             e
         })),
-        i => Ok(i)
+        i => Ok(i),
     }
 }
 #+end_src
@@ -1846,6 +1877,8 @@ use base64;
 use internment::Intern;
 use std::collections::VecDeque;
 use std::fmt;
+use std::rc::Rc;
+
 
 fn lookup_builtin(w: Word, standard_dictionary: Option<&Dictionary>) -> Item {
     if let Some(dict) = standard_dictionary {
@@ -1862,7 +1895,6 @@ fn lookup_builtin(w: Word, standard_dictionary: Option<&Dictionary>) -> Item {
 }
 const BYTE_TAG: &str = "b64";
 
-
 fn to_item(
     item: &edn_format::Value,
     standard_dictionary: Option<&Dictionary>,
@@ -1870,11 +1902,11 @@ fn to_item(
     //println!("to item {:?}", item);
     match item {
         edn_format::Value::Integer(i) => Ok(Item::Int(*i)),
-        edn_format::Value::Vector(v) => Ok(Item::List(
+        edn_format::Value::Vector(v) => Ok(Item::List(Rc::new(
             v.iter()
                 .map(|i| to_item(i, standard_dictionary))
                 .collect::<Result<VecDeque<Item>, Error>>()?,
-        )),
+        ))),
         edn_format::Value::Symbol(s) => Ok(lookup_builtin(
             Intern::new(s.name().to_string()),
             standard_dictionary,
