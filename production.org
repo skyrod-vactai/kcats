@@ -38,6 +38,7 @@ base64 = "0.13.0"
 internment = "0.6.0" 
 lazy_static = "1.4.0"
 num-integer = "0.1.44"
+dyn-clone = "1.0.5"
 
 [dev-dependencies]
 test-case = "2.0.0"
@@ -45,18 +46,20 @@ test-case = "2.0.0"
 ** Code
 Let's start by defining some data structures in a separate module
 #+begin_src rust :tangle src/types.rs
+use crate::pipes::{In, Out, Tunnel};
 use internment::Intern;
 use lazy_static::lazy_static;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::hash::Hash;
-use std::mem;
 use std::rc::Rc;
 //extern crate thiserror;
 
 pub type Word = Intern<String>;
 
-pub type List = VecDeque<Item>;
+pub type ListContent = VecDeque<Item>;
+
+pub type List = Rc<ListContent>;
 
 pub type KeyList = VecDeque<KeyItem>;
 
@@ -87,6 +90,7 @@ lazy_static! {
     pub static ref S_ITEM: Intern<String> = Intern::new("item".to_string());
     pub static ref S_LIST: Intern<String> = Intern::new("list".to_string());
     pub static ref S_NUMBER: Intern<String> = Intern::new("number".to_string());
+    pub static ref S_PIPE: Intern<String> = Intern::new("pipe".to_string());
     pub static ref S_PROGRAM: Intern<String> = Intern::new("program".to_string());
     pub static ref S_STRING: Intern<String> = Intern::new("string".to_string());
     pub static ref S_WORD: Intern<String> = Intern::new("word".to_string());
@@ -106,6 +110,9 @@ pub enum Item {
     AxiomDef(AxiomDef),
     DerivedDef(DerivedDef),
     Error(Error),
+    In(Box<dyn In>),
+    Out(Box<dyn Out>),
+    Tunnel(Box<dyn Tunnel>),
     Nothing,
 }
 
@@ -199,29 +206,36 @@ impl PartialEq for AxiomDef {
 
 impl Eq for AxiomDef {}
 
-pub fn extend_front(l: &mut List, mut to_prepend: List) {
-    mem::swap(l, &mut to_prepend);
-    l.extend(to_prepend);
-}
-
 impl Environment {
     pub fn push(mut self, i: Item) -> Environment {
-        self.stack.push_front(i);
+        Rc::make_mut(&mut self.stack).push_front(i);
         self
     }
 
     pub fn pop(&mut self) -> Item {
-        self.stack.pop_front().unwrap()
+        Rc::make_mut(&mut self.stack).pop_front().unwrap()
     }
 
-    pub fn append_expression(mut self, items: VecDeque<Item>) -> Environment {
-        extend_front(&mut self.expression, items);
+    pub fn push_expr(mut self, i: Item) -> Environment {
+        Rc::make_mut(&mut self.expression).push_front(i);
+        self
+    }
+
+    pub fn pop_expr(&mut self) -> Item {
+        Rc::make_mut(&mut self.expression).pop_front().unwrap()
+    }
+
+    pub fn append_expression(mut self, items: List) -> Environment {
+        let expr = Rc::make_mut(&mut self.expression);
+        let ct = expr.len();
+        expr.append(Rc::make_mut(&mut items.clone()));
+        expr.rotate_left(ct);
         self
     }
 }
 
 impl Error {
-    fn create(asked: List, reason: &str) -> Error {
+    pub fn create(asked: List, reason: &str) -> Error {
         Error {
             is_handled: false,
             data: HashMap::from([
@@ -250,14 +264,22 @@ impl Error {
 
     pub fn short_list(expected: Int) -> Error {
         Error::create(
-            List::from_iter([word("count"), Item::Int(expected), word(">=")]),
+            Rc::new(ListContent::from_iter([
+                word("count"),
+                Item::Int(expected),
+                word(">="),
+            ])),
             "list had too few items",
         )
     }
 
     pub fn list_count(expected: Int) -> Error {
         Error::create(
-            List::from_iter([word("count"), Item::Int(expected), word("=")]),
+            Rc::new(ListContent::from_iter([
+                word("count"),
+                Item::Int(expected),
+                word("="),
+            ])),
             "list had wrong number of items",
         )
     }
@@ -275,7 +297,7 @@ impl Error {
 }
 
 pub fn wrap(i: Item) -> List {
-    List::from_iter([i])
+    Rc::new(ListContent::from_iter([i]))
 }
 
 impl TryFrom<Item> for List {
@@ -283,10 +305,16 @@ impl TryFrom<Item> for List {
     fn try_from(i: Item) -> Result<Self, Self::Error> {
         match i {
             Item::List(l) => Ok(l),
-            Item::Assoc(a) => Ok(a
-                .into_iter()
-                .map(|(k, v)| Item::List(List::from(vec![to_value_item(k), Item::from(v)])))
-                .collect::<List>()),
+            Item::Assoc(a) => Ok(Rc::new(
+                a.into_iter()
+                    .map(|(k, v)| {
+                        Item::List(Rc::new(ListContent::from(vec![
+                            to_value_item(k),
+                            Item::from(v),
+                        ])))
+                    })
+                    .collect::<ListContent>(),
+            )),
             Item::Error(e) => List::try_from(Item::Assoc(e.data)),
             _ => Err(Error::expected("list")),
         }
@@ -364,6 +392,27 @@ impl TryFrom<Item> for Environment {
     }
 }
 
+impl TryFrom<Item> for Box<dyn In> {
+    type Error = Error;
+    fn try_from(i: Item) -> Result<Self, Self::Error> {
+        if let Item::In(i) = i {
+            Ok(i)
+        } else {
+            Err(Error::expected("pipe"))
+        }
+    }
+}
+
+impl TryFrom<Item> for Box<dyn Out> {
+    type Error = Error;
+    fn try_from(i: Item) -> Result<Self, Self::Error> {
+        match i {
+            Item::Out(o) => Ok(o),
+            _ => Err(Error::expected("pipe")),
+        }
+    }
+}
+
 impl From<DerivedDef> for Association {
     fn from(d: DerivedDef) -> Association {
         let mut a = Association::new();
@@ -407,7 +456,7 @@ impl From<Association> for DerivedDef {
             definition: d
                 .remove(&key_item("definition"))
                 .and_then(|i| List::try_from(i).ok())
-                .unwrap_or(List::new()),
+                .unwrap_or(Rc::new(ListContent::new())),
             examples: d
                 .remove(&key_item("examples"))
                 .and_then(|i| List::try_from(i).ok()),
@@ -437,6 +486,12 @@ impl From<Environment> for Association {
 impl From<Environment> for Item {
     fn from(env: Environment) -> Item {
         Item::Env(Environment::from(env))
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Error {
+        Error::create(wrap(word("io")), &err.to_string())
     }
 }
 
@@ -479,9 +534,11 @@ pub fn to_value_item(i: KeyItem) -> Item {
     match i {
         KeyItem::Int(i) => Item::Int(i),
         KeyItem::String(i) => Item::String(i),
-        KeyItem::List(l) => {
-            Item::List(l.iter().map(|i| to_value_item(i.clone())).collect::<List>())
-        }
+        KeyItem::List(l) => Item::List(Rc::new(
+            l.iter()
+                .map(|i| to_value_item(i.clone()))
+                .collect::<ListContent>(),
+        )),
         KeyItem::Word(w) => Item::Word(w),
         KeyItem::Boolean(b) => Item::Boolean(b),
         KeyItem::Bytes(bs) => Item::Bytes(bs),
@@ -499,9 +556,10 @@ pub fn to_entry(i: Item) -> Result<(KeyItem, Item), Error> {
             if l.len() != 2 {
                 Err(Error::expected("List[2]"))
             } else {
-                let v = l.pop_back();
-                let k = l.pop_back();
-                let e = l.pop_back();
+                let lm = Rc::make_mut(&mut l);
+                let v = lm.pop_back();
+                let k = lm.pop_back();
+                let e = lm.pop_back();
                 match (k, v, e) {
                     (Some(k), Some(v), None) => Ok((to_key_item(k)?, v)),
                     _ => Err(Error::expected("List[2]")),
@@ -525,8 +583,10 @@ kcats ASTs, later we'll put command line options here.
 #+begin_src rust :tangle src/main.rs
 mod types;
 use crate::types::*;
+use std::rc::Rc;
 mod axiom;
 mod serialize;
+mod pipes;
 use std::io;
 use std::io::BufRead;
 
@@ -556,8 +616,9 @@ fn main() {
     let mut env = axiom::standard_env(None, None);
     let parse_result = serialize::parse(program, Some(&env.dictionary));
     match parse_result {
-        Ok(program) => {
-            env.expression.extend(program);
+        Ok(mut program) => {
+            let expr = Rc::make_mut(&mut env.expression);
+            expr.extend(Rc::make_mut(&mut program).drain(..));
             print_result(axiom::eval(env));
         }
         Err(e) => {
@@ -590,8 +651,8 @@ mod tests {
         expected: List,
     ) -> Option<Error> {
         let mut exp_env = prog_env.clone();
-        prog_env.expression.extend(program.clone());
-        exp_env.expression.extend(expected.clone());
+        prog_env = prog_env.append_expression(program.clone());
+        exp_env = exp_env.append_expression(expected.clone());
 
         //let res = eval(env).ok()?;
         prog_env = axiom::eval(prog_env);
@@ -724,7 +785,6 @@ modify the expression or dictionary and are functions of the environment.
 #+begin_src rust :tangle src/axiom.rs
 use super::serialize;
 use crate::types::*;
-use internment::Intern;
 use num_integer::Roots;
 use std::collections::VecDeque;
 use std::fs;
@@ -732,7 +792,7 @@ use std::mem;
 use std::ops::Range;
 use std::rc::Rc;
 
-type ItemResult = Result<Item, Error>;
+pub type ItemResult = Result<Item, Error>;
 
 impl From<ItemResult> for Item {
     fn from(i: ItemResult) -> Self {
@@ -804,7 +864,9 @@ pub fn add_builtins(d: Dictionary) -> Dictionary {
             ("branch", Rc::new(branch)),
             ("bytes", Rc::new(f_stack1(bytes))),
             ("clone", Rc::new(clone)),
+            ("close", Rc::new(f_stack1(crate::pipes::close))),
             ("ceil", Rc::new(f_stack1(ceil))),
+            ("closed?", Rc::new(f_stack1(crate::pipes::is_closed))),            
             ("count", Rc::new(f_stack1(count))),
             ("dec", Rc::new(f_stack1(dec))),
             ("decide", Rc::new(decide)),
@@ -817,6 +879,8 @@ pub fn add_builtins(d: Dictionary) -> Dictionary {
             ("evaluate", Rc::new(f_stack1(evaluate))),
             ("even?", Rc::new(f_stack1(is_even))),
             ("evert", Rc::new(evert)),
+            ("file-in", Rc::new(f_stack1(crate::pipes::fs::file_in))),
+            ("file-out", Rc::new(f_stack1(crate::pipes::fs::file_out))),
             ("execute", Rc::new(execute)),
             ("first", Rc::new(f_stack1(first))),
             ("float", Rc::new(float)),
@@ -831,6 +895,7 @@ pub fn add_builtins(d: Dictionary) -> Dictionary {
             ("odd?", Rc::new(f_stack1(is_odd))),
             ("or", Rc::new(f_stack2(or))),
             ("pack", Rc::new(f_stack2(pack))),
+            ("put", Rc::new(crate::pipes::put_)),
             ("range", Rc::new(range)),
             ("read", Rc::new(read)),
             ("recur", Rc::new(recur)),
@@ -838,6 +903,7 @@ pub fn add_builtins(d: Dictionary) -> Dictionary {
             ("resume", Rc::new(identity)),
             ("reverse", Rc::new(f_stack1(reverse))),
             ("second", Rc::new(f_stack1(second))),
+            ("serversocket", Rc::new(f_stack2(crate::pipes::net::server_socket))),
             ("sink", Rc::new(sink)),
             ("sqrt", Rc::new(f_stack1(sqrt))),
             ("step", Rc::new(step)),
@@ -845,6 +911,7 @@ pub fn add_builtins(d: Dictionary) -> Dictionary {
             ("string?", Rc::new(f_stack1(is_string))),
             ("swap", Rc::new(swap)),
             ("swapdown", Rc::new(swapdown)),
+            ("take", Rc::new(crate::pipes::take_)),
             ("unassign", Rc::new(f_stack2(unassign))),
             ("unpack", Rc::new(unpack)),
             ("unwrap", Rc::new(unwrap)),
@@ -1009,8 +1076,10 @@ pub fn lte(i: Item, j: Item) -> ItemResult {
 
 pub fn join(i: Item, j: Item) -> ItemResult {
     match (i, j) {
-        (Item::List(mut i), Item::List(j)) => {
-            i.extend(j);
+        (Item::List(mut i), Item::List(mut j)) => {
+            let imut = Rc::make_mut(&mut i);
+
+            imut.append(Rc::make_mut(&mut j));
             Ok(Item::List(i))
         }
         (Item::String(mut i), Item::String(j)) => {
@@ -1023,7 +1092,7 @@ pub fn join(i: Item, j: Item) -> ItemResult {
 
 pub fn pack(i: Item, j: Item) -> ItemResult {
     let mut l = List::try_from(i)?;
-    l.push_back(j);
+    Rc::make_mut(&mut l).push_back(j);
     Ok(Item::List(l))
 }
 
@@ -1033,7 +1102,7 @@ pub fn clone(env: Environment) -> Environment {
 }
 
 fn swap2(mut env: Environment, offset: usize) -> Environment {
-    env.stack.swap(offset, offset + 1);
+    Rc::make_mut(&mut env.stack).swap(offset, offset + 1);
     env
 }
 
@@ -1046,14 +1115,16 @@ pub fn swapdown(env: Environment) -> Environment {
 }
 
 pub fn sink(mut env: Environment) -> Environment {
-    env.stack.swap(0, 2);
-    env.stack.swap(0, 1);
+    let s = Rc::make_mut(&mut env.stack);
+    s.swap(0, 2);
+    s.swap(0, 1);
     env
 }
 
 pub fn float(mut env: Environment) -> Environment {
-    env.stack.swap(0, 2);
-    env.stack.swap(1, 2);
+    let s = Rc::make_mut(&mut env.stack);
+    s.swap(0, 2);
+    s.swap(1, 2);
     env
 }
 
@@ -1097,19 +1168,18 @@ pub fn is_list(i: Item) -> ItemResult {
 }
 
 pub fn first(i: Item) -> ItemResult {
-    let mut l = List::try_from(i)?;
-    Ok(if let Some(i) = l.pop_front() {
-        i
+    let l = List::try_from(i)?;
+    Ok(if let Some(i) = l.front() {
+        i.clone()
     } else {
         Item::Nothing
     })
 }
 
 pub fn second(i: Item) -> ItemResult {
-    let mut l = List::try_from(i)?;
-    l.pop_front();
-    Ok(if let Some(i) = l.pop_front() {
-        i
+    let l = List::try_from(i)?;
+    Ok(if let Some(i) = l.get(1) {
+        i.clone()
     } else {
         Item::Nothing
     })
@@ -1122,8 +1192,9 @@ pub fn loop_(mut env: Environment) -> Environment {
             let f = env.pop();
             if is_truthy(f) {
                 let p2 = p.clone();
-                p.push_back(Item::List(p2));
-                p.push_back(word("loop"));
+                let pm = Rc::make_mut(&mut p);
+                pm.push_back(Item::List(p2));
+                pm.push_back(word("loop"));
                 env.append_expression(p)
             } else {
                 env
@@ -1142,15 +1213,17 @@ pub fn execute(mut env: Environment) -> Environment {
 
 pub fn wrap(mut env: Environment) -> Environment {
     let item = env.pop();
-    let mut v = List::new();
-    v.push_front(item);
-    env.push(Item::List(v))
+    let mut lc = ListContent::new();
+    lc.push_front(item);
+    env.push(Item::List(Rc::new(lc)))
 }
 
 pub fn unwrap(mut env: Environment) -> Environment {
     match List::try_from(env.pop()) {
         Ok(l) => {
-            for i in l {
+            let len = l.len();
+            let l2 = (0..len).map(move |i| l[i].clone());
+            for i in l2 {
                 env = env.push(i);
             }
             env
@@ -1163,12 +1236,12 @@ pub fn dip(mut env: Environment) -> Environment {
     match List::try_from(env.pop()) {
         Ok(program) => {
             let item = env.pop();
-            env.expression
-                .push_front(Item::Word(Intern::new("unwrap".to_string())));
-            let mut v = List::new();
-            v.push_front(item);
-
-            env.expression.push_front(Item::List(v));
+            let mut lc = ListContent::new();
+            lc.push_front(item);
+            let v = Rc::new(lc);
+            let expr = Rc::make_mut(&mut env.expression);
+            expr.push_front(word("unwrap"));
+            expr.push_front(Item::List(v));
             env.append_expression(program)
         }
         Err(e) => env.push(Item::Error(e)),
@@ -1178,14 +1251,15 @@ pub fn dip(mut env: Environment) -> Environment {
 pub fn dipdown(mut env: Environment) -> Environment {
     match List::try_from(env.pop()) {
         Ok(program) => {
+            let item1 = env.pop();
             let item2 = env.pop();
-            let item3 = env.pop();
-            env.expression
-                .push_front(Item::Word(Intern::new("unwrap".to_string())));
-            let mut v = List::new();
-            v.push_front(item2);
-            v.push_front(item3);
-            env.expression.push_front(Item::List(v));
+            let mut lc = ListContent::new();
+            lc.push_front(item1);
+            lc.push_front(item2);
+            let v = Rc::new(lc);
+            let expr = Rc::make_mut(&mut env.expression);
+            expr.push_front(word("unwrap"));
+            expr.push_front(Item::List(v));
             env.append_expression(program)
         }
         Err(e) => env.push(Item::Error(e)),
@@ -1194,21 +1268,24 @@ pub fn dipdown(mut env: Environment) -> Environment {
 
 pub fn unpack(mut env: Environment) -> Environment {
     // TODO: handle Nothing case
-
-    let i = if let Some(s1) = env.stack.front_mut() {
-        if let Item::List(l) = s1 {
-            if let Some(i) = l.pop_front() {
+    let stack = Rc::make_mut(&mut env.stack);
+    let i = if let Some(s) = stack.front_mut() {
+        if let Item::List(ref mut l) = s {
+            if let Some(i) = Rc::make_mut(l).pop_front() {
                 i
             } else {
                 Item::Nothing
             }
         } else {
-            Item::from(invalid_type_error(List::from_iter([Item::Word(*S_LIST)])))
+            Item::from(invalid_type_error(Rc::new(ListContent::from_iter([
+                Item::Word(*S_LIST),
+            ]))))
         }
     } else {
         Item::Error(Error::stack_underflow())
     };
-    env.push(i)
+    stack.push_front(i);
+    env
 }
 
 fn is_truthy(i: Item) -> bool {
@@ -1239,13 +1316,15 @@ pub fn branch(mut env: Environment) -> Environment {
 pub fn step(mut env: Environment) -> Environment {
     let p = List::try_from(env.pop()).unwrap();
     let mut l = List::try_from(env.pop()).unwrap();
-    if let Some(litem) = l.pop_front() {
+    let lm = Rc::make_mut(&mut l);
+    if let Some(litem) = lm.pop_front() {
+        let expr = Rc::make_mut(&mut env.expression);
         if !l.is_empty() {
-            env.expression.push_front(word("step"));
-            env.expression.push_front(Item::List(p.clone()));
-            env.expression.push_front(Item::List(l));
+            expr.push_front(word("step"));
+            expr.push_front(Item::List(p.clone()));
+            expr.push_front(Item::List(l));
         }
-        env.expression.push_front(word("execute"));
+        expr.push_front(word("execute"));
         env.push(litem).push(Item::List(p))
     } else {
         env
@@ -1255,9 +1334,9 @@ pub fn step(mut env: Environment) -> Environment {
 pub fn range(mut env: Environment) -> Environment {
     let to = Int::try_from(env.pop()).unwrap();
     let from = Int::try_from(env.pop()).unwrap();
-    env.push(Item::List(
+    env.push(Item::List(Rc::new(
         (from..to).map(|i| Item::Int(i)).collect::<VecDeque<Item>>(),
-    ))
+    )))
 }
 
 // (effect [rec2 rec1 then pred]
@@ -1267,26 +1346,26 @@ pub fn range(mut env: Environment) -> Environment {
 // then pred]])
 
 pub fn recur(mut env: Environment) -> Environment {
-    let rec2 = List::try_from(env.pop()).unwrap();
-    let rec1 = List::try_from(env.pop()).unwrap();
+    let mut rec2 = List::try_from(env.pop()).unwrap();
+    let mut rec1 = List::try_from(env.pop()).unwrap();
     let then = List::try_from(env.pop()).unwrap();
     let pred = List::try_from(env.pop()).unwrap();
-    env.expression.push_front(word("if"));
-    let r = Item::List(List::from([
+    env = env.push_expr(word("if"));
+    let r = Item::List(Rc::new(ListContent::from([
         Item::List(pred.clone()),
         Item::List(then.clone()),
         Item::List(rec1.clone()),
         Item::List(rec2.clone()),
         word("recur"),
-    ]));
-    let mut e = List::new();
-    e.extend(rec1);
+    ])));
+    let mut e = ListContent::new();
+    e.extend(Rc::make_mut(&mut rec1).drain(..));
     e.push_back(r);
-    e.extend(rec2);
+    e.extend(Rc::make_mut(&mut rec2).drain(..));
 
     env.push(Item::List(pred))
         .push(Item::List(then))
-        .push(Item::List(e))
+        .push(Item::List(Rc::new(e)))
 }
 
 //(fn [{[l & others] 'stack :as env}]
@@ -1353,7 +1432,8 @@ fn assoc_in(i: Item, ks: &[KeyItem], v: Item) -> Result<Association, Error> {
 }
 
 pub fn assign(m: Item, ks: Item, v: Item) -> ItemResult {
-    let ks = List::try_from(ks).unwrap();
+    let mut kit = List::try_from(ks).unwrap();
+    let ks = Rc::make_mut(&mut kit).drain(..);
     let mut ksvec = ks
         .into_iter()
         .map(|k| to_key_item(k))
@@ -1418,26 +1498,31 @@ pub fn is_even(i: Item) -> ItemResult {
 
 pub fn decide(mut env: Environment) -> Environment {
     let mut clauses = List::try_from(env.pop()).unwrap();
-    let clause = clauses.pop_front();
+    let clauses_data = Rc::make_mut(&mut clauses);
+    let clause = clauses_data.pop_front();
+    
     if let Some(clause) = clause {
         if let Item::List(mut clause) = clause {
             if clause.len() != 2 {
                 env.push(Item::Error(Error::list_count(2)))
             } else {
-                let test = clause.pop_front().unwrap();
-                let expr = clause.pop_front().unwrap();
+                let clause_data = Rc::make_mut(&mut clause);
+                let test = clause_data.pop_front().unwrap();
+                let expr = clause_data.pop_front().unwrap();
 
                 match (test, expr) {
                     (Item::List(test), Item::List(expr)) => {
                         // construct if
-                        let testp = List::from(vec![Item::List(test), word("shield")]);
-                        let elsep = List::from(vec![Item::List(clauses), word("decide")]);
-                        let newexpr = List::from(vec![
+                        let testp =
+                            Rc::new(ListContent::from(vec![Item::List(test), word("shield")]));
+                        let elsep =
+                            Rc::new(ListContent::from(vec![Item::List(clauses), word("decide")]));
+                        let newexpr = Rc::new(ListContent::from(vec![
                             Item::List(testp),
                             Item::List(expr),
                             Item::List(elsep),
                             word("if"),
-                        ]);
+                        ]));
                         env.append_expression(newexpr)
                     }
                     _ => env.push(Item::from(invalid_type_error(serialize::to_list(
@@ -1557,6 +1642,27 @@ fn check_type(i: &Item, w: Word) -> Result<(), Error> {
                 Err(Error::expected(&w))
             }
         }
+        Item::In(_) => {
+            if w == *S_ITEM || w == *S_PIPE {
+                Ok(())
+            } else {
+                Err(Error::expected(&w))
+            }
+        }
+        Item::Out(_) => {
+            if w == *S_ITEM || w == *S_PIPE {
+                Ok(())
+            } else {
+                Err(Error::expected(&w))
+            }
+        }
+        Item::Tunnel(_) => {
+            if w == *S_ITEM || w == *S_PIPE {
+                Ok(())
+            } else {
+                Err(Error::expected(&w))
+            }
+        }
     }
 }
 
@@ -1616,13 +1722,14 @@ pub fn eval_step(mut env: Environment) -> Environment {
                         Item::AxiomDef(d) => {
                             if let Some(spec) = &d.spec {
                                 if let Err(e) = check_input_spec(&spec, &env) {
-                                    env.stack.push_front(Item::Error(e));
+                                    env = env.push(Item::Error(e));
                                     return env;
                                 }
                             } else {
                                 println!("No spec for {}!", word);
                             }
-                            env.expression.pop_front();
+                            let expr = Rc::make_mut(&mut env.expression);
+                            expr.pop_front();
                             let f = d.f.clone();
 
                             (f)(env)
@@ -1630,25 +1737,26 @@ pub fn eval_step(mut env: Environment) -> Environment {
                         Item::DerivedDef(d) => {
                             if let Some(spec) = &d.spec {
                                 if let Err(e) = check_input_spec(&spec, &env) {
-                                    env.stack.push_front(Item::Error(e));
+                                    let stack = Rc::make_mut(&mut env.stack);
+                                    stack.push_front(Item::Error(e));
                                 }
                             } else {
                                 println!("No spec for {}!", word);
                             }
-                            env.expression.pop_front();
-                            let mut items = d.definition.clone();
-                            mem::swap(&mut items, &mut env.expression);
-                            env.expression.extend(items);
-                            env
+                            let expr = Rc::make_mut(&mut env.expression);
+
+                            expr.pop_front();
+                            let items = d.definition.clone();
+                            env.append_expression(items)
                         }
                         _ => {
-                            env.stack.push_front(Item::Error(Error::undefined(*word)));
-                            env
+                            let w = *word;
+                            env.push(Item::Error(Error::undefined(w)))
                         }
                     }
                 } else {
-                    env.stack.push_front(Item::Error(Error::undefined(*word)));
-                    env
+                    let w = *word;
+                    env.push(Item::Error(Error::undefined(w)))
                 }
             }
             _ => {
@@ -1661,12 +1769,12 @@ pub fn eval_step(mut env: Environment) -> Environment {
                             return env;
                         }
                     }
-                    let b = AxiomDef::try_from(env.expression.pop_front().unwrap()).unwrap();
+                    let b = AxiomDef::try_from(env.pop_expr()).unwrap();
                     (b.f)(env)
                 } else {
                     // not a word, just push onto stack
-                    env.stack.push_front(env.expression.pop_front().unwrap());
-                    env
+                    let i = env.pop_expr();
+                    env.push(i)
                 }
             }
         }
@@ -1676,10 +1784,10 @@ pub fn eval_step(mut env: Environment) -> Environment {
 }
 
 fn reverse(i: Item) -> ItemResult {
-    let l = List::try_from(i).unwrap();
+    let mut l = List::try_from(i).unwrap();
     //l.make_contiguous().reverse();
-
-    Ok(Item::List(l.into_iter().rev().collect()))
+    let lmut = Rc::make_mut(&mut l);
+    Ok(Item::List(Rc::new(lmut.drain(..).rev().collect())))
 }
 
 fn bytes(i: Item) -> ItemResult {
@@ -1698,7 +1806,8 @@ fn string(i: Item) -> ItemResult {
 
 fn rest(i: Item) -> ItemResult {
     let mut l = List::try_from(i).unwrap();
-    l.pop_front();
+    let ld = Rc::make_mut(&mut l);
+    ld.pop_front();
     Ok(Item::List(l))
 }
 
@@ -1725,7 +1834,7 @@ fn unwind(mut env: Environment) -> (Environment, bool) {
     if can_handle {
         let mut next = env.expression.front();
         while next.is_some() && next.unwrap() != w {
-            env.expression.pop_front();
+            env.pop_expr();
             next = env.expression.front();
         }
     }
@@ -1754,11 +1863,11 @@ pub fn eval(mut env: Environment) -> Environment {
 pub fn standard_env(program: Option<List>, stack: Option<List>) -> Environment {
     let prog_expr = match program {
         Some(p) => Stack::from(p),
-        _ => Stack::new(),
+        _ => Stack::new(ListContent::new()),
     };
 
     let env = Environment {
-        stack: stack.unwrap_or(Stack::new()),
+        stack: stack.unwrap_or(Stack::new(ListContent::new())),
         expression: prog_expr,
         dictionary: Dictionary::new(),
     };
@@ -1770,11 +1879,11 @@ fn environment(p: Item) -> ItemResult {
     let stack = env
         .remove(&to_key_item(word("stack")).unwrap())
         .and_then(|s| List::try_from(s).ok())
-        .or(Some(List::new()));
+        .or(Some(List::new(ListContent::new())));
     let expression = env
         .remove(&to_key_item(word("expression")).unwrap())
         .and_then(|s| List::try_from(s).ok())
-        .or(Some(List::new()));
+        .or(Some(List::new(ListContent::new())));
     let dictionary = env
         .remove(&to_key_item(word("dictionary")).unwrap())
         .and_then(|d| Association::try_from(d).ok());
@@ -1806,10 +1915,9 @@ pub fn identity(env: Environment) -> Environment {
     env
 }
 
-pub fn dictionary(mut env: Environment) -> Environment {
+pub fn dictionary(env: Environment) -> Environment {
     let d = env.dictionary.clone();
-    env.stack.push_front(Item::Assoc(d));
-    env
+    env.push(Item::Assoc(d))
 }
 
 fn ceil(i: Item) -> ItemResult {
@@ -1831,7 +1939,7 @@ fn handle(i: Item) -> ItemResult {
             e.is_handled = true;
             e
         })),
-        i => Ok(i)
+        i => Ok(i),
     }
 }
 #+end_src
@@ -1845,6 +1953,11 @@ use base64;
 use internment::Intern;
 use std::collections::VecDeque;
 use std::fmt;
+use std::rc::Rc;
+
+pub trait Display {
+    fn representation(&self) -> Item;
+}
 
 fn lookup_builtin(w: Word, standard_dictionary: Option<&Dictionary>) -> Item {
     if let Some(dict) = standard_dictionary {
@@ -1861,7 +1974,6 @@ fn lookup_builtin(w: Word, standard_dictionary: Option<&Dictionary>) -> Item {
 }
 const BYTE_TAG: &str = "b64";
 
-
 fn to_item(
     item: &edn_format::Value,
     standard_dictionary: Option<&Dictionary>,
@@ -1869,11 +1981,11 @@ fn to_item(
     //println!("to item {:?}", item);
     match item {
         edn_format::Value::Integer(i) => Ok(Item::Int(*i)),
-        edn_format::Value::Vector(v) => Ok(Item::List(
+        edn_format::Value::Vector(v) => Ok(Item::List(Rc::new(
             v.iter()
                 .map(|i| to_item(i, standard_dictionary))
                 .collect::<Result<VecDeque<Item>, Error>>()?,
-        )),
+        ))),
         edn_format::Value::Symbol(s) => Ok(lookup_builtin(
             Intern::new(s.name().to_string()),
             standard_dictionary,
@@ -1896,7 +2008,15 @@ fn to_item(
     }
 }
 
-fn from_item(item: &Item) -> edn_format::Value {
+pub fn vectorize(a: &Association) -> Vec<edn_format::Value> {
+    a.iter()
+        .map(|(k, v)| {
+            edn_format::Value::Vector(vec![from_item(&to_value_item(k.clone())), from_item(v)])
+        })
+        .collect()
+}
+
+pub fn from_item(item: &Item) -> edn_format::Value {
     match item {
         Item::Int(i) => edn_format::Value::Integer(*i),
         Item::List(v) => edn_format::Value::Vector(
@@ -1914,25 +2034,10 @@ fn from_item(item: &Item) -> edn_format::Value {
             Box::new(edn_format::Value::String(base64::encode(bs))),
         ),
         Item::Assoc(h) => edn_format::Value::Vector(
-            h.iter()
-                .map(|(k, v)| {
-                    edn_format::Value::Vector(vec![
-                        from_item(&to_value_item(k.clone())),
-                        from_item(v),
-                    ])
-                })
-                .collect(),
+            vectorize(h)
         ),
         Item::Error(h) => edn_format::Value::Vector(
-            h.data
-                .iter()
-                .map(|(k, v)| {
-                    edn_format::Value::Vector(vec![
-                        from_item(&to_value_item(k.clone())),
-                        from_item(v),
-                    ])
-                })
-                .collect(),
+            vectorize(&h.data)
         ),
         Item::Env(e) => edn_format::Value::Vector(vec![
             edn_format::Value::Vector(vec![
@@ -1953,17 +2058,22 @@ fn from_item(item: &Item) -> edn_format::Value {
                 from_item(&Item::Word(d.word))
             }
         }
+        Item::In(i) => from_item(&i.representation()),
+        Item::Out(i) => from_item(&i.representation()),
+        Item::Tunnel(i) => from_item(&i.representation()),
     }
 }
 
 pub fn parse(s: String, standard_dictionary: Option<&Dictionary>) -> Result<List, Error> {
     let parser = edn_format::Parser::from_iter(s.chars(), edn_format::ParserOptions::default());
-    parser
-        .map(move |r| match r {
-            Ok(expr) => Ok(to_item(&expr, standard_dictionary)?),
-            Err(_) => Err(Error::parse("Invalid edn")),
-        })
-        .collect()
+    Ok(Rc::new(
+        parser
+            .map(move |r| match r {
+                Ok(expr) => Ok(to_item(&expr, standard_dictionary)?),
+                Err(_) => Err(Error::parse("Invalid edn")),
+            })
+            .collect::<Result<ListContent, Error>>()?,
+    ))
 }
 
 pub fn to_list(s: &str) -> List {
@@ -1993,6 +2103,401 @@ impl fmt::Debug for Error {
 }
 #+end_src
 
+Now we'll add the functions that do input/output (pipes)
+
+#+begin_src rust :tangle src/pipes.rs
+use crate::axiom::ItemResult;
+use crate::types::{Environment, Error, Item};
+use crate::{word, List};
+use dyn_clone::DynClone;
+use std::fmt::Debug;
+pub mod fs;
+pub mod net;
+
+pub trait Writable: Close + Debug + crate::serialize::Display + DynClone {}
+pub trait Readable: Close + Debug + crate::serialize::Display + DynClone {}
+
+pub trait In: Writable {
+    fn put(&mut self, i: Item) -> Result<(), Error>;
+}
+
+pub trait Out: Readable {
+    fn take(&mut self) -> Result<Item, Error>;
+}
+
+/* Pipes can be "closed", from either end to signal that either the
+ ,* putter or taker has gone away. Sometimes the type of pipe
+ ,* may not really support this concept but an implementation is
+ ,* required.  For example, files. When you open a file for writing and
+ ,* then "close" it, that doesn't really do anything. Rust doesn't have
+ ,* an explicit file close. You have to drop the reference to it, which
+ ,* in kcats you can do by popping the pipe off the stack. Rust will
+ ,* clean up automatically, other impls might have to reference count.
+ ,*
+ ,* The contract here is as follows:
+ ,* 1. After calling close, put on the pipe returns an error
+ ,*
+ ,* 2. After calling close, take on the pipe will return still-buffered
+ ,* items (if the pipe has a buffer), but once buffer is exhausted it
+ ,* will return error.
+ ,*
+ ,* 2. Errors cannot be put into a pipe (the taker can't distinguish
+ ,* between io error and an error value). To work around this, wrap the
+ ,* error value in a list to quote it. Putting error into a pipe will
+ ,* return an io error.
+ ,*
+ ,* 3. Once closed pipes cannot be ever be put into again. closed? will always
+ ,* return true thereafter.
+ ,*
+ ,* One use case that has to be handled specially is a file we've fully
+ ,* read but later someone else might write more bytes to the end. Does
+ ,* the pipe close when we reach EOF? I think we might need to support
+ ,* both types (a type that closes when hitting eof and one that
+ ,* doesn't). The former is the "normal" use case, which will be the
+ ,* default.
+ ,*
+ ,* These two types are basically static vs dynamic content. Either all
+ ,* the content is known now, or it isn't.
+ ,*
+,*/
+pub trait Close: Debug + DynClone {
+    fn close(&mut self) -> Result<(), Error>;
+    fn is_closed(&self) -> bool;
+}
+
+dyn_clone::clone_trait_object!(In);
+dyn_clone::clone_trait_object!(Out);
+dyn_clone::clone_trait_object!(Close);
+
+fn closed_error(on_take: bool) -> Error {
+    Error::create(
+        List::from_iter([word("close"), word(if on_take { "take" } else { "put" })]),
+        "attempt to use closed pipe",
+    )
+}
+
+pub fn put_(mut env: Environment) -> Environment {
+    let item = env.pop();
+    let pipe = env.pop();
+
+    match pipe {
+        Item::In(mut p) => {
+            match p.put(item) {
+                Ok(_) => {}
+                Err(e) => {
+                    env.stack.push_front(Item::Error(e));
+                }
+            }
+            env.stack.push_front(Item::In(p));
+        }
+        _ => {
+            env.stack.push_front(Item::Error(Error::expected("pipe")));
+        }
+    }
+
+    env
+}
+
+pub fn take_(mut env: Environment) -> Environment {
+    let pipe = env.pop();
+    match pipe {
+        Item::Out(mut p) => {
+            let i = Out::take(&mut *p);
+            env.stack.push_front(Item::Out(p));
+
+            match i {
+                Ok(i) => env.stack.push_front(i),
+                Err(e) => {
+                    env.stack.push_front(Item::Error(e));
+                }
+            }
+        }
+        _ => {
+            env.stack.push_front(Item::Error(Error::expected("pipe")));
+        }
+    }
+    env
+}
+
+pub fn is_closed(i: Item) -> ItemResult {
+    match i {
+        Item::In(p) => Ok(Item::Boolean(p.is_closed())),
+        Item::Out(p) => Ok(Item::Boolean(p.is_closed())),
+        _ => Err(Error::expected("pipe")),
+    }
+}
+
+pub fn close(i: Item) -> ItemResult {
+    match i {
+        Item::In(mut p) => Ok({
+            p.close()?;
+            Item::In(p)
+        }),
+        Item::Out(mut p) => Ok({
+            p.close()?;
+            Item::Out(p)
+        }),
+        _ => Err(Error::expected("pipe")),
+    }
+}
+#+end_src
+
+Now some specific types of pipes. These are for reading/writing data to files.
+#+begin_src rust :tangle src/pipes/fs.rs
+use crate::pipes::{Readable, Writable, Close, In, Out, closed_error};
+use std::fs::File;
+use std::io::{Read, Write};
+use crate::axiom::ItemResult;
+use crate::types::{word_key, word, Association, Error, Item};
+
+#[derive(Debug)]
+struct StaticFile {
+    pub file: File,
+    pub closed: bool,
+    pub path: String,
+}
+
+impl Clone for StaticFile {
+    fn clone(&self) -> Self {
+        StaticFile {
+            file: self.file.try_clone().unwrap(),
+            closed: false,
+            path: self.path.clone(),
+        }
+    }
+}
+
+impl Close for StaticFile {
+    fn close(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed
+    }
+}
+
+impl Writable for StaticFile {}
+impl Readable for StaticFile {}
+
+impl In for StaticFile {
+    fn put(&mut self, i: Item) -> Result<(), Error> {
+        match i {
+            Item::Bytes(bs) => {
+                let mut pos = 0;
+                while pos < bs.len() {
+                    let bytes_written = self.file.write(&bs[pos..])?;
+                    pos += bytes_written;
+                }
+                self.file.flush()?;
+                Ok(())
+            }
+            _ => Err(Error::expected("bytes")),
+        }
+    }
+}
+
+impl Out for StaticFile {
+    fn take(&mut self) -> Result<Item, Error> {
+        if self.is_closed() {
+            return Err(closed_error(true));
+        }
+        let mut bs = [0u8; 1024];
+        let ct = self.file.read(&mut bs)?;
+        if ct == 0 {
+            // EOF, no more takes since it's static
+            self.closed = true;
+        }
+        Ok(Item::Bytes(bs[0..ct].to_vec()))
+    }
+}
+
+impl crate::serialize::Display for StaticFile {
+    fn representation(&self) -> Item {
+        Item::Assoc(Association::from([
+            (word_key("type"), word("pipe")),
+            (word_key("file"), Item::String(self.path.clone())),
+        ]))
+    }
+}
+
+pub fn file_in(i: Item) -> ItemResult {
+    let path = String::try_from(i)?;
+    Ok(Item::In(Box::new(StaticFile {
+        file: File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path.clone())?,
+        closed: false,
+        path,
+    })))
+}
+
+pub fn file_out(i: Item) -> ItemResult {
+    let path = String::try_from(i)?;
+    Ok(Item::Out(Box::new(StaticFile {
+        file: File::open(path.clone())?,
+        closed: false,
+        path,
+    })))
+}
+#+end_src
+
+These are for reading/writing data over tcp/ip sockets.
+#+begin_src rust :tangle src/pipes/net.rs
+use crate::axiom::ItemResult;
+use crate::pipes::{closed_error, Close, In, Out, Readable, Tunnel, Writable};
+use crate::types::{word, word_key, wrap, Association, Int, Item};
+use crate::Error;
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
+use std::str::FromStr;
+
+#[derive(Debug)]
+struct Socket {
+    pub socket: TcpStream,
+    pub addr: SocketAddr,
+    pub closed: bool,
+}
+
+impl Clone for Socket {
+    fn clone(&self) -> Self {
+        Socket {
+            socket: self.socket.try_clone().unwrap(),
+            addr: self.addr.clone(),
+            closed: false,
+        }
+    }
+}
+
+impl Close for Socket {
+    fn close(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed
+    }
+}
+
+impl Readable for Socket {}
+impl Writable for Socket {}
+
+impl crate::serialize::Display for Socket {
+    fn representation(&self) -> Item {
+        Item::Assoc(Association::from([
+            (word_key("type"), word("tunnel")),
+            (word_key("realm"), word("tcp")),
+            (word_key("address"), Item::String(self.addr.to_string())),
+        ]))
+    }
+}
+
+impl Out for Socket {
+    fn take(&mut self) -> Result<Item, Error> {
+        if self.is_closed() {
+            return Err(closed_error(true));
+        }
+        let mut bs = [0u8; 1024];
+        let ct = self.socket.read(&mut bs)?;
+        if ct == 0 {
+            // EOF, no more takes since it's static
+            self.closed = true;
+        }
+        Ok(Item::Bytes(bs[0..ct].to_vec()))
+    }
+}
+
+impl In for Socket {
+    fn put(&mut self, i: Item) -> Result<(), Error> {
+        match i {
+            Item::Bytes(bs) => {
+                let mut pos = 0;
+                while pos < bs.len() {
+                    let bytes_written = self.socket.write(&bs[pos..])?;
+                    pos += bytes_written;
+                }
+                self.socket.flush()?;
+                Ok(())
+            }
+            _ => Err(Error::expected("bytes")),
+        }
+    }
+}
+
+impl Tunnel for Socket {}
+
+// Server sockets
+#[derive(Debug)]
+struct ServerSocket {
+    pub socket: TcpListener,
+    pub closed: bool,
+}
+
+impl Clone for ServerSocket {
+    fn clone(&self) -> Self {
+        ServerSocket {
+            socket: self.socket.try_clone().unwrap(),
+            closed: false,
+        }
+    }
+}
+
+impl Close for ServerSocket {
+    fn close(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed
+    }
+}
+
+impl Readable for ServerSocket {}
+
+impl crate::serialize::Display for ServerSocket {
+    fn representation(&self) -> Item {
+        Item::Assoc(Association::from([
+            (word_key("type"), word("pipe")),
+            (
+                word_key("serversocket"),
+                Item::String(self.socket.local_addr().unwrap().to_string()),
+            ),
+        ]))
+    }
+}
+
+impl Out for ServerSocket {
+    fn take(&mut self) -> Result<Item, Error> {
+        if self.is_closed() {
+            return Err(closed_error(true));
+        }
+        let (socket, addr) = self.socket.accept()?;
+
+        Ok(Item::Tunnel(Box::new(Socket {
+            socket,
+            addr,
+            closed: false,
+        })))
+    }
+}
+
+pub fn server_socket(i: Item, j: Item) -> ItemResult {
+    let addr = Ipv4Addr::from_str(String::try_from(j)?.as_str())?;
+    let port = Int::try_from(i)? as u16;
+    Ok(Item::Out(Box::new(ServerSocket {
+        socket: TcpListener::bind(SocketAddrV4::new(addr, port))?,
+        closed: false,
+    })))
+}
+
+impl From<std::net::AddrParseError> for Error {
+    fn from(err: std::net::AddrParseError) -> Error {
+        Error::create(wrap(word("addrparse")), &err.to_string())
+    }
+}
+#+end_src
 ** Issues
 *** DONE Serialization treats any tagged literal as byte string
 *** DONE Serialization panics on reading invalid data
@@ -2508,7 +3013,7 @@ if
 : [22]
 
 
-#+begin_src kcats
+#+begin_src kcats :results code
 5
 [1 2 "oh fudge"]
 [[+]
@@ -2518,8 +3023,10 @@ map
 #+end_src
 
 #+RESULTS:
-: 
-: [[6 7 5] 5]
+#+begin_src kcats
+
+[[6 7 5] 5]
+#+end_src
 
 #+begin_src kcats
  [+]
@@ -2566,13 +3073,15 @@ before the flag could be set.)
 
 We can delete the word =resume=.
 
-#+begin_src kcats
+#+begin_src kcats :results code
  discard 1 2 + handle discard 3 4 +
 #+end_src
 
 #+RESULTS:
-: 
-: [7]
+#+begin_src kcats
+
+[7]
+#+end_src
 
 #+begin_src kcats
 1 [[zero?] [pos?]] [execute] every?
@@ -2639,6 +3148,87 @@ Right now I'm inclined to leave as-is, as it's the least bad
 solution. Allowing undefined words to just go onto the stack is going
 to mask all kinds of errors and will cause untold headaches.
 *** TODO Division by zero panics
+*** INPROGRESS Implement pipes
+**** DONE Write to a file
+#+begin_src kcats
+[[file "/tmp/bar2"]] pipe-in
+
+["hello world!"
+ "Nice to meet you!"
+ "My name is kcats"]
+
+["\n" join bytes put]
+
+step
+#+end_src
+
+#+RESULTS:
+: 
+: [[[file "/tmp/bar2"] [type pipe]]]
+**** DONE Read from a file
+#+begin_src kcats :results code
+"" [string join] [[file "/tmp/bar2"]] pipe-out
+
+assemble 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+
+["hello world!\nNice to meet you!\nMy name is kcats\n"]
+#+end_src
+
+#+begin_src kcats :results code
+dictionary [assemble definition] lookup
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+
+[[swap [take swap] swap pack [dip] join [[closed? not]] dip while discard]]
+#+end_src
+**** DONE Close a pipe
+#+begin_src kcats :results code
+[[file "/tmp/foopytoop"]] pipe-in "foo" bytes put close "bar" bytes put
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+
+[999]
+#+end_src
+**** DONE Serialize pipes with something sane
+Maybe they can't be easily round-tripped, but at least we can print
+something reasonable that will tell human eyes what it is.
+something like[[type pipe-in] [file "/tmp/foo"]]
+**** DONE Sockets
+***** DONE Server Sockets
+#+begin_src kcats :results code
+[[type ip-port] [address "127.0.0.1"] [port 11211]] pipe-out take take string
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+
+["hello world!\n" [[realm tcp] [type tunnel] [address "127.0.0.1:52212"]] [[type pipe] [serversocket "127.0.0.1:11211"]]]
+#+end_src
+
+#+begin_src kcats :results code
+[[type ip-port] [address "127.0.0.1"] [port 11211]] pipe-out ;; server socket
+take ;; accept connection by taking a socket out of the pipe
+"foo\n" bytes put ;; write a message to the socket
+take string ;; get a message from the socket
+[discard ;; close the socket
+ discard] ;; close the server socket
+dip
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+["bar\n"]
+#+end_src
+
+***** DONE Sockets
 * Notes
 ** Bootstrapping
 + Builtin words need to exist *before* the derived words are read from
