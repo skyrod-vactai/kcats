@@ -2108,9 +2108,10 @@ Now we'll add the functions that do input/output (pipes)
 #+begin_src rust :tangle src/pipes.rs
 use crate::axiom::ItemResult;
 use crate::types::{Environment, Error, Item};
-use crate::{word, List};
+use crate::{word, ListContent};
 use dyn_clone::DynClone;
 use std::fmt::Debug;
+use std::rc::Rc;
 pub mod fs;
 pub mod net;
 
@@ -2124,6 +2125,8 @@ pub trait In: Writable {
 pub trait Out: Readable {
     fn take(&mut self) -> Result<Item, Error>;
 }
+
+pub trait Tunnel: In + Out {}
 
 /* Pipes can be "closed", from either end to signal that either the
  ,* putter or taker has gone away. Sometimes the type of pipe
@@ -2168,55 +2171,53 @@ pub trait Close: Debug + DynClone {
 dyn_clone::clone_trait_object!(In);
 dyn_clone::clone_trait_object!(Out);
 dyn_clone::clone_trait_object!(Close);
+dyn_clone::clone_trait_object!(Tunnel);
 
 fn closed_error(on_take: bool) -> Error {
     Error::create(
-        List::from_iter([word("close"), word(if on_take { "take" } else { "put" })]),
+        Rc::new(ListContent::from_iter([
+            word("close"),
+            word(if on_take { "take" } else { "put" }),
+        ])),
         "attempt to use closed pipe",
     )
 }
 
 pub fn put_(mut env: Environment) -> Environment {
     let item = env.pop();
-    let pipe = env.pop();
-
-    match pipe {
-        Item::In(mut p) => {
-            match p.put(item) {
-                Ok(_) => {}
+    let pipe = env.expression.front().unwrap();
+    if let Item::In(p) = pipe {
+        match (p.clone()).put(item) {
+                Ok(_) => { env }
                 Err(e) => {
-                    env.stack.push_front(Item::Error(e));
+                    env.push(Item::Error(e))
                 }
             }
-            env.stack.push_front(Item::In(p));
-        }
-        _ => {
-            env.stack.push_front(Item::Error(Error::expected("pipe")));
-        }
     }
+    else {
+        env.push(Item::Error(Error::expected("pipe")))
 
-    env
+    }
+    
 }
 
-pub fn take_(mut env: Environment) -> Environment {
-    let pipe = env.pop();
+pub fn take_(env: Environment) -> Environment {
+    let pipe = env.expression.front().unwrap().clone();
+    
     match pipe {
         Item::Out(mut p) => {
             let i = Out::take(&mut *p);
-            env.stack.push_front(Item::Out(p));
-
             match i {
-                Ok(i) => env.stack.push_front(i),
+                Ok(i) => env.push(i),
                 Err(e) => {
-                    env.stack.push_front(Item::Error(e));
+                    env.push(Item::Error(e))
                 }
             }
         }
         _ => {
-            env.stack.push_front(Item::Error(Error::expected("pipe")));
+            env.push(Item::Error(Error::expected("pipe")))
         }
     }
-    env
 }
 
 pub fn is_closed(i: Item) -> ItemResult {
