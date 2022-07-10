@@ -71,7 +71,9 @@ pub type Int = i64;
 
 pub type Float = f64;
 
-pub type Association = HashMap<KeyItem, Item>;
+pub type AssociationContent = HashMap<KeyItem, Item>;
+
+pub type Association = Rc<AssociationContent>;
 
 #[derive(Clone, PartialEq)]
 pub struct Error {
@@ -238,11 +240,11 @@ impl Error {
     pub fn create(asked: List, reason: &str) -> Error {
         Error {
             is_handled: false,
-            data: HashMap::from([
+            data: Rc::new(HashMap::from([
                 (word_key("type"), word("error")),
                 (word_key("asked"), Item::List(asked)),
                 (word_key("reason"), Item::String(reason.to_string())),
-            ]),
+            ])),
         }
     }
 
@@ -290,8 +292,9 @@ impl Error {
 
     pub fn test_assertion(program: List, expected: List, actual: List) -> Error {
         let mut e = Error::create(program, "assertion failed");
-        e.data.insert(word_key("expected"), Item::List(expected));
-        e.data.insert(word_key("actual"), Item::List(actual));
+        let d = Rc::make_mut(&mut e.data);
+        d.insert(word_key("expected"), Item::List(expected));
+        d.insert(word_key("actual"), Item::List(actual));
         return e;
     }
 }
@@ -305,16 +308,18 @@ impl TryFrom<Item> for List {
     fn try_from(i: Item) -> Result<Self, Self::Error> {
         match i {
             Item::List(l) => Ok(l),
-            Item::Assoc(a) => Ok(Rc::new(
-                a.into_iter()
+            Item::Assoc(mut a) => {
+                let amut = Rc::make_mut(&mut a);
+                Ok(Rc::new(
+                amut.into_iter()
                     .map(|(k, v)| {
                         Item::List(Rc::new(ListContent::from(vec![
-                            to_value_item(k),
-                            Item::from(v),
+                            to_value_item(k.clone()),
+                            Item::from(v.clone()),
                         ])))
                     })
                     .collect::<ListContent>(),
-            )),
+            ))},
             Item::Error(e) => List::try_from(Item::Assoc(e.data)),
             _ => Err(Error::expected("list")),
         }
@@ -371,7 +376,7 @@ impl TryFrom<Item> for Association {
         match i {
             Item::Assoc(a) => Ok(a),
             Item::List(l) => Ok(to_hash(l)?),
-            Item::Nothing => Ok(Association::new()),
+            Item::Nothing => Ok(Rc::new(AssociationContent::new())),
             Item::DerivedDef(d) => Ok(Association::from(d)),
             Item::AxiomDef(a) => Ok(Association::from(a)),
             Item::Env(e) => Ok(Association::from(e)),
@@ -415,13 +420,13 @@ impl TryFrom<Item> for Box<dyn Out> {
 
 impl From<DerivedDef> for Association {
     fn from(d: DerivedDef) -> Association {
-        let mut a = Association::new();
+        let mut a = AssociationContent::new();
         a.insert(word_key("definition"), Item::List(d.definition.clone()));
         d.examples
             .and_then(|l| a.insert(word_key("examples"), Item::List(l.clone())));
         d.spec
             .and_then(|l| a.insert(word_key("spec"), Item::List(l.clone())));
-        a
+        Rc::new(a)
     }
 }
 
@@ -439,28 +444,29 @@ impl From<DerivedDef> for Item {
 
 impl From<AxiomDef> for Association {
     fn from(d: AxiomDef) -> Association {
-        let mut a = Association::new();
+        let mut a = AssociationContent::new();
         d.examples
             .and_then(|l| a.insert(word_key("examples"), Item::List(l.clone())));
         d.spec
             .and_then(|l| a.insert(word_key("spec"), Item::List(l.clone())));
-        a
+        Rc::new(a)
     }
 }
 
 impl From<Association> for DerivedDef {
     fn from(mut d: Association) -> DerivedDef {
+        let dmut = Rc::make_mut(&mut d);
         DerivedDef {
             word: Intern::new("".to_string()),
             serialize: true,
-            definition: d
+            definition: dmut
                 .remove(&key_item("definition"))
                 .and_then(|i| List::try_from(i).ok())
                 .unwrap_or(Rc::new(ListContent::new())),
-            examples: d
+            examples: dmut
                 .remove(&key_item("examples"))
                 .and_then(|i| List::try_from(i).ok()),
-            spec: d
+            spec: dmut
                 .remove(&key_item("spec"))
                 .and_then(|i| List::try_from(i).ok()),
         }
@@ -475,11 +481,11 @@ impl From<AxiomDef> for Item {
 
 impl From<Environment> for Association {
     fn from(env: Environment) -> Association {
-        let mut a = Association::new();
+        let mut a = AssociationContent::new();
         a.insert(word_key("stack"), Item::List(env.stack.clone()));
         a.insert(word_key("expression"), Item::List(env.expression.clone()));
         a.insert(word_key("dictionary"), Item::Assoc(env.dictionary.clone()));
-        a
+        Rc::new(a)
     }
 }
 
@@ -571,9 +577,11 @@ pub fn to_entry(i: Item) -> Result<(KeyItem, Item), Error> {
 }
 
 pub fn to_hash(l: List) -> Result<Association, Error> {
-    l.iter()
-        .map(|i| to_entry(i.clone()))
-        .collect::<Result<HashMap<KeyItem, Item>, Error>>()
+    Ok(Rc::new(
+        l.iter()
+            .map(|i| to_entry(i.clone()))
+            .collect::<Result<HashMap<KeyItem, Item>, Error>>()?,
+    ))
 }
 #+end_src
 
@@ -831,8 +839,9 @@ fn f_stack3(f: fn(Item, Item, Item) -> ItemResult) -> impl Fn(Environment) -> En
 }
 
 fn update_axiom_entries(mut d: Dictionary, updates: Vec<(&str, &'static StepFn)>) -> Dictionary {
+    let dm = Rc::make_mut(&mut d);
     for (w, f) in updates {
-        d.entry(KeyItem::Word(Word::from(w)))
+        dm.entry(KeyItem::Word(Word::from(w)))
             .and_modify(|e| match e {
                 Item::AxiomDef(a) => {
                     a.f = f;
@@ -940,13 +949,15 @@ pub fn read_lexicon_file(filename: &str, mut env: Environment) -> Environment {
     match fs::read_to_string(filename) {
         Ok(s) => {
             let items = serialize::parse(s, Some(&env.dictionary)).unwrap();
-            let vitems = to_hash(List::from(items)).unwrap();
-            for (k, def) in vitems.into_iter() {
-                let h = to_hash(List::try_from(def).unwrap()).unwrap();
-                let word = as_word(k).unwrap();
+            let mut vitems = to_hash(List::from(items)).unwrap();
+            let vitemsmut = Rc::make_mut(&mut vitems);
+            for (k, def) in vitemsmut.into_iter() {
+                let h = to_hash(List::try_from(def.clone()).unwrap()).unwrap();
+                let word = as_word(k.clone()).unwrap();
                 let newdef = to_lexicon_entry(word, h);
                 let newdef2 = newdef.clone();
-                env.dictionary
+                let dict = Rc::make_mut(&mut env.dictionary);
+                dict
                     .entry(KeyItem::Word(word))
                     .and_modify(|e| match (e, newdef) {
                         (Item::AxiomDef(a), Item::AxiomDef(new_a)) => {
@@ -1400,8 +1411,8 @@ fn as_word(i: KeyItem) -> Option<Word> {
 }
 
 fn to_lexicon_entry(w: Word, mut def: Association) -> Item {
-    //println!("{:?}", def);
-    if def.get(&key_item("definition")).is_some() {
+    let dm = Rc::make_mut(&mut def);
+    if dm.get(&key_item("definition")).is_some() {
         let mut d = DerivedDef::from(def);
         d.word = w;
         Item::DerivedDef(d)
@@ -1409,10 +1420,10 @@ fn to_lexicon_entry(w: Word, mut def: Association) -> Item {
         Item::AxiomDef(AxiomDef {
             word: w,
             serialize: true,
-            examples: def
+            examples: dm
                 .remove(&key_item("examples"))
                 .and_then(|i| List::try_from(i).ok()),
-            spec: def
+            spec: dm
                 .remove(&key_item("spec"))
                 .and_then(|i| List::try_from(i).ok()),
             f: Box::leak(Box::new(move |env: Environment| {
@@ -1424,20 +1435,21 @@ fn to_lexicon_entry(w: Word, mut def: Association) -> Item {
 
 fn assoc_in(i: Item, ks: &[KeyItem], v: Item) -> Result<Association, Error> {
     let mut h = Association::try_from(i)?;
+    let hm = Rc::make_mut(&mut h);
     if let [k, ks @ ..] = ks {
         if ks.is_empty() {
-            h.insert(k.clone(), v);
+            hm.insert(k.clone(), v);
         } else {
-            let inner = h.get(&k.clone()).unwrap_or(&Item::Nothing).clone();
+            let inner = hm.get(&k.clone()).unwrap_or(&Item::Nothing).clone();
             // if the inner value isn't a map, we're just overwriting whatever it
             // is with a new map.
 
-            h.insert(
+            hm.insert(
                 k.clone(),
                 Item::Assoc(assoc_in(
                     Item::Assoc(match inner {
                         Item::Assoc(inner) => inner,
-                        _ => Association::new(),
+                        _ => Rc::new(AssociationContent::new()),
                     }),
                     ks,
                     v,
@@ -1463,8 +1475,9 @@ pub fn assign(m: Item, ks: Item, v: Item) -> ItemResult {
 //TODO: this should really take a keylist like assign and lookup
 pub fn unassign(m: Item, k: Item) -> ItemResult {
     let mut m = Association::try_from(m).unwrap();
+    let mm = Rc::make_mut(&mut m);
     let k = to_key_item(k)?;
-    m.remove(&k);
+    mm.remove(&k);
     Ok(Item::Assoc(m))
 }
 
@@ -1886,34 +1899,38 @@ pub fn standard_env(program: Option<List>, stack: Option<List>) -> Environment {
     let env = Environment {
         stack: stack.unwrap_or(Stack::new(ListContent::new())),
         expression: prog_expr,
-        dictionary: Dictionary::new(),
+        dictionary: Rc::new(AssociationContent::new()),
     };
     add_standard_dictionary(env)
 }
 
 fn environment(p: Item) -> ItemResult {
     let mut env = Association::try_from(p).unwrap();
-    let stack = env
+    let envm = Rc::make_mut(&mut env);
+    let stack = envm
         .remove(&to_key_item(word("stack")).unwrap())
         .and_then(|s| List::try_from(s).ok())
         .or(Some(List::new(ListContent::new())));
-    let expression = env
+    let expression = envm
         .remove(&to_key_item(word("expression")).unwrap())
         .and_then(|s| List::try_from(s).ok())
         .or(Some(List::new(ListContent::new())));
-    let dictionary = env
+    let dictionary = envm
         .remove(&to_key_item(word("dictionary")).unwrap())
         .and_then(|d| Association::try_from(d).ok());
     let mut env = standard_env(expression, stack);
-    for (k, v) in dictionary.into_iter().flatten() {
-        List::try_from(v)
-            .and_then(to_hash)
-            .and_then(|h| {
-                env.dictionary
-                    .insert(k, Item::DerivedDef(DerivedDef::from(h)));
-                Ok(())
-            })
-            .ok();
+    if let Some(mut d) = dictionary {
+        let dmut = Rc::make_mut(&mut d);
+        let edmut = Rc::make_mut(&mut env.dictionary);
+        for (k, v) in dmut {
+            List::try_from(v.clone())
+                .and_then(to_hash)
+                .and_then( |h| {
+                    edmut.insert(k.clone(), Item::DerivedDef(DerivedDef::from(h)));
+                    Ok(())
+                })
+                .ok();
+        }
     }
     Ok(Item::Env(env))
 }
@@ -2262,11 +2279,12 @@ pub fn close(i: Item) -> ItemResult {
 
 Now some specific types of pipes. These are for reading/writing data to files.
 #+begin_src rust :tangle src/pipes/fs.rs
-use crate::pipes::{Readable, Writable, Close, In, Out, closed_error};
+use crate::axiom::ItemResult;
+use crate::pipes::{closed_error, Close, In, Out, Readable, Writable};
+use crate::types::{word, word_key, AssociationContent, Error, Item};
 use std::fs::File;
 use std::io::{Read, Write};
-use crate::axiom::ItemResult;
-use crate::types::{word_key, word, Association, Error, Item};
+use std::rc::Rc;
 
 #[derive(Debug)]
 struct StaticFile {
@@ -2332,10 +2350,10 @@ impl Out for StaticFile {
 
 impl crate::serialize::Display for StaticFile {
     fn representation(&self) -> Item {
-        Item::Assoc(Association::from([
+        Item::Assoc(Rc::new(AssociationContent::from([
             (word_key("type"), word("pipe")),
             (word_key("file"), Item::String(self.path.clone())),
-        ]))
+        ])))
     }
 }
 
@@ -2366,11 +2384,12 @@ These are for reading/writing data over tcp/ip sockets.
 #+begin_src rust :tangle src/pipes/net.rs
 use crate::axiom::ItemResult;
 use crate::pipes::{closed_error, Close, In, Out, Readable, Tunnel, Writable};
-use crate::types::{word, word_key, wrap, Association, Int, Item};
+use crate::types::{word, word_key, wrap, AssociationContent, Int, Item};
 use crate::Error;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 use std::str::FromStr;
+use std::rc::Rc;
 
 #[derive(Debug)]
 struct Socket {
@@ -2404,11 +2423,11 @@ impl Writable for Socket {}
 
 impl crate::serialize::Display for Socket {
     fn representation(&self) -> Item {
-        Item::Assoc(Association::from([
+        Item::Assoc(Rc::new(AssociationContent::from([
             (word_key("type"), word("tunnel")),
             (word_key("realm"), word("tcp")),
             (word_key("address"), Item::String(self.addr.to_string())),
-        ]))
+        ])))
     }
 }
 
@@ -2476,13 +2495,13 @@ impl Readable for ServerSocket {}
 
 impl crate::serialize::Display for ServerSocket {
     fn representation(&self) -> Item {
-        Item::Assoc(Association::from([
+        Item::Assoc(Rc::new(AssociationContent::from([
             (word_key("type"), word("pipe")),
             (
                 word_key("serversocket"),
                 Item::String(self.socket.local_addr().unwrap().to_string()),
             ),
-        ]))
+        ])))
     }
 }
 
