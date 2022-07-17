@@ -370,6 +370,17 @@ impl TryFrom<Item> for String {
     }
 }
 
+impl TryFrom<Item> for Word {
+    type Error = Error;
+    fn try_from(i: Item) -> Result<Self, Self::Error> {
+        if let Item::Word(i) = i {
+            Ok(i)
+        } else {
+            Err(Error::expected("word"))
+        }
+    }
+}
+
 impl TryFrom<Item> for Association {
     type Error = Error;
     fn try_from(i: Item) -> Result<Self, Self::Error> {
@@ -726,6 +737,7 @@ mod tests {
     #[test_case("if")]
     #[test_case("inc")]
     #[test_case("inject")]
+    #[test_case("inscribe")]
     #[test_case("join")]
     #[test_case("list?" ; "is_list")]
     #[test_case("lookup")]
@@ -811,9 +823,33 @@ impl From<ItemResult> for Item {
     }
 }
 
+fn f_stack1_option(
+    f: fn(Item) -> Result<Option<Item>, Error>,
+) -> impl Fn(Environment) -> Environment {
+    move |mut env: Environment| {
+        let x = env.pop();
+        match f(x) {
+            Ok(r) => {
+                if let Some(r) = r {
+                    let i = Item::from(r);
+                    match i {
+                        Item::Error(e) => env.push(Item::Error(e)),
+                        _ => env,
+                    }
+                } else {
+                    env
+                }
+            },
+            Err(e) => {
+                env.push(Item::Error(e))
+            }
+        }
+        
+    }
+}
+
 fn f_stack1(f: fn(Item) -> ItemResult) -> impl Fn(Environment) -> Environment {
     move |mut env: Environment| {
-        //check_stack_depth(&env, 1)?;
         let x = env.pop();
         env.push(Item::from(f(x)))
     }
@@ -821,7 +857,6 @@ fn f_stack1(f: fn(Item) -> ItemResult) -> impl Fn(Environment) -> Environment {
 
 fn f_stack2(f: fn(Item, Item) -> ItemResult) -> impl Fn(Environment) -> Environment {
     move |mut env: Environment| {
-        //check_stack_depth(&env, 2)?;
         let x = env.pop();
         let y = env.pop();
         env.push(Item::from(f(y, x)))
@@ -830,7 +865,6 @@ fn f_stack2(f: fn(Item, Item) -> ItemResult) -> impl Fn(Environment) -> Environm
 
 fn f_stack3(f: fn(Item, Item, Item) -> ItemResult) -> impl Fn(Environment) -> Environment {
     move |mut env: Environment| {
-        //check_stack_depth(&env, 3)?;
         let x = env.pop();
         let y = env.pop();
         let z = env.pop();
@@ -907,6 +941,7 @@ pub fn add_builtins(d: Dictionary) -> Dictionary {
             ("float", Box::leak(Box::new(float))),
             ("handle", Box::leak(Box::new(f_stack1(handle)))),
             ("inc", Box::leak(Box::new(f_stack1(inc)))),
+            ("inscribe", Box::leak(Box::new(inscribe))),
             ("join", Box::leak(Box::new(f_stack2(join)))),
             ("list?", Box::leak(Box::new(f_stack1(is_list)))),
             ("loop", Box::leak(Box::new(loop_))),
@@ -957,8 +992,7 @@ pub fn read_lexicon_file(filename: &str, mut env: Environment) -> Environment {
                 let newdef = to_lexicon_entry(word, h);
                 let newdef2 = newdef.clone();
                 let dict = Rc::make_mut(&mut env.dictionary);
-                dict
-                    .entry(KeyItem::Word(word))
+                dict.entry(KeyItem::Word(word))
                     .and_modify(|e| match (e, newdef) {
                         (Item::AxiomDef(a), Item::AxiomDef(new_a)) => {
                             a.examples = new_a.examples;
@@ -1925,7 +1959,7 @@ fn environment(p: Item) -> ItemResult {
         for (k, v) in dmut {
             List::try_from(v.clone())
                 .and_then(to_hash)
-                .and_then( |h| {
+                .and_then(|h| {
                     edmut.insert(k.clone(), Item::DerivedDef(DerivedDef::from(h)));
                     Ok(())
                 })
@@ -1974,6 +2008,27 @@ fn handle(i: Item) -> ItemResult {
             e
         })),
         i => Ok(i),
+    }
+}
+
+fn inscription(env: &mut Environment) -> Result<(Word, DerivedDef), Error> {
+    let d = Association::try_from(env.pop())?;
+    let mut wl = List::try_from(env.pop())?;
+    let w1 = Rc::make_mut(&mut wl).pop_front();
+    let x = w1.ok_or(Error::short_list(1))?;
+    let w = Word::try_from(x.clone())?;
+    Ok((w, DerivedDef::from(d)))
+}
+
+pub fn inscribe(mut env: Environment) -> Environment {
+    let r = inscription(&mut env);
+    match r {
+        Ok((w, def)) => {
+            let d = Rc::make_mut(&mut env.dictionary);
+            d.insert(KeyItem::Word(w), Item::DerivedDef(def));
+            env
+        }
+        Err(e) => env.push(Item::Error(e)),
     }
 }
 #+end_src
