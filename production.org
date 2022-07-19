@@ -311,16 +311,19 @@ impl TryFrom<Item> for List {
             Item::Assoc(mut a) => {
                 let amut = Rc::make_mut(&mut a);
                 Ok(Rc::new(
-                amut.into_iter()
-                    .map(|(k, v)| {
-                        Item::List(Rc::new(ListContent::from(vec![
-                            to_value_item(k.clone()),
-                            Item::from(v.clone()),
-                        ])))
-                    })
-                    .collect::<ListContent>(),
-            ))},
+                    amut.into_iter()
+                        .map(|(k, v)| {
+                            Item::List(Rc::new(ListContent::from(vec![
+                                to_value_item(k.clone()),
+                                Item::from(v.clone()),
+                            ])))
+                        })
+                        .collect::<ListContent>(),
+                ))
+            }
             Item::Error(e) => List::try_from(Item::Assoc(e.data)),
+            // 'Nothing' is equivalent to an empty list
+            Item::Nothing => Ok(Rc::new(ListContent::new())),
             _ => Err(Error::expected("list")),
         }
     }
@@ -1270,7 +1273,7 @@ pub fn loop_(mut env: Environment) -> Environment {
     match p {
         Ok(mut p) => {
             let f = env.pop();
-            if is_truthy(f) {
+            if is_truthy(&f) {
                 let p2 = p.clone();
                 let pm = Rc::make_mut(&mut p);
                 pm.push_back(Item::List(p2));
@@ -1368,9 +1371,8 @@ pub fn unpack(mut env: Environment) -> Environment {
     env
 }
 
-fn is_truthy(i: Item) -> bool {
+fn is_truthy(i: &Item) -> bool {
     match i {
-        Item::Boolean(b) => b,
         Item::Nothing => false,
         Item::List(l) => !l.is_empty(),
         _ => true,
@@ -1382,7 +1384,7 @@ pub fn branch(mut env: Environment) -> Environment {
         (Ok(false_branch), Ok(true_branch)) => {
             let b = env.pop();
 
-            env.append_expression(if is_truthy(b) {
+            env.append_expression(if is_truthy(&b) {
                 true_branch
             } else {
                 false_branch
@@ -1550,20 +1552,33 @@ pub fn lookup(m: Item, k: Item) -> ItemResult {
 }
 
 pub fn or(i: Item, j: Item) -> ItemResult {
-    Ok(Item::Boolean(is_truthy(i) || is_truthy(j)))
+    Ok(if is_truthy(&i) {
+        i
+    } else {
+        if is_truthy(&j) {
+            j
+        } else {
+            Item::Nothing
+        }
+    })
+    //Ok(Item::from(is_truthy(i) || is_truthy(j)))
 }
 
 pub fn and(i: Item, j: Item) -> ItemResult {
-    Ok(Item::Boolean(is_truthy(i) && is_truthy(j)))
+    Ok(if is_truthy(&i) && is_truthy(&j){
+        j
+    } else {
+        Item::Nothing
+    })
 }
 
 pub fn not(i: Item) -> ItemResult {
-    Ok(Item::Boolean(!is_truthy(i)))
+    Ok(Item::from(!is_truthy(&i)))
 }
 
 pub fn is_association(i: Item) -> ItemResult {
     //println!("assocation? {:?}", i);
-    Ok(Item::Boolean(if let Ok(_) = Association::try_from(i) {
+    Ok(Item::from(if let Ok(_) = Association::try_from(i) {
         true
     } else {
         false
@@ -3396,7 +3411,9 @@ arbitrary code. The lexicon doesn't really do that - it's just a data
 file. 
 #+begin_src kcats
 [derive]
-[[string [string]]] association wrap
+[[string [string]]
+ 
+] association wrap
 [swap [type] lookup wrap lookup execute] join
 [definition] swap pack
 wrap
@@ -3417,6 +3434,100 @@ derive
 #+RESULTS:
 : 
 : [[foo]]
+
+Experiment with whether we can easily determine the 'from' type so
+that we can dispatch on both 'from' and 'to'.
+#+begin_src kcats :results code
+;;[[type foo]]
+5
+[[[association?] [[[[type] lookup]
+                   [[association] unwrap]] [execute] any?]]
+ [[number?] [[number] unwrap]]]
+decide
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+
+[number 5]
+#+end_src
+
+#+begin_src kcats
+[] [] [] [discard [default] unwrap] if
+#+end_src
+
+#+RESULTS:
+: 
+: [default]
+
+#+begin_src kcats
+[[bar 12]]
+[
+[[foo] lookup]
+[[bar] lookup]
+[5]
+[6]
+]
+swap [nothing?] shield
+[[unpack] dip swap execute [nothing?] shield] loop
+;;sink discard discard
+#+end_src
+
+#+RESULTS:
+: 
+: [[[bar 12]] [[[foo] lookup] [[bar] lookup] [5] [6]]]
+
+#+begin_src kcats
+[[bar 12]]
+[[[foo] lookup]
+ [[bar] lookup]]
+[execute] any?
+#+end_src
+
+#+RESULTS:
+: 
+: [12 [[bar 12]]]
+
+#+begin_src kcats
+1 2 or
+#+end_src
+
+#+RESULTS:
+: 
+: [1]
+
+*** INPROGRESS Change boolean operators to retain values
+=or= and =and= should return the actual value if it is truthy, instead
+of =true=. But neither should ever return =[]=, but use =false=
+instead.
+#+begin_src kcats
+2 []+ or
+#+end_src
+
+#+RESULTS:
+: 
+: [2]
+
+#+begin_src kcats
+1 10 inc range unpack swap [*] step
+#+end_src
+
+#+RESULTS:
+: 
+: [3628800]
+
+This does bring up the question of whether the boolean type is really
+needed. It may be possible to use =[]= as =false= and anything else as
+=true= (=1= for example, or maybe the bare word =true= which then
+wouldn't carry any other meaning)
+
+#+begin_src kcats
+1 1 = [true] unwrap =
+#+end_src
+
+#+RESULTS:
+: 
+: [true]
 
 * Notes
 ** Bootstrapping
