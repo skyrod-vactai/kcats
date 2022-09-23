@@ -1628,7 +1628,7 @@ pub fn is_association(i: Item) -> ItemResult {
         Item::Nothing => true,
         Item::Env(_) => true,
         Item::List(l) => Association::try_from(Item::List(l)).is_ok(),
-        _ => false
+        _ => false,
     }))
 }
 
@@ -1950,45 +1950,49 @@ fn rest(i: Item) -> ItemResult {
     Ok(Item::List(l))
 }
 
-fn is_uncaught_error(env: &Environment) -> bool {
+fn is_unhandlable_error(env: &Environment) -> bool {
     if let Some(i) = env.stack.front() {
         if let Item::Error(e) = i {
             // if the top of stack is an error we're done unless
             // there's a recovery coming. we know recovery is
             // coming if the expression has a handle word
-            !e.is_handled
-        } else {
-            false
+            if !e.is_handled {
+                let w = &word("handle");
+                if env.expression.contains(w) {
+                    return false;
+                } else {
+                    return true;
+                };
+            }
         }
-    } else {
-        false
     }
+    return false;
 }
 
-fn unwind(mut env: Environment) -> (Environment, bool) {
-    //TODO: This is messy, word and axiomdef for that word should
-    // compare equal
+fn handle_error(env: Environment) -> Environment {
+    if is_unhandlable_error(&env) {
+        return env;
+    } else {
+        return unwind(env);
+    };
+}
+
+fn unwind(mut env: Environment) -> Environment {
+    let mut next = env.expression.front();
     let w = &word("handle");
-    let can_handle = env.expression.contains(w);
-    if can_handle {
-        let mut next = env.expression.front();
-        while next.is_some() && next.unwrap() != w {
-            env.pop_expr();
-            next = env.expression.front();
-        }
+    while next.is_some() && next.unwrap() != w {
+        env.pop_expr();
+        next = env.expression.front();
     }
-    (env, can_handle)
+    return env;
 }
 
 pub fn eval(mut env: Environment) -> Environment {
     loop {
         //check for error
-        if is_uncaught_error(&env) {
-            let (e, handled) = unwind(env);
-            env = e;
-            if !handled {
-                break;
-            }
+        env = handle_error(env);
+        if is_unhandlable_error(&env) {
+            break;
         }
         if !env.expression.is_empty() {
             env = eval_step(env);
@@ -3676,7 +3680,47 @@ yes or no = yes ?
 : 
 : stack: [[[reason "word is not defined"] [type error] [asked [false]]] []]
 : expression: [false =]
+*** TODO 'recover' is broken
+#+begin_src kcats
+[+]
+[discard 1
+ [+] [discard 2 +]
+ recover]
+recover
+#+end_src
 
+#+RESULTS:
+: 
+: [[[reason "not enough items on stack"] [asked [consume]] [type error]]]
+
+#+begin_src kcats
+[[expression [[+] [3] recover]]] environment advance advance
+eval-step
+advance
+advance
+advance
+advance
+advance
+eval-step
+advance
+advance
+advance
+eval-step
+eval-step
+eval-step
+#+end_src
+
+#+RESULTS:
+: 
+: [[[stack [[[reason "not enough items on stack"] [type error] [asked [consume]]] [[reason "not enough items on stack"] [asked [consume]] [type error]]]] [expression [+ handle [[[3]]] unwrap evert [first error?] [first swap execute] [evert discard] if]]]]
+*** TODO Fix handle in nested env
+=handle= doesn't work properly in a nested environment. That is
+because =eval= has some logic to check for uncaught exceptions, but
+the =advance= self-hosted evaluator doesn't.
+
+Looks like the word =error?= is shadowed - there's a builtin that's
+overwritten by a definition that depends on the builtin (via calling
+=type=, which expects the builtin version of =error?=).
 * Notes
 ** Bootstrapping
 + Builtin words need to exist *before* the derived words are read from
