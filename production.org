@@ -939,6 +939,7 @@ pub fn add_builtins(d: Dictionary) -> Dictionary {
             ("discard", Box::leak(Box::new(discard))),
             ("environment", Box::leak(Box::new(f_stack1(environment)))),
             ("error?", Box::leak(Box::new(f_stack1(is_error)))),
+            ("errored?", Box::leak(Box::new(f_stack1(is_errored)))),
             ("eval-step", Box::leak(Box::new(f_stack1(eval_step_outer)))),
             ("evaluate", Box::leak(Box::new(f_stack1(evaluate)))),
             ("even?", Box::leak(Box::new(f_stack1(is_even)))),
@@ -1421,7 +1422,16 @@ fn is_truthy(i: &Item) -> bool {
     match i {
         Item::Nothing => false,
         Item::List(l) => !l.is_empty(),
+        Item::Assoc(a) => !a.is_empty(),
         _ => true,
+    }
+}
+
+fn boolean_value(b: bool) -> Item {
+    if b {
+        word("true")
+    } else {
+        Item::Nothing
     }
 }
 
@@ -1768,7 +1778,7 @@ fn check_type(i: &Item, w: Word) -> Result<(), Error> {
             }
         }
         Item::Nothing => {
-            if w == *S_LIST || w == *S_ITEM || w == *S_ASSOC || w == *S_BOOLEAN {
+            if w == *S_LIST || w == *S_ITEM || w == *S_ASSOC || w == *S_BOOLEAN || w == *S_PROGRAM {
                 Ok(())
             } else {
                 Err(Error::expected(&w))
@@ -1850,7 +1860,7 @@ fn check_input_spec(spec: &List, env: &Environment) -> Result<(), Error> {
 }
 
 pub fn eval_step(mut env: Environment) -> Environment {
-    //println!("{:?}", env);
+    println!("{:?}", env);
     let next_item = env.expression.front();
 
     if let Some(val) = next_item {
@@ -1950,33 +1960,60 @@ fn rest(i: Item) -> ItemResult {
     Ok(Item::List(l))
 }
 
-fn is_unhandlable_error(env: &Environment) -> bool {
+fn get_error(env: &Environment) -> Option<&Error> {
     if let Some(i) = env.stack.front() {
         if let Item::Error(e) = i {
-            // if the top of stack is an error we're done unless
-            // there's a recovery coming. we know recovery is
-            // coming if the expression has a handle word
-            if !e.is_handled {
-                let w = &word("handle");
-                if env.expression.contains(w) {
-                    return false;
-                } else {
-                    return true;
-                };
-            }
+            return Some(e);
+        }
+    }
+    return None;
+}
+
+fn is_unhandled_error(env: &Environment) -> bool {
+    if let Some(err) = get_error(env) {
+        if !err.is_handled {
+            return true;
         }
     }
     return false;
 }
 
-fn handle_error(env: Environment) -> Environment {
-    if is_unhandlable_error(&env) {
-        return env;
-    } else {
-        return unwind(env);
-    };
+fn is_unhandlable_error(env: &Environment, err: &Error) -> bool {
+    if !err.is_handled {
+        let w = &word("handle");
+        if env.expression.contains(w) {
+            return false;
+        } else {
+            return true;
+        };
+    }
+    return false;
 }
 
+fn handle_error(env: Environment) -> Environment {
+    if let Some(err) = get_error(&env) {
+        if is_unhandlable_error(&env, err) {
+            println!("Unhandled error!");
+            return env;
+        } else {
+            return unwind(env);
+        };
+    }
+    return env;
+}
+
+/// Takes an env on ToS and replaces it with whether there's an
+/// unhandlable error on its ToS. Only for use with nested
+/// environments.
+pub fn is_errored(i: Item) -> ItemResult {
+    let env = Environment::try_from(i)?;
+    Ok(boolean_value(if let Some(err) = get_error(&env) {
+        is_unhandlable_error(&env, err)
+    } else {
+        false
+    }))
+    
+}
 fn unwind(mut env: Environment) -> Environment {
     let mut next = env.expression.front();
     let w = &word("handle");
@@ -1989,10 +2026,15 @@ fn unwind(mut env: Environment) -> Environment {
 
 pub fn eval(mut env: Environment) -> Environment {
     loop {
-        //check for error
-        env = handle_error(env);
-        if is_unhandlable_error(&env) {
-            break;
+        if let Some(err) = get_error(&env) {
+            if is_unhandlable_error(&env, err) {
+                //println!("unhandled err!");
+                break;
+            } else {
+                if !err.is_handled {
+                    env = unwind(env); // TODO: this should be done in eval_step
+                };
+            }
         }
         if !env.expression.is_empty() {
             env = eval_step(env);
@@ -3297,7 +3339,7 @@ We can delete the word =resume=.
 It should result in [1 2 3], since people would assume unpack just
 does the opposite of pack. But it doesn't, it takes items from the
 front and pack puts them on the end.
-*** TODO true and false are not words?
+*** INPROGRESS true and false are not words?
 #+begin_src kcats :results code
 [true] unwrap word?
 #+end_src
@@ -3680,7 +3722,7 @@ yes or no = yes ?
 : 
 : stack: [[[reason "word is not defined"] [type error] [asked [false]]] []]
 : expression: [false =]
-*** TODO 'recover' is broken
+*** DONE 'recover' is broken
 #+begin_src kcats
 [+]
 [discard 1
@@ -3691,7 +3733,7 @@ recover
 
 #+RESULTS:
 : 
-: [[[reason "not enough items on stack"] [asked [consume]] [type error]]]
+: [3]
 
 #+begin_src kcats
 [[expression [[+] [3] recover]]] environment advance advance
@@ -3705,22 +3747,194 @@ eval-step
 advance
 advance
 advance
-eval-step
-eval-step
-eval-step
 #+end_src
 
 #+RESULTS:
 : 
-: [[[stack [[[reason "not enough items on stack"] [type error] [asked [consume]]] [[reason "not enough items on stack"] [asked [consume]] [type error]]]] [expression [+ handle [[[3]]] unwrap evert [first error?] [first swap execute] [evert discard] if]]]]
+: [[[stack [[+ handle] [[3]]]] [expression [dip evert [first error?] [first swap execute] [evert discard] if]]]]
 *** TODO Fix handle in nested env
 =handle= doesn't work properly in a nested environment. That is
 because =eval= has some logic to check for uncaught exceptions, but
 the =advance= self-hosted evaluator doesn't.
 
+#+begin_src kcats
+1 + handle error?
+#+end_src
+
+#+RESULTS:
+: { stack: [], expression: [1 + handle error?] }
+: { stack: [1], expression: [+ handle error?] }
+: { stack: [[[asked [consume]] [reason "not enough items on stack"] [type error]] 1], expression: [handle error?] }
+: { stack: [[[asked [consume]] [reason "not enough items on stack"] [type error]] 1], expression: [error?] }
+: 
+: [true 1]
+
+#+begin_src kcats
++ handle type
+#+end_src
+
+#+RESULTS:
+: 
+: [error]
+
 Looks like the word =error?= is shadowed - there's a builtin that's
 overwritten by a definition that depends on the builtin (via calling
 =type=, which expects the builtin version of =error?=).
+
+#+begin_src kcats
+[[expression [+]]] environment eval-step 
+#+end_src
+
+#+RESULTS:
+: 
+: [[[stack [[[type error] [reason "not enough items on stack"] [asked [consume]]]]] [expression [+]]]]
+
+#+begin_src kcats
+[[expression [1 +]]] environment advance advance advance 
+#+end_src
+
+#+RESULTS:
+: 
+: [[[stack [[[asked [consume]] [reason "not enough items on stack"] [type error]] 1]] [expression [+]]]]
+
+#+begin_src kcats
+[[expression [[[3]] [+ handle] dip]]] environment advance advance advance
+#+end_src
+
+#+RESULTS:
+: 
+: [[[stack [[[asked [+_handle]] [reason "word is not defined"] [type error]]]] [expression [+_handle [[[3]]] unwrap]]]]
+
+#+begin_src kcats
+[[expression [+ handle]]] environment eval-step eval-step
+#+end_src
+
+#+RESULTS:
+: { stack: [], expression: [[[expression [+ handle]]] environment eval-step eval-step] }
+: { stack: [[[expression [+ handle]]]], expression: [environment eval-step eval-step] }
+: { stack: [[[stack []] [expression [+ handle]]]], expression: [eval-step eval-step] }
+: { stack: [], expression: [+ handle] }
+: { stack: [[[stack [[[asked [consume]] [type error] [reason "not enough items on stack"]]]] [expression [+ handle]]]], expression: [eval-step] }
+: { stack: [[[asked [consume]] [type error] [reason "not enough items on stack"]]], expression: [+ handle] }
+: 
+: [[[stack [[[reason "not enough items on stack"] [type error] [asked [consume]]] [[asked [consume]] [type error] [reason "not enough items on stack"]]]] [expression [+ handle]]]]
+
+There is a problem in the design where an error (with no =handle=) is
+supposed to halt execution, but later we want to do things with the
+environment (like examine objects etc). For example, if we're
+executing a nested env and it has an error, we can't even natively
+examine it, because as soon as we retrieve it from the inner env, it
+is an unhandled error on ToS and it halts the outer env. This is not
+what I intended.
+
+A possible solution is to have whatever =eval= we're using halt but
+remove the =halt= bit (in the current design it's the =is_handled=
+field of the error) on its way out. So that whatever executes next is
+presumed to be after some manual intervention has taken place.
+
+Also for nested envs we need several words to help deal with errors:
+
++ a word that tells whether the env will halt: that there's an error
+  on ToS with halt bit set, and =handle= does not appear in the
+  expression. The word can efficiently return =false= if ToS isn't an
+  Error.
+
++ A word that removes the halt bit - as the last thing to do before
+  exiting.
+
+So what about the word =advance= that completely executes a word -
+let's say the word errors out and halts. We removed the halt bit first
+but how do we know what happened? In =eval= it's pretty obvious if we
+halted on error - the expression isn't empty (that's the only other
+reason to stop). We could see in =advance= that the expression got
+longer, but isn't very obvious in many cases.
+
+Another possibility is letting the expression unwind until it's empty,
+which would also halt execution. That's not ideal because we're giving
+up the possibility of manually fixing it and continuing. On the other
+hand, real programs are probably not going to have universal error
+handlers (eg like java's 'catch Exception e'. In other words, the
+=recover= is often going to examine the error, see that it's not one
+that it knows how to deal with, and re-throw it hoping there's a
+recovery further down the expression that will know what to do. But
+there may not be, and the end result is a major unwind of the
+expression, at least, all the way to the deepest =recover=. At that
+point it's likely too far unwound to do any manual
+interventions. We're just not going to know at 'throw time' whether
+any of the recoveries can really help. It's possible they'll all look
+at the error and pass it on.
+
+But there's no denying that halting when there's no recovery, is
+better than unwinding everything - you find out what went wrong *and*
+you get the possibility of continuing. It's just a matter of providing
+this feature without making other things more difficult.
+
+Maybe another possibility is unwinding the expression **into** the
+error object. In other words, whatever expression items we lop off, we
+save them in the error object, in a field named, say, =unwound= or
+something like that. Then the runtime can just exit with the error on
+ToS, and if the user wants to manually intervene they can copy the
+expression from that field. This doesn't solve the problem of 'just
+examining an error causes unwind' but it saves us from having to
+special case unhandlable errors. Perhaps we could have a word called
+=rewind= or something, that restores the expression from the error on
+ToS and clears the halt bit.
+
+I like this idea more and more - it opens up the possibility of
+common-lisp's retry, where you can catch an error thrown from deep
+within nested code, twiddle the stack a bit and retry the code
+again. We already retain the expression item that threw the error so
+we would still have it to retry. I'm thinking syntax like this:
+
+#+begin_src kcats
+[+] [[1 1] dip retry] recover
+#+end_src
+
+In this case we try to add, but there's no numbers on the stack. So we
+enter the recovery program that finds the env like this:
+
+#+begin_src kcats
+[[stack [[[type error] [asked [consume]] [unwound [+]]]]
+ [expression [[1 1] dip retry]]]]
+#+end_src
+
+So we =dip= the numbers underneath the error, then calling =retry= on
+an error will extract the =unwound= field (discarding the rest of the
+error) and =execute= it. So then we end up with =1 1 +=.
+*** TODO Lots of association-like objects that aren't
+Environment and Error, for example. We can't just treat it like an
+assoc, even though it is. I'm not quite sure how to solve this. I
+don't think I can make a trait *and* make the trait object part of the
+Item enum.
+
+#+begin_src rust
+trait Foo {};
+
+struct Quux { }
+
+impl Foo for Quux {}
+
+enum Bar { Int(i32), Foo(Box<dyn Foo>), Quux(Quux) }
+#+end_src
+
+#+RESULTS:
+
+Rust doesn't complain if you have an object that can match the enum in
+more than one way. I think that's because one is boxed and the other isn't.
+
+#+begin_src rust
+trait Foo {};
+
+struct Quux { }
+
+impl Foo for Quux {}
+
+enum Bar<'a> { Int(i32), Foo(&'a dyn Foo), Quux(&'a Quux) }
+#+end_src
+
+#+RESULTS:
+
+
 * Notes
 ** Bootstrapping
 + Builtin words need to exist *before* the derived words are read from
