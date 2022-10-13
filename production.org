@@ -53,6 +53,9 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::hash::Hash;
 use std::rc::Rc;
+//use std::convert::From as _;
+//use std::array::IntoIter;
+
 //extern crate thiserror;
 
 pub type Word = Intern<String>;
@@ -76,10 +79,92 @@ pub type AssociationContent = HashMap<KeyItem, Item>;
 pub type Association = Rc<AssociationContent>;
 
 #[derive(Clone, PartialEq)]
-pub struct Error {
-    pub data: Association,
+struct Extensible<Core> {
+    pub core: Core,
+    pub extra: Option<AssociationContent>,
+}
+
+pub trait Associative {
+    fn get(&self, k: KeyItem) -> Option<&Item>;
+    fn insert(&mut self, k: KeyItem, val: Item) -> Option<Item>;
+    fn remove(&mut self, k: KeyItem) -> Option<Item>;
+}
+
+impl Associative for AssociationContent {
+    fn get(&self, k: KeyItem) -> Option<&Item> {
+        return self.get(&k);
+    }
+
+    fn insert(&mut self, k: KeyItem, val: Item) -> Option<Item> {
+        return self.insert(k, val);
+    }
+
+    fn remove(&mut self, k: KeyItem) -> Option<Item> {
+        return self.remove(&k);
+    }
+}
+
+#[derive(Clone, PartialEq)]
+pub struct ErrorCore {
+    pub asked: List,
+    pub unwound: Option<List>,
+    pub reason: Option<String>,
     pub is_handled: bool,
 }
+
+pub type Error = Extensible<ErrorCore>;
+
+pub trait From<T>: Sized {
+    fn from(_: T) -> Self;
+}
+
+impl Associative for Error {
+    fn get(&self, k: KeyItem) -> Option<&Item> {
+        match k {
+            KeyItem::Word(w) => match w.as_str() {
+                "asked" => return Some(&Item::List(self.core.asked)),
+                "unwound" => {
+                    return self
+                        .core
+                        .unwound
+                        .and_then(|uw| Some(Item::List(uw)))
+                        .as_ref()
+                }
+                "reason" => {
+                    return self
+                        .core
+                        .reason
+                        .and_then(|r| Some(Item::String(r)))
+                        .as_ref()
+                }
+                "handled?" => return Some(&From::from(self.core.is_handled)),
+            },
+            _ => return self.extra.and_then(|xtra| xtra.get(&k)),
+        }
+    }
+
+    fn insert(&mut self, k: KeyItem, val: Item) -> Option<Item> {
+        return self.insert(k, val);
+    }
+
+    fn remove(&mut self, k: KeyItem) -> Option<Item> {
+        return self.remove(k);
+    }
+}
+
+// impl IntoIterator for Error {
+//     type Item = (KeyItem, Item);
+//     type IntoIter = std::array::IntoIter<Self::Item, 1>;
+//     fn into_iter(self) -> Self::IntoIter {
+//         let i = self.extra.unwrap();
+//         let j = [
+//             (word_key("asked"), Item::List(self.core.asked)),
+//             (word_key("unw"), Item::List(self.core.asked)),
+//         ]
+//         .into_iter();
+//         return j.chain(i);
+//     }
+// }
 
 lazy_static! {
     pub static ref S_ASSOC: Intern<String> = Intern::new("association".to_string());
@@ -185,9 +270,8 @@ impl PartialEq for Item {
             (Item::List(l), Item::Assoc(a)) => a.is_empty() && l.is_empty(),
             (Item::Assoc(a), Item::List(l)) => a.is_empty() && l.is_empty(),
 
-            (Item::Error(i), Item::Assoc(j)) => (*i).data == *j,
-            (Item::Assoc(i), Item::Error(j)) => (*j).data == *i,
-
+            //(Item::Error(i), Item::Assoc(j)) => (*i).data == *j,
+            //(Item::Assoc(i), Item::Error(j)) => (*j).data == *i,
             (Item::Word(i), Item::AxiomDef(j)) => j.word == *i,
             (Item::AxiomDef(i), Item::Word(j)) => i.word == *j,
 
@@ -236,27 +320,28 @@ impl Environment {
 }
 
 impl Error {
-    pub fn create(asked: List, reason: &str) -> Error {
+    pub fn create(asked: List, reason: &str, unwound: Option<List>) -> Error {
         Error {
-            is_handled: false,
-            data: Rc::new(HashMap::from([
-                (word_key("type"), word("error")),
-                (word_key("asked"), Item::List(asked)),
-                (word_key("reason"), Item::String(reason.to_string())),
-            ])),
+            core: ErrorCore {
+                is_handled: false,
+                asked,
+                reason: Some(reason.to_string()),
+                unwound,
+            },
+            extra: None,
         }
     }
 
     pub fn stack_underflow() -> Error {
-        Error::create(wrap(word("consume")), "not enough items on stack")
+        Error::create(wrap(word("consume")), "not enough items on stack", None)
     }
 
     pub fn undefined(w: Word) -> Error {
-        Error::create(wrap(Item::Word(w)), "word is not defined")
+        Error::create(wrap(Item::Word(w)), "word is not defined", None)
     }
 
     pub fn type_mismatch(asked: List) -> Error {
-        Error::create(asked, "type mismatch")
+        Error::create(asked, "type mismatch", None)
     }
 
     pub fn expected(typestr: &str) -> Error {
@@ -271,6 +356,7 @@ impl Error {
                 word(">="),
             ])),
             "list had too few items",
+            None,
         )
     }
 
@@ -282,18 +368,18 @@ impl Error {
                 word("="),
             ])),
             "list had wrong number of items",
+            None,
         )
     }
 
     pub fn parse(reason: &str) -> Error {
-        Error::create(wrap(word("read")), reason)
+        Error::create(wrap(word("read")), reason, None)
     }
 
     pub fn test_assertion(program: List, expected: List, actual: List) -> Error {
-        let mut e = Error::create(program, "assertion failed");
-        let d = Rc::make_mut(&mut e.data);
-        d.insert(word_key("expected"), Item::List(expected));
-        d.insert(word_key("actual"), Item::List(actual));
+        let mut e = Error::create(program, "assertion failed", None);
+        e.insert(word_key("expected"), Item::List(expected));
+        e.insert(word_key("actual"), Item::List(actual));
         return e;
     }
 }
@@ -307,20 +393,8 @@ impl TryFrom<Item> for List {
     fn try_from(i: Item) -> Result<Self, Self::Error> {
         match i {
             Item::List(l) => Ok(l),
-            Item::Assoc(mut a) => {
-                let amut = Rc::make_mut(&mut a);
-                Ok(Rc::new(
-                    amut.into_iter()
-                        .map(|(k, v)| {
-                            Item::List(Rc::new(ListContent::from(vec![
-                                to_value_item(k.clone()),
-                                Item::from(v.clone()),
-                            ])))
-                        })
-                        .collect::<ListContent>(),
-                ))
-            }
-            Item::Error(e) => List::try_from(Item::Assoc(e.data)),
+            Item::Assoc(mut a) => Ok(From::from(a)),
+            Item::Error(e) => Ok(From::from(e)),
             // 'Nothing' is equivalent to an empty list
             Item::Nothing => Ok(Rc::new(ListContent::new())),
             _ => Err(Error::expected("list")),
@@ -390,10 +464,10 @@ impl TryFrom<Item> for Association {
             Item::Assoc(a) => Ok(a),
             Item::List(l) => Ok(to_hash(l)?),
             Item::Nothing => Ok(Rc::new(AssociationContent::new())),
-            Item::DerivedDef(d) => Ok(Association::from(d)),
-            Item::AxiomDef(a) => Ok(Association::from(a)),
-            Item::Env(e) => Ok(Association::from(e)),
-            Item::Error(e) => Ok(Association::from(e)),
+            Item::DerivedDef(d) => Ok(From::from(d)),
+            Item::AxiomDef(a) => Ok(From::from(a)),
+            Item::Env(e) => Ok(From::from(e)),
+            Item::Error(e) => Ok(From::from(e)),
             _ => Err(Error::expected("association")),
         }
     }
@@ -431,6 +505,16 @@ impl TryFrom<Item> for Box<dyn Out> {
     }
 }
 
+impl TryFrom<Item> for Box<dyn Associative> {
+    type Error = Error;
+    fn try_from(i: Item) -> Result<Self, Self::Error> {
+        match i {
+            Item::Error(e) => Ok(Box::new(e) as Box<dyn Associative>),
+            // TODO env, deriveddef etc
+            _ => Err(Error::expected("pipe")),
+        }
+    }
+}
 impl From<DerivedDef> for Association {
     fn from(d: DerivedDef) -> Association {
         let mut a = AssociationContent::new();
@@ -443,15 +527,9 @@ impl From<DerivedDef> for Association {
     }
 }
 
-impl From<Error> for Association {
-    fn from(e: Error) -> Association {
-        e.data
-    }
-}
-
 impl From<DerivedDef> for Item {
     fn from(dd: DerivedDef) -> Item {
-        Item::Assoc(Association::from(dd))
+        Item::Assoc(From::from(dd))
     }
 }
 
@@ -488,7 +566,7 @@ impl From<Association> for DerivedDef {
 
 impl From<AxiomDef> for Item {
     fn from(ad: AxiomDef) -> Item {
-        Item::Assoc(Association::from(ad))
+        Item::Assoc(From::from(ad))
     }
 }
 
@@ -500,8 +578,7 @@ impl From<bool> for Item {
     fn from(b: bool) -> Item {
         if b {
             word("true")
-        }
-        else {
+        } else {
             Item::Nothing
         }
     }
@@ -525,7 +602,59 @@ impl From<Environment> for Item {
 
 impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Error {
-        Error::create(wrap(word("io")), &err.to_string())
+        Error::create(wrap(word("io")), &err.to_string(), None)
+    }
+}
+
+impl From<ErrorCore> for AssociationContent {
+    fn from(ec: ErrorCore) -> AssociationContent {
+        let ac = AssociationContent::new();
+        let b: Item = From::from(ec.is_handled);
+        ac.insert(word_key("handled?"), b);
+       
+        if let Some(u) = ec.unwound {
+            ac.insert(word_key("unwound"), Item::List(u));
+        }
+        if let Some(s) = ec.reason {
+            ac.insert(word_key("reason"), Item::String(s));
+        }
+        return ac;
+    }
+}
+
+impl From<AssociationContent> for ListContent {
+    fn from(a: AssociationContent) -> ListContent {
+        a.into_iter()
+            .map(|(k, v)| {
+                Item::List(Rc::new(std::convert::From::from(vec![
+                    to_value_item(k.clone()),
+                    std::convert::From::from(v.clone()),
+                ])))
+            })
+            .collect::<ListContent>()
+    }
+}
+
+impl From<Association> for List {
+    fn from(a: Association) -> List {
+        Rc::new(From::from(*a))
+    }
+}
+
+// impl From<Error> for Association {
+//     fn from(e: Error) -> Association {
+//         let ac: AssociationContent = From::from(e.core);
+//         let extra: AssociationContent = e.extra.unwrap_or_default();
+//         ac.extend(extra);
+//         return Rc::new(ac);
+//     }
+// }
+impl<T: Into<AssociationContent>> From<Extensible<T>> for Association {
+    fn from(e: Extensible<T>) -> Association {
+        let ac: AssociationContent = e.core.into();
+        let extra: AssociationContent = e.extra.unwrap_or_default();
+        ac.extend(extra);
+        return Rc::new(ac);
     }
 }
 
@@ -691,6 +820,7 @@ mod tests {
         //let res = eval(env).ok()?;
         prog_env = axiom::eval(prog_env);
         exp_env = axiom::eval(exp_env);
+        println!("Testing {:?} {:?}", prog_env.stack, exp_env.stack);
         if prog_env.stack == exp_env.stack {
             None
         } else {
@@ -703,6 +833,7 @@ mod tests {
     }
 
     fn test_word(standard_env: Environment, w: Word) -> Vec<Error> {
+        println!("hi");
         if let Some(d) = standard_env.dictionary.get(&KeyItem::Word(w)) {
             let examples = match d {
                 Item::AxiomDef(a) => &a.examples,
@@ -847,8 +978,7 @@ fn f_stack1_option(
         match f(x) {
             Ok(r) => {
                 if let Some(r) = r {
-                    let i = Item::from(r);
-                    match i {
+                    match r {
                         Item::Error(e) => env.push(Item::Error(e)),
                         _ => env,
                     }
@@ -864,7 +994,7 @@ fn f_stack1_option(
 fn f_stack1(f: fn(Item) -> ItemResult) -> impl Fn(Environment) -> Environment {
     move |mut env: Environment| {
         let x = env.pop();
-        env.push(Item::from(f(x)))
+        env.push(From::from(f(x)))
     }
 }
 
@@ -872,7 +1002,7 @@ fn f_stack2(f: fn(Item, Item) -> ItemResult) -> impl Fn(Environment) -> Environm
     move |mut env: Environment| {
         let x = env.pop();
         let y = env.pop();
-        env.push(Item::from(f(y, x)))
+        env.push(From::from(f(y, x)))
     }
 }
 
@@ -881,7 +1011,7 @@ fn f_stack3(f: fn(Item, Item, Item) -> ItemResult) -> impl Fn(Environment) -> En
         let x = env.pop();
         let y = env.pop();
         let z = env.pop();
-        env.push(Item::from(f(z, y, x)))
+        env.push(From::from(f(z, y, x)))
     }
 }
 
@@ -1141,7 +1271,7 @@ pub fn gt(i: Item, j: Item) -> ItemResult {
 
 pub fn lt(i: Item, j: Item) -> ItemResult {
     match (i, j) {
-        (Item::Int(i), Item::Int(j)) => Ok(Item::from(i < j)),
+        (Item::Int(i), Item::Int(j)) => Ok(From::from(i < j)),
         (Item::Float(i), Item::Float(j)) => Ok(Item::from(i < j)),
         (Item::Int(i), Item::Float(j)) => Ok(Item::from((i as Float) < j)),
         (Item::Float(i), Item::Int(j)) => Ok(Item::from(i < j as Float)),
@@ -1860,7 +1990,7 @@ fn check_input_spec(spec: &List, env: &Environment) -> Result<(), Error> {
 }
 
 pub fn eval_step(mut env: Environment) -> Environment {
-    println!("{:?}", env);
+    //println!("{:?}", env);
     let next_item = env.expression.front();
 
     if let Some(val) = next_item {
@@ -1971,7 +2101,7 @@ fn get_error(env: &Environment) -> Option<&Error> {
 
 fn is_unhandled_error(env: &Environment) -> bool {
     if let Some(err) = get_error(env) {
-        if !err.is_handled {
+        if !err.core.is_handled {
             return true;
         }
     }
@@ -1979,7 +2109,7 @@ fn is_unhandled_error(env: &Environment) -> bool {
 }
 
 fn is_unhandlable_error(env: &Environment, err: &Error) -> bool {
-    if !err.is_handled {
+    if !err.core.is_handled {
         let w = &word("handle");
         if env.expression.contains(w) {
             return false;
@@ -2031,7 +2161,7 @@ pub fn eval(mut env: Environment) -> Environment {
                 //println!("unhandled err!");
                 break;
             } else {
-                if !err.is_handled {
+                if !err.core.is_handled {
                     env = unwind(env); // TODO: this should be done in eval_step
                 };
             }
@@ -2125,7 +2255,7 @@ fn sqrt(i: Item) -> ItemResult {
 fn handle(i: Item) -> ItemResult {
     match i {
         Item::Error(mut e) => Ok(Item::Error({
-            e.is_handled = true;
+            e.core.is_handled = true;
             e
         })),
         i => Ok(i),
@@ -3934,6 +4064,35 @@ enum Bar<'a> { Int(i32), Foo(&'a dyn Foo), Quux(&'a Quux) }
 
 #+RESULTS:
 
+Hm this works too, well maybe it will be fine.
+*** TODO Implement my own From/TryFrom
+Can't implement this on existing types. but there seems to be naming collision even if i don't implement the =std::convert::From= at all:
+
+#+begin_src rust
+pub trait SomeOther<T>: Sized {
+    fn from(_: T) -> Self;
+}
+
+#[derive(Debug)]
+pub struct Foo {}
+
+impl SomeOther<String> for Foo {
+    fn from(s: String) -> Foo {
+        return Foo{}
+    }
+}
+
+
+
+fn main() {
+    let x: Foo = SomeOther::from("foo".to_string());
+    println!("Foo! {:?}", x);
+}
+
+#+end_src
+
+#+RESULTS:
+: Foo! Foo
 
 * Notes
 ** Bootstrapping
