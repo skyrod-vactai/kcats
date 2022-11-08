@@ -53,6 +53,9 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::hash::Hash;
 use std::rc::Rc;
+pub mod error;
+use crate::types::error::Error;
+
 //extern crate thiserror;
 
 pub type Word = Intern<String>;
@@ -74,12 +77,6 @@ pub type Float = f64;
 pub type AssociationContent = HashMap<KeyItem, Item>;
 
 pub type Association = Rc<AssociationContent>;
-
-#[derive(Clone, PartialEq)]
-pub struct Error {
-    pub data: Association,
-    pub is_handled: bool,
-}
 
 lazy_static! {
     pub static ref S_ASSOC: Intern<String> = Intern::new("association".to_string());
@@ -232,69 +229,6 @@ impl Environment {
         expr.append(Rc::make_mut(&mut items.clone()));
         expr.rotate_left(ct);
         self
-    }
-}
-
-impl Error {
-    pub fn create(asked: List, reason: &str) -> Error {
-        Error {
-            is_handled: false,
-            data: Rc::new(HashMap::from([
-                (word_key("type"), word("error")),
-                (word_key("asked"), Item::List(asked)),
-                (word_key("reason"), Item::String(reason.to_string())),
-            ])),
-        }
-    }
-
-    pub fn stack_underflow() -> Error {
-        Error::create(wrap(word("consume")), "not enough items on stack")
-    }
-
-    pub fn undefined(w: Word) -> Error {
-        Error::create(wrap(Item::Word(w)), "word is not defined")
-    }
-
-    pub fn type_mismatch(asked: List) -> Error {
-        Error::create(asked, "type mismatch")
-    }
-
-    pub fn expected(typestr: &str) -> Error {
-        Error::type_mismatch(wrap(word(typestr)))
-    }
-
-    pub fn short_list(expected: Int) -> Error {
-        Error::create(
-            Rc::new(ListContent::from_iter([
-                word("count"),
-                Item::Int(expected),
-                word(">="),
-            ])),
-            "list had too few items",
-        )
-    }
-
-    pub fn list_count(expected: Int) -> Error {
-        Error::create(
-            Rc::new(ListContent::from_iter([
-                word("count"),
-                Item::Int(expected),
-                word("="),
-            ])),
-            "list had wrong number of items",
-        )
-    }
-
-    pub fn parse(reason: &str) -> Error {
-        Error::create(wrap(word("read")), reason)
-    }
-
-    pub fn test_assertion(program: List, expected: List, actual: List) -> Error {
-        let mut e = Error::create(program, "assertion failed");
-        let d = Rc::make_mut(&mut e.data);
-        d.insert(word_key("expected"), Item::List(expected));
-        d.insert(word_key("actual"), Item::List(actual));
-        return e;
     }
 }
 
@@ -500,8 +434,7 @@ impl From<bool> for Item {
     fn from(b: bool) -> Item {
         if b {
             word("true")
-        }
-        else {
+        } else {
             Item::Nothing
         }
     }
@@ -611,6 +544,86 @@ pub fn to_hash(l: List) -> Result<Association, Error> {
 }
 #+end_src
 
+Let's put errors in its own module, since it's got a lot of special handling.
+#+begin_src rust :tangle src/types/error.rs
+use crate::types;
+use crate::types::{Association, Int, Item, List, ListContent, Word};
+use std::collections::HashMap;
+use std::rc::Rc;
+
+#[derive(Clone, PartialEq)]
+pub struct Error {
+    pub data: Association,
+    pub is_handled: bool,
+}
+
+impl Error {
+    pub fn create(asked: List, reason: &str) -> Error {
+        Error {
+            is_handled: false,
+            data: Rc::new(HashMap::from([
+                (types::word_key("type"), types::word("error")),
+                (types::word_key("asked"), Item::List(asked)),
+                (types::word_key("reason"), Item::String(reason.to_string())),
+            ])),
+        }
+    }
+
+    pub fn stack_underflow() -> Error {
+        Error::create(
+            types::wrap(types::word("consume")),
+            "not enough items on stack",
+        )
+    }
+
+    pub fn undefined(w: Word) -> Error {
+        Error::create(types::wrap(Item::Word(w)), "word is not defined")
+    }
+
+    pub fn type_mismatch(asked: List) -> Error {
+        Error::create(asked, "type mismatch")
+    }
+
+    pub fn expected(typestr: &str) -> Error {
+        Error::type_mismatch(types::wrap(types::word(typestr)))
+    }
+
+    pub fn short_list(expected: Int) -> Error {
+        Error::create(
+            Rc::new(ListContent::from_iter([
+                types::word("count"),
+                Item::Int(expected),
+                types::word(">="),
+            ])),
+            "list had too few items",
+        )
+    }
+
+    pub fn list_count(expected: Int) -> Error {
+        Error::create(
+            Rc::new(ListContent::from_iter([
+                types::word("count"),
+                Item::Int(expected),
+                types::word("="),
+            ])),
+            "list had wrong number of items",
+        )
+    }
+
+    pub fn parse(reason: &str) -> Error {
+        Error::create(types::wrap(types::word("read")), reason)
+    }
+
+    pub fn test_assertion(program: List, expected: List, actual: List) -> Error {
+        let mut e = Error::create(program, "assertion failed");
+        let d = Rc::make_mut(&mut e.data);
+        d.insert(types::word_key("expected"), Item::List(expected));
+        d.insert(types::word_key("actual"), Item::List(actual));
+        return e;
+    }
+}
+#+end_src
+
 Next is the top level functions, including =main=, how to evaluate
 kcats ASTs, later we'll put command line options here.
 
@@ -619,8 +632,8 @@ mod types;
 use crate::types::*;
 use std::rc::Rc;
 mod axiom;
-mod serialize;
 mod pipes;
+mod serialize;
 use std::io;
 use std::io::BufRead;
 
@@ -664,6 +677,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     // Note this useful idiom: importing names from outer (for mod tests) scope.
+    use super::error::Error;
     use super::*;
     use internment::Intern;
     use test_case::test_case;
@@ -679,11 +693,7 @@ mod tests {
         }
     }
 
-    fn test_example(
-        mut prog_env: Environment,
-        program: List,
-        expected: List,
-    ) -> Option<Error> {
+    fn test_example(mut prog_env: Environment, program: List, expected: List) -> Option<Error> {
         let mut exp_env = prog_env.clone();
         prog_env = prog_env.append_expression(program.clone());
         exp_env = exp_env.append_expression(expected.clone());
@@ -707,7 +717,7 @@ mod tests {
             let examples = match d {
                 Item::AxiomDef(a) => &a.examples,
                 Item::DerivedDef(d) => &d.examples,
-                _ => &None
+                _ => &None,
             };
             examples
                 .iter()
@@ -819,6 +829,7 @@ topmost stack items, and we'll call them with =f_stack1= etc. The rest
 modify the expression or dictionary and are functions of the environment.
 #+begin_src rust :tangle src/axiom.rs
 use super::serialize;
+use crate::types::error::Error;
 use crate::types::*;
 use internment::Intern;
 use num_integer::Roots;
@@ -2012,7 +2023,6 @@ pub fn is_errored(i: Item) -> ItemResult {
     } else {
         false
     }))
-    
 }
 fn unwind(mut env: Environment) -> Environment {
     let mut next = env.expression.front();
@@ -2163,6 +2173,7 @@ Now we'll add the functions for parsing and emitting kcats source.
 
 #+begin_src rust :tangle src/serialize.rs
 extern crate edn_format;
+use crate::types::error::Error;
 use crate::types::*;
 use base64;
 use internment::Intern;
@@ -2320,7 +2331,8 @@ Now we'll add the functions that do input/output (pipes)
 
 #+begin_src rust :tangle src/pipes.rs
 use crate::axiom::ItemResult;
-use crate::types::{Environment, Error, Item};
+use crate::types::error::Error;
+use crate::types::{Environment, Item};
 use crate::{word, ListContent};
 use dyn_clone::DynClone;
 use std::fmt::Debug;
@@ -2401,35 +2413,26 @@ pub fn put_(mut env: Environment) -> Environment {
     let pipe = env.expression.front().unwrap();
     if let Item::In(p) = pipe {
         match (p.clone()).put(item) {
-                Ok(_) => { env }
-                Err(e) => {
-                    env.push(Item::Error(e))
-                }
-            }
-    }
-    else {
+            Ok(_) => env,
+            Err(e) => env.push(Item::Error(e)),
+        }
+    } else {
         env.push(Item::Error(Error::expected("pipe")))
-
     }
-    
 }
 
 pub fn take_(env: Environment) -> Environment {
     let pipe = env.expression.front().unwrap().clone();
-    
+
     match pipe {
         Item::Out(mut p) => {
             let i = Out::take(&mut *p);
             match i {
                 Ok(i) => env.push(i),
-                Err(e) => {
-                    env.push(Item::Error(e))
-                }
+                Err(e) => env.push(Item::Error(e)),
             }
         }
-        _ => {
-            env.push(Item::Error(Error::expected("pipe")))
-        }
+        _ => env.push(Item::Error(Error::expected("pipe"))),
     }
 }
 
@@ -2460,7 +2463,8 @@ Now some specific types of pipes. These are for reading/writing data to files.
 #+begin_src rust :tangle src/pipes/fs.rs
 use crate::axiom::ItemResult;
 use crate::pipes::{closed_error, Close, In, Out, Readable, Writable};
-use crate::types::{word, word_key, AssociationContent, Error, Item};
+use crate::types::error::Error;
+use crate::types::{word, word_key, AssociationContent, Item};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::rc::Rc;
@@ -2563,12 +2567,12 @@ These are for reading/writing data over tcp/ip sockets.
 #+begin_src rust :tangle src/pipes/net.rs
 use crate::axiom::ItemResult;
 use crate::pipes::{closed_error, Close, In, Out, Readable, Tunnel, Writable};
+use crate::types::error::Error;
 use crate::types::{word, word_key, wrap, AssociationContent, Int, Item};
-use crate::Error;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
-use std::str::FromStr;
 use std::rc::Rc;
+use std::str::FromStr;
 
 #[derive(Debug)]
 struct Socket {
