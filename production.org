@@ -47,16 +47,17 @@ test-case = "2.0.0"
 Let's start by defining some data structures in a separate module
 #+begin_src rust :tangle src/types.rs
 use crate::pipes::{In, Out, Tunnel};
+use crate::types::definition as def;
+use crate::types::error::Error;
 use internment::Intern;
 use lazy_static::lazy_static;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::hash::Hash;
 use std::rc::Rc;
-pub mod error;
-use crate::types::error::Error;
 
-//extern crate thiserror;
+pub mod definition;
+pub mod error;
 
 pub type Word = Intern<String>;
 
@@ -99,15 +100,14 @@ lazy_static! {
 pub enum Item {
     Int(Int),
     Float(Float),
-    //Boolean(bool),
     Bytes(Bytes),
     String(String),
     Word(Word),
     Assoc(Association),
     List(List),
     Env(Environment),
-    AxiomDef(AxiomDef),
-    DerivedDef(DerivedDef),
+    AxiomDef(def::Axiom),
+    DerivedDef(def::Derived),
     Error(Error),
     In(Box<dyn In>),
     Out(Box<dyn Out>),
@@ -118,7 +118,6 @@ pub enum Item {
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub enum KeyItem {
     Int(Int),
-    //Boolean(bool),
     Bytes(Bytes),
     String(String),
     Word(Word),
@@ -136,26 +135,6 @@ pub struct Environment {
 }
 
 pub type StepFn = dyn Fn(Environment) -> Environment;
-
-#[derive(Clone)]
-pub struct AxiomDef {
-    pub word: Word,
-    pub examples: Option<List>,
-    pub spec: Option<List>,
-    // whether or not to print this as a compiled word (false) or an
-    // entire dictionary entry (true)
-    pub serialize: bool,
-    pub f: &'static StepFn,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct DerivedDef {
-    pub word: Word,
-    pub examples: Option<List>,
-    pub spec: Option<List>,
-    pub serialize: bool,
-    pub definition: List,
-}
 
 impl PartialEq for Item {
     fn eq(&self, other: &Self) -> bool {
@@ -193,16 +172,6 @@ impl PartialEq for Item {
         }
     }
 }
-
-// dictionary entries are equal if they have the same function reference,
-// no need to compare the function values
-impl PartialEq for AxiomDef {
-    fn eq(&self, other: &Self) -> bool {
-        self.word == other.word && self.examples == other.examples && self.spec == other.spec
-    }
-}
-
-impl Eq for AxiomDef {}
 
 impl Environment {
     pub fn push(mut self, i: Item) -> Environment {
@@ -258,17 +227,6 @@ impl TryFrom<Item> for List {
             // 'Nothing' is equivalent to an empty list
             Item::Nothing => Ok(Rc::new(ListContent::new())),
             _ => Err(Error::expected("list")),
-        }
-    }
-}
-
-impl TryFrom<Item> for AxiomDef {
-    type Error = Error;
-    fn try_from(i: Item) -> Result<Self, Self::Error> {
-        if let Item::AxiomDef(b) = i {
-            Ok(b)
-        } else {
-            Err(Error::expected("AxiomWord"))
         }
     }
 }
@@ -365,64 +323,9 @@ impl TryFrom<Item> for Box<dyn Out> {
     }
 }
 
-impl From<DerivedDef> for Association {
-    fn from(d: DerivedDef) -> Association {
-        let mut a = AssociationContent::new();
-        a.insert(word_key("definition"), Item::List(d.definition.clone()));
-        d.examples
-            .and_then(|l| a.insert(word_key("examples"), Item::List(l.clone())));
-        d.spec
-            .and_then(|l| a.insert(word_key("spec"), Item::List(l.clone())));
-        Rc::new(a)
-    }
-}
-
 impl From<Error> for Association {
     fn from(e: Error) -> Association {
         e.data
-    }
-}
-
-impl From<DerivedDef> for Item {
-    fn from(dd: DerivedDef) -> Item {
-        Item::Assoc(Association::from(dd))
-    }
-}
-
-impl From<AxiomDef> for Association {
-    fn from(d: AxiomDef) -> Association {
-        let mut a = AssociationContent::new();
-        d.examples
-            .and_then(|l| a.insert(word_key("examples"), Item::List(l.clone())));
-        d.spec
-            .and_then(|l| a.insert(word_key("spec"), Item::List(l.clone())));
-        Rc::new(a)
-    }
-}
-
-impl From<Association> for DerivedDef {
-    fn from(mut d: Association) -> DerivedDef {
-        let dmut = Rc::make_mut(&mut d);
-        DerivedDef {
-            word: Intern::new("".to_string()),
-            serialize: true,
-            definition: dmut
-                .remove(&key_item("definition"))
-                .and_then(|i| List::try_from(i).ok())
-                .unwrap_or(Rc::new(ListContent::new())),
-            examples: dmut
-                .remove(&key_item("examples"))
-                .and_then(|i| List::try_from(i).ok()),
-            spec: dmut
-                .remove(&key_item("spec"))
-                .and_then(|i| List::try_from(i).ok()),
-        }
-    }
-}
-
-impl From<AxiomDef> for Item {
-    fn from(ad: AxiomDef) -> Item {
-        Item::Assoc(Association::from(ad))
     }
 }
 
@@ -459,14 +362,6 @@ impl From<Environment> for Item {
 impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Error {
         Error::create(wrap(word("io")), &err.to_string())
-    }
-}
-
-impl fmt::Debug for AxiomDef {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let mut ds = f.debug_struct("AxiomDef");
-        ds.field("word", &self.word);
-        ds.finish()
     }
 }
 
@@ -544,7 +439,7 @@ pub fn to_hash(l: List) -> Result<Association, Error> {
 }
 #+end_src
 
-Let's put errors in its own module, since it's got a lot of special handling.
+Let's put some types in their own modules, since they've got a lot of special handling.
 #+begin_src rust :tangle src/types/error.rs
 use crate::types;
 use crate::types::{Association, Int, Item, List, ListContent, Word};
@@ -624,6 +519,113 @@ impl Error {
 }
 #+end_src
 
+#+begin_src rust :tangle src/types/definition.rs
+use crate::types::*;
+
+#[derive(Clone)]
+pub struct Axiom {
+    pub word: Word,
+    pub examples: Option<List>,
+    pub spec: Option<List>,
+    // whether or not to print this as a compiled word (false) or an
+    // entire dictionary entry (true)
+    pub serialize: bool,
+    pub f: &'static StepFn,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Derived {
+    pub word: Word,
+    pub examples: Option<List>,
+    pub spec: Option<List>,
+    pub serialize: bool,
+    pub definition: List,
+}
+
+// dictionary entries are equal if they have the same function reference,
+// no need to compare the function values
+impl PartialEq for Axiom {
+    fn eq(&self, other: &Self) -> bool {
+        self.word == other.word && self.examples == other.examples && self.spec == other.spec
+    }
+}
+
+impl Eq for Axiom {}
+
+impl fmt::Debug for Axiom {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let mut ds = f.debug_struct("AxiomDef");
+        ds.field("word", &self.word);
+        ds.finish()
+    }
+}
+
+impl TryFrom<Item> for Axiom {
+    type Error = Error;
+    fn try_from(i: Item) -> Result<Self, Self::Error> {
+        if let Item::AxiomDef(b) = i {
+            Ok(b)
+        } else {
+            Err(Error::expected("AxiomWord"))
+        }
+    }
+}
+
+impl From<Derived> for Association {
+    fn from(d: Derived) -> Association {
+        let mut a = AssociationContent::new();
+        a.insert(word_key("definition"), Item::List(d.definition.clone()));
+        d.examples
+            .and_then(|l| a.insert(word_key("examples"), Item::List(l.clone())));
+        d.spec
+            .and_then(|l| a.insert(word_key("spec"), Item::List(l.clone())));
+        Rc::new(a)
+    }
+}
+
+impl From<Derived> for Item {
+    fn from(dd: Derived) -> Item {
+        Item::Assoc(Association::from(dd))
+    }
+}
+
+impl From<Axiom> for Association {
+    fn from(d: Axiom) -> Association {
+        let mut a = AssociationContent::new();
+        d.examples
+            .and_then(|l| a.insert(word_key("examples"), Item::List(l.clone())));
+        d.spec
+            .and_then(|l| a.insert(word_key("spec"), Item::List(l.clone())));
+        Rc::new(a)
+    }
+}
+
+impl From<Association> for Derived {
+    fn from(mut d: Association) -> Derived {
+        let dmut = Rc::make_mut(&mut d);
+        Derived {
+            word: Intern::new("".to_string()),
+            serialize: true,
+            definition: dmut
+                .remove(&key_item("definition"))
+                .and_then(|i| List::try_from(i).ok())
+                .unwrap_or(Rc::new(ListContent::new())),
+            examples: dmut
+                .remove(&key_item("examples"))
+                .and_then(|i| List::try_from(i).ok()),
+            spec: dmut
+                .remove(&key_item("spec"))
+                .and_then(|i| List::try_from(i).ok()),
+        }
+    }
+}
+
+impl From<Axiom> for Item {
+    fn from(ad: Axiom) -> Item {
+        Item::Assoc(Association::from(ad))
+    }
+}
+#+end_src
 Next is the top level functions, including =main=, how to evaluate
 kcats ASTs, later we'll put command line options here.
 
@@ -829,6 +831,7 @@ topmost stack items, and we'll call them with =f_stack1= etc. The rest
 modify the expression or dictionary and are functions of the environment.
 #+begin_src rust :tangle src/axiom.rs
 use super::serialize;
+use crate::types::definition as def;
 use crate::types::error::Error;
 use crate::types::*;
 use internment::Intern;
@@ -1047,7 +1050,7 @@ fn add_derivations(mut env: Environment) -> Environment {
     let d = Rc::make_mut(&mut env.dictionary);
     d.insert(
         word_key("derivations"),
-        Item::DerivedDef(DerivedDef {
+        Item::DerivedDef(def::Derived {
             definition: Rc::new(ListContent::from_iter([
                 //Item::Word(*S_LIST),
                 Item::Assoc(Rc::new(AssociationContent::new())),
@@ -1536,11 +1539,11 @@ fn as_word(i: KeyItem) -> Option<Word> {
 fn to_lexicon_entry(w: Word, mut def: Association) -> Item {
     let dm = Rc::make_mut(&mut def);
     if dm.get(&key_item("definition")).is_some() {
-        let mut d = DerivedDef::from(def);
+        let mut d = def::Derived::from(def);
         d.word = w;
         Item::DerivedDef(d)
     } else {
-        Item::AxiomDef(AxiomDef {
+        Item::AxiomDef(def::Axiom {
             word: w,
             serialize: true,
             examples: dm
@@ -1929,7 +1932,7 @@ pub fn eval_step(mut env: Environment) -> Environment {
                             return env;
                         }
                     }
-                    let b = AxiomDef::try_from(env.pop_expr()).unwrap();
+                    let b = def::Axiom::try_from(env.pop_expr()).unwrap();
                     (b.f)(env)
                 } else {
                     // not a word, just push onto stack
@@ -2091,7 +2094,7 @@ fn environment(p: Item) -> ItemResult {
             List::try_from(v.clone())
                 .and_then(to_hash)
                 .and_then(|h| {
-                    edmut.insert(k.clone(), Item::DerivedDef(DerivedDef::from(h)));
+                    edmut.insert(k.clone(), Item::DerivedDef(def::Derived::from(h)));
                     Ok(())
                 })
                 .ok();
@@ -2142,13 +2145,13 @@ fn handle(i: Item) -> ItemResult {
     }
 }
 
-fn inscription(env: &mut Environment) -> Result<(Word, DerivedDef), Error> {
+fn inscription(env: &mut Environment) -> Result<(Word, def::Derived), Error> {
     let d = Association::try_from(env.pop())?;
     let mut wl = List::try_from(env.pop())?;
     let w1 = Rc::make_mut(&mut wl).pop_front();
     let x = w1.ok_or(Error::short_list(1))?;
     let w = Word::try_from(x.clone())?;
-    Ok((w, DerivedDef::from(d)))
+    Ok((w, def::Derived::from(d)))
 }
 
 pub fn inscribe(mut env: Environment) -> Environment {
