@@ -64,7 +64,7 @@ pub type ListContent = VecDeque<Item>;
 
 pub type List = Rc<ListContent>;
 
-pub type KeyList = VecDeque<KeyItem>;
+pub type KeyList = VecDeque<KeyItem>; //TODO: Iterator?
 
 pub type Stack = List;
 
@@ -78,23 +78,64 @@ pub type AssociationContent = HashMap<KeyItem, Item>;
 
 pub type Association = Rc<AssociationContent>;
 
-#[derive(Clone, PartialEq)]
-struct Extensible<Core> {
-    pub core: Core,
-    pub extra: Option<AssociationContent>,
+pub type AssocEntry = (KeyItem, Item);
+
+pub trait Lookup {
+    fn get(&self, k: KeyItem) -> Option<&Item>;
 }
 
-pub trait Associative {
-    fn get(&self, k: KeyItem) -> Option<&Item>;
+pub trait Associate: Lookup {
     fn insert(&mut self, k: KeyItem, val: Item) -> Option<Item>;
     fn remove(&mut self, k: KeyItem) -> Option<Item>;
 }
 
-impl Associative for AssociationContent {
+pub trait SetFields: Lookup {
+    fn set(&mut self, k: KeyItem, val: Item) -> Option<Item>;
+}
+
+#[derive(Clone, PartialEq)]
+struct Extensible<Core: SetFields> {
+    pub core: Core,
+    pub extra: AssociationContent,
+}
+
+#[derive(Debug, Clone)]
+pub enum Item {
+    Int(Int),
+    Float(Float),
+    //Boolean(bool),
+    Bytes(Bytes),
+    String(String),
+    Word(Word),
+    Assoc(Association),
+    List(List),
+    Env(Environment),
+    Def(Definition),
+    Error(Error),
+    In(Box<dyn In>),
+    Out(Box<dyn Out>),
+    Tunnel(Box<dyn Tunnel>),
+    Nothing,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub enum KeyItem {
+    Int(Int),
+    //Boolean(bool),
+    Bytes(Bytes),
+    String(String),
+    Word(Word),
+    List(VecDeque<KeyItem>),
+    Nothing,
+}
+
+impl Lookup for AssociationContent {
     fn get(&self, k: KeyItem) -> Option<&Item> {
         return self.get(&k);
     }
+}
 
+impl Associate for AssociationContent {
     fn insert(&mut self, k: KeyItem, val: Item) -> Option<Item> {
         return self.insert(k, val);
     }
@@ -114,41 +155,90 @@ pub struct ErrorCore {
 
 pub type Error = Extensible<ErrorCore>;
 
+impl<T: SetFields> Lookup for Extensible<T> {
+    fn get(&self, k: KeyItem) -> Option<&Item> {
+        (&self.core as &dyn Lookup).get(k)
+    }
+}
+
+impl<T: SetFields> SetFields for Extensible<T> {
+    fn set(&mut self, k: KeyItem, val: Item) -> Option<Item> {
+        None
+    }
+}
+
+impl<T: SetFields> Associate for Extensible<T> {
+    fn insert(&mut self, k: KeyItem, val: Item) -> Option<Item> {
+        None
+    }
+    fn remove(&mut self, k: KeyItem) -> Option<Item> {
+        None
+    }
+}
+
 pub trait From<T>: Sized {
     fn from(_: T) -> Self;
 }
 
-impl Associative for Error {
+// impl IntoIterator for ErrorCore {
+//     type Item = AssocEntry;
+//     type IntoIter = std::array::IntoIter<Self::Item, 1>;
+
+//     fn into_iter(self) -> Self::IntoIter {
+//         std::array::IntoIter::new([(word_key("asked"), Item::List(self.asked))])
+//     }
+// }
+
+// impl<T: SetFields + Iterator> IntoIterator for Extensible<T> {
+//     type Item = AssocEntry;
+
+//     fn into_iter(self) -> Self::IntoIter {
+//         self.core.into_iter().chain(self.extra.into_iter())
+//     }
+// }
+
+impl Lookup for ErrorCore {
     fn get(&self, k: KeyItem) -> Option<&Item> {
         match k {
             KeyItem::Word(w) => match w.as_str() {
-                "asked" => return Some(&Item::List(self.core.asked)),
-                "unwound" => {
-                    return self
-                        .core
-                        .unwound
-                        .and_then(|uw| Some(Item::List(uw)))
-                        .as_ref()
-                }
-                "reason" => {
-                    return self
-                        .core
-                        .reason
-                        .and_then(|r| Some(Item::String(r)))
-                        .as_ref()
-                }
-                "handled?" => return Some(&From::from(self.core.is_handled)),
+                "asked" => return Some(&Item::List(self.asked)),
+                "unwound" => return self.unwound.and_then(|uw| Some(Item::List(uw))).as_ref(),
+                "reason" => return self.reason.and_then(|r| Some(Item::String(r))).as_ref(),
+                "handled?" => return Some(&From::from(self.is_handled)),
             },
-            _ => return self.extra.and_then(|xtra| xtra.get(&k)),
+            _ => return None,
         }
     }
+}
 
-    fn insert(&mut self, k: KeyItem, val: Item) -> Option<Item> {
-        return self.insert(k, val);
-    }
-
-    fn remove(&mut self, k: KeyItem) -> Option<Item> {
-        return self.remove(k);
+impl SetFields for ErrorCore {
+    fn set(&mut self, k: KeyItem, val: Item) -> Option<Item> {
+        match k {
+            KeyItem::Word(w) => match (w.as_str(), val) {
+                ("asked", Item::List(l)) => {
+                    let cur = self.asked;
+                    self.asked = l;
+                    return Some(Item::List(cur));
+                }
+                ("unwound", Item::List(l)) => {
+                    let cur = self.unwound;
+                    self.unwound = Some(l);
+                    match cur {
+                        None => return Some(Item::Nothing),
+                        Some(l) => return Some(Item::List(l)),
+                    }
+                }
+                // "reason" => {
+                //     return self
+                //         .reason
+                //         .and_then(|r| Some(Item::String(r)))
+                //         .as_ref()
+                // }
+                // "handled?" => return Some(&From::from(self.is_handled)),
+                _ => return None,
+            },
+            _ => None,
+        }
     }
 }
 
@@ -183,44 +273,34 @@ lazy_static! {
     pub static ref S_WORD: Intern<String> = Intern::new("word".to_string());
 }
 
-#[derive(Debug, Clone)]
-pub enum Item {
-    Int(Int),
-    Float(Float),
-    //Boolean(bool),
-    Bytes(Bytes),
-    String(String),
-    Word(Word),
-    Assoc(Association),
-    List(List),
-    Env(Environment),
-    AxiomDef(AxiomDef),
-    DerivedDef(DerivedDef),
-    Error(Error),
-    In(Box<dyn In>),
-    Out(Box<dyn Out>),
-    Tunnel(Box<dyn Tunnel>),
-    Nothing,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
-pub enum KeyItem {
-    Int(Int),
-    //Boolean(bool),
-    Bytes(Bytes),
-    String(String),
-    Word(Word),
-    List(VecDeque<KeyItem>),
-    Nothing,
-}
-
-pub type Dictionary = Association;
+pub type Dictionary = HashMap<Word, Definition>;
 
 #[derive(Clone, PartialEq)]
 pub struct Environment {
     pub stack: Stack,
     pub expression: Stack,
     pub dictionary: Dictionary,
+}
+
+impl Lookup for Environment {
+    fn get(&self, k: KeyItem) -> Option<&Item> {
+        None
+    }
+}
+
+impl SetFields for Environment {
+    fn set(&mut self, k: KeyItem, val: Item) -> Option<Item> {
+        None
+    }
+}
+
+impl Associate for Environment {
+    fn insert(&mut self, k: KeyItem, val: Item) -> Option<Item> {
+        None
+    }
+    fn remove(&mut self, k: KeyItem) -> Option<Item> {
+        None
+    }
 }
 
 pub type StepFn = dyn Fn(Environment) -> Environment;
@@ -236,6 +316,27 @@ pub struct AxiomDef {
     pub f: &'static StepFn,
 }
 
+impl Lookup for AxiomDef {
+    fn get(&self, k: KeyItem) -> Option<&Item> {
+        None
+    }
+}
+
+impl SetFields for AxiomDef {
+    fn set(&mut self, k: KeyItem, val: Item) -> Option<Item> {
+        None
+    }
+}
+
+impl Associate for AxiomDef {
+    fn insert(&mut self, k: KeyItem, val: Item) -> Option<Item> {
+        None
+    }
+    fn remove(&mut self, k: KeyItem) -> Option<Item> {
+        None
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DerivedDef {
     pub word: Word,
@@ -243,6 +344,27 @@ pub struct DerivedDef {
     pub spec: Option<List>,
     pub serialize: bool,
     pub definition: List,
+}
+
+impl Lookup for DerivedDef {
+    fn get(&self, k: KeyItem) -> Option<&Item> {
+        None
+    }
+}
+
+impl SetFields for DerivedDef {
+    fn set(&mut self, k: KeyItem, val: Item) -> Option<Item> {
+        None
+    }
+}
+
+impl Associate for DerivedDef {
+    fn insert(&mut self, k: KeyItem, val: Item) -> Option<Item> {
+        None
+    }
+    fn remove(&mut self, k: KeyItem) -> Option<Item> {
+        None
+    }
 }
 
 impl PartialEq for Item {
@@ -328,7 +450,7 @@ impl Error {
                 reason: Some(reason.to_string()),
                 unwound,
             },
-            extra: None,
+            extra: AssociationContent::new(),
         }
     }
 
@@ -388,13 +510,14 @@ pub fn wrap(i: Item) -> List {
     Rc::new(ListContent::from_iter([i]))
 }
 
+//TODO: should be Sequence (a trait)
 impl TryFrom<Item> for List {
     type Error = Error;
     fn try_from(i: Item) -> Result<Self, Self::Error> {
         match i {
             Item::List(l) => Ok(l),
-            Item::Assoc(mut a) => Ok(From::from(a)),
-            Item::Error(e) => Ok(From::from(e)),
+            //Item::Assoc(mut a) => Ok(From::from(a)),
+            //Item::Error(e) => Ok(From::from(e)),
             // 'Nothing' is equivalent to an empty list
             Item::Nothing => Ok(Rc::new(ListContent::new())),
             _ => Err(Error::expected("list")),
@@ -457,17 +580,17 @@ impl TryFrom<Item> for Word {
     }
 }
 
-impl TryFrom<Item> for Association {
+impl TryFrom<Item> for &dyn Associate {
     type Error = Error;
     fn try_from(i: Item) -> Result<Self, Self::Error> {
         match i {
-            Item::Assoc(a) => Ok(a),
-            Item::List(l) => Ok(to_hash(l)?),
-            Item::Nothing => Ok(Rc::new(AssociationContent::new())),
-            Item::DerivedDef(d) => Ok(From::from(d)),
-            Item::AxiomDef(a) => Ok(From::from(a)),
-            Item::Env(e) => Ok(From::from(e)),
-            Item::Error(e) => Ok(From::from(e)),
+            Item::Assoc(a) => Ok(&(*a) as &dyn Associate),
+            Item::List(l) => Ok(&to_hash(l)?),
+            Item::Nothing => Ok(&AssociationContent::new() as &dyn Associate),
+            Item::DerivedDef(d) => Ok(&d as &dyn Associate),
+            Item::AxiomDef(a) => Ok(&a as &dyn Associate),
+            Item::Env(e) => Ok(&e as &dyn Associate),
+            Item::Error(e) => Ok(&e as &dyn Associate),
             _ => Err(Error::expected("association")),
         }
     }
@@ -505,16 +628,16 @@ impl TryFrom<Item> for Box<dyn Out> {
     }
 }
 
-impl TryFrom<Item> for Box<dyn Associative> {
-    type Error = Error;
-    fn try_from(i: Item) -> Result<Self, Self::Error> {
-        match i {
-            Item::Error(e) => Ok(Box::new(e) as Box<dyn Associative>),
-            // TODO env, deriveddef etc
-            _ => Err(Error::expected("pipe")),
-        }
-    }
-}
+// impl<T: Associate> TryFrom<Item> for &T {
+//     type Error = Error;
+//     fn try_from(i: Item) -> Result<Self, Self::Error> {
+//         match i {
+//             Item::Error(e) => Ok(Box::new(e) as Box<dyn Associate>),
+//             // TODO env, deriveddef etc
+//             _ => Err(Error::expected("pipe")),
+//         }
+//     }
+// }
 impl From<DerivedDef> for Association {
     fn from(d: DerivedDef) -> Association {
         let mut a = AssociationContent::new();
@@ -570,6 +693,48 @@ impl From<AxiomDef> for Item {
     }
 }
 
+impl From<Error> for Item {
+    fn from(e: Error) -> Item {
+        Item::Error(e)
+    }
+}
+
+impl From<&[Item]> for List {
+    fn from(a: &[Item]) -> List {
+        let lc = ListContent::new();
+        lc.extend(a.iter().cloned());
+        Rc::new(lc)
+    }
+}
+
+impl TryFrom<Item> for Box<dyn Associate> {
+    type Error = Error;
+    fn try_from(i: Item) -> Result<Self, Error> {
+        match i {
+            Item::Assoc(a) => Ok(Box::new(*a) as Box<dyn Associate>),
+            _ => Err(Error::expected("association")),
+        }
+    }
+}
+// impl From<Error> for List {
+//     fn from(e: Error) -> List {
+//         From::from(Box::new(e) as Box<dyn Associate>)
+//     }
+// }
+
+// impl From<Box<dyn Associate>> for ListContent {
+//     fn from(a: Box<dyn Associate>) -> ListContent {
+//         a.into_iter()
+//             .map(|(k, v)| {
+//                 Item::List(Rc::new(std::convert::From::from(vec![
+//                     to_value_item(k.clone()),
+//                     std::convert::From::from(v.clone()),
+//                 ])))
+//             })
+//             .collect::<ListContent>()
+//     }
+// }
+
 // As there are no real booleans, we use the word 'true' but literally
 // any value except the empty list is truthy. If we read a value
 // 'false' in edn, that's not actually a boolean, it's just the
@@ -584,15 +749,16 @@ impl From<bool> for Item {
     }
 }
 
-impl From<Environment> for Association {
-    fn from(env: Environment) -> Association {
-        let mut a = AssociationContent::new();
-        a.insert(word_key("stack"), Item::List(env.stack.clone()));
-        a.insert(word_key("expression"), Item::List(env.expression.clone()));
-        a.insert(word_key("dictionary"), Item::Assoc(env.dictionary.clone()));
-        Rc::new(a)
-    }
-}
+// shouldn't need to convert anymore
+// impl From<Environment> for Association {
+//     fn from(env: Environment) -> Association {
+//         let mut a = AssociationContent::new();
+//         a.insert(word_key("stack"), Item::List(env.stack.clone()));
+//         a.insert(word_key("expression"), Item::List(env.expression.clone()));
+//         a.insert(word_key("dictionary"), Item::Assoc(env.dictionary.clone()));
+//         Rc::new(a)
+//     }
+// }
 
 impl From<Environment> for Item {
     fn from(env: Environment) -> Item {
@@ -611,7 +777,7 @@ impl From<ErrorCore> for AssociationContent {
         let ac = AssociationContent::new();
         let b: Item = From::from(ec.is_handled);
         ac.insert(word_key("handled?"), b);
-       
+
         if let Some(u) = ec.unwound {
             ac.insert(word_key("unwound"), Item::List(u));
         }
@@ -622,24 +788,25 @@ impl From<ErrorCore> for AssociationContent {
     }
 }
 
-impl From<AssociationContent> for ListContent {
-    fn from(a: AssociationContent) -> ListContent {
-        a.into_iter()
-            .map(|(k, v)| {
-                Item::List(Rc::new(std::convert::From::from(vec![
-                    to_value_item(k.clone()),
-                    std::convert::From::from(v.clone()),
-                ])))
-            })
-            .collect::<ListContent>()
-    }
-}
+// shouldn't need to explicitly convert
+// impl From<AssociationContent> for ListContent {
+//     fn from(a: AssociationContent) -> ListContent {
+//         a.into_iter()
+//             .map(|(k, v)| {
+//                 Item::List(Rc::new(std::convert::From::from(vec![
+//                     to_value_item(k.clone()),
+//                     std::convert::From::from(v.clone()),
+//                 ])))
+//             })
+//             .collect::<ListContent>()
+//     }
+// }
 
-impl From<Association> for List {
-    fn from(a: Association) -> List {
-        Rc::new(From::from(*a))
-    }
-}
+// impl From<Association> for List {
+//     fn from(a: Association) -> List {
+//         Rc::new(From::from(*a))
+//     }
+// }
 
 // impl From<Error> for Association {
 //     fn from(e: Error) -> Association {
@@ -649,10 +816,10 @@ impl From<Association> for List {
 //         return Rc::new(ac);
 //     }
 // }
-impl<T: Into<AssociationContent>> From<Extensible<T>> for Association {
+impl<T: Into<AssociationContent> + SetFields> From<Extensible<T>> for Association {
     fn from(e: Extensible<T>) -> Association {
         let ac: AssociationContent = e.core.into();
-        let extra: AssociationContent = e.extra.unwrap_or_default();
+        let extra: AssociationContent = e.extra;
         ac.extend(extra);
         return Rc::new(ac);
     }
@@ -731,12 +898,10 @@ pub fn to_entry(i: Item) -> Result<(KeyItem, Item), Error> {
     }
 }
 
-pub fn to_hash(l: List) -> Result<Association, Error> {
-    Ok(Rc::new(
-        l.iter()
-            .map(|i| to_entry(i.clone()))
-            .collect::<Result<HashMap<KeyItem, Item>, Error>>()?,
-    ))
+pub fn to_hash(l: List) -> Result<AssociationContent, Error> {
+    Ok(l.iter()
+        .map(|i| to_entry(i.clone()))
+        .collect::<Result<HashMap<KeyItem, Item>, Error>>()?)
 }
 #+end_src
 
@@ -1045,7 +1210,7 @@ pub fn add_builtins(d: Dictionary) -> Dictionary {
             (">=", Box::leak(Box::new(f_stack2(gte)))),
             ("and", Box::leak(Box::new(f_stack2(and)))),
             ("assign", Box::leak(Box::new(f_stack3(assign)))),
-            ("association", Box::leak(Box::new(f_stack1(association)))),
+            //("association", Box::leak(Box::new(f_stack1(association)))),
             (
                 "association?",
                 Box::leak(Box::new(f_stack1(is_association))),
@@ -1133,12 +1298,11 @@ pub fn read_lexicon_file(filename: &str, mut env: Environment) -> Environment {
     match fs::read_to_string(filename) {
         Ok(s) => {
             let items = serialize::parse(s, Some(&env.dictionary)).unwrap();
-            let mut vitems = to_hash(List::from(items)).unwrap();
-            let vitemsmut = Rc::make_mut(&mut vitems);
-            for (k, def) in vitemsmut.into_iter() {
+            let mut vitems = to_hash(items).unwrap();
+            for (k, def) in vitems.into_iter() {
                 let h = to_hash(List::try_from(def.clone()).unwrap()).unwrap();
                 let word = as_word(k.clone()).unwrap();
-                let newdef = to_lexicon_entry(word, h);
+                let newdef = to_lexicon_entry(word, Rc::new(h));
                 let newdef2 = newdef.clone();
                 let dict = Rc::make_mut(&mut env.dictionary);
                 dict.entry(KeyItem::Word(word))
@@ -1252,18 +1416,18 @@ pub fn dec(i: Item) -> ItemResult {
 
 pub fn is_zero(i: Item) -> ItemResult {
     match i {
-        Item::Int(i) => Ok(Item::from(i == 0)),
-        Item::Float(i) => Ok(Item::from(i == 0.0)),
+        Item::Int(i) => Ok(From::from(i == 0)),
+        Item::Float(i) => Ok(From::from(i == 0.0)),
         _ => number_type_error(),
     }
 }
 
 pub fn gt(i: Item, j: Item) -> ItemResult {
     match (i, j) {
-        (Item::Int(i), Item::Int(j)) => Ok(Item::from(i > j)),
-        (Item::Float(i), Item::Float(j)) => Ok(Item::from(i > j)),
-        (Item::Int(i), Item::Float(j)) => Ok(Item::from(i as Float > j)),
-        (Item::Float(i), Item::Int(j)) => Ok(Item::from(i > j as Float)),
+        (Item::Int(i), Item::Int(j)) => Ok(From::from(i > j)),
+        (Item::Float(i), Item::Float(j)) => Ok(From::from(i > j)),
+        (Item::Int(i), Item::Float(j)) => Ok(From::from(i as Float > j)),
+        (Item::Float(i), Item::Int(j)) => Ok(From::from(i > j as Float)),
 
         _ => number_type_error(),
     }
@@ -1272,9 +1436,9 @@ pub fn gt(i: Item, j: Item) -> ItemResult {
 pub fn lt(i: Item, j: Item) -> ItemResult {
     match (i, j) {
         (Item::Int(i), Item::Int(j)) => Ok(From::from(i < j)),
-        (Item::Float(i), Item::Float(j)) => Ok(Item::from(i < j)),
-        (Item::Int(i), Item::Float(j)) => Ok(Item::from((i as Float) < j)),
-        (Item::Float(i), Item::Int(j)) => Ok(Item::from(i < j as Float)),
+        (Item::Float(i), Item::Float(j)) => Ok(From::from(i < j)),
+        (Item::Int(i), Item::Float(j)) => Ok(From::from((i as Float) < j)),
+        (Item::Float(i), Item::Int(j)) => Ok(From::from(i < j as Float)),
 
         _ => number_type_error(),
     }
@@ -1282,10 +1446,10 @@ pub fn lt(i: Item, j: Item) -> ItemResult {
 
 pub fn gte(i: Item, j: Item) -> ItemResult {
     match (i, j) {
-        (Item::Int(i), Item::Int(j)) => Ok(Item::from(i >= j)),
-        (Item::Float(i), Item::Float(j)) => Ok(Item::from(i >= j)),
-        (Item::Int(i), Item::Float(j)) => Ok(Item::from(i as Float >= j)),
-        (Item::Float(i), Item::Int(j)) => Ok(Item::from(i >= j as Float)),
+        (Item::Int(i), Item::Int(j)) => Ok(From::from(i >= j)),
+        (Item::Float(i), Item::Float(j)) => Ok(From::from(i >= j)),
+        (Item::Int(i), Item::Float(j)) => Ok(From::from(i as Float >= j)),
+        (Item::Float(i), Item::Int(j)) => Ok(From::from(i >= j as Float)),
 
         _ => number_type_error(),
     }
@@ -1293,10 +1457,10 @@ pub fn gte(i: Item, j: Item) -> ItemResult {
 
 pub fn lte(i: Item, j: Item) -> ItemResult {
     match (i, j) {
-        (Item::Int(i), Item::Int(j)) => Ok(Item::from(i <= j)),
-        (Item::Float(i), Item::Float(j)) => Ok(Item::from(i <= j)),
-        (Item::Int(i), Item::Float(j)) => Ok(Item::from((i as Float).le(&j))),
-        (Item::Float(i), Item::Int(j)) => Ok(Item::from(i <= j as Float)),
+        (Item::Int(i), Item::Int(j)) => Ok(From::from(i <= j)),
+        (Item::Float(i), Item::Float(j)) => Ok(From::from(i <= j)),
+        (Item::Int(i), Item::Float(j)) => Ok(From::from((i as Float).le(&j))),
+        (Item::Float(i), Item::Int(j)) => Ok(From::from(i <= j as Float)),
 
         _ => number_type_error(),
     }
@@ -1362,7 +1526,7 @@ pub fn discard(mut env: Environment) -> Environment {
 }
 
 pub fn eq(i: Item, j: Item) -> ItemResult {
-    Ok(Item::from(i == j))
+    Ok(From::from(i == j))
 }
 
 pub fn count(i: Item) -> ItemResult {
@@ -1370,7 +1534,7 @@ pub fn count(i: Item) -> ItemResult {
 }
 
 pub fn is_string(i: Item) -> ItemResult {
-    Ok(Item::from(if let Item::String(_) = i {
+    Ok(From::from(if let Item::String(_) = i {
         true
     } else {
         false
@@ -1378,7 +1542,7 @@ pub fn is_string(i: Item) -> ItemResult {
 }
 
 pub fn is_bytes(i: Item) -> ItemResult {
-    Ok(Item::from(if let Item::Bytes(_) = i {
+    Ok(From::from(if let Item::Bytes(_) = i {
         true
     } else {
         false
@@ -1386,7 +1550,7 @@ pub fn is_bytes(i: Item) -> ItemResult {
 }
 
 pub fn is_error(i: Item) -> ItemResult {
-    Ok(Item::from(if let Item::Error(_) = i {
+    Ok(From::from(if let Item::Error(_) = i {
         true
     } else {
         false
@@ -1394,7 +1558,7 @@ pub fn is_error(i: Item) -> ItemResult {
 }
 
 pub fn is_word(i: Item) -> ItemResult {
-    Ok(Item::from(match i {
+    Ok(From::from(match i {
         Item::Word(_) => true,
         Item::AxiomDef(_) => true,
         Item::DerivedDef(_) => true,
@@ -1403,14 +1567,14 @@ pub fn is_word(i: Item) -> ItemResult {
 }
 
 pub fn is_pipe(i: Item) -> ItemResult {
-    Ok(Item::from(match i {
+    Ok(From::from(match i {
         Item::In(_) => true,
         Item::Out(_) => true,
         _ => false,
     }))
 }
 pub fn is_number(i: Item) -> ItemResult {
-    Ok(Item::from(if let Item::Int(_) | Item::Float(_) = i {
+    Ok(From::from(if let Item::Int(_) | Item::Float(_) = i {
         true
     } else {
         false
@@ -1418,7 +1582,7 @@ pub fn is_number(i: Item) -> ItemResult {
 }
 
 pub fn is_list(i: Item) -> ItemResult {
-    Ok(Item::from(
+    Ok(From::from(
         if let Item::List(_) | Item::Nothing | Item::Assoc(_) = i {
             true
         } else {
@@ -1537,7 +1701,7 @@ pub fn unpack(mut env: Environment) -> Environment {
                 Item::Nothing
             }
         } else {
-            Item::from(invalid_type_error(Rc::new(ListContent::from_iter([
+            From::from(invalid_type_error(Rc::new(ListContent::from_iter([
                 Item::Word(*S_LIST),
             ]))))
         }
@@ -1619,16 +1783,19 @@ pub fn recur(mut env: Environment) -> Environment {
     let then = List::try_from(env.pop()).unwrap();
     let pred = List::try_from(env.pop()).unwrap();
     env = env.push_expr(word("if"));
-    let r = Item::List(Rc::new(ListContent::from([
-        Item::List(pred.clone()),
-        Item::List(then.clone()),
-        Item::List(rec1.clone()),
-        Item::List(rec2.clone()),
-        word("recur"),
-    ])));
+
+    let r: List = From::from(
+        &[
+            Item::List(pred.clone()),
+            Item::List(then.clone()),
+            Item::List(rec1.clone()),
+            Item::List(rec2.clone()),
+            word("recur"),
+        ][..],
+    );
     let mut e = ListContent::new();
     e.extend(Rc::make_mut(&mut rec1).drain(..));
-    e.push_back(r);
+    e.push_back(Item::List(r));
     e.extend(Rc::make_mut(&mut rec2).drain(..));
 
     env.push(Item::List(pred))
@@ -1655,7 +1822,7 @@ fn as_word(i: KeyItem) -> Option<Word> {
 fn to_lexicon_entry(w: Word, mut def: Association) -> Item {
     let dm = Rc::make_mut(&mut def);
     if dm.get(&key_item("definition")).is_some() {
-        let mut d = DerivedDef::from(def);
+        let mut d: DerivedDef = From::from(def);
         d.word = w;
         Item::DerivedDef(d)
     } else {
@@ -1675,31 +1842,30 @@ fn to_lexicon_entry(w: Word, mut def: Association) -> Item {
     }
 }
 
-fn assoc_in(i: Item, ks: &[KeyItem], v: Item) -> Result<Association, Error> {
-    let mut h = Association::try_from(i)?;
-    let hm = Rc::make_mut(&mut h);
+fn assoc_in(i: Item, ks: &[KeyItem], v: Item) -> Result<Item, Error> {
+    let a: &dyn Associate = i.try_into()?;
     if let [k, ks @ ..] = ks {
         if ks.is_empty() {
-            hm.insert(k.clone(), v);
+            a.insert(k.clone(), v);
         } else {
-            let inner = hm.get(&k.clone()).unwrap_or(&Item::Nothing).clone();
+            let inner = a.get(*k).unwrap_or(&Item::Nothing).clone();
             // if the inner value isn't a map, we're just overwriting whatever it
             // is with a new map.
 
-            hm.insert(
+            a.insert(
                 k.clone(),
-                Item::Assoc(assoc_in(
+                assoc_in(
                     Item::Assoc(match inner {
                         Item::Assoc(inner) => inner,
                         _ => Rc::new(AssociationContent::new()),
                     }),
                     ks,
                     v,
-                )?),
+                )?,
             );
         }
     }
-    Ok(h)
+    Ok(v)
 }
 
 pub fn assign(m: Item, ks: Item, v: Item) -> ItemResult {
@@ -1711,30 +1877,33 @@ pub fn assign(m: Item, ks: Item, v: Item) -> ItemResult {
         .collect::<Result<KeyList, Error>>()?;
     ksvec.make_contiguous();
     let (ks, _) = ksvec.as_slices();
-    Ok(Item::Assoc(assoc_in(m, ks, v)?))
+    Ok(assoc_in(m, ks, v)?)
 }
 
 //TODO: this should really take a keylist like assign and lookup
 pub fn unassign(m: Item, k: Item) -> ItemResult {
-    let mut m = Association::try_from(m).unwrap();
-    let mm = Rc::make_mut(&mut m);
+    let mm: &dyn Associate = m.try_into()?;
+
+    //let mut m = Association::try_from(m).unwrap();
+    //let mm = Rc::make_mut(&mut m);
     let k = to_key_item(k)?;
-    mm.remove(&k);
-    Ok(Item::Assoc(m))
+    mm.remove(k);
+    Ok(m)
 }
 
-pub fn association(m: Item) -> ItemResult {
-    match Association::try_from(m) {
-        Ok(m) => Ok(Item::Assoc(m)),
-        Err(e) => Err(e),
-    }
-}
+// pub fn association(m: Item) -> ItemResult {
+//     match Association::try_from(m) {
+//         Ok(m) => Ok(Item::Assoc(m)),
+//         Err(e) => Err(e),
+//     }
+// }
 
 pub fn lookup(m: Item, k: Item) -> ItemResult {
     //println!("lookup {:?} \n {:?}", m, k);
     let k = to_key_item(k)?;
-    let m = Association::try_from(m)?;
-    Ok(m.get(&k).unwrap_or(&Item::Nothing).clone())
+    let mm: &dyn Associate = m.try_into()?;
+    //let m = Association::try_from(m)?;
+    Ok(*mm.get(k).unwrap_or(&Item::Nothing))
 }
 
 pub fn or(i: Item, j: Item) -> ItemResult {
@@ -1759,27 +1928,27 @@ pub fn and(i: Item, j: Item) -> ItemResult {
 }
 
 pub fn not(i: Item) -> ItemResult {
-    Ok(Item::from(!is_truthy(&i)))
+    Ok(From::from(!is_truthy(&i)))
 }
 
 pub fn is_association(i: Item) -> ItemResult {
-    Ok(Item::from(match i {
+    Ok(From::from(match i {
         Item::Assoc(_) => true,
         Item::Nothing => true,
         Item::Env(_) => true,
-        Item::List(l) => Association::try_from(Item::List(l)).is_ok(),
+        Item::List(l) => TryInto::<Box<dyn Associate>>::try_into(i).is_ok(),
         _ => false,
     }))
 }
 
 pub fn is_odd(i: Item) -> ItemResult {
     let i = Int::try_from(i)?;
-    Ok(Item::from(i & 1 == 1))
+    Ok(From::from(i & 1 == 1))
 }
 
 pub fn is_even(i: Item) -> ItemResult {
     let i = Int::try_from(i)?;
-    Ok(Item::from(i & 1 == 0))
+    Ok(From::from(i & 1 == 0))
 }
 
 pub fn decide(mut env: Environment) -> Environment {
@@ -1803,15 +1972,17 @@ pub fn decide(mut env: Environment) -> Environment {
                             Rc::new(ListContent::from(vec![Item::List(test), word("shield")]));
                         let elsep =
                             Rc::new(ListContent::from(vec![Item::List(clauses), word("decide")]));
-                        let newexpr = Rc::new(ListContent::from(vec![
-                            Item::List(testp),
-                            Item::List(expr),
-                            Item::List(elsep),
-                            word("if"),
-                        ]));
+                        let newexpr: List = From::from(
+                            &[
+                                Item::List(testp),
+                                Item::List(expr),
+                                Item::List(elsep),
+                                word("if"),
+                            ][..],
+                        );
                         env.append_expression(newexpr)
                     }
-                    _ => env.push(Item::from(invalid_type_error(serialize::to_list(
+                    _ => env.push(From::from(invalid_type_error(serialize::to_list(
                         "[list?] both",
                     )))),
                 }
@@ -2142,7 +2313,6 @@ pub fn is_errored(i: Item) -> ItemResult {
     } else {
         false
     }))
-    
 }
 fn unwind(mut env: Environment) -> Environment {
     let mut next = env.expression.front();
@@ -2176,10 +2346,7 @@ pub fn eval(mut env: Environment) -> Environment {
 }
 
 pub fn standard_env(program: Option<List>, stack: Option<List>) -> Environment {
-    let prog_expr = match program {
-        Some(p) => Stack::from(p),
-        _ => Stack::new(ListContent::new()),
-    };
+    let prog_expr: Stack = program.unwrap_or(Stack::new(ListContent::new()));
 
     let env = Environment {
         stack: stack.unwrap_or(Stack::new(ListContent::new())),
@@ -2190,18 +2357,17 @@ pub fn standard_env(program: Option<List>, stack: Option<List>) -> Environment {
 }
 
 fn environment(p: Item) -> ItemResult {
-    let mut env = Association::try_from(p).unwrap();
-    let envm = Rc::make_mut(&mut env);
-    let stack = envm
-        .remove(&to_key_item(word("stack")).unwrap())
+    let mut env: Box<dyn Associate> = p.try_into().unwrap();
+    let stack = env
+        .remove(to_key_item(word("stack")).unwrap())
         .and_then(|s| List::try_from(s).ok())
         .or(Some(List::new(ListContent::new())));
-    let expression = envm
-        .remove(&to_key_item(word("expression")).unwrap())
+    let expression = env
+        .remove(to_key_item(word("expression")).unwrap())
         .and_then(|s| List::try_from(s).ok())
         .or(Some(List::new(ListContent::new())));
-    let dictionary = envm
-        .remove(&to_key_item(word("dictionary")).unwrap())
+    let dictionary = env
+        .remove(to_key_item(word("dictionary")).unwrap())
         .and_then(|d| Association::try_from(d).ok());
     let mut env = standard_env(expression, stack);
     if let Some(mut d) = dictionary {
@@ -4065,34 +4231,310 @@ enum Bar<'a> { Int(i32), Foo(&'a dyn Foo), Quux(&'a Quux) }
 #+RESULTS:
 
 Hm this works too, well maybe it will be fine.
+**** INPROGRESS Trait for association-like structs
+The idea here is that we can just leave structs like Error, DerivedDef
+etc as-is until such time that in kcats we try to treat it like a list
+or associative. At that time those objects have an implementation of
+List or Associative that allows us to eg iterate or lookup or set.
+
+Let's experiment with a playground here
+
+#+begin_src rust
+  use std::collections::HashMap;
+  use std::rc::Rc;
+
+  #[derive(Clone, Eq, Hash, PartialEq, Debug)]
+  pub enum Item {
+      Bool(bool),
+      String(String),
+      List(Vec<Item>),
+      Env(Env),
+      //Assoc(Rc<dyn Associate>)
+  }
+
+  #[derive(Clone, Eq, Hash, PartialEq, Debug)]
+  pub struct Env {
+      pub foo: Vec<Item>,
+  }
+
+  pub trait Lookup {
+      fn get(&self, k: Item) -> Option<Item>;
+  }
+
+  pub trait Associate: Lookup {
+      fn insert(&mut self, k: Item, val: Item) -> Option<Item>;
+      fn remove(&mut self, k: Item) -> Option<Item>;
+  }
+
+  pub trait SetFields: Lookup {
+      fn set(&mut self, k: Item, val: Item) -> Option<Item>;
+  }
+
+  #[derive(Clone, PartialEq)]
+  struct Extensible<Core: SetFields> {
+      pub core: Core,
+      pub extra: HashMap<Item, Item>,
+  }
+
+  impl Lookup for Env {
+      fn get(&self, k: Item) -> Option<Item> {
+          println!("looking up");
+          if k == Item::String("foo".to_string()) {
+              Some(Item::List(self.foo.clone()))
+          } else {
+              None
+          }
+      }
+  }
+
+  impl SetFields for Env {
+      fn set(&mut self, k: Item, val: Item) -> Option<Item> {
+          None
+      }
+  }
+
+  impl<T: SetFields> Lookup for Extensible<T> {
+      fn get(&self, k: Item) -> Option<Item> {
+          (&self.core as &dyn Lookup).get(k)
+      }
+  }
+
+  impl<T: SetFields> SetFields for Extensible<T> {
+      fn set(&mut self, k: Item, val: Item) -> Option<Item> {
+          None
+      }
+  }
+
+  impl<T: SetFields> Associate for Extensible<T> {
+      fn insert(&mut self, k: Item, val: Item) -> Option<Item> {
+          None
+      }
+      fn remove(&mut self, k: Item) -> Option<Item> {
+          None
+      }
+  }
+
+  //a generic assoc
+
+  fn assoc<T: Associate>(x: T) -> T {
+      return x;
+  }
+
+
+  fn main() {
+      println!("Hi");
+      let i = Item::List(Vec::<Item>::new());
+
+      //let env = Item::Env(e);
+      let mut eenv = Extensible {
+          core: Env {
+              foo: Vec::<Item>::new(),
+          },
+          extra: HashMap::new(),
+      };
+      eenv.core.foo.push(Item::String("hello".to_string()));
+      println!(
+          "env's foo is: {:?}",
+          (&eenv as &dyn Associate).get(Item::String("foo".to_string()))
+      );
+  }
+#+end_src
+
+Let's try nested enum
+#+begin_src rust
+use std::collections::HashMap;
+use std::rc::Rc;
+
+#[derive(Clone, Eq, Hash, PartialEq, Debug)]
+pub enum<K: Item,V: Item, T> Associate<T> {
+    Ext(Extensible<T>),
+    HM(HashMap<K,V>)
+}
+
+#[derive(Clone, Eq, Hash, PartialEq, Debug)]
+pub enum Item {
+    Bool(bool),
+    String(String),
+    List(Vec<Item>),
+    Assoc(Associate), //Assoc(Rc<dyn Associate>)
+}
+
+#[derive(Clone, Eq, Hash, PartialEq, Debug)]
+pub struct Env {
+    pub foo: Vec<Item>,
+}
+
+impl Associate {
+    pub fn get(&self, k: Item) -> Option<Item> {
+        match self {
+            Associate::Env(e) => {
+                println!("looking up");
+                if k == Item::String("foo".to_string()) {
+                    Some(Item::List(self.foo.clone()))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+    pub fn set(&mut self, k: Item, val: Item) -> Option<Item> {
+        None
+    }
+    
+}
+pub trait Lookup {
+    fn get(&self, k: Item) -> Option<Item>;
+}
+
+pub trait SetFields: Lookup {
+    fn set(&mut self, k: Item, val: Item) -> Option<Item>;
+}
+
+#[derive(Clone, PartialEq)]
+struct Extensible<Core: SetFields> {
+    pub core: Core,
+    pub extra: HashMap<Item, Item>,
+}
+
+impl<T: SetFields> Lookup for Extensible<T> {
+    fn get(&self, k: Item) -> Option<Item> {
+        (&self.core as &dyn Lookup).get(k)
+    }
+}
+
+impl<T: SetFields> SetFields for Extensible<T> {
+    fn set(&mut self, k: Item, val: Item) -> Option<Item> {
+        None
+    }
+}
+
+impl<T: SetFields> Associate for Extensible<T> {
+    fn insert(&mut self, k: Item, val: Item) -> Option<Item> {
+        None
+    }
+    fn remove(&mut self, k: Item) -> Option<Item> {
+        None
+    }
+}
+
+//a generic assoc
+
+fn assoc<T: Associate>(x: T) -> T {
+    return x;
+}
+
+fn main() {
+    println!("Hi");
+    let i = Item::List(Vec::<Item>::new());
+
+    //let env = Item::Env(e);
+    let mut eenv = Extensible {
+        core: Env {
+            foo: Vec::<Item>::new(),
+        },
+        extra: HashMap::new(),
+    };
+    eenv.core.foo.push(Item::String("hello".to_string()));
+    println!(
+        "env's foo is: {:?}",
+        (&eenv as &dyn Associate).get(Item::String("foo".to_string()))
+    );
+}
+#+end_src
+
+#+RESULTS:
+: error: Could not compile `cargouS8IYJ`.
+
+**** TODO think about types
+Sometimes an item is just an association. But the minute we say
+=[[type error] ]= it's a special =Error= type? The only reason we even
+have special rust types for =Error=, =Environment=, etc is for quick
+dispatch and lookup. Otherwise we would only need =Association= and
+everything would be looked up dynamically. The tough part is to how to
+make this faster without making the code too complex.
+
+What happens when we dynamically change =type= to say, =error=? Do we
+actually instantiate an =Error= object? It seems like we have to, or
+else any =Assocation= could potentially really be an =Error= and we
+have to check anytime it matters.
+
+And then what happens if the expected predefined fields we expect
+=Error= to have, are different types? Is it still an =Error=?
+
+The essence off "errorness" in kcats is having a field =type= whose
+value is =error=? If so we have to replace the rust object with a
+different type if we change that field. So the =assign= action might
+return various types depending on what we're setting. Maybe error out
+if the existing fields don't fit with the type we're changing to?
+
+Ok maybe it makes sense to do it that way.
+
+How does the =assign= word work then - it can't return an =Item=, it
+has to return an =Associate= trait object.
+
+Then what do we do with the =Item= enum? Those are just the concrete
+types. We need to somehow say "An item is either x y z" eg bytes,
+string etc, and define what to do based on what kind it is.
+
+We could maybe just define traits and dispatch that way. Maybe we
+don't care if something is a string. Maybe we only care that it is
+Indexable, Joinable etc. Then during execution we try to convert
+whatever it is to that kind of trait object?
+
+Let's say all we know at runtime is the thing implements =Item=
+(perhaps an empty trait). We are calling =join= and we want to make
+sure the two =Items= are in fact =Joinables=. How? I don't think we
+can and that's why we need the enum - so we can convert an =Item= to a
+=Joinable= and have a bounded set of possible conversions. If we use
+traits, the number of possible implementers of =Item= is
+infinite. Maybe we can go the other way? Find out the concrete type?
+Nah, looks like this is what enums are for.
+
+We have a fixed set of concrete types, but overlapping traits. The
+question is where to use concrete types in signatures, and where to
+use traits. Maybe we use =Item= (the enum type) at the top level (when
+we don't know eg what is on ToS). Then to find out if a given =Item=
+implements a trait maybe we have to make an explicit method to return
+one. eg =Item::to_joinable= or something, where we have a match
+statement to return either the trait object or an error. The problem
+is these trait objects aren't =Items=! This becomes a problem when
+we're doing eg nested assignment. We have to deal in =Items=. Or maybe
+it's not really a problem, as we can wrap it before returning.
+
+Let's think about when we need to switch context of a given object. We need to:
+
++ Treat an env like a association (adding or changing a field, eg the stack)
++ Treat an association like a [Error, Env, DerivedDef, etc] - do we
+  really need that? I think maybe we don't. Yes we do, in =assoc-in=
+  we need to make the value an Item which kind of item? We don't know,
+  we only know it's an Associative.
 *** TODO Implement my own From/TryFrom
 Can't implement this on existing types. but there seems to be naming collision even if i don't implement the =std::convert::From= at all:
 
 #+begin_src rust
-pub trait SomeOther<T>: Sized {
-    fn from(_: T) -> Self;
-}
+  pub trait SomeOther<T>: Sized {
+      fn from(_: T) -> Self;
+  }
 
-#[derive(Debug)]
-pub struct Foo {}
+  #[derive(Debug)]
+  pub struct Foo {}
 
-impl SomeOther<String> for Foo {
-    fn from(s: String) -> Foo {
-        return Foo{}
-    }
-}
+  impl SomeOther<String> for Foo {
+      fn from(s: String) -> Foo {
+          return Foo{}
+      }
+  }
 
-
-
-fn main() {
-    let x: Foo = SomeOther::from("foo".to_string());
-    println!("Foo! {:?}", x);
-}
+  fn main() {
+      let x: Foo = SomeOther::from("foo".to_string());
+      println!("Foo! {:?}", x);
+  }
 
 #+end_src
 
 #+RESULTS:
-: Foo! Foo
+: error: Could not compile `cargokiXxEZ`.
+
 
 * Notes
 ** Bootstrapping
