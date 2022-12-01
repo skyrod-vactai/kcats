@@ -438,6 +438,7 @@ Here are some association-related definition
       pub fn get(&self, k: &KeyItem) -> Option<&Item> {
           match self {
               Associative::Assoc(a) => a.get(k),
+              Associative::Error(e) => e.data.get(k),
               _ => None,
           }
       }
@@ -551,6 +552,7 @@ Here are some association-related definition
       fn try_from(i: Item) -> Result<Self, Error> {
           match i {
               Item::Assoc(a) => Ok(a),
+              Item::Error(e) => Ok(Associative::Error(e)),
               Item::List(l) => Ok(Associative::Assoc(Rc::new(
                   l.iter()
                       .map(|i| i.clone().try_into())
@@ -587,14 +589,12 @@ Let's put some types in their own modules, since they've got a lot of special ha
   pub struct Error {
       pub data: Association,
       pub is_handled: bool,
-      pub unwound: Option<List>,
   }
 
   impl Error {
       pub fn create(asked: List, reason: &str) -> Error {
           Error {
               is_handled: false,
-              unwound: None,
               data: Rc::new(HashMap::from([
                   ("type".into(), "error".into()),
                   ("asked".into(), Item::List(asked)),
@@ -655,12 +655,8 @@ Let's put some types in their own modules, since they've got a lot of special ha
   }
 
   impl From<Error> for Association {
-      fn from(mut e: Error) -> Association {
-          let a = Rc::make_mut(&mut e.data);
-          if let Some(u) = e.unwound {
-              a.insert("unwound".into(), Item::List(u));
-          }
-          return e.data;
+      fn from(e: Error) -> Association {
+          e.data
       }
   }
 #+end_src
@@ -1762,6 +1758,8 @@ modify the expression or dictionary and are functions of the environment.
           Item::Assoc(_) => true,
           Item::Nothing => true,
           Item::Env(_) => true,
+          Item::Error(_) => true,
+          Item::Entry(_) => true,
           Item::List(l) => Associative::try_from(Item::List(l)).is_ok(),
           _ => false,
       }))
@@ -2023,20 +2021,19 @@ modify the expression or dictionary and are functions of the environment.
                       env.push(Item::Error(Error::undefined(w)))
                   }
               }
-              Item::Entry(_) => {
+              Item::Entry(entry) => {
+                  if let Some(spec) = &entry.spec {
+                      if let Err(e) = check_input_spec(&spec, &env) {
+                          env = env.push(Item::Error(e));
+                          return env;
+                      }
+                  }
                   let expr = Rc::make_mut(&mut env.expression);
-                  let e = expr.pop_front().unwrap();
-                  if let Item::Entry(d) = e {
-                      match &d.definition {
+                  let i = expr.pop_front().unwrap();
+                  if let Item::Entry(e) = i {
+                      match e.definition {
                           def::Definition::Axiom(builtin) => {
-                              if let Some(spec) = &d.spec {
-                                  if let Err(e) = check_input_spec(&spec, &env) {
-                                      env = env.push(Item::Error(e));
-                                      return env;
-                                  }
-                              }
                               //let b = def::Axiom::try_from(env.pop_expr()).unwrap();
-
                               (builtin)(env)
                           }
                           def::Definition::Derived(d) => {
@@ -2045,6 +2042,7 @@ modify the expression or dictionary and are functions of the environment.
                           }
                       }
                   } else {
+                      // Should not ever reach here, we already know the item is an Entry
                       env
                   }
               }
@@ -2132,7 +2130,8 @@ modify the expression or dictionary and are functions of the environment.
               env.pop_expr();
               // set the is_handled bit
               e.is_handled = true;
-              e.unwound = Some(Rc::new(unwound));
+              let em = Rc::make_mut(&mut e.data);
+              em.insert("unwound".into(), Item::List(Rc::new(unwound)));
               Item::Error(e)
           }
           i => i,
@@ -2368,12 +2367,7 @@ Now we'll add the functions for parsing and emitting kcats source.
           ),
           Item::Assoc(h) => edn_format::Value::Vector(vectorize(h.clone())),
           Item::Error(err) => {
-              let mut ed = err.data.clone();
-              let e = Rc::make_mut(&mut ed);
-              if let Some(unwound) = err.unwound.clone() {
-                  e.insert("unwound".into(), Item::List(unwound));
-              }
-              edn_format::Value::Vector(vectorize(Associative::Assoc(ed)))
+              edn_format::Value::Vector(vectorize(Associative::Assoc(err.data.clone())))
           }
           Item::Env(e) => edn_format::Value::Vector(vec![
               edn_format::Value::Vector(vec![
@@ -4043,23 +4037,26 @@ but i don't know what I did with it. I know it worked quite well and I
 wanted to keep it. Need to do it again.
 
 #+begin_src kcats
-  + * 1 2 3 handle 
+  ;; there needs to be 3 numbers here to add/mult but we forgot!
+  + * 1 2 3
+  handle ;; catch the error here, stack is empty except the error
+  [5 6 7] dip ;; put numbers underneath
+  retry ;; rerun what failed before
 #+end_src
 
 #+RESULTS:
 : 
-: [[[reason "not enough items on stack"] [type error] [asked [consume]] [unwound [* 1 2 3]]]]
+: [3 2 1 65]
 
-It looks like the =+= gets popped off the expression too soon - we want it there to get unwound.
+Now put it together using the higher-level =recover=
 
 #+begin_src kcats
-+ 2
+  [+ *] [[5 6 7] dip retry] recover
 #+end_src
 
 #+RESULTS:
 : 
-: stack: [[[type error] [reason "not enough items on stack"] [asked [consume]]]]
-: expression: [2]
+: [65]
 
 *** TODO Lots of association-like objects that aren't
 Environment and Error, for example. We can't just treat it like an
