@@ -405,12 +405,12 @@ Here are some association-related definition
 #+begin_src rust :tangle src/types/associative.rs
   use crate::types::*;
 
-  type Entry = (KeyItem, Item);
+  type MapEntry = (KeyItem, Item);
 
   #[derive(Debug, Clone)]
   pub enum Associative {
       Assoc(Association),
-      Entry(def::Entry),
+      DictEntry(def::Entry),
       Env(Environment),
       Error(Error),
       Nothing,
@@ -465,7 +465,7 @@ Here are some association-related definition
       }
   }
 
-  impl TryFrom<Item> for Entry {
+  impl TryFrom<Item> for MapEntry {
       type Error = Error;
       fn try_from(i: Item) -> Result<Self, Error> {
           match i {
@@ -488,31 +488,51 @@ Here are some association-related definition
       }
   }
 
-  pub enum AssocIntoIter<'a> {
+  pub enum AssocIntoIter {
       //TODO add other struct types
-      Assoc(std::collections::hash_map::Iter<'a, KeyItem, Item>),
+      Assoc(std::collections::hash_map::IntoIter<KeyItem, Item>),
+      DictEntry(std::vec::IntoIter<MapEntry>),
   }
 
-  impl<'a> Iterator for AssocIntoIter<'a> {
-      type Item = (&'a KeyItem, &'a Item);
+  impl Iterator for AssocIntoIter {
+      type Item = MapEntry;
 
       fn next(&mut self) -> Option<Self::Item> {
           match self {
-              AssocIntoIter::Assoc(iter) => {
-                  //println!("iterator {:?}", iter);
-                  iter.next()
-              }
+              AssocIntoIter::Assoc(iter) => iter.next(),
+              AssocIntoIter::DictEntry(iter) => iter.next(),
           }
       }
   }
 
-  impl<'a> IntoIterator for &'a Associative {
-      type Item = (&'a KeyItem, &'a Item);
-      type IntoIter = AssocIntoIter<'a>;
+  impl IntoIterator for Associative {
+      type Item = MapEntry;
+      type IntoIter = AssocIntoIter;
 
-      fn into_iter(self) -> AssocIntoIter<'a> {
+      fn into_iter<'a>(self) -> AssocIntoIter {
           match self {
-              Associative::Assoc(a) => AssocIntoIter::Assoc(a.iter()),
+              Associative::Assoc(a) => {
+                  let inner = Rc::try_unwrap(a).unwrap_or_else(|rc| (*rc).clone());
+                  AssocIntoIter::Assoc(inner.into_iter())
+              }
+              Associative::DictEntry(e) => {
+                  let mut v: Vec<MapEntry> = vec![
+                      ("word".into(), Item::Word(e.word)),
+                      ("definition".into(), {
+                          match e.definition {
+                              def::Definition::Derived(l) => Item::List(l),
+                              def::Definition::Axiom(_) => "builtin-function".into(),
+                          }
+                      }),
+                  ];
+                  if let Some(e) = e.examples {
+                      v.push(("examples".into(), Item::List(e)));
+                  }
+                  if let Some(s) = e.spec {
+                      v.push(("spec".into(), Item::List(s)))
+                  }
+                  AssocIntoIter::DictEntry(v.into_iter())
+              }
               _ => panic!("can't iterate"),
           }
       }
@@ -523,7 +543,7 @@ Here are some association-related definition
           match (self, other) {
               // same types, just use their own eq
               (Associative::Assoc(i), Associative::Assoc(j)) => i == j,
-              (Associative::Entry(i), Associative::Entry(j)) => i == j,
+              (Associative::DictEntry(i), Associative::DictEntry(j)) => i == j,
               (Associative::Env(i), Associative::Env(j)) => i == j,
               (Associative::Error(i), Associative::Error(j)) => i == j,
 
@@ -568,7 +588,10 @@ Here are some association-related definition
                       .collect::<Result<HashMap<KeyItem, Item>, Error>>()?,
               ))),
               Item::Env(e) => Ok(Associative::Env(e)),
-              _ => Err(Error::expected("association (unfinished tryfrom impl)")),
+              Item::Entry(e) => Ok(Associative::DictEntry(e)),
+              i => Err(Error::expected(
+                  format!("association (unfinished tryfrom impl) {:?}", i).as_str(),
+              )),
           }
       }
   }
@@ -578,7 +601,7 @@ Here are some association-related definition
       fn try_from(l: List) -> Result<Self, Error> {
           Ok(Associative::Assoc(Rc::new(
               l.iter()
-                  .map(|i| Entry::try_from(i.clone()))
+                  .map(|i| MapEntry::try_from(i.clone()))
                   .collect::<Result<HashMap<KeyItem, Item>, Error>>()?,
           )))
       }
@@ -691,10 +714,12 @@ Let's put some types in their own modules, since they've got a lot of special ha
       Derived(List),
   }
 
+  //pub type Dictionary = HashMap<Word, Definition>;
+
   impl PartialEq for Definition {
       fn eq(&self, _: &Self) -> bool {
           // TODO actually implement this
-          false
+          true
       }
   }
 
@@ -1090,7 +1115,6 @@ modify the expression or dictionary and are functions of the environment.
               ("discard", Box::leak(Box::new(discard))),
               ("environment", Box::leak(Box::new(f_stack1(environment)))),
               ("error?", Box::leak(Box::new(f_stack1(is_error)))),
-              ("errored?", Box::leak(Box::new(f_stack1(is_errored)))),
               ("eval-step", Box::leak(Box::new(f_stack1(eval_step_outer)))),
               ("evaluate", Box::leak(Box::new(f_stack1(evaluate)))),
               ("even?", Box::leak(Box::new(f_stack1(is_even)))),
@@ -1440,7 +1464,7 @@ modify the expression or dictionary and are functions of the environment.
 
   pub fn is_list(i: Item) -> ItemResult {
       Ok(Item::from(
-          if let Item::List(_) | Item::Nothing | Item::Assoc(_) = i {
+          if let Item::List(_) | Item::Nothing | Item::Assoc(_) | Item::Entry(_) = i {
               true
           } else {
               false
@@ -1578,13 +1602,13 @@ modify the expression or dictionary and are functions of the environment.
       }
   }
 
-  fn boolean_value(b: bool) -> Item {
-      if b {
-          "true".into()
-      } else {
-          Item::Nothing
-      }
-  }
+  // fn boolean_value(b: bool) -> Item {
+  //     if b {
+  //         "true".into()
+  //     } else {
+  //         Item::Nothing
+  //     }
+  // }
 
   pub fn branch(mut env: Environment) -> Environment {
       match (List::try_from(env.pop()), List::try_from(env.pop())) {
@@ -2109,26 +2133,6 @@ modify the expression or dictionary and are functions of the environment.
       return None;
   }
 
-  fn is_unhandlable_error(env: &Environment, err: &Error) -> bool {
-      if !err.is_handled {
-          let w: &Item = &"handle".into();
-          return !env.expression.contains(w);
-      }
-      return false;
-  }
-
-  /// Takes an env on ToS and replaces it with whether there's an
-  /// unhandlable error on its ToS. Only for use with nested
-  /// environments.
-  pub fn is_errored(i: Item) -> ItemResult {
-      let env = Environment::try_from(i)?;
-      Ok(boolean_value(if let Some(err) = get_error(&env) {
-          is_unhandlable_error(&env, err)
-      } else {
-          false
-      }))
-  }
-
   fn unwind(mut env: Environment) -> Environment {
       let err = env.pop();
       let w: &Item = &"handle".into();
@@ -2142,7 +2146,9 @@ modify the expression or dictionary and are functions of the environment.
                   unwound.push_back(i);
                   next = env.expression.front();
               }
-              env.pop_expr();
+              if next.is_some() {
+                  env.pop_expr();
+              }
               // set the is_handled bit
               e.is_handled = true;
               let em = Rc::make_mut(&mut e.data);
@@ -2158,13 +2164,9 @@ modify the expression or dictionary and are functions of the environment.
   pub fn eval(mut env: Environment) -> Environment {
       loop {
           if let Some(err) = get_error(&env) {
-              if is_unhandlable_error(&env, err) {
-                  break;
-              } else {
-                  if !err.is_handled {
-                      env = unwind(env); // TODO: this should be done in eval_step
-                  };
-              }
+              if !err.is_handled {
+                  env = unwind(env); // TODO: this should be done in eval_step
+              };
           }
           if !env.expression.is_empty() {
               env = eval_step(env);
@@ -2204,7 +2206,7 @@ modify the expression or dictionary and are functions of the environment.
       let mut env = standard_env(expression, stack);
       if let Some(d) = dictionary {
           let edmut = Rc::make_mut(&mut env.dictionary);
-          for (k, v) in &d {
+          for (k, v) in d {
               List::try_from(v.clone())
                   .and_then(Associative::try_from)
                   .and_then(|h| {
