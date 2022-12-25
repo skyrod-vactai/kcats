@@ -49,6 +49,7 @@ Let's start by defining some data structures in a separate module
   use crate::pipes::{In, Out, Tunnel};
   use crate::types::associative::Associative;
   use crate::types::dictionary as def;
+  use crate::types::environment as env;
   use crate::types::error::Error;
   use internment::Intern;
   use lazy_static::lazy_static;
@@ -59,6 +60,7 @@ Let's start by defining some data structures in a separate module
 
   pub mod associative;
   pub mod dictionary;
+  pub mod environment;
   pub mod error;
 
   pub type Word = Intern<String>;
@@ -115,7 +117,7 @@ Let's start by defining some data structures in a separate module
       Assoc(Associative),
       //Seq(Sequence),
       List(List),
-      Env(Environment),
+      Env(env::Environment),
       Entry(def::Entry),
       Error(Error),
       In(Box<dyn In>),
@@ -136,14 +138,7 @@ Let's start by defining some data structures in a separate module
 
   pub type Dictionary = Association;
 
-  #[derive(Clone, PartialEq)]
-  pub struct Environment {
-      pub stack: Stack,
-      pub expression: Stack,
-      pub dictionary: Dictionary,
-  }
-
-  pub type StepFn = dyn Fn(Environment) -> Environment;
+  pub type StepFn = dyn Fn(env::Environment) -> env::Environment;
 
   impl PartialEq for Item {
       fn eq(&self, other: &Self) -> bool {
@@ -174,34 +169,6 @@ Let's start by defining some data structures in a separate module
               //TODO Definition, Associative etc
               _ => false,
           }
-      }
-  }
-
-  impl Environment {
-      pub fn push(mut self, i: Item) -> Environment {
-          Rc::make_mut(&mut self.stack).push_front(i);
-          self
-      }
-
-      pub fn pop(&mut self) -> Item {
-          Rc::make_mut(&mut self.stack).pop_front().unwrap()
-      }
-
-      pub fn push_expr(mut self, i: Item) -> Environment {
-          Rc::make_mut(&mut self.expression).push_front(i);
-          self
-      }
-
-      pub fn pop_expr(&mut self) -> Item {
-          Rc::make_mut(&mut self.expression).pop_front().unwrap()
-      }
-
-      pub fn append_expression(mut self, items: List) -> Environment {
-          let expr = Rc::make_mut(&mut self.expression);
-          let ct = expr.len();
-          expr.append(Rc::make_mut(&mut items.clone()));
-          expr.rotate_left(ct);
-          self
       }
   }
 
@@ -283,17 +250,6 @@ Let's start by defining some data structures in a separate module
   //     }
   // }
 
-  impl TryFrom<Item> for Environment {
-      type Error = Error;
-      fn try_from(i: Item) -> Result<Self, Self::Error> {
-          if let Item::Env(i) = i {
-              Ok(i)
-          } else {
-              Err(Error::expected("environment"))
-          }
-      }
-  }
-
   impl TryFrom<Item> for Box<dyn In> {
       type Error = Error;
       fn try_from(i: Item) -> Result<Self, Self::Error> {
@@ -338,12 +294,6 @@ Let's start by defining some data structures in a separate module
   //         Rc::new(a)
   //     }
   // }
-
-  impl From<Environment> for Item {
-      fn from(env: Environment) -> Item {
-          Item::Env(Environment::from(env))
-      }
-  }
 
   impl From<std::io::Error> for Error {
       fn from(err: std::io::Error) -> Error {
@@ -403,6 +353,7 @@ Let's start by defining some data structures in a separate module
 
 Here are some association-related definition
 #+begin_src rust :tangle src/types/associative.rs
+  use crate::types::environment as env;
   use crate::types::*;
 
   type MapEntry = (KeyItem, Item);
@@ -411,7 +362,7 @@ Here are some association-related definition
   pub enum Associative {
       Assoc(Association),
       DictEntry(def::Entry),
-      Env(Environment),
+      Env(env::Environment),
       Error(Error),
       Nothing,
   }
@@ -803,6 +754,97 @@ Let's put some types in their own modules, since they've got a lot of special ha
       }
   }
 #+end_src
+
+#+begin_src rust :tangle src/types/environment.rs
+  use crate::axiom;
+  use crate::types::*;
+
+  #[derive(Clone, PartialEq)]
+  pub struct Environment {
+      pub stack: Stack,
+      pub expression: Stack,
+      pub dictionary: Dictionary,
+  }
+
+  impl Environment {
+      pub fn push(mut self, i: Item) -> Environment {
+          Rc::make_mut(&mut self.stack).push_front(i);
+          self
+      }
+
+      pub fn pop(&mut self) -> Item {
+          Rc::make_mut(&mut self.stack).pop_front().unwrap()
+      }
+
+      pub fn push_expr(mut self, i: Item) -> Environment {
+          Rc::make_mut(&mut self.expression).push_front(i);
+          self
+      }
+
+      pub fn pop_expr(&mut self) -> Item {
+          Rc::make_mut(&mut self.expression).pop_front().unwrap()
+      }
+
+      pub fn append_expression(mut self, items: List) -> Environment {
+          let expr = Rc::make_mut(&mut self.expression);
+          let ct = expr.len();
+          expr.append(Rc::make_mut(&mut items.clone()));
+          expr.rotate_left(ct);
+          self
+      }
+  }
+
+  impl From<Associative> for Environment {
+      fn from(envm: Associative) -> Self {
+          let (envm, stack) = envm.remove(&"stack".into());
+          let (envm, expression) = envm.remove(&"expression".into());
+          let (_, dictionary) = envm.remove(&"dictionary".into());
+          let stack = stack
+              .and_then(|s| List::try_from(s).ok())
+              .or(Some(List::new(ListContent::new())));
+          let expression = expression
+              .and_then(|s| List::try_from(s).ok())
+              .or(Some(List::new(ListContent::new())));
+          let dictionary = dictionary.and_then(|d| Associative::try_from(d).ok());
+          let mut env = axiom::standard_env(expression, stack);
+          if let Some(d) = dictionary {
+              let edmut = Rc::make_mut(&mut env.dictionary);
+              for (k, v) in d {
+                  List::try_from(v.clone())
+                      .and_then(Associative::try_from)
+                      .and_then(|h| {
+                          edmut.insert(k.clone(), Item::Entry(def::Entry::try_from(h).unwrap()));
+                          Ok(())
+                      })
+                      .ok();
+              }
+          }
+          println!("got env {:?}", env);
+          env
+      }
+  }
+
+  impl TryFrom<Item> for Environment {
+      type Error = Error;
+      fn try_from(i: Item) -> Result<Self, Self::Error> {
+          match i {
+              Item::Env(e) => Ok(e),
+              Item::List(l) => {
+                  let a: Associative = l.try_into()?;
+                  Ok(a.into())
+              }
+              Item::Assoc(a) => Ok(a.into()),
+              _ => Err(Error::expected("environment")),
+          }
+      }
+  }
+
+  impl From<Environment> for Item {
+      fn from(env: Environment) -> Item {
+          Item::Env(Environment::from(env))
+      }
+  }
+#+end_src
 Next is the top level functions, including =main=, how to evaluate
 kcats ASTs, later we'll put command line options here.
 
@@ -813,6 +855,7 @@ kcats ASTs, later we'll put command line options here.
   mod axiom;
   mod pipes;
   mod serialize;
+  use crate::types::environment::Environment;
   use std::io;
   use std::io::BufRead;
 
@@ -1018,6 +1061,7 @@ modify the expression or dictionary and are functions of the environment.
   use super::serialize;
   use crate::types::associative::Associative;
   use crate::types::dictionary as def;
+  use crate::types::environment::Environment;
   use crate::types::error::Error;
 
   use crate::types::*;
@@ -2192,31 +2236,7 @@ modify the expression or dictionary and are functions of the environment.
   }
 
   fn environment(p: Item) -> ItemResult {
-      let envm = Associative::try_from(p).unwrap();
-      let (envm, stack) = envm.remove(&"stack".into());
-      let (envm, expression) = envm.remove(&"expression".into());
-      let (_, dictionary) = envm.remove(&"dictionary".into());
-      let stack = stack
-          .and_then(|s| List::try_from(s).ok())
-          .or(Some(List::new(ListContent::new())));
-      let expression = expression
-          .and_then(|s| List::try_from(s).ok())
-          .or(Some(List::new(ListContent::new())));
-      let dictionary = dictionary.and_then(|d| Associative::try_from(d).ok());
-      let mut env = standard_env(expression, stack);
-      if let Some(d) = dictionary {
-          let edmut = Rc::make_mut(&mut env.dictionary);
-          for (k, v) in d {
-              List::try_from(v.clone())
-                  .and_then(Associative::try_from)
-                  .and_then(|h| {
-                      edmut.insert(k.clone(), Item::Entry(def::Entry::try_from(h).unwrap()));
-                      Ok(())
-                  })
-                  .ok();
-          }
-      }
-      Ok(Item::Env(env))
+      Ok(Item::Env(p.try_into()?))
   }
 
   pub fn eval_step_outer(env: Item) -> ItemResult {
@@ -2294,6 +2314,7 @@ Now we'll add the functions for parsing and emitting kcats source.
 #+begin_src rust :tangle src/serialize.rs
   extern crate edn_format;
   use crate::types::associative::Associative;
+  use crate::types::environment::Environment;
   use crate::types::error::Error;
   use crate::types::*;
   use base64;
@@ -2459,8 +2480,9 @@ Now we'll add the functions that do input/output (pipes)
 
 #+begin_src rust :tangle src/pipes.rs
   use crate::axiom::ItemResult;
+  use crate::types::environment::Environment;
   use crate::types::error::Error;
-  use crate::types::{Environment, Item};
+  use crate::types::Item;
   use crate::ListContent;
   use dyn_clone::DynClone;
   use std::fmt::Debug;
@@ -3630,6 +3652,27 @@ pull from a dictionary on the stack instead of the builtin one, and
 =extend= will modify that dict.
 
 Another approach would be for =execute= to
+*** DONE Move environment stuff into own module
+#+begin_src kcats :results code
+  [[expression [1 2 3]]] environment 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+{ stack: [], expression: [[[expression [1 2 3]]] environment] }
+{ stack: [[[expression [1 2 3]]]], expression: [environment] }
+
+[[[stack []] [expression [1 2 3]]]]
+#+end_src
+
+#+begin_src kcats
+1 2 +
+#+end_src
+
+#+RESULTS:
+: 
+: [3]
+
 * Notes
 ** Bootstrapping
 + Builtin words need to exist *before* the derived words are read from
