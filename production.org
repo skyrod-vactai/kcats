@@ -752,10 +752,10 @@ Let's put some types in their own modules, since they've got a lot of special ha
   impl TryFrom<Item> for Entry {
       type Error = Error;
       fn try_from(i: Item) -> Result<Self, Self::Error> {
-          if let Item::Entry(b) = i {
-              Ok(b)
-          } else {
-              Err(Error::expected("Definition"))
+          match i {
+              Item::Entry(e) => Ok(e),
+              Item::Assoc(a) => a.try_into(),
+              _ => Err(Error::expected("Definition")),
           }
       }
   }
@@ -1245,6 +1245,7 @@ modify the expression or dictionary and are functions of the environment.
               ("range", Box::leak(Box::new(range))),
               ("read", Box::leak(Box::new(read))),
               ("recur", Box::leak(Box::new(recur))),
+              ("redefine", Box::leak(Box::new(redefine))),
               ("rest", Box::leak(Box::new(f_stack1(rest)))),
               ("resume", Box::leak(Box::new(identity))),
               ("reverse", Box::leak(Box::new(f_stack1(reverse)))),
@@ -2114,8 +2115,9 @@ modify the expression or dictionary and are functions of the environment.
           match val {
               Item::Word(word) => {
                   if let Some(dfn) = env.dictionary.get(&KeyItem::Word(*word)) {
-                      match dfn {
-                          Item::Entry(d) => {
+                      match dict::Entry::try_from(dfn.clone()) {
+                          // TODO: remove this clone ^
+                          Ok(d) => {
                               if let Some(spec) = &d.spec {
                                   if let Err(e) = check_input_spec(&spec, &env) {
                                       env = env.push(Item::Error(e));
@@ -2141,10 +2143,7 @@ modify the expression or dictionary and are functions of the environment.
                                   }
                               }
                           }
-                          _ => {
-                              let w = *word;
-                              env.push(Item::Error(Error::undefined(w)))
-                          }
+                          Err(e) => env.push(Item::Error(e)),
                       }
                   } else {
                       let w = *word;
@@ -2359,6 +2358,20 @@ modify the expression or dictionary and are functions of the environment.
       let mut e: Error = e.try_into().unwrap();
       e.is_handled = false;
       Err(e)
+  }
+
+  pub fn redefine(mut env: Environment) -> Environment {
+      let d = Associative::try_from(env.pop()).unwrap();
+      match d {
+          Associative::Assoc(a) => {
+              env.dictionary = a;
+              env
+          }
+          _ => {
+              env = env.push(Item::Error(Error::expected("dictionary")));
+              env
+          }
+      }
   }
 #+end_src
 
@@ -3767,8 +3780,45 @@ it. =update= should help.
 keeping dictionaries on the stack, in other words =execute= will always
 pull from a dictionary on the stack instead of the builtin one, and
 =extend= will modify that dict.
+**** Implementation
+It seems viable that we could use the stack to hold dictionary changes.
 
-Another approach would be for =execute= to
+We'd have to retain a copy of the original dictionary to restore later.
+
+An axiom word like =definitions= or something that sets the dictionary
+to ToS would help. I think the rest could be pure kcats.
+
+it'd be something like:
+
+#+begin_src kcats :results code
+  [[square] [[definition [clone *]]
+             [word square]
+             [spec [[number] [number]]]] association assign];; ops-dict
+  [9 square];; program-to-run
+  dictionary ;; fetch the dictionary
+  sink ;; p o d
+  [clone] dipdown ;; p o d d
+  [execute] dip ;; n=new-dict p n d
+  float ;; d p n
+  swapdown ;; d n p
+  [redefine ;; p
+   execute]
+  dip ;; d
+  redefine
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+81
+#+end_src
+
+A few problems remaining above:
+- [ ] Need to specify the word inside the definition.
+- [ ] Need to explicitly convert the definition to an association.
+
+But I think this proves the concept.
+
+Probably want to eventually make a rust implementation.
 *** DONE Move environment stuff into own module
 #+begin_src kcats :results code
   [[expression [1 2 3]]] environment 
