@@ -271,6 +271,16 @@ Let's start by defining some data structures in a separate module
       }
   }
 
+  impl TryFrom<KeyItem> for Word {
+      type Error = Error;
+      fn try_from(k: KeyItem) -> Result<Self, Self::Error> {
+          match k {
+              KeyItem::Word(w) => Ok(w.clone()),
+              _ => Err(Error::expected("word")),
+          }
+      }
+  }
+
   // As there are no real booleans, we use the word 'true' but literally
   // any value except the empty list is truthy. If we read a value
   // 'false' in edn, that's not actually a boolean, it's just the
@@ -576,7 +586,8 @@ Here are some association-related definition
 Let's put some types in their own modules, since they've got a lot of special handling.
 #+begin_src rust :tangle src/types/error.rs
   use crate::types;
-  use crate::types::{Association, Int, Item, List, ListContent, Word};
+  use crate::types::associative as assoc;
+  use crate::types::{Association, Int, Item, KeyItem, List, ListContent, Word};
   use std::collections::HashMap;
   use std::rc::Rc;
 
@@ -652,6 +663,38 @@ Let's put some types in their own modules, since they've got a lot of special ha
   impl From<Error> for Association {
       fn from(e: Error) -> Association {
           e.data
+      }
+  }
+
+  impl TryFrom<Item> for Error {
+      type Error = Error;
+      fn try_from(i: Item) -> Result<Self, Self::Error> {
+          match i {
+              Item::List(l) => Item::Assoc(assoc::Associative::try_from(l)?).try_into(),
+              Item::Error(e) => Ok(e),
+              Item::Assoc(a) => a.try_into(),
+              _ => Err(Error::expected("error")),
+          }
+      }
+  }
+
+  impl TryFrom<assoc::Associative> for Error {
+      type Error = Error;
+      fn try_from(a: assoc::Associative) -> Result<Self, Self::Error> {
+          match a {
+              assoc::Associative::Error(e) => Ok(e),
+              assoc::Associative::Assoc(a) => {
+                  if a.get(&KeyItem::from("type")) != Some(&Item::from("error")) {
+                      Err(Error::expected("error"))
+                  } else {
+                      Ok(Error {
+                          data: a.clone(),
+                          is_handled: true,
+                      })
+                  }
+              }
+              _ => Err(Error::expected("error")),
+          }
       }
   }
 #+end_src
@@ -1071,7 +1114,7 @@ modify the expression or dictionary and are functions of the environment.
 #+begin_src rust :tangle src/axiom.rs
   use super::serialize;
   use crate::types::associative::Associative;
-  use crate::types::dictionary as def;
+  use crate::types::dictionary as dict;
   use crate::types::environment::Environment;
   use crate::types::error::Error;
 
@@ -1123,7 +1166,7 @@ modify the expression or dictionary and are functions of the environment.
       let dm = Rc::make_mut(&mut d);
       for (w, f) in updates {
           dm.entry(w.into()).and_modify(|e| match e {
-              Item::Entry(e) => e.definition = def::Definition::Axiom(f),
+              Item::Entry(e) => e.definition = dict::Definition::Axiom(f),
               _ => {}
           });
       }
@@ -1175,6 +1218,7 @@ modify the expression or dictionary and are functions of the environment.
               ("even?", Box::leak(Box::new(f_stack1(is_even)))),
               ("evert", Box::leak(Box::new(evert))),
               ("execute", Box::leak(Box::new(execute))),
+              ("fail", Box::leak(Box::new(f_stack1(fail)))),
               (
                   "file-in",
                   Box::leak(Box::new(f_stack1(crate::pipes::fs::file_in))),
@@ -1239,7 +1283,7 @@ modify the expression or dictionary and are functions of the environment.
               for (k, def) in vitems.into_iter() {
                   //println!("Reading {:?}", k);
                   let h: Associative = List::try_from(def.clone()).unwrap().try_into().unwrap();
-                  let word = as_word(k.clone()).unwrap();
+                  let word: Word = k.try_into().unwrap();
                   let newdef = to_lexicon_entry(word, h);
                   let newdef2 = newdef.clone();
                   let dict = Rc::make_mut(&mut env.dictionary);
@@ -1264,8 +1308,8 @@ modify the expression or dictionary and are functions of the environment.
       let d = Rc::make_mut(&mut env.dictionary);
       d.insert(
           "derivations".into(),
-          Item::Entry(def::Entry {
-              definition: def::Definition::Derived(Rc::new(ListContent::from_iter([
+          Item::Entry(dict::Entry {
+              definition: dict::Definition::Derived(Rc::new(ListContent::from_iter([
                   //Item::Word(*S_LIST),
                   Item::Assoc(Associative::Assoc(Rc::new(AssociationContent::new()))),
               ]))),
@@ -1744,14 +1788,7 @@ modify the expression or dictionary and are functions of the environment.
       env.push(Item::List(l))
   }
 
-  fn as_word(i: KeyItem) -> Option<Word> {
-      match i {
-          KeyItem::Word(w) => Some(w.clone()),
-          _ => None,
-      }
-  }
-
-  fn to_lexicon_entry(w: Word, def: Associative) -> def::Entry {
+  fn to_lexicon_entry(w: Word, def: Associative) -> dict::Entry {
       let (def, _) = def.insert("word".into(), Item::Word(w));
       def.try_into().unwrap()
   }
@@ -2091,14 +2128,14 @@ modify the expression or dictionary and are functions of the environment.
                               expr.pop_front();
 
                               match &d.definition {
-                                  def::Definition::Axiom(a) => {
+                                  dict::Definition::Axiom(a) => {
                                       // we can't keep borrowing the env, so we
                                       // clone the axiom def to release it and then
                                       // we can pass the env to the axiom def fn
                                       let f = a.clone();
                                       (f)(env)
                                   }
-                                  def::Definition::Derived(d) => {
+                                  dict::Definition::Derived(d) => {
                                       let items = d.clone();
                                       env.append_expression(items)
                                   }
@@ -2125,11 +2162,11 @@ modify the expression or dictionary and are functions of the environment.
                   let i = expr.pop_front().unwrap();
                   if let Item::Entry(e) = i {
                       match e.definition {
-                          def::Definition::Axiom(builtin) => {
-                              //let b = def::Axiom::try_from(env.pop_expr()).unwrap();
+                          dict::Definition::Axiom(builtin) => {
+                              //let b = dict::Axiom::try_from(env.pop_expr()).unwrap();
                               (builtin)(env)
                           }
-                          def::Definition::Derived(d) => {
+                          dict::Definition::Derived(d) => {
                               let d = d.clone();
                               env.append_expression(d)
                           }
@@ -2291,13 +2328,13 @@ modify the expression or dictionary and are functions of the environment.
       }
   }
 
-  // fn inscription(env: &mut Environment) -> Result<(Word, def::Entry), Error> {
+  // fn inscription(env: &mut Environment) -> Result<(Word, dict::Entry), Error> {
   //     let d = env.pop();
   //     let mut wl = List::try_from(env.pop())?;
   //     let w1 = Rc::make_mut(&mut wl).pop_front();
   //     let x = w1.ok_or(Error::short_list(1))?;
   //     let w = Word::try_from(x.clone())?;
-  //     Ok((w, def::Entry::try_from(d)?))
+  //     Ok((w, dict::Entry::try_from(d)?))
   // }
 
   // pub fn inscribe(mut env: Environment) -> Environment {
@@ -2316,6 +2353,12 @@ modify the expression or dictionary and are functions of the environment.
   // itself onto the stack.
   pub fn true_(env: Environment) -> Environment {
       env.push("true".into())
+  }
+
+  pub fn fail(e: Item) -> ItemResult {
+      let mut e: Error = e.try_into().unwrap();
+      e.is_handled = false;
+      Err(e)
   }
 #+end_src
 
@@ -3069,8 +3112,17 @@ pipe could take an optional transform. Clojure.core.async channels do this.
 Maybe the first thing to do is implement transducers?
 
 
-*** TODO 'Fail' is not defined
+*** DONE 'Fail' is not defined
 We need to be able to throw our own errors (eg lookup tries to do this)
+
+#+begin_src kcats
+1 2 [1 "two" +] [fail] recover 3 4 
+#+end_src
+
+#+RESULTS:
+: converting to error: Error([[type error] [asked [number]] [unwound [+]] [reason "type mismatch"]])
+: [[type error] [asked [number]] [unwound [3 4]] [reason "type mismatch"]] 2 1
+
 *** TODO 'dictionary' doesn't allow access to the data inside definitions
 The definition is just shown as the word itself and we can't access
 spec, definition etc.
@@ -3624,6 +3676,13 @@ enum Bar<'a> { Int(i32), Foo(&'a dyn Foo), Quux(&'a Quux) }
 #+begin_src kcats
 true
 #+end_src
+
+#+begin_src kcats
+dictionary [fail] lookup
+#+end_src
+
+#+RESULTS:
+: [[spec [[string] [*]]] [definition []]]
 
 *** TODO scoping of dictionary entries
 The original design was to have the dictionary be a single atomic data
