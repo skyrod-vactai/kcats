@@ -780,6 +780,7 @@ Let's put some types in their own modules, since they've got a lot of special ha
   impl TryFrom<Associative> for Entry {
       type Error = Error;
       fn try_from(d: Associative) -> Result<Self, Error> {
+          //println!("got {:?}", d);
           // TODO: This should handle cases where there's no def present
           // and return error
           let (d, def) = d.remove(&"definition".into());
@@ -805,6 +806,14 @@ Let's put some types in their own modules, since they've got a lot of special ha
               examples: examples.and_then(|i| List::try_from(i).ok()),
               spec: spec.and_then(|i| List::try_from(i).ok()),
           })
+      }
+  }
+
+  impl TryFrom<List> for Entry {
+      type Error = Error;
+      fn try_from(l: List) -> Result<Self, Error> {
+          let a: Associative = l.try_into()?;
+          a.try_into()
       }
   }
 #+end_src
@@ -873,7 +882,6 @@ Let's put some types in their own modules, since they've got a lot of special ha
                       .ok();
               }
           }
-          println!("got env {:?}", env);
           env
       }
   }
@@ -2360,13 +2368,42 @@ modify the expression or dictionary and are functions of the environment.
       Err(e)
   }
 
+  fn normalize_dictionary(mut d: Dictionary) -> Result<Dictionary, Error> {
+      let dm = Rc::make_mut(&mut d);
+      for (k, v) in dm.iter_mut() {
+          match v {
+              Item::Assoc(a) => {
+                  let aa = a.clone();
+                  let (aa, _) = aa.insert("word".into(), Item::try_from(k.clone()).unwrap());
+                  ,*v = Item::Assoc(Associative::DictEntry(aa.try_into()?))
+              }
+              Item::List(l) => {
+                  let a: Associative = l.clone().try_into()?;
+                  let (a, _) = a.insert("word".into(), Item::try_from(k.clone()).unwrap());
+                  ,*v = Item::Assoc(Associative::DictEntry(a.try_into()?))
+              }
+              Item::Entry(_) => {}
+              x => {
+                  println!("oh no {:?}", x);
+                  return Err(Error::expected("dictionary"));
+              }
+          }
+      }
+      Ok(d)
+  }
   pub fn redefine(mut env: Environment) -> Environment {
       let d = Associative::try_from(env.pop()).unwrap();
       match d {
-          Associative::Assoc(a) => {
-              env.dictionary = a;
-              env
-          }
+          Associative::Assoc(a) => match normalize_dictionary(a) {
+              Ok(d) => {
+                  env.dictionary = d;
+                  env
+              }
+              Err(e) => {
+                  env = env.push(Item::Error(e));
+                  env
+              }
+          },
           _ => {
               env = env.push(Item::Error(Error::expected("dictionary")));
               env
@@ -3790,10 +3827,10 @@ to ToS would help. I think the rest could be pure kcats.
 
 it'd be something like:
 
-#+begin_src kcats :results code
+#+begin_src kcats 
   [[square] [[definition [clone *]]
-             [word square]
-             [spec [[number] [number]]]] association assign];; ops-dict
+            ; [word square]
+             [spec [[number] [number]]]] assign];; ops-dict
   [9 square];; program-to-run
   dictionary ;; fetch the dictionary
   sink ;; p o d
@@ -3808,9 +3845,6 @@ it'd be something like:
 #+end_src
 
 #+RESULTS:
-#+begin_src kcats
-81
-#+end_src
 
 A few problems remaining above:
 - [ ] Need to specify the word inside the definition.
