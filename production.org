@@ -1003,7 +1003,7 @@ kcats ASTs, later we'll put command line options here.
   fn main() {
       let program = get_stdin();
       let mut env = axiom::standard_env(None, None);
-      let parse_result = serialize::parse(program, Some(&env.dictionary));
+      let parse_result = serialize::parse(program);
       match parse_result {
           Ok(mut program) => {
               let expr = Rc::make_mut(&mut env.expression);
@@ -1341,7 +1341,7 @@ modify the expression or dictionary and are functions of the environment.
   pub fn read_lexicon_file(filename: &str, mut env: Environment) -> Environment {
       match fs::read_to_string(filename) {
           Ok(s) => {
-              let items = serialize::parse(s, Some(&env.dictionary)).unwrap();
+              let items = serialize::parse(s).unwrap();
               let vitems: Associative = List::from(items).try_into().unwrap();
               //println!("Items {:?}", vitems);
 
@@ -2016,7 +2016,7 @@ modify the expression or dictionary and are functions of the environment.
 
   pub fn read(mut env: Environment) -> Environment {
       let s = String::try_from(env.pop()).unwrap();
-      let parsed = serialize::parse(s, Some(&env.dictionary));
+      let parsed = serialize::parse(s);
       env.push(match parsed {
           Ok(l) => Item::List(l),
           Err(e) => Item::Error(e),
@@ -2469,12 +2469,10 @@ Now we'll add the functions for parsing and emitting kcats source.
 #+begin_src rust :tangle src/serialize.rs
   extern crate edn_format;
   use crate::types::associative::Associative;
-  use crate::types::dictionary as dict;
   use crate::types::environment::Environment;
   use crate::types::error::Error;
   use crate::types::*;
   use base64;
-  use internment::Intern;
   use std::collections::VecDeque;
   use std::fmt;
   use std::rc::Rc;
@@ -2483,35 +2481,18 @@ Now we'll add the functions for parsing and emitting kcats source.
       fn representation(&self) -> Item;
   }
 
-  fn lookup_builtin(w: Word, standard_dictionary: Option<&dict::Dictionary>) -> Item {
-      if let Some(dict) = standard_dictionary {
-          //println!("Looking up {} in dict of {} words", w, dict.len());
-          if let Some(def) = dict.get(&w) {
-              let mut aa = def.clone();
-              aa.serialize = false;
-              return Item::Entry(aa);
-          }
-      }
-      return Item::Word(w);
-  }
   const BYTE_TAG: &str = "b64";
 
-  fn to_item(
-      item: &edn_format::Value,
-      standard_dictionary: Option<&dict::Dictionary>,
-  ) -> Result<Item, Error> {
+  fn to_item(item: &edn_format::Value) -> Result<Item, Error> {
       //println!("to item {:?}", item);
       match item {
           edn_format::Value::Integer(i) => Ok(Item::Int(*i)),
           edn_format::Value::Vector(v) => Ok(Item::List(Rc::new(
               v.iter()
-                  .map(|i| to_item(i, standard_dictionary))
+                  .map(|i| to_item(i))
                   .collect::<Result<VecDeque<Item>, Error>>()?,
           ))),
-          edn_format::Value::Symbol(s) => Ok(lookup_builtin(
-              Intern::new(s.name().to_string()),
-              standard_dictionary,
-          )),
+          edn_format::Value::Symbol(s) => Ok(Item::Word(s.to_string().into())),
           // we don't have booleans in kcats, so if we see 'false' that
           // is the word false which is not defined in the base
           // language, but might be user-defined later.
@@ -2588,12 +2569,12 @@ Now we'll add the functions for parsing and emitting kcats source.
       }
   }
 
-  pub fn parse(s: String, standard_dictionary: Option<&dict::Dictionary>) -> Result<List, Error> {
+  pub fn parse(s: String) -> Result<List, Error> {
       let parser = edn_format::Parser::from_iter(s.chars(), edn_format::ParserOptions::default());
       Ok(Rc::new(
           parser
               .map(move |r| match r {
-                  Ok(expr) => Ok(to_item(&expr, standard_dictionary)?),
+                  Ok(expr) => Ok(to_item(&expr)?),
                   Err(_) => Err(Error::parse("Invalid edn")),
               })
               .collect::<Result<ListContent, Error>>()?,
@@ -2601,7 +2582,7 @@ Now we'll add the functions for parsing and emitting kcats source.
   }
 
   pub fn to_list(s: &str) -> List {
-      parse(s.to_string(), None).unwrap()
+      parse(s.to_string()).unwrap()
   }
 
   pub fn emit(item: &Item) -> String {
