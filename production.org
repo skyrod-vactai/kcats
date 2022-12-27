@@ -48,7 +48,7 @@ Let's start by defining some data structures in a separate module
 #+begin_src rust :tangle src/types.rs
   use crate::pipes::{In, Out, Tunnel};
   use crate::types::associative::Associative;
-  use crate::types::dictionary as def;
+  use crate::types::dictionary as dict;
   use crate::types::environment as env;
   use crate::types::error::Error;
   use internment::Intern;
@@ -118,7 +118,8 @@ Let's start by defining some data structures in a separate module
       //Seq(Sequence),
       List(List),
       Env(env::Environment),
-      Entry(def::Entry),
+      Entry(dict::Entry),
+      Dictionary(dict::Dictionary),
       Error(Error),
       In(Box<dyn In>),
       Out(Box<dyn Out>),
@@ -135,8 +136,6 @@ Let's start by defining some data structures in a separate module
       List(VecDeque<KeyItem>),
       Nothing,
   }
-
-  pub type Dictionary = Association;
 
   pub type StepFn = dyn Fn(env::Environment) -> env::Environment;
 
@@ -359,6 +358,10 @@ Let's start by defining some data structures in a separate module
           Item::Word(Word::from(i))
       }
   }
+
+  pub fn rc_inner<T: Clone>(r: &Rc<T>) -> T {
+      Rc::try_unwrap(r.clone()).unwrap_or_else(|rc| (*rc).clone())
+  }
 #+end_src
 
 Here are some association-related definition
@@ -372,9 +375,10 @@ Here are some association-related definition
   #[derive(Debug, Clone)]
   pub enum Associative {
       Assoc(Association),
-      DictEntry(def::Entry),
+      DictEntry(dict::Entry),
       Env(env::Environment),
       Error(Error),
+      Dictionary(dict::Dictionary),
       Nothing,
   }
 
@@ -405,7 +409,7 @@ Here are some association-related definition
                   KeyItem::Word(s) => match s.as_str() {
                       "stack" => Some(Item::List(e.stack.clone())),
                       "expression" => Some(Item::List(e.expression.clone())),
-                      "dictionary" => Some(Item::Assoc(Associative::Assoc(e.dictionary.clone()))),
+                      "dictionary" => Some(Item::Dictionary(e.dictionary.clone())),
                       _ => None,
                   },
                   _ => None,
@@ -486,17 +490,14 @@ Here are some association-related definition
 
       fn into_iter<'a>(self) -> AssocIntoIter {
           match self {
-              Associative::Assoc(a) => {
-                  let inner = Rc::try_unwrap(a).unwrap_or_else(|rc| (*rc).clone());
-                  AssocIntoIter::Assoc(inner.into_iter())
-              }
+              Associative::Assoc(a) => AssocIntoIter::Assoc(rc_inner(&a).into_iter()),
               Associative::DictEntry(e) => {
                   let mut v: Vec<MapEntry> = vec![
                       ("word".into(), Item::Word(e.word)),
                       ("definition".into(), {
                           match e.definition {
-                              def::Definition::Derived(l) => Item::List(l),
-                              def::Definition::Axiom(_) => "builtin-function".into(),
+                              dict::Definition::Derived(l) => Item::List(l),
+                              dict::Definition::Axiom(_) => "builtin-function".into(),
                           }
                       }),
                   ];
@@ -700,6 +701,7 @@ Let's put some types in their own modules, since they've got a lot of special ha
 #+end_src
 
 #+begin_src rust :tangle src/types/dictionary.rs
+  use crate::types::associative as assoc;
   use crate::types::*;
 
   #[derive(Debug, Clone)]
@@ -713,13 +715,13 @@ Let's put some types in their own modules, since they've got a lot of special ha
       pub definition: Definition,
   }
 
+  pub type Dictionary = Rc<HashMap<Word, Entry>>;
+
   #[derive(Clone)]
   pub enum Definition {
       Axiom(&'static StepFn),
       Derived(List),
   }
-
-  //pub type Dictionary = HashMap<Word, Definition>;
 
   impl PartialEq for Definition {
       fn eq(&self, _: &Self) -> bool {
@@ -792,12 +794,12 @@ Let's put some types in their own modules, since they've got a lot of special ha
               word: word.unwrap().try_into()?,
               serialize: true,
               definition: if let Some(d) = def {
-                  def::Definition::Derived(List::try_from(d).unwrap())
+                  Definition::Derived(List::try_from(d).unwrap())
               } else {
                   //Err(Error::expected("definition field"))?  use a
                   // dummy value, presumably if this is during
                   // bootstrap,the definition will be replaced later.
-                  def::Definition::Derived(Rc::new(ListContent::new()))
+                  Definition::Derived(Rc::new(ListContent::new()))
               },
 
               // {Box::leak(Box::new(move |env: Environment| {
@@ -816,17 +818,60 @@ Let's put some types in their own modules, since they've got a lot of special ha
           a.try_into()
       }
   }
+
+  impl TryFrom<assoc::Associative> for Dictionary {
+      type Error = Error;
+      fn try_from(a: assoc::Associative) -> Result<Self, Self::Error> {
+          match a {
+              assoc::Associative::Dictionary(e) => Ok(e),
+              assoc::Associative::Assoc(a) => {
+                  let h = rc_inner(&a)
+                      .into_iter()
+                      .map(|(k, v)| {
+                          let e: (Word, Entry) = (k.try_into()?, v.try_into()?);
+                          Ok(e)
+                      })
+                      .collect::<Result<HashMap<Word, Entry>, Error>>()?;
+                  Ok(Rc::new(h))
+              }
+              _ => Err(Error::expected("dictionary")),
+          }
+      }
+  }
+
+  impl From<Dictionary> for assoc::Associative {
+      fn from(d: Dictionary) -> Self {
+          Associative::Assoc(Rc::new(
+              rc_inner(&d).into_iter()
+                  .map(|(k, v)| (KeyItem::Word(k), Item::Entry(v)))
+                  .collect(),
+          ))
+      }
+  }
+
+  impl TryFrom<Item> for Dictionary {
+      type Error = Error;
+      fn try_from(i: Item) -> Result<Self, Self::Error> {
+          match i {
+              Item::Dictionary(d) => Ok(d),
+              Item::Assoc(a) => a.try_into(),
+              Item::List(l) => Associative::try_from(l).and_then(|a| a.try_into()),
+              _ => Err(Error::expected("dictionary")),
+          }
+      }
+  }
 #+end_src
 
 #+begin_src rust :tangle src/types/environment.rs
   use crate::axiom;
+  use crate::types::dictionary as dict;
   use crate::types::*;
 
   #[derive(Clone, PartialEq)]
   pub struct Environment {
       pub stack: Stack,
       pub expression: Stack,
-      pub dictionary: Dictionary,
+      pub dictionary: dict::Dictionary,
   }
 
   impl Environment {
@@ -868,19 +913,15 @@ Let's put some types in their own modules, since they've got a lot of special ha
           let expression = expression
               .and_then(|s| List::try_from(s).ok())
               .or(Some(List::new(ListContent::new())));
-          let dictionary = dictionary.and_then(|d| Associative::try_from(d).ok());
+          let dictionary = dictionary.and_then(|d| {
+              Associative::try_from(d)
+                  .and_then(|d| dict::Dictionary::try_from(d))
+                  .ok()
+          });
           let mut env = axiom::standard_env(expression, stack);
           if let Some(d) = dictionary {
               let edmut = Rc::make_mut(&mut env.dictionary);
-              for (k, v) in d {
-                  List::try_from(v.clone())
-                      .and_then(Associative::try_from)
-                      .and_then(|h| {
-                          edmut.insert(k.clone(), Item::Entry(def::Entry::try_from(h).unwrap()));
-                          Ok(())
-                      })
-                      .ok();
-              }
+              edmut.extend(rc_inner(&d).into_iter());
           }
           env
       }
@@ -999,12 +1040,8 @@ kcats ASTs, later we'll put command line options here.
       }
 
       fn test_word(standard_env: Environment, w: Word) -> Vec<Error> {
-          if let Some(d) = standard_env.dictionary.get(&KeyItem::Word(w)) {
-              let examples = match d {
-                  Item::Entry(a) => &a.examples,
-                  _ => &None,
-              };
-              examples
+          if let Some(d) = standard_env.dictionary.get(&w) {
+              d.examples
                   .iter()
                   .filter_map(|ex| {
                       let x = ex.get(0).unwrap().clone();
@@ -1126,10 +1163,10 @@ modify the expression or dictionary and are functions of the environment.
   use crate::types::dictionary as dict;
   use crate::types::environment::Environment;
   use crate::types::error::Error;
-
   use crate::types::*;
   use internment::Intern;
   use num_integer::Roots;
+  use std::collections::HashMap;
   use std::collections::VecDeque;
   use std::fs;
   use std::mem;
@@ -1171,18 +1208,20 @@ modify the expression or dictionary and are functions of the environment.
       }
   }
 
-  fn update_axiom_entries(mut d: Dictionary, updates: Vec<(&str, &'static StepFn)>) -> Dictionary {
+  fn update_axiom_entries(
+      mut d: dict::Dictionary,
+      updates: Vec<(&str, &'static StepFn)>,
+  ) -> dict::Dictionary {
       let dm = Rc::make_mut(&mut d);
       for (w, f) in updates {
-          dm.entry(w.into()).and_modify(|e| match e {
-              Item::Entry(e) => e.definition = dict::Definition::Axiom(f),
-              _ => {}
+          dm.entry(Word::from(w)).and_modify(|e| {
+              e.definition = dict::Definition::Axiom(f);
           });
       }
       d
   }
 
-  pub fn add_builtins(d: Dictionary) -> Dictionary {
+  pub fn add_builtins(d: dict::Dictionary) -> dict::Dictionary {
       update_axiom_entries(
           d,
           vec![
@@ -1297,16 +1336,13 @@ modify the expression or dictionary and are functions of the environment.
                   let newdef = to_lexicon_entry(word, h);
                   let newdef2 = newdef.clone();
                   let dict = Rc::make_mut(&mut env.dictionary);
-                  dict.entry(KeyItem::Word(word))
-                      .and_modify(|e| match (e, newdef) {
-                          (Item::Entry(a), new_a) => {
-                              a.examples = new_a.examples;
-                              a.spec = new_a.spec;
-                              a.definition = new_a.definition;
-                          }
-                          _ => {}
+                  dict.entry(word)
+                      .and_modify(|e| {
+                          e.examples = newdef.examples;
+                          e.spec = newdef.spec;
+                          e.definition = newdef.definition;
                       })
-                      .or_insert(Item::Entry(newdef2));
+                      .or_insert(newdef2);
               }
               env
           }
@@ -1317,8 +1353,8 @@ modify the expression or dictionary and are functions of the environment.
   fn add_derivations(mut env: Environment) -> Environment {
       let d = Rc::make_mut(&mut env.dictionary);
       d.insert(
-          "derivations".into(),
-          Item::Entry(dict::Entry {
+          Word::from("derivations"),
+          dict::Entry {
               definition: dict::Definition::Derived(Rc::new(ListContent::from_iter([
                   //Item::Word(*S_LIST),
                   Item::Assoc(Associative::Assoc(Rc::new(AssociationContent::new()))),
@@ -1327,7 +1363,7 @@ modify the expression or dictionary and are functions of the environment.
               spec: None,
               serialize: false,
               word: Intern::new("derivations".to_string()),
-          }),
+          },
       );
       env
   }
@@ -2020,6 +2056,13 @@ modify the expression or dictionary and are functions of the environment.
                   Err(Error::expected(&w))
               }
           }
+          Item::Dictionary(_) => {
+              if w == *S_ITEM || w == *S_ASSOC || w == *S_LIST {
+                  Ok(())
+              } else {
+                  Err(Error::expected(&w))
+              }
+          }
           Item::Assoc(_) => {
               if w == *S_ASSOC || w == *S_LIST || w == *S_ITEM {
                   Ok(())
@@ -2123,38 +2166,31 @@ modify the expression or dictionary and are functions of the environment.
       if let Some(val) = next_item {
           match val {
               Item::Word(word) => {
-                  if let Some(dfn) = env.dictionary.get(&KeyItem::Word(*word)) {
-                      match dfn {
-                          // TODO: remove this clone ^
-                          Item::Entry(d) => {
-                              if let Some(spec) = &d.spec {
-                                  if let Err(e) = check_input_spec(&spec, &env) {
-                                      env = env.push(Item::Error(e));
-                                      return env;
-                                  }
-                              } else {
-                                  println!("No spec for {}!", word);
+                  if let Some(dfn) = env.dictionary.get(word) {
+                      {
+                          if let Some(spec) = &dfn.spec {
+                              if let Err(e) = check_input_spec(&spec, &env) {
+                                  env = env.push(Item::Error(e));
+                                  return env;
                               }
-                              let expr = Rc::make_mut(&mut env.expression);
-                              expr.pop_front();
-
-                              match &d.definition {
-                                  dict::Definition::Axiom(a) => {
-                                      // we can't keep borrowing the env, so we
-                                      // clone the axiom def to release it and then
-                                      // we can pass the env to the axiom def fn
-                                      let f = a.clone();
-                                      (f)(env)
-                                  }
-                                  dict::Definition::Derived(d) => {
-                                      let items = d.clone();
-                                      env.append_expression(items)
-                                  }
-                              }
+                          } else {
+                              println!("No spec for {}!", word);
                           }
-                          _ => {
-                              let w = *word;
-                              env.push(Item::Error(Error::undefined(w)))
+                          let expr = Rc::make_mut(&mut env.expression);
+                          expr.pop_front();
+
+                          match &dfn.definition {
+                              dict::Definition::Axiom(a) => {
+                                  // we can't keep borrowing the env, so we
+                                  // clone the axiom def to release it and then
+                                  // we can pass the env to the axiom def fn
+                                  let f = a.clone();
+                                  (f)(env)
+                              }
+                              dict::Definition::Derived(d) => {
+                                  let items = d.clone();
+                                  env.append_expression(items)
+                              }
                           }
                       }
                   } else {
@@ -2288,7 +2324,7 @@ modify the expression or dictionary and are functions of the environment.
       let env = Environment {
           stack: stack.unwrap_or(Stack::new(ListContent::new())),
           expression: prog_expr,
-          dictionary: Rc::new(AssociationContent::new()),
+          dictionary: Rc::new(HashMap::<Word, dict::Entry>::new()),
       };
       add_standard_dictionary(env)
   }
@@ -2313,7 +2349,7 @@ modify the expression or dictionary and are functions of the environment.
 
   pub fn dictionary(env: Environment) -> Environment {
       let d = env.dictionary.clone();
-      env.push(Item::Assoc(Associative::Assoc(d)))
+      env.push(Item::Dictionary(d))
   }
 
   fn ceil(i: Item) -> ItemResult {
@@ -2372,43 +2408,38 @@ modify the expression or dictionary and are functions of the environment.
       Err(e)
   }
 
-  fn normalize_dictionary(mut d: Dictionary) -> Result<Dictionary, Error> {
-      let dm = Rc::make_mut(&mut d);
-      for (k, v) in dm.iter_mut() {
-          match v {
-              Item::Assoc(a) => {
-                  let aa = a.clone();
-                  let (aa, _) = aa.insert("word".into(), Item::try_from(k.clone()).unwrap());
-                  ,*v = Item::Entry(aa.try_into()?)
-              }
-              Item::List(l) => {
-                  let a: Associative = l.clone().try_into()?;
-                  let (a, _) = a.insert("word".into(), Item::try_from(k.clone()).unwrap());
-                  ,*v = Item::Entry(a.try_into()?)
-              }
-              Item::Entry(_) => {}
-              _ => {
-                  return Err(Error::expected("dictionary"));
-              }
-          }
-      }
-      Ok(d)
-  }
+  // fn normalize_dictionary(mut d: dict::Dictionary) -> Result<dict::Dictionary, Error> {
+  //     let dm = Rc::make_mut(&mut d);
+  //     for (k, v) in dm.iter_mut() {
+  //         match v {
+  //             Item::Assoc(a) => {
+  //                 let aa = a.clone();
+  //                 let (aa, _) = aa.insert("word".into(), Item::try_from(k.clone()).unwrap());
+  //                 *v = Item::Entry(aa.try_into()?)
+  //             }
+  //             Item::List(l) => {
+  //                 let a: Associative = l.clone().try_into()?;
+  //                 let (a, _) = a.insert("word".into(), Item::try_from(k.clone()).unwrap());
+  //                 *v = Item::Entry(a.try_into()?)
+  //             }
+  //             Item::Entry(_) => {}
+  //             _ => {
+  //                 return Err(Error::expected("dictionary"));
+  //             }
+  //         }
+  //     }
+  //     Ok(d)
+  // }
+
   pub fn redefine(mut env: Environment) -> Environment {
-      let d = Associative::try_from(env.pop()).unwrap();
+      let d = dict::Dictionary::try_from(env.pop());
       match d {
-          Associative::Assoc(a) => match normalize_dictionary(a) {
-              Ok(d) => {
-                  env.dictionary = d;
-                  env
-              }
-              Err(e) => {
-                  env = env.push(Item::Error(e));
-                  env
-              }
-          },
-          _ => {
-              env = env.push(Item::Error(Error::expected("dictionary")));
+          Ok(d) => {
+              env.dictionary = d;
+              env
+          }
+          Err(e) => {
+              env = env.push(Item::Error(e));
               env
           }
       }
@@ -2420,6 +2451,7 @@ Now we'll add the functions for parsing and emitting kcats source.
 #+begin_src rust :tangle src/serialize.rs
   extern crate edn_format;
   use crate::types::associative::Associative;
+  use crate::types::dictionary as dict;
   use crate::types::environment::Environment;
   use crate::types::error::Error;
   use crate::types::*;
@@ -2433,15 +2465,13 @@ Now we'll add the functions for parsing and emitting kcats source.
       fn representation(&self) -> Item;
   }
 
-  fn lookup_builtin(w: Word, standard_dictionary: Option<&Dictionary>) -> Item {
+  fn lookup_builtin(w: Word, standard_dictionary: Option<&dict::Dictionary>) -> Item {
       if let Some(dict) = standard_dictionary {
           //println!("Looking up {} in dict of {} words", w, dict.len());
-          if let Some(def) = dict.get(&KeyItem::Word(w)) {
-              if let Item::Entry(a) = def {
-                  let mut aa = a.clone();
-                  aa.serialize = false;
-                  return Item::Entry(aa);
-              };
+          if let Some(def) = dict.get(&w) {
+              let mut aa = def.clone();
+              aa.serialize = false;
+              return Item::Entry(aa);
           }
       }
       return Item::Word(w);
@@ -2450,7 +2480,7 @@ Now we'll add the functions for parsing and emitting kcats source.
 
   fn to_item(
       item: &edn_format::Value,
-      standard_dictionary: Option<&Dictionary>,
+      standard_dictionary: Option<&dict::Dictionary>,
   ) -> Result<Item, Error> {
       //println!("to item {:?}", item);
       match item {
@@ -2525,6 +2555,7 @@ Now we'll add the functions for parsing and emitting kcats source.
               // TODO emit the non-builtin words of the dictionary
           ]),
           Item::Nothing => edn_format::Value::Vector(Vec::new()),
+          Item::Dictionary(d) => from_item(&Item::Assoc(Associative::from(d.clone()))),
           Item::Entry(d) => {
               if d.serialize {
                   let a: Associative = (*d).clone().into();
@@ -2539,7 +2570,7 @@ Now we'll add the functions for parsing and emitting kcats source.
       }
   }
 
-  pub fn parse(s: String, standard_dictionary: Option<&Dictionary>) -> Result<List, Error> {
+  pub fn parse(s: String, standard_dictionary: Option<&dict::Dictionary>) -> Result<List, Error> {
       let parser = edn_format::Parser::from_iter(s.chars(), edn_format::ParserOptions::default());
       Ok(Rc::new(
           parser
