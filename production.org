@@ -121,9 +121,9 @@ Let's start by defining some data structures in a separate module
       Entry(dict::Entry),
       Dictionary(dict::Dictionary),
       Error(Error),
-      In(Box<dyn In>),
-      Out(Box<dyn Out>),
-      Tunnel(Box<dyn Tunnel>),
+      In(In),
+      Out(Out),
+      Tunnel(Tunnel),
       Nothing,
   }
 
@@ -249,7 +249,7 @@ Let's start by defining some data structures in a separate module
   //     }
   // }
 
-  impl TryFrom<Item> for Box<dyn In> {
+  impl TryFrom<Item> for In {
       type Error = Error;
       fn try_from(i: Item) -> Result<Self, Self::Error> {
           if let Item::In(i) = i {
@@ -260,7 +260,7 @@ Let's start by defining some data structures in a separate module
       }
   }
 
-  impl TryFrom<Item> for Box<dyn Out> {
+  impl TryFrom<Item> for Out {
       type Error = Error;
       fn try_from(i: Item) -> Result<Self, Self::Error> {
           match i {
@@ -2612,25 +2612,101 @@ Now we'll add the functions that do input/output (pipes)
   use crate::types::error::Error;
   use crate::types::Item;
   use crate::ListContent;
-  use dyn_clone::DynClone;
-  use std::fmt::Debug;
   use std::rc::Rc;
   pub mod fs;
   pub mod net;
 
-  pub trait Writable: Close + Debug + crate::serialize::Display + DynClone {}
-  pub trait Readable: Close + Debug + crate::serialize::Display + DynClone {}
-
-  pub trait In: Writable {
-      fn put(&mut self, i: Item) -> Result<(), Error>;
+  #[derive(Debug, Clone)]
+  pub enum In {
+      StaticFile(fs::StaticFile),
+      Socket(net::Socket),
   }
 
-  pub trait Out: Readable {
-      fn take(&mut self) -> Result<Item, Error>;
+  #[derive(Debug, Clone)]
+  pub enum Out {
+      StaticFile(fs::StaticFile),
+      Socket(net::Socket),
+      ServerSocket(net::ServerSocket),
   }
 
-  pub trait Tunnel: In + Out {}
+  #[derive(Debug, Clone)]
+  pub enum Tunnel {
+      StaticFile(fs::StaticFile),
+      Socket(net::Socket),
+  }
 
+  impl In {
+      fn put(&mut self, i: Item) -> Result<(), Error> {
+          match self {
+              In::StaticFile(f) => f.put(i),
+              In::Socket(f) => f.put(i),
+          }
+      }
+      fn close(&mut self) -> Result<(), Error> {
+          match self {
+              In::StaticFile(f) => f.close(),
+              In::Socket(f) => f.close(),
+          }
+      }
+      fn is_closed(&self) -> bool {
+          match self {
+              In::StaticFile(f) => f.is_closed(),
+              In::Socket(f) => f.is_closed(),
+          }
+      }
+  }
+
+  impl Out {
+      fn take(&mut self) -> Result<Item, Error> {
+          match self {
+              Out::StaticFile(f) => f.take(),
+              Out::Socket(f) => f.take(),
+              Out::ServerSocket(f) => f.take(),
+          }
+      }
+      fn close(&mut self) -> Result<(), Error> {
+          match self {
+              Out::StaticFile(f) => f.close(),
+              Out::Socket(f) => f.close(),
+              Out::ServerSocket(f) => f.close(),
+          }
+      }
+      fn is_closed(&self) -> bool {
+          match self {
+              Out::StaticFile(f) => f.is_closed(),
+              Out::Socket(f) => f.is_closed(),
+              Out::ServerSocket(f) => f.is_closed(),
+          }
+      }
+  }
+
+  impl crate::serialize::Display for In {
+      fn representation(&self) -> Item {
+          match self {
+              In::StaticFile(f) => f.representation(),
+              In::Socket(f) => f.representation(),
+          }
+      }
+  }
+
+  impl crate::serialize::Display for Out {
+      fn representation(&self) -> Item {
+          match self {
+              Out::StaticFile(f) => f.representation(),
+              Out::Socket(f) => f.representation(),
+              Out::ServerSocket(f) => f.representation(),
+          }
+      }
+  }
+
+  impl crate::serialize::Display for Tunnel {
+      fn representation(&self) -> Item {
+          match self {
+              Tunnel::StaticFile(f) => f.representation(),
+              Tunnel::Socket(f) => f.representation(),
+          }
+      }
+  }
   /* Pipes can be "closed", from either end to signal that either the
    ,* putter or taker has gone away. Sometimes the type of pipe
    ,* may not really support this concept but an implementation is
@@ -2666,15 +2742,6 @@ Now we'll add the functions that do input/output (pipes)
    ,* the content is known now, or it isn't.
    ,*
   ,*/
-  pub trait Close: Debug + DynClone {
-      fn close(&mut self) -> Result<(), Error>;
-      fn is_closed(&self) -> bool;
-  }
-
-  dyn_clone::clone_trait_object!(In);
-  dyn_clone::clone_trait_object!(Out);
-  dyn_clone::clone_trait_object!(Close);
-  dyn_clone::clone_trait_object!(Tunnel);
 
   fn closed_error(on_take: bool) -> Error {
       Error::create(
@@ -2688,9 +2755,11 @@ Now we'll add the functions that do input/output (pipes)
 
   pub fn put_(mut env: Environment) -> Environment {
       let item = env.pop();
-      let pipe = env.expression.front().unwrap();
+      let expr = Rc::make_mut(&mut env.stack);
+
+      let pipe = expr.front_mut().unwrap();
       if let Item::In(p) = pipe {
-          match (p.clone()).put(item) {
+          match p.put(item) {
               Ok(_) => env,
               Err(e) => env.push(Item::Error(e)),
           }
@@ -2699,18 +2768,17 @@ Now we'll add the functions that do input/output (pipes)
       }
   }
 
-  pub fn take_(env: Environment) -> Environment {
-      let pipe = env.expression.front().unwrap().clone();
-
-      match pipe {
-          Item::Out(mut p) => {
-              let i = Out::take(&mut *p);
-              match i {
-                  Ok(i) => env.push(i),
-                  Err(e) => env.push(Item::Error(e)),
-              }
+  pub fn take_(mut env: Environment) -> Environment {
+      let expr = Rc::make_mut(&mut env.stack);
+      let pipe = expr.front_mut().unwrap();
+      if let Item::Out(p) = pipe {
+          let i = Out::take(p);
+          match i {
+              Ok(i) => env.push(i),
+              Err(e) => env.push(Item::Error(e)),
           }
-          _ => env.push(Item::Error(Error::expected("pipe"))),
+      } else {
+          env.push(Item::Error(Error::expected("pipe")))
       }
   }
 
@@ -2740,7 +2808,7 @@ Now we'll add the functions that do input/output (pipes)
 Now some specific types of pipes. These are for reading/writing data to files.
 #+begin_src rust :tangle src/pipes/fs.rs
   use crate::axiom::ItemResult;
-  use crate::pipes::{closed_error, Close, In, Out, Readable, Writable};
+  use crate::pipes::closed_error;
   use crate::types::associative::Associative;
   use crate::types::error::Error;
   use crate::types::{AssociationContent, Item};
@@ -2749,7 +2817,7 @@ Now some specific types of pipes. These are for reading/writing data to files.
   use std::rc::Rc;
 
   #[derive(Debug)]
-  struct StaticFile {
+  pub struct StaticFile {
       pub file: File,
       pub closed: bool,
       pub path: String,
@@ -2765,21 +2833,16 @@ Now some specific types of pipes. These are for reading/writing data to files.
       }
   }
 
-  impl Close for StaticFile {
-      fn close(&mut self) -> Result<(), Error> {
+  impl StaticFile {
+      pub fn close(&mut self) -> Result<(), Error> {
           Ok(())
       }
 
-      fn is_closed(&self) -> bool {
+      pub fn is_closed(&self) -> bool {
           self.closed
       }
-  }
 
-  impl Writable for StaticFile {}
-  impl Readable for StaticFile {}
-
-  impl In for StaticFile {
-      fn put(&mut self, i: Item) -> Result<(), Error> {
+      pub fn put(&mut self, i: Item) -> Result<(), Error> {
           match i {
               Item::Bytes(bs) => {
                   let mut pos = 0;
@@ -2793,10 +2856,8 @@ Now some specific types of pipes. These are for reading/writing data to files.
               _ => Err(Error::expected("bytes")),
           }
       }
-  }
 
-  impl Out for StaticFile {
-      fn take(&mut self) -> Result<Item, Error> {
+      pub fn take(&mut self) -> Result<Item, Error> {
           if self.is_closed() {
               return Err(closed_error(true));
           }
@@ -2821,7 +2882,7 @@ Now some specific types of pipes. These are for reading/writing data to files.
 
   pub fn file_in(i: Item) -> ItemResult {
       let path = String::try_from(i)?;
-      Ok(Item::In(Box::new(StaticFile {
+      Ok(Item::In(super::In::StaticFile(StaticFile {
           file: File::options()
               .read(true)
               .write(true)
@@ -2834,7 +2895,7 @@ Now some specific types of pipes. These are for reading/writing data to files.
 
   pub fn file_out(i: Item) -> ItemResult {
       let path = String::try_from(i)?;
-      Ok(Item::Out(Box::new(StaticFile {
+      Ok(Item::Out(super::Out::StaticFile(StaticFile {
           file: File::open(path.clone())?,
           closed: false,
           path,
@@ -2845,7 +2906,7 @@ Now some specific types of pipes. These are for reading/writing data to files.
 These are for reading/writing data over tcp/ip sockets.
 #+begin_src rust :tangle src/pipes/net.rs
   use crate::axiom::ItemResult;
-  use crate::pipes::{closed_error, Close, In, Out, Readable, Tunnel, Writable};
+  use crate::pipes::closed_error;
   use crate::types::associative::Associative;
   use crate::types::error::Error;
   use crate::types::{wrap, AssociationContent, Int, Item};
@@ -2855,7 +2916,7 @@ These are for reading/writing data over tcp/ip sockets.
   use std::str::FromStr;
 
   #[derive(Debug)]
-  struct Socket {
+  pub struct Socket {
       pub socket: TcpStream,
       pub addr: SocketAddr,
       pub closed: bool,
@@ -2871,46 +2932,16 @@ These are for reading/writing data over tcp/ip sockets.
       }
   }
 
-  impl Close for Socket {
-      fn close(&mut self) -> Result<(), Error> {
+  impl Socket {
+      pub fn close(&mut self) -> Result<(), Error> {
           Ok(())
       }
 
-      fn is_closed(&self) -> bool {
+      pub fn is_closed(&self) -> bool {
           self.closed
       }
-  }
 
-  impl Readable for Socket {}
-  impl Writable for Socket {}
-
-  impl crate::serialize::Display for Socket {
-      fn representation(&self) -> Item {
-          Item::Assoc(Associative::Assoc(Rc::new(AssociationContent::from([
-              ("type".into(), "tunnel".into()),
-              ("realm".into(), "tcp".into()),
-              ("address".into(), Item::String(self.addr.to_string())),
-          ]))))
-      }
-  }
-
-  impl Out for Socket {
-      fn take(&mut self) -> Result<Item, Error> {
-          if self.is_closed() {
-              return Err(closed_error(true));
-          }
-          let mut bs = [0u8; 1024];
-          let ct = self.socket.read(&mut bs)?;
-          if ct == 0 {
-              // EOF, no more takes since it's static
-              self.closed = true;
-          }
-          Ok(Item::Bytes(bs[0..ct].to_vec()))
-      }
-  }
-
-  impl In for Socket {
-      fn put(&mut self, i: Item) -> Result<(), Error> {
+      pub fn put(&mut self, i: Item) -> Result<(), Error> {
           match i {
               Item::Bytes(bs) => {
                   let mut pos = 0;
@@ -2924,13 +2955,33 @@ These are for reading/writing data over tcp/ip sockets.
               _ => Err(Error::expected("bytes")),
           }
       }
-  }
 
-  impl Tunnel for Socket {}
+      pub fn take(&mut self) -> Result<Item, Error> {
+          if self.is_closed() {
+              return Err(closed_error(true));
+          }
+          let mut bs = [0u8; 1024];
+          let ct = self.socket.read(&mut bs)?;
+          if ct == 0 {
+              // EOF, no more takes since it's static
+              self.closed = true;
+          }
+          Ok(Item::Bytes(bs[0..ct].to_vec()))
+      }
+  }
+  impl crate::serialize::Display for Socket {
+      fn representation(&self) -> Item {
+          Item::Assoc(Associative::Assoc(Rc::new(AssociationContent::from([
+              ("type".into(), "tunnel".into()),
+              ("realm".into(), "tcp".into()),
+              ("address".into(), Item::String(self.addr.to_string())),
+          ]))))
+      }
+  }
 
   // Server sockets
   #[derive(Debug)]
-  struct ServerSocket {
+  pub struct ServerSocket {
       pub socket: TcpListener,
       pub closed: bool,
   }
@@ -2944,17 +2995,28 @@ These are for reading/writing data over tcp/ip sockets.
       }
   }
 
-  impl Close for ServerSocket {
-      fn close(&mut self) -> Result<(), Error> {
+  impl ServerSocket {
+      pub fn close(&mut self) -> Result<(), Error> {
           Ok(())
       }
 
-      fn is_closed(&self) -> bool {
+      pub fn is_closed(&self) -> bool {
           self.closed
       }
-  }
 
-  impl Readable for ServerSocket {}
+      pub fn take(&mut self) -> Result<Item, Error> {
+          if self.is_closed() {
+              return Err(closed_error(true));
+          }
+          let (socket, addr) = self.socket.accept()?;
+
+          Ok(Item::Tunnel(super::Tunnel::Socket(Socket {
+              socket,
+              addr,
+              closed: false,
+          })))
+      }
+  }
 
   impl crate::serialize::Display for ServerSocket {
       fn representation(&self) -> Item {
@@ -2968,25 +3030,10 @@ These are for reading/writing data over tcp/ip sockets.
       }
   }
 
-  impl Out for ServerSocket {
-      fn take(&mut self) -> Result<Item, Error> {
-          if self.is_closed() {
-              return Err(closed_error(true));
-          }
-          let (socket, addr) = self.socket.accept()?;
-
-          Ok(Item::Tunnel(Box::new(Socket {
-              socket,
-              addr,
-              closed: false,
-          })))
-      }
-  }
-
   pub fn server_socket(i: Item, j: Item) -> ItemResult {
       let addr = Ipv4Addr::from_str(String::try_from(j)?.as_str())?;
       let port = Int::try_from(i)? as u16;
-      Ok(Item::Out(Box::new(ServerSocket {
+      Ok(Item::Out(super::Out::ServerSocket(ServerSocket {
           socket: TcpListener::bind(SocketAddrV4::new(addr, port))?,
           closed: false,
       })))
@@ -3036,15 +3083,14 @@ It should attempt to parse before popping the item off the stack.
 It should result in [1 2 3], since people would assume unpack just
 does the opposite of pack. But it doesn't, it takes items from the
 front and pack puts them on the end.
-*** INPROGRESS true and false are not words?
+*** DONE true and false are not words?
 #+begin_src kcats :results code
 [true] unwrap word?
 #+end_src
 
 #+RESULTS:
 #+begin_src kcats
-
-[[[asked [word?]] [type error] [reason "word is not defined"]] true]
+true
 #+end_src
 
 If you didn't know =true= was a boolean you would think it was a
@@ -3070,7 +3116,7 @@ to mask all kinds of errors and will cause untold headaches.
 *** INPROGRESS Implement pipes
 **** DONE Write to a file
 #+begin_src kcats
-[[file "/tmp/bar2"]] pipe-in
+[[file "/tmp/bar4"]] pipe-in
 
 ["hello world!"
  "Nice to meet you!"
@@ -3082,9 +3128,32 @@ step
 #+end_src
 
 #+RESULTS:
-: 
-: stack: [[[reason "type mismatch"] [asked [pipe]] [type error]] [[file "/tmp/bar2"] [type pipe]]]
-: expression: [["Nice to meet you!" "My name is kcats"] ["\n" join bytes put] step]
+: [[asked [pipe]] [unwound [["Nice to meet you!" "My name is kcats"] ["\n" join bytes put] step]] [type error] [reason "type mismatch"]] [[type pipe] [file "/tmp/bar4"]]
+
+#+begin_src kcats
+  [[file "/tmp/bar10r7"]] pipe-in
+
+  "hello world!"
+
+  bytes put
+
+#+end_src
+
+#+RESULTS:
+: [[type pipe] [file "/tmp/bar10r7"]]
+
+#+begin_src kcats
+  [[file "/tmp/bar10r7"]] pipe-out
+
+  take
+
+  string
+
+#+end_src
+
+#+RESULTS:
+: "hello world!" [[type pipe] [file "/tmp/bar10r7"]]
+
 **** DONE Read from a file
 #+begin_src kcats :results code
 "" [string join] [[file "/tmp/bar2"]] pipe-out
@@ -3119,8 +3188,7 @@ dictionary [assemble spec] lookup
 
 #+RESULTS:
 #+begin_src kcats
-
-[999]
+[[type pipe] [file "/tmp/foopytoop"]]
 #+end_src
 **** DONE Serialize pipes with something sane
 Maybe they can't be easily round-tripped, but at least we can print
@@ -3155,7 +3223,7 @@ dip
 
 ***** DONE Sockets
 
-**** TODO Convert In/Out traits to enums in pipes modules
+**** DONE Convert In/Out traits to enums in pipes modules
 Enums seem to work well elsewhere, and since pipes are also a closed
 set, we can use them here too.
 
@@ -3758,7 +3826,7 @@ dictionary [fail] lookup
 #+RESULTS:
 : [[spec [[string] [*]]] [definition []]]
 
-*** TODO scoping of dictionary entries
+*** DONE scoping of dictionary entries
 The original design was to have the dictionary be a single atomic data
 structure that code could modify basically at will, with words like
 =inscribe= (to add words) etc.
@@ -3828,10 +3896,7 @@ it. =update= should help.
 + refine
 + supplement
 + babel
-+ lingo <= front runnerbe easy to do a kats-only impl just
-keeping dictionaries on the stack, in other words =execute= will always
-pull from a dictionary on the stack instead of the builtin one, and
-=extend= will modify that dict.
++ lingo <= front runner.
 **** Implementation
 It seems viable that we could use the stack to hold dictionary changes.
 
@@ -3932,6 +3997,14 @@ Probably want to eventually make a rust implementation.
 *** DONE When printing results, don't wrap the stack
 Evaling =1 1 += should print =2=, not =[2]=. We don't have to wrap the
 input, so why wrap the output.
+
+*** INPROGRESS Update pipes to use enums instead of traits
+It's worked out well for everything else, and I don't think anyone
+else will be implementing these traits.
+
+Looking at this I am not in that big a hurry to change it, with traits
+at least I can spread out the impls into different modules. with enums
+that'd be awkward.
 * Notes
 ** Bootstrapping
 + Builtin words need to exist *before* the derived words are read from
