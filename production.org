@@ -1115,6 +1115,7 @@ kcats ASTs, later we'll put command line options here.
       #[test_case("recover")]
       #[test_case("recur")]
       #[test_case("rest")]
+      #[test_case("retry")]
       #[test_case("reverse")]
       #[test_case("shield")]
       #[test_case("shielddown")]
@@ -4005,507 +4006,110 @@ else will be implementing these traits.
 Looking at this I am not in that big a hurry to change it, with traits
 at least I can spread out the impls into different modules. with enums
 that'd be awkward.
-* Notes
-** Bootstrapping
-+ Builtin words need to exist *before* the derived words are read from
-  the lexicon - so that the words in the derivation can be replaced
-  with objects that are directly callable.
-+ The parser for the lexicon needs to have the prebuilt builtin
-  dictionary.
 
-  So bootstrap in 2 stages:
-  + read builtins.kcats that contains just specs/docs. Build a
-    Dictionary. Populate the function fields with explicit code.
-  + parse lexicon.cats, using the dictionary just built, replacing
-    builtin words with builtin objects (I see no need to have Builtin
-    as a separate struct, just use AxiomWord)
-
-    What about string internment? the strings in builtins file should
-    get interned at parse time.
-    
-* Code Playground
-A bunch of code snippets to test things out, org-babel makes this a
-piece of cake.
-
-#+RESULTS:
-: error: Could not compile `cargoVyY4IO`.
-
-#+begin_src rust
-// test swap
-use std::collections::VecDeque;
-type List = Vec<Item>;
-
-type Stack = VecDeque<i32>;
-#[derive(Debug)]
-enum Item {
-    Int(i32),
-    List(List),
-}
-
-fn main(){
-    use std::mem;
-    let mut x = List::new();
-    x.push(Item::Int(5));
-    let mut y = List::new();
-    y.push(Item::Int(6));
-    //x.push(Item::List(y));
-    mem::swap(&mut x, &mut y);
-    y.push(Item::List(x));
-    println!("{:?}",y);
-
-    let mut v = Stack::new();
-    v.push_front(5);
-    v.push_front(6);
-    println!("{:?}", v);
-}
-
+*** CANCELED Recover clears the stack built up in the try program
+#+begin_src kcats :results code
+ [2 3 "four" * +] [] recover
 #+end_src
 
 #+RESULTS:
-: [Int(5), List([Int(6)])]
-: [6, 5]
-
-Test hash of fn
-#+begin_src rust :crates
-use std::collections::HashMap;
-//use std::boxed::Box;
-use std::rc::Rc;
-
-struct Env {
-    number: Option<i32>,
-    dict: HashMap<String, Rc<dyn Fn(Env) -> Env>>
-}
-
-fn inc(i: i32) -> i32 {
-    i + 1
-}
-
-struct Builtins {
-    inc: fn(i32) -> i32
-}
-
-fn make_thing(f: fn(i32) -> i32) -> impl Fn(Env) -> Env {
-    move | mut e: Env | {
-        if let Some(n) = e.number {
-            e.number = Some(f(n));
-            e
-        } else { e }
-        
-    }
-}
-
-fn main () {
-    let mut dict = HashMap::<String, Rc<dyn Fn(Env) -> Env>>::new();
-    let i = make_thing(inc);
-    let builtins = Builtins { inc: inc };
-    dict.insert("inc".to_string(), Rc::new(i));
-    let mut env = Env { number: Some(12), dict: dict };
-    let f = env.dict.get(&"inc".to_string()).unwrap().clone();
-    println!("{}", f(env).number.unwrap());
-}
+#+begin_src kcats
+[[reason "type mismatch"] [unwound [* +]] [type error] [asked [number]]]
 #+end_src
 
-#+RESULTS:
-: 13
-
-#+begin_src rust
-use std::boxed::Box;
-struct Environment {
-    stack: Vec<Box<dyn Item>>
-}
-
-struct Inc {}
-
-trait Item {
-    fn onto_stack(self, env: Environment);
-}
-
-impl Item for i32 {
-    fn onto_stack(self, mut env: Environment){
-        env.stack.push(Box::new(self));
-    }
-}
-
-impl Item for Inc {
-    fn onto_stack(self, mut env: Environment) {
-        
-    }
-    
-}
-  
-#+end_src
-
-destructuring
-#+begin_src rust
-let a = [];
-let [x, y @ ..] = a;
-
-println!("{:?}", y);
-#+end_src
-
-#+begin_src rust
-use std::collections::VecDeque;
-
-let x = VecDeque::from(vec![1, 2, 3]);
-let y = &x[0..1];
-
-println!("{}", y);
-
-#+end_src
-
-#+RESULTS:
-: error: Could not compile `cargoewKZ71`.
-
-experiment with single vecdeque
-
-#+begin_src rust
-use std::collections::VecDeque;
-
-pub struct Plus {}
-pub struct Inc {}
-
-#[derive(Debug)]
-pub enum Item {
-    Number(i32),
-    Plus,
-    Inc
-}
-#[derive(Debug)]
-pub struct Stack {
-    stack: VecDeque<Item>,
-    tos: usize
-}
-
-// move from expr to stack
-fn push(v: &mut Stack) {
-    v.stack.rotate_left(1);
-    v.tos -= 1  
-}
-    
-fn exec2(v: &mut Stack) {
-
-    let i = v.stack.pop_back().unwrap();
-    let j = v.stack.pop_back().unwrap();
-    v.stack.pop_front();
-    println!("exec {:?} {:?}", i, j);
-    if let (Item::Number(i), Item::Number(j)) = (i, j) {
-        let res = i + j;
-        v.stack.push_front(Item::Number(res));
-        v.tos -= 1;
-    }
-}
-    
-
-fn main(){
-    let mut env = Stack { stack: VecDeque::new(),
-                          tos: 0 };
-    // load the program
-    env.stack.extend(vec![Item::Number(1), Item::Number(2), Item::Number(3), Item::Plus]);
-    env.tos = 4;
-    //buf.push_front(Item::Plus);
-
-    //
-    println!("{:?}", env);
-    push(&mut env);
-    println!("{:?}", env);
-    push(&mut env);
-    println!("{:?}", env);
-    push(&mut env);
-    println!("{:?}", env);
-    exec2(&mut env);
-    println!("{:?}", env);
-    println!("{:?}", env.stack.front());
-    
-
-}
-
-
-#+end_src
-
-#+RESULTS:
-: Stack { stack: [Number(1), Number(2), Number(3), Plus], tos: 4 }
-: Stack { stack: [Number(2), Number(3), Plus, Number(1)], tos: 3 }
-: Stack { stack: [Number(3), Plus, Number(1), Number(2)], tos: 2 }
-: Stack { stack: [Plus, Number(1), Number(2), Number(3)], tos: 1 }
-: exec Number(3) Number(2)
-: Stack { stack: [Number(5), Number(1)], tos: 0 }
-: Some(Number(5))
-
-experiment with stackexpr trait
-#+begin_src rust
-use std::collections::VecDeque;
-pub enum Item {
-    Int(i32),
-    Plus,
-    Inc
-}
-
-pub struct Environment {
-    stack: VecDeque<Item>,
-}
-
-trait StackExpr {
-    fn tos(self) -> Option<&'static Item>;
-    fn toe(self) -> Option<&'static Item>;
-    fn pop_stack(self) -> Option<Item>;
-    fn pop_expression(self) -> Option<Item>;
-    fn prepend_expression(self, l: List);
-    fn append_expression(self, l: List);
-    fn onto_stack(self);
-}
-
-impl StackExpr for VecDeque<T> {
-    fn tos(self) -> Option<&'static Item> {
-        self.as_slices().
-    }
-    fn toe(self) -> Option<&'static Item> {
-        self.stack.front()
-    }
-    fn pop_stack(self) -> Option<Item> {
-        self.stack.pop_back()
-    }
-    fn pop_expression(self) -> Option<Item> {
-        let item = self.stack.pop_front();
-        
-    }
-    fn prepend_expression(self, l: List);
-    fn append_expression(self, l: List);
-    fn onto_stack(self);
-
-}
-#+end_src
-
-#+RESULTS:
-
-#+begin_src rust
-use std::collections::VecDeque;
-
-let mut vector = VecDeque::new();
-
-vector.push_back(0);
-vector.push_back(1);
-vector.push_back(2);
-
-assert_eq!(vector.as_slices(), (&[0, 1, 2][..], &[][..]));
-
-vector.push_front(10);
-vector.push_front(9);
-
-assert_eq!(vector.as_slices(), (&[9, 10][..], &[0, 1, 2][..]));
-
-let mut v = VecDeque::new();
-v.push_back(1);
-assert_eq!(v.as_slices(), (&[1][..], &[][..]));
-
-#+end_src
-
-#+RESULTS:
-
-vec to hashmap
-#+begin_src rust
-use std::collections::HashMap;
-use std::hash::Hash;
-
-impl<K, V> TryFrom<dyn Iterator<Item = dyn Eq>> for HashMap<K, V>
-where K: Eq + Hash,
-    
-{
-    type Error = ();
-
-    fn try_from(v: dyn Iterator<Item = dyn Eq>) -> Result<Self, Self::Error> {
-        
-        HashMap::from_iter(v.map(|i| {
-            if let [k,v] = i[0..2] {
-                (k, v)
-            }
-            else {Err()}
-        }))
-    }
-}
-
-fn main() {
-    let a = vec![1, 2];
-    let b = vec![3, 4];
-    let vec = vec![a, b];
-    let h: HashMap<i32, i32> = HashMap::from_iter(
-        vec.iter().map(|i| {
-            if let [k,v] = i[0..2] {
-                (k, v)
-            }
-            else {(0,0)}
-        })
-    );
-    println!("{:?}", h);
-}
-
-
-#+end_src
-
-#+RESULTS:
-: error: Could not compile `cargo8MBNov`.
-
-from reddit:
-#+begin_src rust
-use std::collections::HashMap;
-use std::hash::Hash;
-#[derive(Debug)]
-struct NotPairsError;
-
-fn to_hashmap<T>(v: Vec<Vec<T>>) -> Result<HashMap<T, T>,NotPairsError>
-    where T: Eq + Hash,
-{
-    v.iter().map(|v| match (v.get(0), v.get(1), v.get(2)) {
-        (Some(k), Some(v), None) => Ok((k, v)),
-        _ => Err(NotPairsError),
-    }).collect()
-}
-
-
-fn main() {
-    
-    let a = vec![vec!["a", "b"], vec!["c", "d"], vec![]];
-
-    
-    println!("{:?}", to_hashmap(a));
-}
-
-#+end_src
-
-#+RESULTS:
-: error: Could not compile `cargorhVTIG`.
-
-from reddit:
-
-#+begin_src rust :crates '((itertools . "0.10.0"))
-use itertools::Itertools;
-
-use std::collections::HashMap;
-
-fn into_hm<I, T, V>(iter: I) -> Result<HashMap<V, V>, String>
-where
-    I: IntoIterator<Item = T>,
-    T: IntoIterator<Item = V>,
-    V: std::hash::Hash + Eq,
-{
-    
-}
-
-trait IntoHashMap<T> {
-    fn into_hashmap(self) -> Result<HashMap<T, T>, String>;
-}
-
-impl<I, T, V> IntoHashMap<V> for I
-where
-    I: IntoIterator<Item = T>,
-    T: IntoIterator<Item = V>,
-    V: std::hash::Hash + Eq,
-{
-    fn into_hashmap(self) -> Result<HashMap<V, V>, String> {
-        into_hm(self.into_iter())
-    }
-}
-
-fn main() {
-    let v = vec![vec!["k1", "v1"], vec!["k2", "v2"]];
-    println!("{:#?}", v.into_hashmap());
-}
-#+end_src
-
-
-
-#+RESULTS:
-: error: Could not compile `cargoTmcGbz`.
-
-edn comment bug - doesn't parse correctly when 2nd line comment in multiline
-comment is at beginning of line
-#+begin_src rust :crates '((edn-format . "3.2.2"))
-extern crate edn_format;
-
-fn main() {
-    println!("{:?}", edn_format::parse_str(";; abc\n;; def \n\n ced"));
-}
-#+end_src
-
-#+RESULTS:
-: Err(ParserErrorWithContext { context: [], row: 1, col: 2, error: UnexpectedCharacter(';') })
-
-#+begin_src rust
-use std::hash::Hash;
-fn into_entry<T, K, V>(k: T, v: V) -> Result<(K, V), String>
-where K: Eq + Hash
-{
-    match k {
-        
-    }
-}
-#+end_src
-
-#+RESULTS:
-
-#+begin_src rust
-#[derive(Debug)]
-enum Value {
-    Int(i32),
-    Float(f32),
-    String(String)
-}
-
-#[derive(Debug)]
-enum Key {
-    Int(i32),
-    String(String)
-}
-
-fn entry(mut l: Vec<Value>) -> Result<(Key, Value), String> {
-    let v = l.pop();
-    let k = l.pop();
-    let e = l.pop();
-    match (k, v, e) {
-        (Some(k), Some(v), None) => {
-            match (k) {
-                Value::Int(k) => { Ok((Key::Int(k), v)) }
-                _ => {Err("Key is wrong type".to_string())}
-            }
-            
-        },
-        _ => { Err("Entry must be a duple".to_string()) }
-    }
-}
-fn main(){
-
-    let v = vec![Value::Float(1.2), Value::Float(3.12)];
-    println!("{:?}", entry(v));
-    
-}
-#+end_src
-
-#+RESULTS:
-: Err("Key is wrong type")
-
-testing type checking dynamic?
-#+begin_src rust
-use std::ops::Range;
-let r = Range { start: 0, end: 5 };
-let x: Vec<i32> = r.into_iter().map(|i| i+1).collect();
-
-println!("{:?}", x)
-    
-#+end_src
-
-#+RESULTS:
-: [1, 2, 3, 4, 5]
-
-#+begin_src rust
-use std::any::Any;
-
-fn main(){
-    let x: [&dyn Any] = [&1, ""];
-}
-#+end_src
-
-#+RESULTS:
-: error: Could not compile `cargo7Clegh`.
+Apparently this was my design. I am not so sure about it now, that we
+have =retry=. If an error occurs in the middle of a program, what do we
+do with the stack? If the recovery is meant to be "try something else
+instead of the entire program" then restoring the stack makes
+sense. However then that breaks use of =retry= because the recovery
+can't pick up where the program left off.
+
+Maybe =recover= and =retry= are mutually exclusive.
+
+We could also use =retry= with =handle=:
 
 #+begin_src kcats
-[[expression [1 1 +]]] environment [[expression [1 1 +] stack
+2 3 "four" * + handle [discard 4] dip retry
 #+end_src
+
+#+RESULTS:
+: 14
+
+To make this work you have to know which item is the potential problem.
+
+Specifying alternates seems useful, such that it will keep retrying
+until it hits an empty alternates object or the program finishes. Each
+time an alternate is tried it is removed from the list.
+
+#+begin_src kcats
+[2 3 ["four" 4] alternates * +] retry 
+#+end_src
+
+*** INPROGRESS List access and update by index
+I think re-using =lookup= and =assign= for lists, using their index, makes sense here:
+#+begin_src kcats
+  [5 10 15 20] [1] lookup
+#+end_src
+should print 10.
+
+#+begin_src kcats
+  [5 10 15 20] [1] 30 assign
+#+end_src
+
+#+RESULTS:
+: [5 30 15 20]
+
+ would leave =[5 30 15 20]=.
+
+ The problem here is that this is ambiguous:
+
+#+begin_src kcats
+  [[a b] [c d]] [0] [d e] assign
+
+  ;; is it (assigned as a hashmap by key)
+  ;;[[a b] [c d] [0 [d e]]]
+
+  ;; or is it (assigned as a vector by index)
+  ;;[[d e] [c d]]
+#+end_src
+
+#+RESULTS:
+: [[d e] [c d]]
+
+We could clear up the ambiguity by saying that int keys on a list mean
+vector behavior. If you want the other you have to specify =association=
+first.
+
+lets check some corner cases - creating nested lists
+#+begin_src kcats
+  [1 2 3] [1 0 0] "foo" assign
+;; should be [1 [[foo]] 3]
+#+end_src
+
+#+RESULTS:
+: [1 [["foo"]] 3]
+
+What do we do when we're requested to assign beyond the end of the
+list? We can extend the list and pad it with =Nothing=, although this
+seems maybe going a bit too far to honor the user's request that maybe
+doesn't make sense.
+
+#+begin_src kcats
+  [1 2 3] [1 2] "foo" assign
+#+end_src
+
+#+RESULTS:
+: [1 [[] [] "foo"] 3]
+
+Now let's test mixed list/assoc
+
+#+begin_src kcats
+  [1 2 3] [1 foo baz 0] "bar" assign
+#+end_src
+
+#+RESULTS:
+: [1 [[foo [[baz [[0 "bar"]]]]]] 3]
+
+Note that here, the last 0 index inserts as a map key because the
+object is already an assoc. The contract is basically that once you're
+in assoc-land you stay there.
