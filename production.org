@@ -1844,34 +1844,74 @@ modify the expression or dictionary and are functions of the environment.
       def.try_into().unwrap()
   }
 
-  fn assoc_in(i: Item, ks: &[KeyItem], v: Item) -> Result<Associative, Error> {
-      let a = Associative::try_from(i)?;
+  fn assoc_in(i: Item, ks: &[KeyItem], v: Item) -> Result<Item, Error> {
       if let [k, ks @ ..] = ks {
           if ks.is_empty() {
-              return Ok(a.insert(k.clone(), v).0);
+              match (i, k) {
+                  (Item::List(mut l), KeyItem::Int(k)) => {
+                      // vector set by index
+                      let lm = Rc::make_mut(&mut l);
+                      let idx = *k as usize;
+                      // extend the size of the vector to be big enough to set
+                      // the given index, pad with 'nothing' values.
+                      if lm.len() <= idx {
+                          lm.resize(idx + 1, Item::Nothing);
+                      }
+                      lm[*k as usize] = v;
+                      Ok(Item::List(l))
+                  }
+                  (i, k) => {
+                      let a = Associative::try_from(i)?;
+                      Ok(Item::Assoc(a.insert(k.clone(), v).0))
+                  }
+              }
               //hm.insert(k.clone(), v);
           } else {
-              let inner = a.get(&k).unwrap_or(Item::Nothing).clone();
-              // if the inner value isn't a map, we're just overwriting whatever it
-              // is with a new map.
+              match (i, k) {
+                  (Item::List(mut l), KeyItem::Int(k)) => {
+                      let lm = Rc::make_mut(&mut l);
+                      let idx = *k as usize;
+                      // extend the size of the vector to be big enough to set
+                      // the given index, pad with 'nothing' values.
+                      if lm.len() <= idx {
+                          lm.resize(idx + 1, Item::Nothing);
+                      }
+                      let inner = &lm[idx];
 
-              return Ok(a
-                  .insert(
-                      k.clone(),
-                      Item::Assoc(assoc_in(
-                          Item::Assoc(match inner {
-                              Item::Assoc(inner) => inner,
-                              // TODO: other associative types
-                              _ => Associative::Assoc(Rc::new(AssociationContent::new())),
-                          }),
-                          ks,
-                          v,
-                      )?),
-                  )
-                  .0);
+                      lm[*k as usize] = if let [nextk, ..] = ks {
+                          let i = match (inner, nextk) {
+                              (Item::List(l), KeyItem::Int(_)) => Item::List(l.clone()),
+                              (_, KeyItem::Int(_)) => Item::List(Rc::new(ListContent::new())),
+                              _ => {
+                                  Item::Assoc(Associative::Assoc(Rc::new(AssociationContent::new())))
+                              }
+                          };
+                          assoc_in(i, ks, v)?
+                      } else {
+                          v
+                      };
+
+                      //if the inner value isn't a list, overwrite it
+                      Ok(Item::List(l))
+                  }
+                  (i, k) => {
+                      let a = Associative::try_from(i)?;
+                      let inner = a.get(&k).unwrap_or(Item::Nothing).clone();
+                      // if the inner value isn't a map, we're just overwriting whatever it
+                      // is with a new map.
+
+                      let i = match inner {
+                          Item::Assoc(inner) => Item::Assoc(inner),
+                          Item::List(inner) => Item::List(inner),
+                          // TODO: other associative types
+                          _ => Item::Assoc(Associative::Assoc(Rc::new(AssociationContent::new()))),
+                      };
+                      Ok(Item::Assoc(a.insert(k.clone(), assoc_in(i, ks, v)?).0))
+                  }
+              }
           }
       } else {
-          return Ok(a);
+          Ok(i)
       }
   }
 
@@ -1884,7 +1924,7 @@ modify the expression or dictionary and are functions of the environment.
           .collect::<Result<KeyList, Error>>()?;
       ksvec.make_contiguous();
       let (ks, _) = ksvec.as_slices();
-      Ok(Item::Assoc(assoc_in(m, ks, v)?))
+      Ok(assoc_in(m, ks, v)?)
   }
 
   //TODO: this should really take a keylist like assign and lookup
