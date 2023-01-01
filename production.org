@@ -26,7 +26,7 @@ from stdin and execute it, then print the resulting stack.
 #+begin_src toml :tangle Cargo.toml
 [package]
 name = "kcats"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -38,7 +38,6 @@ base64 = "0.13.0"
 internment = "0.6.0" 
 lazy_static = "1.4.0"
 num-integer = "0.1.44"
-dyn-clone = "1.0.5"
 
 [dev-dependencies]
 test-case = "2.0.0"
@@ -47,7 +46,8 @@ test-case = "2.0.0"
 Let's start by defining some data structures in a separate module
 #+begin_src rust :tangle src/types.rs
   use crate::pipes::{In, Out, Tunnel};
-  use crate::types::associative::Associative;
+  use crate::types::associative as assoc;
+  use crate::types::collection as coll;
   use crate::types::dictionary as dict;
   use crate::types::environment as env;
   use crate::types::error::Error;
@@ -59,6 +59,7 @@ Let's start by defining some data structures in a separate module
   use std::rc::Rc;
 
   pub mod associative;
+  pub mod collection;
   pub mod dictionary;
   pub mod environment;
   pub mod error;
@@ -114,9 +115,10 @@ Let's start by defining some data structures in a separate module
       Bytes(Bytes),
       String(String),
       Word(Word),
-      Assoc(Associative),
+      Assoc(assoc::Associative),
       //Seq(Sequence),
       List(List),
+      Collection(coll::Collection),
       Env(env::Environment),
       Entry(dict::Entry),
       Dictionary(dict::Dictionary),
@@ -363,7 +365,60 @@ Let's start by defining some data structures in a separate module
   }
 #+end_src
 
-Here are some association-related definition
+Here are some collection-related definitions
+#+begin_src rust :tangle src/types/collection.rs
+  use crate::types::associative as assoc;
+  use crate::types::*;
+
+  #[derive(Debug, Clone)]
+  pub enum Collection {
+      Associative(assoc::Associative),
+      List(List),
+      //Set(Set)
+      Nothing,
+  }
+
+  impl Collection {
+      pub fn is_empty(&self) -> bool {
+          match self {
+              Collection::Associative(a) => a.is_empty(),
+              Collection::List(l) => l.is_empty(),
+              Collection::Nothing => true,
+          }
+      }
+  }
+
+  pub enum CollIntoIter {
+      //TODO add other struct types
+      Assoc(assoc::AssocIntoIter),
+      List(std::collections::vec_deque::IntoIter<Item>),
+  }
+
+  impl Iterator for CollIntoIter {
+      type Item = Item;
+
+      fn next(&mut self) -> Option<Self::Item> {
+          match self {
+              CollIntoIter::Assoc(iter) => iter.next().and_then(|x| Some(x.into())),
+              CollIntoIter::List(iter) => iter.next(),
+          }
+      }
+  }
+
+  impl IntoIterator for Collection {
+      type Item = Item;
+      type IntoIter = CollIntoIter;
+
+      fn into_iter<'a>(self) -> CollIntoIter {
+          match self {
+              Collection::Associative(a) => CollIntoIter::Assoc(a.into_iter()),
+              Collection::List(l) => CollIntoIter::List(rc_inner(&l).into_iter()),
+              _ => panic!("can't iterate"),
+          }
+      }
+  }
+#+end_src
+Here are some association-related definitions
 #+begin_src rust :tangle src/types/associative.rs
   use crate::types::dictionary as dict;
   use crate::types::environment as env;
@@ -541,24 +596,10 @@ Here are some association-related definition
 
   impl TryFrom<Associative> for List {
       type Error = Error;
-      fn try_from(i: Associative) -> Result<Self, Self::Error> {
-          match i {
-              Associative::Assoc(mut a) => {
-                  let amut = Rc::make_mut(&mut a);
-                  Ok(Rc::new(
-                      amut.into_iter()
-                          .map(|(k, v)| {
-                              Item::List(Rc::new(ListContent::from(vec![
-                                  Item::from(k.clone()),
-                                  Item::from(v.clone()),
-                              ])))
-                          })
-                          .collect::<ListContent>(),
-                  ))
-              }
-              //TODO support the struct types
-              _ => Err(Error::expected("list")),
-          }
+      fn try_from(a: Associative) -> Result<Self, Self::Error> {
+          Ok(Rc::new(
+              a.into_iter().map(|x| x.into()).collect::<ListContent>(),
+          ))
       }
   }
 
@@ -591,6 +632,15 @@ Here are some association-related definition
                   .map(|i| MapEntry::try_from(i.clone()))
                   .collect::<Result<HashMap<KeyItem, Item>, Error>>()?,
           )))
+      }
+  }
+
+  impl From<(KeyItem, Item)> for Item {
+      fn from((k, v): (KeyItem, Item)) -> Item {
+          Item::List(Rc::new(ListContent::from(vec![
+              Item::from(k.clone()),
+              Item::from(v.clone()),
+          ])))
       }
   }
 #+end_src
@@ -712,7 +762,7 @@ Let's put some types in their own modules, since they've got a lot of special ha
 #+end_src
 
 #+begin_src rust :tangle src/types/dictionary.rs
-  use crate::types::associative as assoc;
+  use crate::types::associative::Associative;
   use crate::types::*;
 
   #[derive(Debug, Clone)]
@@ -871,6 +921,7 @@ Let's put some types in their own modules, since they've got a lot of special ha
 
 #+begin_src rust :tangle src/types/environment.rs
   use crate::axiom;
+  use crate::types::associative::Associative;
   use crate::types::dictionary as dict;
   use crate::types::*;
 
@@ -1168,6 +1219,7 @@ modify the expression or dictionary and are functions of the environment.
 #+begin_src rust :tangle src/axiom.rs
   use super::serialize;
   use crate::types::associative::Associative;
+  use crate::types::collection as coll;
   use crate::types::dictionary as dict;
   use crate::types::environment::Environment;
   use crate::types::error::Error;
@@ -1942,11 +1994,19 @@ modify the expression or dictionary and are functions of the environment.
       }
   }
 
-  pub fn lookup(m: Item, k: Item) -> ItemResult {
+  pub fn lookup(i: Item, k: Item) -> ItemResult {
       //println!("lookup {:?} \n {:?}", m, k);
       let k = KeyItem::try_from(k)?;
-      let m = Associative::try_from(m)?;
-      Ok(m.get(&k).unwrap_or(Item::Nothing).clone())
+      match (i, k) {
+          (Item::List(l), KeyItem::Int(k)) => Ok(l
+              .get(k as usize)
+              .and_then(|x| Some(x.clone()))
+              .unwrap_or(Item::Nothing)),
+          (i, k) => {
+              let m = Associative::try_from(i)?;
+              Ok(m.get(&k).unwrap_or(Item::Nothing).clone())
+          }
+      }
   }
 
   pub fn or(i: Item, j: Item) -> ItemResult {
@@ -1982,6 +2042,11 @@ modify the expression or dictionary and are functions of the environment.
           Item::Error(_) => true,
           Item::Entry(_) => true,
           Item::Dictionary(_) => true,
+          Item::Collection(i) => match i {
+              coll::Collection::Associative(_) => true,
+              coll::Collection::List(l) => Associative::try_from(Item::List(l)).is_ok(),
+              coll::Collection::Nothing => true,
+          },
           Item::List(l) => Associative::try_from(Item::List(l)).is_ok(),
           _ => false,
       }))
@@ -2061,6 +2126,13 @@ modify the expression or dictionary and are functions of the environment.
               }
           }
           Item::List(_) => {
+              if w == *S_LIST || w == *S_ITEM || w == *S_ASSOC || w == *S_PROGRAM {
+                  Ok(())
+              } else {
+                  Err(Error::expected(&w))
+              }
+          }
+          Item::Collection(_) => {
               if w == *S_LIST || w == *S_ITEM || w == *S_ASSOC || w == *S_PROGRAM {
                   Ok(())
               } else {
@@ -2555,6 +2627,13 @@ Now we'll add the functions for parsing and emitting kcats source.
           Item::List(v) => edn_format::Value::Vector(
               v.iter()
                   .map(|i| from_item(i))
+                  .collect::<Vec<edn_format::Value>>(),
+          ),
+
+          Item::Collection(v) => edn_format::Value::Vector(
+              v.clone()
+                  .into_iter()
+                  .map(|i| from_item(&i))
                   .collect::<Vec<edn_format::Value>>(),
           ),
           Item::Word(w) => edn_format::Value::Symbol(edn_format::Symbol::from_name(w)),
@@ -4153,3 +4232,28 @@ Now let's test mixed list/assoc
 Note that here, the last 0 index inserts as a map key because the
 object is already an assoc. The contract is basically that once you're
 in assoc-land you stay there.
+
+Now check the changes for =lookup=
+
+#+begin_src kcats
+[1 4 [34 6 45] 99 23] [2 2] lookup
+#+end_src
+
+#+RESULTS:
+: 45
+
+make sure update works too
+
+#+begin_src kcats
+[1 4 [34 6 45] 99 23] [2 2] [inc] update
+#+end_src
+
+#+RESULTS:
+: [1 4 [34 6 46] 99 23]
+
+#+begin_src kcats
+true not
+#+end_src
+
+#+RESULTS:
+: []
