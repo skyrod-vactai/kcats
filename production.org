@@ -42,8 +42,10 @@ num-integer = "0.1.44"
 [dev-dependencies]
 test-case = "2.0.0"
 #+end_src
-** Code
-Let's start by defining some data structures in a separate module
+** Internal data types
+*** Basic internal types
+We'll start by defining the basic data structures that kcats will use
+internally, to keep track of things like the stack, expression, lists etc.
 #+begin_src rust :tangle src/types.rs
   use crate::pipes::{In, Out, Tunnel};
   use crate::types::associative as assoc;
@@ -364,8 +366,7 @@ Let's start by defining some data structures in a separate module
       Rc::try_unwrap(r.clone()).unwrap_or_else(|rc| (*rc).clone())
   }
 #+end_src
-
-Here are some collection-related definitions
+*** Collection types
 #+begin_src rust :tangle src/types/collection.rs
   use crate::types::associative as assoc;
   use crate::types::*;
@@ -418,7 +419,7 @@ Here are some collection-related definitions
       }
   }
 #+end_src
-Here are some association-related definitions
+*** Associative types
 #+begin_src rust :tangle src/types/associative.rs
   use crate::types::dictionary as dict;
   use crate::types::environment as env;
@@ -697,8 +698,7 @@ Here are some association-related definitions
       }
   }
 #+end_src
-
-Let's put some types in their own modules, since they've got a lot of special handling.
+*** Error types
 #+begin_src rust :tangle src/types/error.rs
   use crate::types;
   use crate::types::associative as assoc;
@@ -813,7 +813,7 @@ Let's put some types in their own modules, since they've got a lot of special ha
       }
   }
 #+end_src
-
+*** Dictionary types
 #+begin_src rust :tangle src/types/dictionary.rs
   use crate::types::associative as assoc;
   use crate::types::associative::Associative;
@@ -972,7 +972,7 @@ Let's put some types in their own modules, since they've got a lot of special ha
       }
   }
 #+end_src
-
+*** Environment types
 #+begin_src rust :tangle src/types/environment.rs
   use crate::axiom;
   use crate::types::associative::Associative;
@@ -1060,217 +1060,169 @@ Let's put some types in their own modules, since they've got a lot of special ha
       }
   }
 #+end_src
-Next is the top level functions, including =main=, how to evaluate
-kcats ASTs, later we'll put command line options here.
-
-#+begin_src rust :tangle src/main.rs
-  mod types;
-  use crate::types::*;
-  use std::rc::Rc;
-  mod axiom;
-  mod pipes;
-  mod serialize;
+** Serialization
+We'll define how kcats data structure are parsed and written (for
+example, in order to read/write to/from disk).
+#+begin_src rust :tangle src/serialize.rs
+  extern crate edn_format;
+  use crate::types::associative::Associative;
   use crate::types::environment::Environment;
-  use std::io;
-  use std::io::BufRead;
+  use crate::types::error::Error;
+  use crate::types::*;
+  use base64;
+  use std::collections::VecDeque;
+  use std::fmt;
+  use std::rc::Rc;
 
-  fn print_result(env: Environment) {
-      if env.expression.is_empty() {
-          println!("{}", serialize::emit_all(&env.stack));
-      } else {
-          println!(
-              "stack: {}\nexpression: {}",
-              serialize::emit(&Item::List(env.stack)),
-              serialize::emit(&Item::List(env.expression))
+  pub trait Display {
+      fn representation(&self) -> Item;
+  }
+
+  const BYTE_TAG: &str = "b64";
+
+  fn to_item(item: &edn_format::Value) -> Result<Item, Error> {
+      //println!("to item {:?}", item);
+      match item {
+          edn_format::Value::Integer(i) => Ok(Item::Int(*i)),
+          edn_format::Value::Vector(v) => Ok(Item::List(Rc::new(
+              v.iter()
+                  .map(|i| to_item(i))
+                  .collect::<Result<VecDeque<Item>, Error>>()?,
+          ))),
+          edn_format::Value::Symbol(s) => Ok(Item::Word(s.to_string().into())),
+          // we don't have booleans in kcats, so if we see 'false' that
+          // is the word false which is not defined in the base
+          // language, but might be user-defined later.
+          edn_format::Value::Boolean(b) => Ok(if *b { "true".into() } else { "false".into() }),
+          edn_format::Value::String(s) => Ok(Item::String(s.to_string())),
+          edn_format::Value::Float(f) => Ok(Item::Float(f.into_inner())),
+          edn_format::Value::TaggedElement(tag, e) => {
+              if *tag == edn_format::Symbol::from_name(BYTE_TAG) {
+                  if let edn_format::Value::String(s) = &**e {
+                      Ok(Item::Bytes(base64::decode(s).unwrap()))
+                  } else {
+                      Err(Error::parse("Invalid tag datatype for byte literal"))
+                  }
+              } else {
+                  Err(Error::parse("Unsupported tag"))
+              }
+          }
+          _ => Err(Error::parse("Unsupported data literal")),
+      }
+  }
+
+  pub fn vectorize(a: Associative) -> Vec<edn_format::Value> {
+      a.into_iter()
+          .map(|(k, v)| {
+              edn_format::Value::Vector(vec![from_item(&Item::from(k.clone())), from_item(&v)])
+          })
+          .collect()
+  }
+
+  pub fn from_item(item: &Item) -> edn_format::Value {
+      match item {
+          Item::Int(i) => edn_format::Value::Integer(*i),
+          Item::List(v) => edn_format::Value::Vector(
+              v.iter()
+                  .map(|i| from_item(i))
+                  .collect::<Vec<edn_format::Value>>(),
+          ),
+
+          Item::Collection(v) => edn_format::Value::Vector(
+              v.clone()
+                  .into_iter()
+                  .map(|i| from_item(&i))
+                  .collect::<Vec<edn_format::Value>>(),
+          ),
+          Item::Word(w) => edn_format::Value::Symbol(edn_format::Symbol::from_name(w)),
+          //Item::Entry(w) => edn_format::Value::Symbol(edn_format::Symbol::from_name(&w.word)),
+          Item::String(s) => edn_format::Value::String(s.to_string()),
+          Item::Float(f) => edn_format::Value::from(*f),
+          Item::Bytes(bs) => edn_format::Value::TaggedElement(
+              edn_format::Symbol::from_name("b64"),
+              Box::new(edn_format::Value::String(base64::encode(bs))),
+          ),
+          Item::Assoc(h) => edn_format::Value::Vector(vectorize(h.clone())),
+          Item::Error(err) => {
+              edn_format::Value::Vector(vectorize(Associative::Assoc(err.data.clone())))
+          }
+          Item::Env(e) => edn_format::Value::Vector(vec![
+              edn_format::Value::Vector(vec![
+                  from_item(&"stack".into()),
+                  from_item(&Item::List(e.stack.clone())),
+              ]),
+              edn_format::Value::Vector(vec![
+                  from_item(&"expression".into()),
+                  from_item(&Item::List(e.expression.clone())),
+              ]),
+              // TODO emit the non-builtin words of the dictionary
+          ]),
+          Item::Nothing => edn_format::Value::Vector(Vec::new()),
+          Item::Dictionary(d) => from_item(&Item::Assoc(Associative::from(d.clone()))),
+          Item::Entry(d) => {
+              let a: Associative = (*d).clone().into();
+              from_item(&Item::Assoc(a))
+          }
+          Item::In(i) => from_item(&i.representation()),
+          Item::Out(i) => from_item(&i.representation()),
+          Item::Tunnel(i) => from_item(&i.representation()),
+      }
+  }
+
+  pub fn parse(s: String) -> Result<List, Error> {
+      let parser = edn_format::Parser::from_iter(s.chars(), edn_format::ParserOptions::default());
+      Ok(Rc::new(
+          parser
+              .map(move |r| match r {
+                  Ok(expr) => Ok(to_item(&expr)?),
+                  Err(_) => Err(Error::parse("Invalid edn")),
+              })
+              .collect::<Result<ListContent, Error>>()?,
+      ))
+  }
+
+  pub fn to_list(s: &str) -> List {
+      parse(s.to_string()).unwrap()
+  }
+
+  pub fn emit(item: &Item) -> String {
+      edn_format::emit_str(&from_item(item))
+  }
+
+  pub fn emit_all(items: &VecDeque<Item>) -> String {
+      let mut s: String = String::new();
+      for i in items {
+          s.push_str(&emit(&i));
+          s.push_str(" ".into());
+      }
+      s.pop();
+      return s;
+  }
+
+  // print out envs in error messages
+  impl fmt::Debug for Environment {
+      fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+          write!(
+              f,
+              "{{ stack: {}, expression: {} }}",
+              emit(&Item::List(self.stack.clone())),
+              emit(&Item::List(self.expression.clone())),
           )
       }
   }
 
-  fn get_stdin() -> String {
-      let mut buf = String::new();
-      for line in io::stdin().lock().lines() {
-          buf.push_str(&line.unwrap());
-          buf.push('\n');
-      }
-      buf
-  }
-
-  fn main() {
-      let program = get_stdin();
-      let mut env = axiom::standard_env(None, None);
-      let parse_result = serialize::parse(program);
-      match parse_result {
-          Ok(mut program) => {
-              let expr = Rc::make_mut(&mut env.expression);
-              expr.extend(Rc::make_mut(&mut program).drain(..));
-              print_result(axiom::eval(env));
-          }
-          Err(e) => {
-              println!("Error parsing input: {:?}", e);
-          }
+  impl fmt::Debug for Error {
+      fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+          write!(
+              f,
+              "{}",
+              emit(&Item::Assoc(Associative::Assoc(self.data.clone())))
+          )
       }
   }
-
-  #[cfg(test)]
-  mod tests {
-      // Note this useful idiom: importing names from outer (for mod tests) scope.
-      use super::error::Error;
-      use super::*;
-      use internment::Intern;
-      use test_case::test_case;
-
-      pub fn get_item(i: Item, index: usize) -> Option<Item> {
-          if let Item::List(l) = i {
-              match l.get(index) {
-                  Some(x) => Some(x.clone()),
-                  None => None,
-              }
-          } else {
-              None
-          }
-      }
-
-      fn test_example(mut prog_env: Environment, program: List, expected: List) -> Option<Error> {
-          let mut exp_env = prog_env.clone();
-          prog_env = prog_env.append_expression(program.clone());
-          exp_env = exp_env.append_expression(expected.clone());
-
-          //let res = eval(env).ok()?;
-          prog_env = axiom::eval(prog_env);
-          exp_env = axiom::eval(exp_env);
-
-          if prog_env.stack == exp_env.stack {
-              println!("Nice expected {:?} got {:?}", exp_env.stack, prog_env.stack);
-              None
-          } else {
-              println!(
-                  "uh oh expected {:?} got {:?}",
-                  exp_env.stack, prog_env.stack
-              );
-              Some(Error::test_assertion(program, expected, prog_env.stack))
-          }
-      }
-
-      fn test_word(standard_env: Environment, w: Word) -> Vec<Error> {
-          if let Some(d) = standard_env.dictionary.get(&w) {
-              d.examples
-                  .iter()
-                  .filter_map(|ex| {
-                      let x = ex.get(0).unwrap().clone();
-                      match (get_item(x.clone(), 0).unwrap(), get_item(x, 1).unwrap()) {
-                          (Item::List(p), Item::List(exp)) => {
-                              test_example(standard_env.clone(), p.clone(), exp.clone())
-                          }
-                          _ => Some(Error::expected("list")),
-                      }
-                  })
-                  .collect::<Vec<Error>>()
-          } else {
-              println!("Empty!");
-              Vec::new()
-          }
-      }
-
-      #[test_case("+" ; "plus")]
-      #[test_case("-" ; "minus")]
-      #[test_case("=" ; "eq")]
-      #[test_case(">" ; "gt")]
-      #[test_case("and")]
-      #[test_case("any?" ; "is_any")]
-      #[test_case("assign")]
-      #[test_case("association")]
-      #[test_case("association?" ; "is_association")]
-      #[test_case("both?" ; "is_both")]
-      #[test_case("branch")]
-      #[test_case("clone")]
-      #[test_case("count")]
-      #[test_case("decide")]
-      #[test_case("dip")]
-      #[test_case("dipdown")]
-      #[test_case("discard")]
-      #[test_case("environment")]
-      #[test_case("evaluate")]
-      #[test_case("eval_step")]
-      #[test_case("even?" ; "is_even")]
-      #[test_case("evert")]
-      #[test_case("every?" ; "is_every")]
-      #[test_case("execute")]
-      #[test_case("filter")]
-      #[test_case("first")]
-      #[test_case("float")]
-      #[test_case("if")]
-      #[test_case("inc")]
-      #[test_case("inject")]
-      #[test_case("inscribe")]
-      #[test_case("join")]
-      #[test_case("let")]
-      #[test_case("lingo")]
-      #[test_case("list?" ; "is_list")]
-      #[test_case("lookup")]
-      #[test_case("loop")]
-      #[test_case("map")]
-      #[test_case("not")]
-      #[test_case("nothing?" ; "is_nothing")]
-      #[test_case("number?" ; "is_number")]
-      #[test_case("odd?" ; "is_odd")]
-      #[test_case("or")]
-      #[test_case("pack")]
-      #[test_case("prepend")]
-      #[test_case("primrec")]
-      #[test_case("range")]
-      #[test_case("recover")]
-      #[test_case("recur")]
-      #[test_case("rest")]
-      #[test_case("retry")]
-      #[test_case("reverse")]
-      #[test_case("shield")]
-      #[test_case("shielddown")]
-      #[test_case("shielddowndown")]
-      #[test_case("sink")]
-      #[test_case("snapshot")]
-      #[test_case("something?" ; "is_something")]
-      #[test_case("step")]
-      #[test_case("string")]
-      #[test_case("string?" ; "is_string")]
-      #[test_case("swap")]
-      #[test_case("swapdown")]
-      #[test_case("times")]
-      #[test_case("type")]
-      #[test_case("unassign")]
-      #[test_case("unpack")]
-      #[test_case("unwrap")]
-      #[test_case("update")]
-      #[test_case("value")]
-      #[test_case("while")]
-      #[test_case("wrap")]
-      #[test_case("zero?" ; "is_zero")]
-      #[test_case("zip")]
-      fn test_lexicon(word: &str) {
-          let e = axiom::standard_env(None, None);
-
-          let r = test_word(e.clone(), Intern::new(word.to_string()));
-          assert!(r.is_empty(), "{:?}", r);
-      }
-  }
-
-  // if let (Item::List(program), Item::List(expected)) = (program, expected) {
-
-  //     } else {
-  //         Err(Error::from("Example should be a pair"))
-  //     }
-
-  // for ex in d.examples().iter() {
-  //             let e = List::try_from(*ex).ok().unwrap();
-  //             let p = List::try_from(*e.get(0).unwrap()).ok().unwrap();
-  //             let exp = List::try_from(*e.get(1).unwrap()).ok().unwrap();
-
-  //             test_example(axiom::standard_env.clone(), w, p,exp)
-  //         }.retain(|i| i.is_some()).collect::<Vec<Error>>()
 #+end_src
-
-Here are the axiom functions. Some of them are just functions of the
-topmost stack items, and we'll call them with =f_stack1= etc. The rest
-modify the expression or dictionary and are functions of the environment.
+** Builtin words
+We'll define some words as axioms (not in terms of other words, only defined in Rust). 
 #+begin_src rust :tangle src/axiom.rs
   use super::serialize;
   use crate::types::associative::Associative;
@@ -2634,170 +2586,221 @@ modify the expression or dictionary and are functions of the environment.
       }
   }
 #+end_src
+** Top level execution
+We'll define the main module which reads input for the kcats
+interpreter process, and prints output.
 
-Now we'll add the functions for parsing and emitting kcats source. 
-
-#+begin_src rust :tangle src/serialize.rs
-  extern crate edn_format;
-  use crate::types::associative::Associative;
-  use crate::types::environment::Environment;
-  use crate::types::error::Error;
+We'll also define how to run unit tests.
+#+begin_src rust :tangle src/main.rs
+  mod types;
   use crate::types::*;
-  use base64;
-  use std::collections::VecDeque;
-  use std::fmt;
   use std::rc::Rc;
+  mod axiom;
+  mod pipes;
+  mod serialize;
+  use crate::types::environment::Environment;
+  use std::io;
+  use std::io::BufRead;
 
-  pub trait Display {
-      fn representation(&self) -> Item;
+  fn print_result(env: Environment) {
+      if env.expression.is_empty() {
+          println!("{}", serialize::emit_all(&env.stack));
+      } else {
+          println!(
+              "stack: {}\nexpression: {}",
+              serialize::emit(&Item::List(env.stack)),
+              serialize::emit(&Item::List(env.expression))
+          )
+      }
   }
 
-  const BYTE_TAG: &str = "b64";
+  fn get_stdin() -> String {
+      let mut buf = String::new();
+      for line in io::stdin().lock().lines() {
+          buf.push_str(&line.unwrap());
+          buf.push('\n');
+      }
+      buf
+  }
 
-  fn to_item(item: &edn_format::Value) -> Result<Item, Error> {
-      //println!("to item {:?}", item);
-      match item {
-          edn_format::Value::Integer(i) => Ok(Item::Int(*i)),
-          edn_format::Value::Vector(v) => Ok(Item::List(Rc::new(
-              v.iter()
-                  .map(|i| to_item(i))
-                  .collect::<Result<VecDeque<Item>, Error>>()?,
-          ))),
-          edn_format::Value::Symbol(s) => Ok(Item::Word(s.to_string().into())),
-          // we don't have booleans in kcats, so if we see 'false' that
-          // is the word false which is not defined in the base
-          // language, but might be user-defined later.
-          edn_format::Value::Boolean(b) => Ok(if *b { "true".into() } else { "false".into() }),
-          edn_format::Value::String(s) => Ok(Item::String(s.to_string())),
-          edn_format::Value::Float(f) => Ok(Item::Float(f.into_inner())),
-          edn_format::Value::TaggedElement(tag, e) => {
-              if *tag == edn_format::Symbol::from_name(BYTE_TAG) {
-                  if let edn_format::Value::String(s) = &**e {
-                      Ok(Item::Bytes(base64::decode(s).unwrap()))
-                  } else {
-                      Err(Error::parse("Invalid tag datatype for byte literal"))
-                  }
-              } else {
-                  Err(Error::parse("Unsupported tag"))
+  fn main() {
+      let program = get_stdin();
+      let mut env = axiom::standard_env(None, None);
+      let parse_result = serialize::parse(program);
+      match parse_result {
+          Ok(mut program) => {
+              let expr = Rc::make_mut(&mut env.expression);
+              expr.extend(Rc::make_mut(&mut program).drain(..));
+              print_result(axiom::eval(env));
+          }
+          Err(e) => {
+              println!("Error parsing input: {:?}", e);
+          }
+      }
+  }
+
+  #[cfg(test)]
+  mod tests {
+      // Note this useful idiom: importing names from outer (for mod tests) scope.
+      use super::error::Error;
+      use super::*;
+      use internment::Intern;
+      use test_case::test_case;
+
+      pub fn get_item(i: Item, index: usize) -> Option<Item> {
+          if let Item::List(l) = i {
+              match l.get(index) {
+                  Some(x) => Some(x.clone()),
+                  None => None,
               }
+          } else {
+              None
           }
-          _ => Err(Error::parse("Unsupported data literal")),
       }
-  }
 
-  pub fn vectorize(a: Associative) -> Vec<edn_format::Value> {
-      a.into_iter()
-          .map(|(k, v)| {
-              edn_format::Value::Vector(vec![from_item(&Item::from(k.clone())), from_item(&v)])
-          })
-          .collect()
-  }
+      fn test_example(mut prog_env: Environment, program: List, expected: List) -> Option<Error> {
+          let mut exp_env = prog_env.clone();
+          prog_env = prog_env.append_expression(program.clone());
+          exp_env = exp_env.append_expression(expected.clone());
 
-  pub fn from_item(item: &Item) -> edn_format::Value {
-      match item {
-          Item::Int(i) => edn_format::Value::Integer(*i),
-          Item::List(v) => edn_format::Value::Vector(
-              v.iter()
-                  .map(|i| from_item(i))
-                  .collect::<Vec<edn_format::Value>>(),
-          ),
+          //let res = eval(env).ok()?;
+          prog_env = axiom::eval(prog_env);
+          exp_env = axiom::eval(exp_env);
 
-          Item::Collection(v) => edn_format::Value::Vector(
-              v.clone()
-                  .into_iter()
-                  .map(|i| from_item(&i))
-                  .collect::<Vec<edn_format::Value>>(),
-          ),
-          Item::Word(w) => edn_format::Value::Symbol(edn_format::Symbol::from_name(w)),
-          //Item::Entry(w) => edn_format::Value::Symbol(edn_format::Symbol::from_name(&w.word)),
-          Item::String(s) => edn_format::Value::String(s.to_string()),
-          Item::Float(f) => edn_format::Value::from(*f),
-          Item::Bytes(bs) => edn_format::Value::TaggedElement(
-              edn_format::Symbol::from_name("b64"),
-              Box::new(edn_format::Value::String(base64::encode(bs))),
-          ),
-          Item::Assoc(h) => edn_format::Value::Vector(vectorize(h.clone())),
-          Item::Error(err) => {
-              edn_format::Value::Vector(vectorize(Associative::Assoc(err.data.clone())))
+          if prog_env.stack == exp_env.stack {
+              println!("Nice expected {:?} got {:?}", exp_env.stack, prog_env.stack);
+              None
+          } else {
+              println!(
+                  "uh oh expected {:?} got {:?}",
+                  exp_env.stack, prog_env.stack
+              );
+              Some(Error::test_assertion(program, expected, prog_env.stack))
           }
-          Item::Env(e) => edn_format::Value::Vector(vec![
-              edn_format::Value::Vector(vec![
-                  from_item(&"stack".into()),
-                  from_item(&Item::List(e.stack.clone())),
-              ]),
-              edn_format::Value::Vector(vec![
-                  from_item(&"expression".into()),
-                  from_item(&Item::List(e.expression.clone())),
-              ]),
-              // TODO emit the non-builtin words of the dictionary
-          ]),
-          Item::Nothing => edn_format::Value::Vector(Vec::new()),
-          Item::Dictionary(d) => from_item(&Item::Assoc(Associative::from(d.clone()))),
-          Item::Entry(d) => {
-              let a: Associative = (*d).clone().into();
-              from_item(&Item::Assoc(a))
+      }
+
+      fn test_word(standard_env: Environment, w: Word) -> Vec<Error> {
+          if let Some(d) = standard_env.dictionary.get(&w) {
+              d.examples
+                  .iter()
+                  .filter_map(|ex| {
+                      let x = ex.get(0).unwrap().clone();
+                      match (get_item(x.clone(), 0).unwrap(), get_item(x, 1).unwrap()) {
+                          (Item::List(p), Item::List(exp)) => {
+                              test_example(standard_env.clone(), p.clone(), exp.clone())
+                          }
+                          _ => Some(Error::expected("list")),
+                      }
+                  })
+                  .collect::<Vec<Error>>()
+          } else {
+              println!("Empty!");
+              Vec::new()
           }
-          Item::In(i) => from_item(&i.representation()),
-          Item::Out(i) => from_item(&i.representation()),
-          Item::Tunnel(i) => from_item(&i.representation()),
+      }
+
+      #[test_case("+" ; "plus")]
+      #[test_case("-" ; "minus")]
+      #[test_case("=" ; "eq")]
+      #[test_case(">" ; "gt")]
+      #[test_case("and")]
+      #[test_case("any?" ; "is_any")]
+      #[test_case("assign")]
+      #[test_case("association")]
+      #[test_case("association?" ; "is_association")]
+      #[test_case("both?" ; "is_both")]
+      #[test_case("branch")]
+      #[test_case("clone")]
+      #[test_case("count")]
+      #[test_case("decide")]
+      #[test_case("dip")]
+      #[test_case("dipdown")]
+      #[test_case("discard")]
+      #[test_case("environment")]
+      #[test_case("evaluate")]
+      #[test_case("eval_step")]
+      #[test_case("even?" ; "is_even")]
+      #[test_case("evert")]
+      #[test_case("every?" ; "is_every")]
+      #[test_case("execute")]
+      #[test_case("filter")]
+      #[test_case("first")]
+      #[test_case("float")]
+      #[test_case("if")]
+      #[test_case("inc")]
+      #[test_case("inject")]
+      #[test_case("inscribe")]
+      #[test_case("join")]
+      #[test_case("let")]
+      #[test_case("lingo")]
+      #[test_case("list?" ; "is_list")]
+      #[test_case("lookup")]
+      #[test_case("loop")]
+      #[test_case("map")]
+      #[test_case("not")]
+      #[test_case("nothing?" ; "is_nothing")]
+      #[test_case("number?" ; "is_number")]
+      #[test_case("odd?" ; "is_odd")]
+      #[test_case("or")]
+      #[test_case("pack")]
+      #[test_case("prepend")]
+      #[test_case("primrec")]
+      #[test_case("range")]
+      #[test_case("recover")]
+      #[test_case("recur")]
+      #[test_case("rest")]
+      #[test_case("retry")]
+      #[test_case("reverse")]
+      #[test_case("shield")]
+      #[test_case("shielddown")]
+      #[test_case("shielddowndown")]
+      #[test_case("sink")]
+      #[test_case("snapshot")]
+      #[test_case("something?" ; "is_something")]
+      #[test_case("step")]
+      #[test_case("string")]
+      #[test_case("string?" ; "is_string")]
+      #[test_case("swap")]
+      #[test_case("swapdown")]
+      #[test_case("times")]
+      #[test_case("type")]
+      #[test_case("unassign")]
+      #[test_case("unpack")]
+      #[test_case("unwrap")]
+      #[test_case("update")]
+      #[test_case("value")]
+      #[test_case("while")]
+      #[test_case("wrap")]
+      #[test_case("zero?" ; "is_zero")]
+      #[test_case("zip")]
+      fn test_lexicon(word: &str) {
+          let e = axiom::standard_env(None, None);
+
+          let r = test_word(e.clone(), Intern::new(word.to_string()));
+          assert!(r.is_empty(), "{:?}", r);
       }
   }
 
-  pub fn parse(s: String) -> Result<List, Error> {
-      let parser = edn_format::Parser::from_iter(s.chars(), edn_format::ParserOptions::default());
-      Ok(Rc::new(
-          parser
-              .map(move |r| match r {
-                  Ok(expr) => Ok(to_item(&expr)?),
-                  Err(_) => Err(Error::parse("Invalid edn")),
-              })
-              .collect::<Result<ListContent, Error>>()?,
-      ))
-  }
+  // if let (Item::List(program), Item::List(expected)) = (program, expected) {
 
-  pub fn to_list(s: &str) -> List {
-      parse(s.to_string()).unwrap()
-  }
+  //     } else {
+  //         Err(Error::from("Example should be a pair"))
+  //     }
 
-  pub fn emit(item: &Item) -> String {
-      edn_format::emit_str(&from_item(item))
-  }
+  // for ex in d.examples().iter() {
+  //             let e = List::try_from(*ex).ok().unwrap();
+  //             let p = List::try_from(*e.get(0).unwrap()).ok().unwrap();
+  //             let exp = List::try_from(*e.get(1).unwrap()).ok().unwrap();
 
-  pub fn emit_all(items: &VecDeque<Item>) -> String {
-      let mut s: String = String::new();
-      for i in items {
-          s.push_str(&emit(&i));
-          s.push_str(" ".into());
-      }
-      s.pop();
-      return s;
-  }
-
-  // print out envs in error messages
-  impl fmt::Debug for Environment {
-      fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-          write!(
-              f,
-              "{{ stack: {}, expression: {} }}",
-              emit(&Item::List(self.stack.clone())),
-              emit(&Item::List(self.expression.clone())),
-          )
-      }
-  }
-
-  impl fmt::Debug for Error {
-      fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-          write!(
-              f,
-              "{}",
-              emit(&Item::Assoc(Associative::Assoc(self.data.clone())))
-          )
-      }
-  }
+  //             test_example(axiom::standard_env.clone(), w, p,exp)
+  //         }.retain(|i| i.is_some()).collect::<Vec<Error>>()
 #+end_src
-
-Now we'll add the functions that do input/output (pipes)
-
+** Pipes (input/output)
+Kcats will confine all i/o to pipes. You can put values into pipes and
+they emerge elsewhere. Words that act on pipes are the only ones that
+can be impure. Everything else is a value.
+**** Basic Types
+The basic pipe contracts.
 #+begin_src rust :tangle src/pipes.rs
   use crate::axiom::ItemResult;
   use crate::types::environment::Environment;
@@ -2996,8 +2999,8 @@ Now we'll add the functions that do input/output (pipes)
       }
   }
 #+end_src
-
-Now some specific types of pipes. These are for reading/writing data to files.
+**** Files
+How to interact with files on disk
 #+begin_src rust :tangle src/pipes/fs.rs
   use crate::axiom::ItemResult;
   use crate::pipes::closed_error;
@@ -3094,8 +3097,8 @@ Now some specific types of pipes. These are for reading/writing data to files.
       })))
   }
 #+end_src
-
-These are for reading/writing data over tcp/ip sockets.
+**** Network
+How to interact with the network (TCP/IP sockets)
 #+begin_src rust :tangle src/pipes/net.rs
   use crate::axiom::ItemResult;
   use crate::pipes::closed_error;
@@ -3237,7 +3240,6 @@ These are for reading/writing data over tcp/ip sockets.
       }
   }
 #+end_src
-
 ** Issues
 *** TODO Interactive mode
 run with =kcats -i= for interactive, where you get a repl-like
