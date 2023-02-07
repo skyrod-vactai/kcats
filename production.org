@@ -38,8 +38,11 @@ from stdin and execute it, then print the resulting stack.
   internment = "0.6.0" 
   lazy_static = "1.4.0"
   num-integer = "0.1.44"
-  ring = "0.16.20"
-            
+  ed25519-dalek = {version="1", features=["batch_deterministic", "std", "rand"]}
+  sha2 = "0.10.6"
+  #rand = "0.8.5"
+  rand_core = "0.5.1" # careful here, having 2 versions present will make weird compile errors
+
   [dev-dependencies]
   test-case = "2.0.0"
 #+end_src
@@ -1077,13 +1080,74 @@ We'll implement certain cryptography functions in rust and make kcats
 words for them (hashing, encryption, signing)
 #+begin_src rust :tangle src/crypto.rs
   use crate::axiom::ItemResult;
+  use crate::error;
   use crate::types::{Bytes, Item};
-  use ring::digest;
+  use core::ops::Deref;
+  use ed25519_dalek as signing;
+  use ed25519_dalek::Signer;
+  use rand_core;
+  use rand_core::{CryptoRng, RngCore};
+  use sha2::{self, Digest};
 
   pub fn hash(i: Item) -> ItemResult {
       let b = Bytes::try_from(i).unwrap();
-      let buf = digest::digest(&digest::SHA256, &b);
-      Ok(Item::Bytes(Bytes::from(buf.as_ref())))
+      Ok(Item::Bytes(sha2::Sha256::digest(b).deref().to_vec()))
+  }
+
+  type Value = Vec<u8>;
+
+  pub struct SeededRNG {
+      seed: Value,
+      salt: Value,
+  }
+
+  impl SeededRNG {
+      // Hash of seed|value
+      fn hash(&self) -> Vec<u8> {
+          let mut v = self.seed.clone();
+          v.extend(self.salt.clone());
+          sha2::Sha256::digest(v.as_slice()).deref().to_vec()
+      }
+  }
+
+  impl RngCore for SeededRNG {
+      fn next_u32(&mut self) -> u32 {
+          rand_core::impls::next_u32_via_fill(self)
+      }
+
+      fn next_u64(&mut self) -> u64 {
+          rand_core::impls::next_u64_via_fill(self)
+      }
+
+      fn fill_bytes(&mut self, dest: &mut [u8]) {
+          let l = dest.len();
+          dest.copy_from_slice(&self.hash()[..l]);
+      }
+
+      fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
+          self.fill_bytes(dest);
+          Ok(())
+      }
+  }
+
+  impl CryptoRng for SeededRNG {}
+
+  pub fn key(seed: Item) -> ItemResult {
+      let sbs: Bytes = seed.try_into()?;
+      let kp = signing::Keypair::generate(&mut SeededRNG {
+          seed: vec![],
+          salt: sbs,
+      });
+      Ok(Item::Bytes(kp.to_bytes().to_vec()))
+  }
+
+  pub fn sign(k: Item, m: Item) -> ItemResult {
+      let kbs: Bytes = k.try_into()?;
+      let message: Bytes = m.try_into()?;
+      let kp = signing::Keypair::from_bytes(&kbs)
+          .map_err(|_| error::Error::expected("encoded keypair"))?;
+      let signature: signing::Signature = kp.sign(&message);
+      Ok(Item::Bytes(signature.as_ref().to_vec()))
   }
 #+end_src
 ** Serialization
@@ -1374,6 +1438,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               ("hash", Box::leak(Box::new(f_stack1(crate::crypto::hash)))),
               ("inc", Box::leak(Box::new(f_stack1(inc)))),
               ("join", Box::leak(Box::new(f_stack2(join)))),
+              ("key", Box::leak(Box::new(f_stack1(crate::crypto::key)))),
               ("list?", Box::leak(Box::new(f_stack1(is_list)))),
               ("loop", Box::leak(Box::new(loop_))),
               ("mod", Box::leak(Box::new(f_stack2(mod_)))),
@@ -1396,6 +1461,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   "serversocket",
                   Box::leak(Box::new(f_stack2(crate::pipes::net::server_socket))),
               ),
+              ("sign", Box::leak(Box::new(f_stack2(crate::crypto::sign)))),
               ("sink", Box::leak(Box::new(sink))),
               ("sqrt", Box::leak(Box::new(f_stack1(sqrt)))),
               ("step", Box::leak(Box::new(step))),
@@ -2620,15 +2686,17 @@ interpreter process, and prints output.
 
 We'll also define how to run unit tests.
 #+begin_src rust :tangle src/main.rs
-  mod types;
-  use crate::types::*;
-  use std::rc::Rc;
   mod axiom;
+  mod crypto;
   mod pipes;
   mod serialize;
+  mod types;
+
   use crate::types::environment::Environment;
+  use crate::types::*;
   use std::io;
   use std::io::BufRead;
+  use std::rc::Rc;
 
   fn print_result(env: Environment) {
       if env.expression.is_empty() {
@@ -4477,3 +4545,10 @@ deeper in the stack).
 
 #+RESULTS:
 : #b64 "LCa0a2j/xo/5m0U8HTBBNBNCLXBkg7+g+YpeiGJm564="
+**** INPROGRESS Signing
+#+begin_src kcats
+"foo" bytes key "we attack at dawn" bytes [sign] shield
+#+end_src
+
+#+RESULTS:
+: #b64 "sAVOx61lJzZAcVMPNFBeDGjzaSej++hqjLctgr1stVcAMk+L1mSZC7nxbtj5+8rYj99zXKLZX6gQzO8bBvvlAA==" #b64 "d2UgYXR0YWNrIGF0IGRhd24=" #b64 "LCa0a2j/xo/5m0U8HTBBNBNCLXBkg7+g+YpeiGJm56400mV527RWaT5UBnLPki9S3eDWUy41vwa+ATp8Uy8g4A=="
