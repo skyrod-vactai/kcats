@@ -1080,14 +1080,14 @@ We'll implement certain cryptography functions in rust and make kcats
 words for them (hashing, encryption, signing)
 #+begin_src rust :tangle src/crypto.rs
   use crate::axiom::ItemResult;
-  use crate::error;
-  use crate::types::{Bytes, Item};
+  use crate::types::{associative::Associative, error::Error, AssociationContent, Bytes, Item};
   use core::ops::Deref;
   use ed25519_dalek as signing;
-  use ed25519_dalek::Signer;
+  use ed25519_dalek::{Signer, Verifier};
   use rand_core;
   use rand_core::{CryptoRng, RngCore};
   use sha2::{self, Digest};
+  use std::rc::Rc;
 
   pub fn hash(i: Item) -> ItemResult {
       let b = Bytes::try_from(i).unwrap();
@@ -1138,16 +1138,87 @@ words for them (hashing, encryption, signing)
           seed: vec![],
           salt: sbs,
       });
-      Ok(Item::Bytes(kp.to_bytes().to_vec()))
+      let mut keypair = AssociationContent::new();
+      keypair.insert("type".into(), "elliptic-curve-key".into());
+      keypair.insert("secret".into(), Item::Bytes(kp.secret.as_ref().to_vec()));
+      keypair.insert("public".into(), Item::Bytes(kp.public.as_ref().to_vec()));
+      Ok(Item::Assoc(Associative::Assoc(Rc::new(keypair))))
   }
 
+  impl TryFrom<Item> for signing::Keypair {
+      type Error = Error;
+      fn try_from(i: Item) -> Result<Self, Self::Error> {
+          let sk: signing::SecretKey = i.try_into()?;
+          let pk: signing::PublicKey = (&sk).into();
+          Ok(signing::Keypair {
+              secret: sk,
+              public: pk,
+          })
+      }
+  }
+
+  impl TryFrom<Item> for signing::SecretKey {
+      type Error = Error;
+      fn try_from(i: Item) -> Result<Self, Self::Error> {
+          match i {
+              Item::Assoc(a) => {
+                  if a.get(&"type".into()) == Some("elliptic-curve-key".into()) {
+                      let sk = signing::SecretKey::from_bytes(
+                          &Bytes::try_from(
+                              a.get(&"secret".into())
+                                  .ok_or_else(|| Error::expected("secret"))?,
+                          )?[..],
+                      )
+                      .map_err(|_e| Error::expected("valid-secret-key"))?;
+                      Ok(sk)
+                  } else {
+                      Err(Error::expected("keypair"))
+                  }
+              }
+              _ => Err(Error::expected("keypair")),
+          }
+      }
+  }
+
+  impl TryFrom<Item> for signing::PublicKey {
+      type Error = Error;
+      fn try_from(i: Item) -> Result<Self, Self::Error> {
+          match i {
+              Item::Assoc(a) => {
+                  if a.get(&"type".into()) == Some("elliptic-curve-key".into()) {
+                      let pk = signing::PublicKey::from_bytes(
+                          &Bytes::try_from(
+                              a.get(&"public".into())
+                                  .ok_or_else(|| Error::expected("public"))?,
+                          )?[..],
+                      )
+                      .map_err(|_e| Error::expected("valid-public-key"))?;
+                      Ok(pk)
+                  } else {
+                      Err(Error::expected("public-key"))
+                  }
+              }
+              _ => Err(Error::expected("public-key")),
+          }
+      }
+  }
+  //TODO: we can only call sign from a keypair, so we may want to assume
+  // that we have either the kp, or just the secret key.
   pub fn sign(k: Item, m: Item) -> ItemResult {
-      let kbs: Bytes = k.try_into()?;
+      let kp: signing::Keypair = k.try_into()?;
       let message: Bytes = m.try_into()?;
-      let kp = signing::Keypair::from_bytes(&kbs)
-          .map_err(|_| error::Error::expected("encoded keypair"))?;
       let signature: signing::Signature = kp.sign(&message);
       Ok(Item::Bytes(signature.as_ref().to_vec()))
+  }
+
+  pub fn verify(k: Item, m: Item, s: Item) -> ItemResult {
+      let pk: signing::PublicKey = k.try_into()?;
+      let mbs: Bytes = m.try_into()?;
+      let sbs: Bytes = s.try_into()?;
+      let sig = signing::Signature::from_bytes(&sbs).map_err(|_e| Error::expected("signature"))?;
+      pk.verify(&mbs, &sig)
+          .and(Ok(Item::from(true)))
+          .or(Ok(Item::Nothing))
   }
 #+end_src
 ** Serialization
@@ -1474,6 +1545,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               ("unassign", Box::leak(Box::new(f_stack2(unassign)))),
               ("unpack", Box::leak(Box::new(unpack))),
               ("unwrap", Box::leak(Box::new(unwrap))),
+              (
+                  "verify",
+                  Box::leak(Box::new(f_stack3(crate::crypto::verify))),
+              ),
               ("word?", Box::leak(Box::new(f_stack1(is_word)))),
               ("wrap", Box::leak(Box::new(wrap))),
               ("zero?", Box::leak(Box::new(f_stack1(is_zero)))),
@@ -4552,6 +4627,13 @@ deeper in the stack).
 
 #+RESULTS:
 : true
+
+#+begin_src kcats
+"foo" bytes key
+#+end_src
+
+#+RESULTS:
+: [[secret #b64 "LCa0a2j/xo/5m0U8HTBBNBNCLXBkg7+g+YpeiGJm564="] [public #b64 "NNJledu0Vmk+VAZyz5IvUt3g1lMuNb8GvgE6fFMvIOA="] [type ec-keypair]]
 
 **** INPROGRESS Signing
 #+begin_src kcats
