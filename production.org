@@ -26,7 +26,7 @@ from stdin and execute it, then print the resulting stack.
 #+begin_src toml :tangle Cargo.toml
   [package]
   name = "kcats"
-  version = "0.2.0"
+  version = "0.1.2"
   edition = "2021"
 
   # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -390,7 +390,7 @@ internally, to keep track of things like the stack, expression, lists etc.
 #+end_src
 *** Collection types
 #+begin_src rust :tangle src/types/collection.rs
-  yuse crate::types::associative as assoc;
+  use crate::types::associative as assoc;
   use crate::types::*;
 
   #[derive(Debug, Clone)]
@@ -1404,6 +1404,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   use std::collections::HashMap;
   use std::collections::VecDeque;
   use std::fs;
+  use std::future::Future;
   use std::mem;
   use std::ops::Range;
   use std::sync::Arc;
@@ -3009,9 +3010,9 @@ The basic pipe contracts.
   }
 
   impl In {
-      fn put(&mut self, i: Item) -> Result<(), Error> {
+      async fn put(&mut self, i: Item) -> Result<(), Error> {
           match self {
-              In::StaticFile(f) => f.put(i),
+              In::StaticFile(f) => f.put(i).await,
               In::Socket(f) => f.put(i),
           }
       }
@@ -3030,9 +3031,9 @@ The basic pipe contracts.
   }
 
   impl Out {
-      fn take(&mut self) -> Result<Item, Error> {
+      async fn take(&mut self) -> Result<Item, Error> {
           match self {
-              Out::StaticFile(f) => f.take(),
+              Out::StaticFile(f) => f.take().await,
               Out::Socket(f) => f.take(),
               Out::ServerSocket(f) => f.take(),
           }
@@ -3126,13 +3127,13 @@ The basic pipe contracts.
       )
   }
 
-  pub fn put_(mut env: Environment) -> Environment {
+  pub async fn put_(mut env: Environment) -> Environment {
       let item = env.pop();
       let expr = Arc::make_mut(&mut env.stack);
 
       let pipe = expr.front_mut().unwrap();
       if let Item::In(p) = pipe {
-          match p.put(item) {
+          match p.put(item).await {
               Ok(_) => env,
               Err(e) => env.push(Item::Error(e)),
           }
@@ -3141,12 +3142,12 @@ The basic pipe contracts.
       }
   }
 
-  pub fn take_(mut env: Environment) -> Environment {
+  pub async fn take_(mut env: Environment) -> Environment {
       let expr = Arc::make_mut(&mut env.stack);
       let pipe = expr.front_mut().unwrap();
       if let Item::Out(p) = pipe {
           let i = Out::take(p);
-          match i {
+          match i.await {
               Ok(i) => env.push(i),
               Err(e) => env.push(Item::Error(e)),
           }
@@ -3185,9 +3186,9 @@ How to interact with files on disk
   use crate::types::associative::Associative;
   use crate::types::error::Error;
   use crate::types::{AssociationContent, Item};
-  use std::fs::File;
-  use std::io::{Read, Write};
   use std::sync::Arc;
+  use tokio::fs::File;
+  use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
   #[derive(Debug)]
   pub struct StaticFile {
@@ -3199,7 +3200,7 @@ How to interact with files on disk
   impl Clone for StaticFile {
       fn clone(&self) -> Self {
           StaticFile {
-              file: self.file.try_clone().unwrap(),
+              file: File::from_std(self.file.try_into_std().unwrap().try_clone().unwrap()),
               closed: false,
               path: self.path.clone(),
           }
@@ -3215,27 +3216,27 @@ How to interact with files on disk
           self.closed
       }
 
-      pub fn put(&mut self, i: Item) -> Result<(), Error> {
+      pub async fn put(&mut self, i: Item) -> Result<(), Error> {
           match i {
               Item::Bytes(bs) => {
                   let mut pos = 0;
                   while pos < bs.len() {
-                      let bytes_written = self.file.write(&bs[pos..])?;
+                      let bytes_written = self.file.write(&bs[pos..]).await?;
                       pos += bytes_written;
                   }
-                  self.file.flush()?;
+                  self.file.flush().await?;
                   Ok(())
               }
               _ => Err(Error::expected("bytes")),
           }
       }
 
-      pub fn take(&mut self) -> Result<Item, Error> {
+      pub async fn take(&mut self) -> Result<Item, Error> {
           if self.is_closed() {
               return Err(closed_error(true));
           }
           let mut bs = [0u8; 1024];
-          let ct = self.file.read(&mut bs)?;
+          let ct = self.file.read(&mut bs).await?;
           if ct == 0 {
               // EOF, no more takes since it's static
               self.closed = true;
@@ -3255,21 +3256,22 @@ How to interact with files on disk
 
   pub fn file_in(i: Item) -> ItemResult {
       let path = String::try_from(i)?;
+      let file = std::fs::File::options()
+          .read(true)
+          .write(true)
+          .create_new(true)
+          .open(path.clone())?;
       Ok(Item::In(super::In::StaticFile(StaticFile {
-          file: File::options()
-              .read(true)
-              .write(true)
-              .create_new(true)
-              .open(path.clone())?,
+          file: File::from_std(file),
           closed: false,
           path,
       })))
   }
 
-  pub fn file_out(i: Item) -> ItemResult {
+  pub async fn file_out(i: Item) -> ItemResult {
       let path = String::try_from(i)?;
       Ok(Item::Out(super::Out::StaticFile(StaticFile {
-          file: File::open(path.clone())?,
+          file: File::open(path.clone()).await?,
           closed: false,
           path,
       })))
@@ -4691,12 +4693,31 @@ I think the basic design here is that each environment is a single
 "thread" of execution, and that will map to a tokio Task. Pipe
 operations within an env will call the async functions but will
 immediately =await=. That should yield to allow other envs to run.
+
+It looks like the =async= will creep all the way up to =axiom::eval=. If
+the criteria is that anything we want to be able to pre-empt (if it's
+waiting on i/o) needs to be labeled async, then everything up to =eval=
+is going to be =async=.
+
+I think that means fns like =f_stack1= etc will need to be async because
+the =f= it calls can potentially call i/o. Actually it's probably best
+to make new async versions of these so we don't have to make all the
+Item fns async too.
+
+We'll also need to think about what to do about dangling
+environments - let's say we have the main env, and it spawns env e,
+which will feed values back to main. But let's say main is done and
+doesn't want any more values from e. Is the entire program done and we
+can garbage collect e? My first instinct here is to blow everything
+away as soon as main is done. If we don't want to exit we should be
+taking from a pipe that won't produce anything until we're ready to
+exit. So we're not going to =join= with other environment's tasks.
 **** INPROGRESS Add tokio as dep
 **** INPROGRESS Prepare for multithreading
 ***** DONE Use Arc instead of Rc
 Does Arc have =make_mut=?  Yes! So hopefully it will be a drop-in
 replacement.
-**** TODO Update pipe types for fs and net to use tokio calls
+**** INPROGRESS Update pipe types for fs and net to use tokio calls
 **** TODO Use channel type to implement handoff pipe
 **** TODO Implement 'spawn' or equavalent
 Can probably think of a better name. What we're doing is taking an
