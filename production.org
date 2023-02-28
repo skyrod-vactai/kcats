@@ -48,6 +48,7 @@ from stdin and execute it, then print the resulting stack.
   rand_core = "0.5.1" # careful here, having 2 versions present will make weird compile errors
 
   # multithreading
+  futures = "0.3"
   tokio = { version = "1", features = ["full"] }
 
   [dev-dependencies]
@@ -152,30 +153,38 @@ internally, to keep track of things like the stack, expression, lists etc.
       Nothing,
   }
 
-  pub type StepFn = dyn Fn(env::Environment) -> env::Environment;
+  pub type StepFn = dyn Fn(env::Environment) -> env::Future;
 
   impl PartialEq for Item {
       fn eq(&self, other: &Self) -> bool {
           match (self, other) {
               // same types, just use their own eq
-              (Item::Int(i), Item::Int(j)) => i == j,
-              (Item::Float(i), Item::Float(j)) => i == j,
-              (Item::String(i), Item::String(j)) => i == j,
-              (Item::Bytes(i), Item::Bytes(j)) => i == j,
-              (Item::Word(i), Item::Word(j)) => i == j,
-              (Item::Assoc(i), Item::Assoc(j)) => i == j,
-              (Item::Env(i), Item::Env(j)) => i == j,
-              (Item::List(i), Item::List(j)) => i == j,
-              (Item::Error(i), Item::Error(j)) => i == j,
-
+              (Item::Int(a), Item::Int(b)) => a == b,
+              (Item::Float(a), Item::Float(b)) => a == b,
+              (Item::Bytes(a), Item::Bytes(b)) => a == b,
+              (Item::String(a), Item::String(b)) => a == b,
+              (Item::Word(a), Item::Word(b)) => a == b,
+              (Item::Assoc(a), Item::Assoc(b)) => a == b,
+              (Item::List(a), Item::List(b)) => a == b,
+              //TODO: (Item::Collection(a), Item::Collection(b)) => a == b,
+              (Item::Env(a), Item::Env(b)) => a == b,
+              (Item::Entry(a), Item::Entry(b)) => a == b,
+              (Item::Dictionary(a), Item::Dictionary(b)) => a == b,
+              (Item::Error(a), Item::Error(b)) => a == b,
+              //TODO:
+              //(Item::In(a), Item::In(b)) => a == b,
+              //(Item::Out(a), Item::Out(b)) => a == b,
+              //(Item::Tunnel(a), Item::Tunnel(b)) => a == b,
+              (Item::Nothing, Item::Nothing) => true,
+              // different types, but can be converted to the same type
               (Item::Nothing, Item::List(l)) => l.is_empty(),
               (Item::List(l), Item::Nothing) => l.is_empty(),
 
               (Item::Nothing, Item::Assoc(l)) => l.is_empty(),
               (Item::Assoc(l), Item::Nothing) => l.is_empty(),
 
-              (Item::List(l), Item::Assoc(a)) => a.is_empty() && l.is_empty(),
-              (Item::Assoc(a), Item::List(l)) => a.is_empty() && l.is_empty(),
+              (Item::Nothing, Item::Collection(l)) => l.is_empty(),
+              (Item::Collection(l), Item::Nothing) => l.is_empty(),
 
               //(Item::Error(i), Item::Assoc(j)) => (*i).data == *j,
               //(Item::Assoc(i), Item::Error(j)) => (*j).data == *i,
@@ -459,6 +468,22 @@ internally, to keep track of things like the stack, expression, lists etc.
       Nothing,
   }
 
+  impl PartialEq for Associative {
+      fn eq(&self, other: &Self) -> bool {
+          match (self, other) {
+              (Associative::Assoc(a), Associative::Assoc(b)) => a == b,
+              (Associative::DictEntry(a), Associative::DictEntry(b)) => a == b,
+              (Associative::Env(a), Associative::Env(b)) => a == b,
+              (Associative::Error(a), Associative::Error(b)) => a == b,
+              (Associative::Dictionary(a), Associative::Dictionary(b)) => a == b,
+              (Associative::Nothing, Associative::Nothing) => true,
+              //(Associative::Assoc(a), b) => Association::from(a) == Association::from(b),
+              //(a, Associative::Assoc(b)) => Association::from(a) == Association::from(b),
+              _ => false,
+          }
+      }
+  }
+
   impl Associative {
       pub fn is_empty(&self) -> bool {
           match self {
@@ -641,21 +666,6 @@ internally, to keep track of things like the stack, expression, lists etc.
                       .map(|(w, e)| (KeyItem::Word(w), Item::Entry(e))),
               ),
               _ => panic!("can't iterate"),
-          }
-      }
-  }
-
-  impl PartialEq for Associative {
-      fn eq(&self, other: &Self) -> bool {
-          match (self, other) {
-              // same types, just use their own eq
-              (Associative::Assoc(i), Associative::Assoc(j)) => i == j,
-              (Associative::DictEntry(i), Associative::DictEntry(j)) => i == j,
-              (Associative::Env(i), Associative::Env(j)) => i == j,
-              (Associative::Error(i), Associative::Error(j)) => i == j,
-
-              //TODO compare assoc to other types using field values
-              _ => false,
           }
       }
   }
@@ -1000,6 +1010,8 @@ internally, to keep track of things like the stack, expression, lists etc.
   use crate::types::associative::Associative;
   use crate::types::dictionary as dict;
   use crate::types::*;
+  use std::future;
+  use std::pin::Pin;
 
   #[derive(Clone, PartialEq)]
   pub struct Environment {
@@ -1007,6 +1019,8 @@ internally, to keep track of things like the stack, expression, lists etc.
       pub expression: Stack,
       pub dictionary: dict::Dictionary,
   }
+
+  pub type Future = Pin<Box<dyn future::Future<Output = Environment> + Unpin>>;
 
   impl Environment {
       pub fn push(mut self, i: Item) -> Environment {
@@ -1079,6 +1093,12 @@ internally, to keep track of things like the stack, expression, lists etc.
   impl From<Environment> for Item {
       fn from(env: Environment) -> Item {
           Item::Env(Environment::from(env))
+      }
+  }
+
+  impl From<Environment> for Future {
+      fn from(env: Environment) -> Future {
+          Box::pin(future::ready(env))
       }
   }
 #+end_src
@@ -1396,7 +1416,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   use crate::types::associative::Associative;
   use crate::types::collection as coll;
   use crate::types::dictionary as dict;
-  use crate::types::environment::Environment;
+  use crate::types::environment::{self, Environment};
   use crate::types::error::Error;
   use crate::types::*;
 
@@ -1404,10 +1424,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   use std::collections::HashMap;
   use std::collections::VecDeque;
   use std::fs;
-  use std::future::Future;
   use std::mem;
   use std::ops::Range;
   use std::sync::Arc;
+  use tokio::task;
 
   pub type ItemResult = Result<Item, Error>;
 
@@ -1420,27 +1440,27 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }
   }
 
-  fn f_stack1(f: fn(Item) -> ItemResult) -> impl Fn(Environment) -> Environment {
+  fn f_stack1(f: fn(Item) -> ItemResult) -> impl Fn(Environment) -> environment::Future {
       move |mut env: Environment| {
           let x = env.pop();
-          env.push(Item::from(f(x)))
+          env.push(Item::from(f(x))).into()
       }
   }
 
-  fn f_stack2(f: fn(Item, Item) -> ItemResult) -> impl Fn(Environment) -> Environment {
+  fn f_stack2(f: fn(Item, Item) -> ItemResult) -> impl Fn(Environment) -> environment::Future {
       move |mut env: Environment| {
           let x = env.pop();
           let y = env.pop();
-          env.push(Item::from(f(y, x)))
+          env.push(Item::from(f(y, x))).into()
       }
   }
 
-  fn f_stack3(f: fn(Item, Item, Item) -> ItemResult) -> impl Fn(Environment) -> Environment {
+  fn f_stack3(f: fn(Item, Item, Item) -> ItemResult) -> impl Fn(Environment) -> environment::Future {
       move |mut env: Environment| {
           let x = env.pop();
           let y = env.pop();
           let z = env.pop();
-          env.push(Item::from(f(z, y, x)))
+          env.push(Item::from(f(z, y, x))).into()
       }
   }
 
@@ -1759,41 +1779,41 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       Ok(Item::List(l))
   }
 
-  pub fn clone(env: Environment) -> Environment {
+  pub fn clone(env: Environment) -> environment::Future {
       let clone = env.stack.front().unwrap().clone();
-      env.push(clone)
+      env.push(clone).into()
   }
 
-  fn swap2(mut env: Environment, offset: usize) -> Environment {
+  fn swap2(mut env: Environment, offset: usize) -> environment::Future {
       Arc::make_mut(&mut env.stack).swap(offset, offset + 1);
-      env
+      env.into()
   }
 
-  pub fn swap(env: Environment) -> Environment {
+  pub fn swap(env: Environment) -> environment::Future {
       swap2(env, 0)
   }
 
-  pub fn swapdown(env: Environment) -> Environment {
+  pub fn swapdown(env: Environment) -> environment::Future {
       swap2(env, 1)
   }
 
-  pub fn sink(mut env: Environment) -> Environment {
+  pub fn sink(mut env: Environment) -> environment::Future {
       let s = Arc::make_mut(&mut env.stack);
       s.swap(0, 2);
       s.swap(0, 1);
-      env
+      env.into()
   }
 
-  pub fn float(mut env: Environment) -> Environment {
+  pub fn float(mut env: Environment) -> environment::Future {
       let s = Arc::make_mut(&mut env.stack);
       s.swap(0, 2);
       s.swap(1, 2);
-      env
+      env.into()
   }
 
-  pub fn discard(mut env: Environment) -> Environment {
+  pub fn discard(mut env: Environment) -> environment::Future {
       env.pop();
-      env
+      env.into()
   }
 
   pub fn eq(i: Item, j: Item) -> ItemResult {
@@ -1888,7 +1908,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       })
   }
 
-  pub fn loop_(mut env: Environment) -> Environment {
+  pub fn loop_(mut env: Environment) -> environment::Future {
       let p = List::try_from(env.pop());
       match p {
           Ok(mut p) => {
@@ -1905,23 +1925,25 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           }
           Err(e) => env.push(Item::Error(e)),
       }
+      .into()
   }
 
-  pub fn execute(mut env: Environment) -> Environment {
+  pub fn execute(mut env: Environment) -> environment::Future {
       match List::try_from(env.pop()) {
           Ok(program) => env.append_expression(program),
           Err(e) => env.push(Item::Error(e)),
       }
+      .into()
   }
 
-  pub fn wrap(mut env: Environment) -> Environment {
+  pub fn wrap(mut env: Environment) -> environment::Future {
       let item = env.pop();
       let mut lc = ListContent::new();
       lc.push_front(item);
-      env.push(Item::List(Arc::new(lc)))
+      env.push(Item::List(Arc::new(lc))).into()
   }
 
-  pub fn unwrap(mut env: Environment) -> Environment {
+  pub fn unwrap(mut env: Environment) -> environment::Future {
       match List::try_from(env.pop()) {
           Ok(l) => {
               let len = l.len();
@@ -1933,9 +1955,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           }
           Err(e) => env.push(Item::Error(e)),
       }
+      .into()
   }
 
-  pub fn dip(mut env: Environment) -> Environment {
+  pub fn dip(mut env: Environment) -> environment::Future {
       match List::try_from(env.pop()) {
           Ok(program) => {
               let item = env.pop();
@@ -1949,9 +1972,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           }
           Err(e) => env.push(Item::Error(e)),
       }
+      .into()
   }
 
-  pub fn dipdown(mut env: Environment) -> Environment {
+  pub fn dipdown(mut env: Environment) -> environment::Future {
       match List::try_from(env.pop()) {
           Ok(program) => {
               let item1 = env.pop();
@@ -1967,9 +1991,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           }
           Err(e) => env.push(Item::Error(e)),
       }
+      .into()
   }
 
-  pub fn unpack(mut env: Environment) -> Environment {
+  pub fn unpack(mut env: Environment) -> environment::Future {
       // TODO: handle Nothing case
       let stack = Arc::make_mut(&mut env.stack);
       let i = if let Some(s) = stack.front_mut() {
@@ -1988,7 +2013,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           Item::Error(Error::stack_underflow())
       };
       stack.push_front(i);
-      env
+      env.into()
   }
 
   fn is_truthy(i: &Item) -> bool {
@@ -2008,7 +2033,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   //     }
   // }
 
-  pub fn branch(mut env: Environment) -> Environment {
+  pub fn branch(mut env: Environment) -> environment::Future {
       match (List::try_from(env.pop()), List::try_from(env.pop())) {
           (Ok(false_branch), Ok(true_branch)) => {
               let b = env.pop();
@@ -2022,9 +2047,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           (Err(e), _) => env.push(Item::Error(e)),
           (_, Err(e)) => env.push(Item::Error(e)),
       }
+      .into()
   }
 
-  pub fn step(mut env: Environment) -> Environment {
+  pub fn step(mut env: Environment) -> environment::Future {
       let p = List::try_from(env.pop()).unwrap();
       let mut l = List::try_from(env.pop()).unwrap();
       let lm = Arc::make_mut(&mut l);
@@ -2036,13 +2062,13 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               expr.push_front(Item::List(l));
           }
           expr.push_front("execute".into());
-          env.push(litem).push(Item::List(p))
+          env.push(litem).push(Item::List(p)).into()
       } else {
-          env
+          env.into()
       }
   }
 
-  pub fn range(mut env: Environment) -> Environment {
+  pub fn range(mut env: Environment) -> environment::Future {
       let stepby = Int::try_from(env.pop()).unwrap();
       let to = Int::try_from(env.pop()).unwrap();
       let from = Int::try_from(env.pop()).unwrap();
@@ -2052,6 +2078,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               .map(|i| Item::Int(i))
               .collect::<VecDeque<Item>>(),
       )))
+      .into()
   }
 
   // (effect [rec2 rec1 then pred]
@@ -2060,7 +2087,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   //         [[pred then rec1 rec2 'recur]] rec2)
   // then pred]])
 
-  pub fn recur(mut env: Environment) -> Environment {
+  pub fn recur(mut env: Environment) -> environment::Future {
       let mut rec2 = List::try_from(env.pop()).unwrap();
       let mut rec1 = List::try_from(env.pop()).unwrap();
       let then = List::try_from(env.pop()).unwrap();
@@ -2081,15 +2108,16 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       env.push(Item::List(pred))
           .push(Item::List(then))
           .push(Item::List(Arc::new(e)))
+          .into()
   }
 
   //(fn [{[l & others] 'stack :as env}]
   //            (assoc env 'stack (apply list (vec others) l)))
 
-  pub fn evert(mut env: Environment) -> Environment {
+  pub fn evert(mut env: Environment) -> environment::Future {
       let mut l = List::try_from(env.pop()).unwrap();
       mem::swap(&mut env.stack, &mut l);
-      env.push(Item::List(l))
+      env.push(Item::List(l)).into()
   }
 
   fn to_lexicon_entry(w: Word, def: Associative) -> dict::Entry {
@@ -2263,7 +2291,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       Ok(Item::from(i & 1 == 0))
   }
 
-  pub fn decide(mut env: Environment) -> Environment {
+  pub fn decide(mut env: Environment) -> environment::Future {
       let mut clauses = List::try_from(env.pop()).unwrap();
       let clauses_data = Arc::make_mut(&mut clauses);
       let clause = clauses_data.pop_front();
@@ -2271,7 +2299,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       if let Some(clause) = clause {
           if let Item::List(mut clause) = clause {
               if clause.len() != 2 {
-                  env.push(Item::Error(Error::list_count(2)))
+                  env.push(Item::Error(Error::list_count(2))).into()
               } else {
                   let clause_data = Arc::make_mut(&mut clause);
                   let test = clause_data.pop_front().unwrap();
@@ -2292,29 +2320,32 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                               Item::List(elsep),
                               "if".into(),
                           ]));
-                          env.append_expression(newexpr)
+                          env.append_expression(newexpr).into()
                       }
-                      _ => env.push(Item::from(invalid_type_error(serialize::to_list(
-                          "[list?] both",
-                      )))),
+                      _ => env
+                          .push(Item::from(invalid_type_error(serialize::to_list(
+                              "[list?] both",
+                          ))))
+                          .into(),
                   }
               }
           } else {
-              env.push(Item::Error(Error::expected("list")))
+              env.push(Item::Error(Error::expected("list"))).into()
           }
       } else {
           // clauses empty, return nothing
-          env.push(Item::Nothing)
+          env.push(Item::Nothing).into()
       }
   }
 
-  pub fn read(mut env: Environment) -> Environment {
+  pub fn read(mut env: Environment) -> environment::Future {
       let s = String::try_from(env.pop()).unwrap();
       let parsed = serialize::parse(s);
       env.push(match parsed {
           Ok(l) => Item::List(l),
           Err(e) => Item::Error(e),
       })
+      .into()
   }
 
   fn check_type(i: &Item, w: Word) -> Result<(), Error> {
@@ -2477,7 +2508,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }
   }
 
-  pub fn eval_step(mut env: Environment) -> Environment {
+  pub fn eval_step(mut env: Environment) -> environment::Future {
       //println!("{:?}", env);
       let next_item = env.expression.front();
 
@@ -2489,7 +2520,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                           if let Some(spec) = &dfn.spec {
                               if let Err(e) = check_input_spec(&spec, &env) {
                                   env = env.push(Item::Error(e));
-                                  return env;
+                                  return env.into();
                               }
                           } else {
                               println!("No spec for {}!", word);
@@ -2507,20 +2538,20 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                               }
                               dict::Definition::Derived(d) => {
                                   let items = d.clone();
-                                  env.append_expression(items)
+                                  env.append_expression(items).into()
                               }
                           }
                       }
                   } else {
                       let w = *word;
-                      env.push(Item::Error(Error::undefined(w)))
+                      env.push(Item::Error(Error::undefined(w))).into()
                   }
               }
               Item::Entry(entry) => {
                   if let Some(spec) = &entry.spec {
                       if let Err(e) = check_input_spec(&spec, &env) {
                           env = env.push(Item::Error(e));
-                          return env;
+                          return env.into();
                       }
                   }
                   let expr = Arc::make_mut(&mut env.expression);
@@ -2533,22 +2564,22 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                           }
                           dict::Definition::Derived(d) => {
                               let d = d.clone();
-                              env.append_expression(d)
+                              env.append_expression(d).into()
                           }
                       }
                   } else {
                       // Should not ever reach here, we already know the item is an Entry
-                      env
+                      env.into()
                   }
               }
               _ => {
                   // not a word, just push onto stack
                   let i = env.pop_expr();
-                  env.push(i)
+                  env.push(i).into()
               }
           }
       } else {
-          env.push(Item::Error(Error::short_list(1)))
+          env.push(Item::Error(Error::short_list(1))).into()
       }
   }
 
@@ -2617,7 +2648,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       return env;
   }
 
-  pub fn eval(mut env: Environment) -> Environment {
+  pub async fn eval(mut env: Environment) -> Environment {
       loop {
           if let Some(err) = get_error(&env) {
               if !err.is_handled {
@@ -2625,7 +2656,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               };
           }
           if !env.expression.is_empty() {
-              env = eval_step(env);
+              env = eval_step(env).await;
           } else {
               break;
           }
@@ -2661,13 +2692,13 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       Ok(Item::Env(eval(inner_env)))
   }
 
-  pub fn identity(env: Environment) -> Environment {
-      env
+  pub fn identity(env: Environment) -> environment::Future {
+      env.into()
   }
 
-  pub fn dictionary(env: Environment) -> Environment {
+  pub fn dictionary(env: Environment) -> environment::Future {
       let d = env.dictionary.clone();
-      env.push(Item::Dictionary(d))
+      env.push(Item::Dictionary(d)).into()
   }
 
   fn ceil(i: Item) -> ItemResult {
@@ -2716,8 +2747,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   // make 'true' a word that doesn't have to be quoted, just pushes
   // itself onto the stack.
-  pub fn true_(env: Environment) -> Environment {
-      env.push("true".into())
+  pub fn true_(env: Environment) -> environment::Future {
+      env.push("true".into()).into()
   }
 
   pub fn fail(e: Item) -> ItemResult {
@@ -2749,7 +2780,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   //     Ok(d)
   // }
 
-  pub fn redefine(mut env: Environment) -> Environment {
+  pub fn redefine(mut env: Environment) -> environment::Future {
       let d = dict::Dictionary::try_from(env.pop());
       match d {
           Ok(d) => {
@@ -2761,6 +2792,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               env
           }
       }
+      .into()
   }
 #+end_src
 ** Top level execution
@@ -2982,10 +3014,13 @@ can be impure. Everything else is a value.
 The basic pipe contracts.
 #+begin_src rust :tangle src/pipes.rs
   use crate::axiom::ItemResult;
-  use crate::types::environment::Environment;
+  use crate::types::environment::{self, Environment};
   use crate::types::error::Error;
   use crate::types::Item;
   use crate::ListContent;
+  use futures::future::FutureExt;
+  use std::future::Future;
+  use std::io;
   use std::sync::Arc;
   pub mod fs;
   pub mod net;
@@ -3010,10 +3045,11 @@ The basic pipe contracts.
   }
 
   impl In {
-      async fn put(&mut self, i: Item) -> Result<(), Error> {
+      fn put(&mut self, i: Item) -> Result<impl Future<Output = io::Result<()>> + '_, Error> {
           match self {
-              In::StaticFile(f) => f.put(i).await,
-              In::Socket(f) => f.put(i),
+              In::StaticFile(f) => f.put(i),
+              //In::Socket(f) => f.put(i),
+              _ => Err(Error::expected("foo")),
           }
       }
       fn close(&mut self) -> Result<(), Error> {
@@ -3031,11 +3067,12 @@ The basic pipe contracts.
   }
 
   impl Out {
-      async fn take(&mut self) -> Result<Item, Error> {
+      fn take(&mut self) -> Result<impl Future<Output = io::Result<Item>> + '_, Error> {
           match self {
-              Out::StaticFile(f) => f.take().await,
-              Out::Socket(f) => f.take(),
-              Out::ServerSocket(f) => f.take(),
+              Out::StaticFile(f) => f.take(),
+              //Out::Socket(f) => f.take(),
+              //Out::ServerSocket(f) => f.take(),
+              _ => Err(Error::expected("foobar")),
           }
       }
       fn close(&mut self) -> Result<(), Error> {
@@ -3127,32 +3164,35 @@ The basic pipe contracts.
       )
   }
 
-  pub async fn put_(mut env: Environment) -> Environment {
+  pub fn put_(mut env: Environment) -> environment::Future {
       let item = env.pop();
       let expr = Arc::make_mut(&mut env.stack);
 
       let pipe = expr.front_mut().unwrap();
       if let Item::In(p) = pipe {
-          match p.put(item).await {
-              Ok(_) => env,
-              Err(e) => env.push(Item::Error(e)),
+          match p.put(item) {
+              Ok(fut) => Box::pin(fut.map(|_| env)),
+              Err(e) => env.push(Item::Error(e)).into(),
           }
       } else {
-          env.push(Item::Error(Error::expected("pipe")))
+          env.push(Item::Error(Error::expected("pipe"))).into()
       }
   }
 
-  pub async fn take_(mut env: Environment) -> Environment {
+  pub fn take_(mut env: Environment) -> environment::Future {
       let expr = Arc::make_mut(&mut env.stack);
       let pipe = expr.front_mut().unwrap();
       if let Item::Out(p) = pipe {
           let i = Out::take(p);
-          match i.await {
-              Ok(i) => env.push(i),
-              Err(e) => env.push(Item::Error(e)),
+          match i {
+              Ok(fut) => Box::pin(async move {
+                  let i = fut.await.unwrap();
+                  env.push(i)
+              }),
+              Err(e) => env.push(Item::Error(e)).into(),
           }
       } else {
-          env.push(Item::Error(Error::expected("pipe")))
+          env.push(Item::Error(Error::expected("pipe"))).into()
       }
   }
 
@@ -3186,6 +3226,8 @@ How to interact with files on disk
   use crate::types::associative::Associative;
   use crate::types::error::Error;
   use crate::types::{AssociationContent, Item};
+  use std::future::Future;
+  use std::io;
   use std::sync::Arc;
   use tokio::fs::File;
   use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -3216,32 +3258,26 @@ How to interact with files on disk
           self.closed
       }
 
-      pub async fn put(&mut self, i: Item) -> Result<(), Error> {
+      pub fn put(&mut self, i: Item) -> Result<impl Future<Output = io::Result<()>> + '_, Error> {
           match i {
-              Item::Bytes(bs) => {
-                  let mut pos = 0;
-                  while pos < bs.len() {
-                      let bytes_written = self.file.write(&bs[pos..]).await?;
-                      pos += bytes_written;
-                  }
-                  self.file.flush().await?;
-                  Ok(())
-              }
+              Item::Bytes(bs) => Ok(async move { self.file.write_all(&bs).await }),
               _ => Err(Error::expected("bytes")),
           }
       }
 
-      pub async fn take(&mut self) -> Result<Item, Error> {
+      pub fn take(&mut self) -> Result<impl Future<Output = io::Result<Item>> + '_, Error> {
           if self.is_closed() {
               return Err(closed_error(true));
           }
           let mut bs = [0u8; 1024];
-          let ct = self.file.read(&mut bs).await?;
-          if ct == 0 {
-              // EOF, no more takes since it's static
-              self.closed = true;
-          }
-          Ok(Item::Bytes(bs[0..ct].to_vec()))
+          Ok(async move {
+              let ct = self.file.read(&mut bs).await?;
+              if ct == 0 {
+                  // EOF, no more takes since it's static
+                  self.closed = true;
+              }
+              Ok(Item::Bytes(bs[0..ct].to_vec()))
+          })
       }
   }
 
@@ -3268,10 +3304,11 @@ How to interact with files on disk
       })))
   }
 
-  pub async fn file_out(i: Item) -> ItemResult {
+  pub fn file_out(i: Item) -> ItemResult {
       let path = String::try_from(i)?;
+      let file = std::fs::File::open(path.clone())?;
       Ok(Item::Out(super::Out::StaticFile(StaticFile {
-          file: File::open(path.clone()).await?,
+          file: File::from_std(file),
           closed: false,
           path,
       })))
@@ -3285,10 +3322,13 @@ How to interact with the network (TCP/IP sockets)
   use crate::types::associative::Associative;
   use crate::types::error::Error;
   use crate::types::{wrap, AssociationContent, Int, Item};
-  use std::io::{Read, Write};
-  use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
+  use std::future::Future;
+  use std::io;
+  use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
   use std::str::FromStr;
   use std::sync::Arc;
+  use tokio::io::{AsyncReadExt, AsyncWriteExt};
+  use tokio::net::{TcpListener, TcpStream};
 
   #[derive(Debug)]
   pub struct Socket {
@@ -3300,7 +3340,8 @@ How to interact with the network (TCP/IP sockets)
   impl Clone for Socket {
       fn clone(&self) -> Self {
           Socket {
-              socket: self.socket.try_clone().unwrap(),
+              socket: TcpStream::from_std(self.socket.into_std().unwrap().try_clone().unwrap())
+                  .unwrap(),
               addr: self.addr.clone(),
               closed: false,
           }
@@ -3316,34 +3357,31 @@ How to interact with the network (TCP/IP sockets)
           self.closed
       }
 
-      pub fn put(&mut self, i: Item) -> Result<(), Error> {
+      pub fn put(&mut self, i: Item) -> Result<impl Future<Output = io::Result<()>> + '_, Error> {
           match i {
               Item::Bytes(bs) => {
-                  let mut pos = 0;
-                  while pos < bs.len() {
-                      let bytes_written = self.socket.write(&bs[pos..])?;
-                      pos += bytes_written;
-                  }
-                  self.socket.flush()?;
-                  Ok(())
+                  //let mut socket = self.socket.clone();
+                  Ok(async move { self.socket.write_all(&bs).await })
               }
               _ => Err(Error::expected("bytes")),
           }
       }
 
-      pub fn take(&mut self) -> Result<Item, Error> {
+      pub fn take(&mut self) -> Result<impl Future<Output = io::Result<Item>> + '_, Error> {
           if self.is_closed() {
               return Err(closed_error(true));
           }
           let mut bs = [0u8; 1024];
-          let ct = self.socket.read(&mut bs)?;
-          if ct == 0 {
-              // EOF, no more takes since it's static
-              self.closed = true;
-          }
-          Ok(Item::Bytes(bs[0..ct].to_vec()))
+          Ok(async move {
+              let n = self.socket.read(&mut bs).await?;
+              if n == 0 {
+                  self.closed = true;
+              }
+              Ok(Item::Bytes(bs[..n].to_vec()))
+          })
       }
   }
+
   impl crate::serialize::Display for Socket {
       fn representation(&self) -> Item {
           Item::Assoc(Associative::Assoc(Arc::new(AssociationContent::from([
@@ -3364,7 +3402,8 @@ How to interact with the network (TCP/IP sockets)
   impl Clone for ServerSocket {
       fn clone(&self) -> Self {
           ServerSocket {
-              socket: self.socket.try_clone().unwrap(),
+              socket: TcpListener::from_std(self.socket.into_std().unwrap().try_clone().unwrap())
+                  .unwrap(),
               closed: false,
           }
       }
@@ -3379,17 +3418,19 @@ How to interact with the network (TCP/IP sockets)
           self.closed
       }
 
-      pub fn take(&mut self) -> Result<Item, Error> {
+      pub fn take(&mut self) -> Result<impl Future<Output = io::Result<Item>> + '_, Error> {
           if self.is_closed() {
               return Err(closed_error(true));
           }
-          let (socket, addr) = self.socket.accept()?;
+          Ok(async move {
+              let (socket, addr) = self.socket.accept().await?;
 
-          Ok(Item::Tunnel(super::Tunnel::Socket(Socket {
-              socket,
-              addr,
-              closed: false,
-          })))
+              Ok(Item::Tunnel(super::Tunnel::Socket(Socket {
+                  socket,
+                  addr,
+                  closed: false,
+              })))
+          })
       }
   }
 
@@ -4718,6 +4759,30 @@ exit. So we're not going to =join= with other environment's tasks.
 Does Arc have =make_mut=?  Yes! So hopefully it will be a drop-in
 replacement.
 **** INPROGRESS Update pipe types for fs and net to use tokio calls
+One problem here is that we don't have a trivial way to mix step
+functions that are pure vs involving pipes.
+
+If we don't know until runtime what it is, we have to assume async and
+there's probably a huge performance hit.
+
+Maybe one way to proceed is to make an =Item= variant =Future=. So if
+we're taking from a pipe, we can just put the =Future= on the stack and
+continue. Of course, very soon we'll need to access the value and call
+=await= on it. 
+
+What then, do we do about =put=? Let's say the pipe is full and the put
+needs to wait. We can return the Env but we still need to await sometime.
+
+Maybe in eval-step, we can check if the top item is a Future. If so,
+await it. If it returns another Item, replace it. If it returns Unit,
+just discard it. Somewhere we'd need a type =Option<Item>= for what the
+futures return (None if we're just waiting on a value to put into a
+pipe, Item if we're taking)
+
+So will this work in nested envs? I am not sure but I can't think of
+why it wouldn't.
+
+If this works then only eval/eval-step will need =async=.
 **** TODO Use channel type to implement handoff pipe
 **** TODO Implement 'spawn' or equavalent
 Can probably think of a better name. What we're doing is taking an
