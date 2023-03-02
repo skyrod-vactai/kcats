@@ -3062,7 +3062,8 @@ The basic pipe contracts.
   use crate::types::error::Error;
   use crate::types::{self, Item};
   use crate::ListContent;
-  use futures::future::FutureExt;
+  use futures::FutureExt;
+
   use std::future::Future;
   use std::io;
   use std::sync::Arc;
@@ -3089,11 +3090,11 @@ The basic pipe contracts.
   }
 
   impl In {
-      fn put(self, i: Item) -> Result<impl Future<Output = io::Result<()>>, Error> {
+      fn put(self, i: Item) -> Result<types::Future<io::Result<()>>, Error> {
           match self {
-              In::StaticFile(f) => f.clone().put(i),
-              //In::Socket(f) => f.put(i),
-              _ => Err(Error::expected("foo")),
+              In::StaticFile(f) => f.put(i),
+              In::Socket(f) => f.put(i),
+              //_ => Err(Error::expected("foo")),
           }
       }
       fn close(&mut self) -> Result<(), Error> {
@@ -3211,11 +3212,11 @@ The basic pipe contracts.
   pub fn put_(mut env: Environment) -> types::Future<Environment> {
       let item = env.pop();
       let pipe = env.pop();
-
+      let p2 = pipe.clone();
       //let pipe = expr.front_mut().unwrap();
       if let Item::In(p) = pipe {
           match p.put(item) {
-              Ok(fut) => Box::pin(fut.map(move |_| env)),
+              Ok(fut) => Box::pin(fut.map(move |_| env.push(p2))),
               Err(e) => env.push(Item::Error(e)).into(),
           }
       } else {
@@ -3225,12 +3226,13 @@ The basic pipe contracts.
 
   pub fn take_(mut env: Environment) -> types::Future<Environment> {
       let pipe = env.pop();
+      let p2 = pipe.clone();
       if let Item::Out(p) = pipe {
           let i = Out::take(p);
           match i {
               Ok(fut) => Box::pin(async move {
                   let i = fut.await.unwrap();
-                  env.push(i)
+                  env.push(p2).push(i)
               }),
               Err(e) => env.push(Item::Error(e)).into(),
           }
@@ -3268,7 +3270,7 @@ How to interact with files on disk
   use crate::pipes::closed_error;
   use crate::types::associative::Associative;
   use crate::types::error::Error;
-  use crate::types::{AssociationContent, Item};
+  use crate::types::{self, AssociationContent, Item};
   use std::future::Future;
   use std::io;
   use std::sync::Arc;
@@ -3292,12 +3294,12 @@ How to interact with files on disk
           self.closed
       }
 
-      pub fn put(self, i: Item) -> Result<impl Future<Output = io::Result<()>>, Error> {
+      pub fn put(self, i: Item) -> Result<types::Future<io::Result<()>>, Error> {
           match i {
-              Item::Bytes(bs) => Ok(async move {
+              Item::Bytes(bs) => Ok(Box::pin(async move {
                   let mut f = self.file.lock().await;
                   f.write_all(&bs).await
-              }),
+              })),
               _ => Err(Error::expected("bytes")),
           }
       }
@@ -3365,9 +3367,10 @@ How to interact with the network (TCP/IP sockets)
   use std::io;
   use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
   use std::str::FromStr;
-  use std::sync::{Arc, Mutex};
+  use std::sync::Arc;
   use tokio::io::{AsyncReadExt, AsyncWriteExt};
   use tokio::net::{TcpListener, TcpStream};
+  use tokio::sync::Mutex;
 
   #[derive(Debug, Clone)]
   pub struct Socket {
@@ -3385,11 +3388,13 @@ How to interact with the network (TCP/IP sockets)
           self.closed
       }
 
-      pub fn put(&mut self, i: Item) -> Result<impl Future<Output = io::Result<()>> + '_, Error> {
+      pub fn put(self, i: Item) -> Result<types::Future<io::Result<()>>, Error> {
           match i {
               Item::Bytes(bs) => {
                   //let mut socket = self.socket.clone();
-                  Ok(async move { self.socket.lock().unwrap().write_all(&bs).await })
+                  Ok(Box::pin(async move {
+                      self.socket.lock().await.write_all(&bs).await
+                  }))
               }
               _ => Err(Error::expected("bytes")),
           }
@@ -3401,7 +3406,7 @@ How to interact with the network (TCP/IP sockets)
           }
           let mut bs = [0u8; 1024];
           Ok(async move {
-              let n = self.socket.lock().unwrap().read(&mut bs).await?;
+              let n = self.socket.lock().await.read(&mut bs).await?;
               if n == 0 {
                   self.closed = true;
               }
@@ -3441,7 +3446,7 @@ How to interact with the network (TCP/IP sockets)
               return Err(closed_error(true));
           }
           Ok(async move {
-              let (socket, addr) = self.socket.lock().unwrap().accept().await?;
+              let (socket, addr) = self.socket.lock().await.accept().await?;
 
               Ok(Item::Tunnel(super::Tunnel::Socket(Socket {
                   socket: Arc::new(Mutex::new(socket)),
@@ -3458,14 +3463,7 @@ How to interact with the network (TCP/IP sockets)
               ("type".into(), "pipe".into()),
               (
                   "serversocket".into(),
-                  Item::String(
-                      self.socket
-                          .lock()
-                          .unwrap()
-                          .local_addr()
-                          .unwrap()
-                          .to_string(),
-                  ),
+                  "todo: fix serversocket local addr async issue".into(), //Item::String(self.socket.lock().await.local_addr().unwrap().to_string()),
               ),
           ]))))
       }
@@ -3591,22 +3589,22 @@ to mask all kinds of errors and will cause untold headaches.
 *** INPROGRESS Implement pipes
 **** DONE Write to a file
 #+begin_src kcats
-[[file "/tmp/bar4"]] pipe-in
+  [[file "/tmp/bar4"]] pipe-in
 
-["hello world!"
- "Nice to meet you!"
- "My name is kcats"]
+  ["hello world!"
+   "Nice to meet you!"
+   "My name is kcats"]
 
-["\n" join bytes put]
+  ["\n" join bytes put]
 
-step
+  step
 #+end_src
 
 #+RESULTS:
 : [[asked [pipe]] [unwound [["Nice to meet you!" "My name is kcats"] ["\n" join bytes put] step]] [type error] [reason "type mismatch"]] [[type pipe] [file "/tmp/bar4"]]
 
 #+begin_src kcats
-  [[file "/tmp/bar10r7"]] pipe-in
+  [[file "/tmp/bar101r7"]] pipe-in
 
   "hello world!"
 
@@ -3615,10 +3613,10 @@ step
 #+end_src
 
 #+RESULTS:
-: [[type pipe] [file "/tmp/bar10r7"]]
+: [[file "/tmp/bar101r7"] [type pipe]]
 
 #+begin_src kcats
-  [[file "/tmp/bar10r7"]] pipe-out
+  [[file "/tmp/bar101r7"]] pipe-out
 
   take
 
@@ -3627,7 +3625,7 @@ step
 #+end_src
 
 #+RESULTS:
-: "hello world!" [[type pipe] [file "/tmp/bar10r7"]]
+: "hello world!" [[type pipe] [file "/tmp/bar101r7"]]
 
 **** DONE Read from a file
 #+begin_src kcats :results code
@@ -3672,13 +3670,12 @@ something like[[type pipe-in] [file "/tmp/foo"]]
 **** DONE Sockets
 ***** DONE Server Sockets
 #+begin_src kcats :results code
-[[type ip-port] [address "127.0.0.1"] [port 11211]] pipe-out take take string
+[[type ip-port] [address "127.0.0.1"] [port 11211]] pipe-out take 
 #+end_src
 
 #+RESULTS:
 #+begin_src kcats
-
-["hello world!\n" [[realm tcp] [type tunnel] [address "127.0.0.1:52212"]] [[type pipe] [serversocket "127.0.0.1:11211"]]]
+[[reason "type mismatch"] [unwound [take]] [type error] [asked [string]]]
 #+end_src
 
 #+begin_src kcats :results code
