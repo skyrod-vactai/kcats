@@ -70,8 +70,10 @@ internally, to keep track of things like the stack, expression, lists etc.
   use std::collections::{HashMap, VecDeque};
   use std::fmt;
   use std::hash::Hash;
+  use std::marker::Sync;
   use std::pin::Pin;
   use std::sync::Arc;
+
   pub mod associative;
   pub mod collection;
   pub mod dictionary;
@@ -153,8 +155,8 @@ internally, to keep track of things like the stack, expression, lists etc.
       Nothing,
   }
 
-  pub type Future<T> = Pin<Box<dyn std::future::Future<Output = T>>>;
-  pub type StepFn = dyn Fn(env::Environment) -> Future<env::Environment>;
+  pub type Future<T> = Pin<Box<dyn std::future::Future<Output = T> + Send>>;
+  pub type StepFn = dyn Fn(env::Environment) -> Future<env::Environment> + Sync + Send;
 
   impl PartialEq for Item {
       fn eq(&self, other: &Self) -> bool {
@@ -2678,7 +2680,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               };
           }
           if !env.expression.is_empty() {
-              env = Box::pin(eval_step(env)).await;
+              env = eval_step(env).await;
           } else {
               break;
           }
@@ -2889,6 +2891,7 @@ We'll also define how to run unit tests.
       use super::*;
       use internment::Intern;
       use test_case::test_case;
+      use tokio;
 
       pub fn get_item(i: Item, index: usize) -> Option<Item> {
           if let Item::List(l) = i {
@@ -2901,14 +2904,23 @@ We'll also define how to run unit tests.
           }
       }
 
-      fn test_example(mut prog_env: Environment, program: List, expected: List) -> Option<Error> {
+      #[tokio::main]
+      async fn test_example(
+          mut prog_env: Environment,
+          program: List,
+          expected: List,
+      ) -> Option<Error> {
           let mut exp_env = prog_env.clone();
           prog_env = prog_env.append_expression(program.clone());
           exp_env = exp_env.append_expression(expected.clone());
 
-          //let res = eval(env).ok()?;
-          prog_env = axiom::eval(prog_env);
-          exp_env = axiom::eval(exp_env);
+          let p_fut = tokio::spawn(async move { axiom::eval(prog_env).await });
+
+          let exp_fut = tokio::spawn(async move { axiom::eval(exp_env).await });
+
+          let (prog_env, exp_env) = tokio::join!(p_fut, exp_fut);
+          let prog_env = prog_env.unwrap();
+          let exp_env = exp_env.unwrap();
 
           if prog_env.stack == exp_env.stack {
               println!("Nice expected {:?} got {:?}", exp_env.stack, prog_env.stack);
@@ -3259,9 +3271,10 @@ How to interact with files on disk
   use crate::types::{AssociationContent, Item};
   use std::future::Future;
   use std::io;
-  use std::sync::{Arc, Mutex};
+  use std::sync::Arc;
   use tokio::fs::File;
   use tokio::io::{AsyncReadExt, AsyncWriteExt};
+  use tokio::sync::Mutex;
 
   #[derive(Debug, Clone)]
   pub struct StaticFile {
@@ -3282,7 +3295,7 @@ How to interact with files on disk
       pub fn put(self, i: Item) -> Result<impl Future<Output = io::Result<()>>, Error> {
           match i {
               Item::Bytes(bs) => Ok(async move {
-                  let mut f = self.file.lock().unwrap();
+                  let mut f = self.file.lock().await;
                   f.write_all(&bs).await
               }),
               _ => Err(Error::expected("bytes")),
@@ -3295,7 +3308,7 @@ How to interact with files on disk
           }
           let mut bs = [0u8; 1024];
           Ok(async move {
-              let mut f = self.file.lock().unwrap();
+              let mut f = self.file.lock().await;
               let ct = f.read(&mut bs).await?;
               if ct == 0 {
                   // EOF, no more takes since it's static
