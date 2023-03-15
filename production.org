@@ -3083,33 +3083,36 @@ The basic pipe contracts.
   use crate::types::error::Error;
   use crate::types::{self, Item};
   use crate::ListContent;
-  use futures::FutureExt;
-
+  use std::future;
   use std::sync::Arc;
+  use tokio::sync::RwLock;
+  //use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+  use futures::executor;
+  use futures::future::FutureExt;
   pub mod channel;
   pub mod fs;
   pub mod net;
 
   #[derive(Debug, Clone)]
   pub enum In {
-      StaticFile(fs::StaticFile),
-      Socket(net::Socket),
+      StaticFile(Arc<RwLock<fs::StaticFile>>),
+      Socket(Arc<RwLock<net::Socket>>),
       Handoff(channel::Handoff<Item>),
   }
 
   #[derive(Debug, Clone)]
   pub enum Out {
-      StaticFile(fs::StaticFile),
-      Socket(net::Socket),
-      ServerSocket(net::ServerSocket),
+      StaticFile(Arc<RwLock<fs::StaticFile>>),
+      Socket(Arc<RwLock<net::Socket>>),
+      ServerSocket(Arc<RwLock<net::ServerSocket>>),
       Handoff(channel::Handoff<Item>),
   }
 
   #[derive(Debug, Clone)]
   pub enum Tunnel {
-      StaticFile(fs::StaticFile),
-      Socket(net::Socket),
+      StaticFile(Arc<RwLock<fs::StaticFile>>),
+      Socket(Arc<RwLock<net::Socket>>),
       Handoff(channel::Handoff<Item>),
   }
 
@@ -3134,52 +3137,62 @@ The basic pipe contracts.
   }
 
   impl In {
-      fn put(self, i: Item) -> Result<types::Future<Result<(), Error>>, Error> {
+      fn put(self, i: Item) -> types::Future<Result<(), Error>> {
           match self {
-              In::StaticFile(f) => f.put(i),
-              In::Socket(f) => f.put(i),
-              In::Handoff(f) => f.put(i), //_ => Err(Error::expected("foo")),
+              In::StaticFile(f) => Box::pin(async move { f.write().await.put(i).await }),
+              In::Socket(f) => Box::pin(async move { f.write().await.put(i).await }),
+              In::Handoff(f) => Box::pin(f.put(i)), //_ => Err(Error::expected("foo")),
           }
       }
-      fn close(&mut self) -> Result<(), Error> {
+      fn close(self) -> types::Future<Result<(), Error>> {
           match self {
-              In::StaticFile(f) => f.close(),
-              In::Socket(s) => s.close(),
-              In::Handoff(_) => Ok(()),
+              In::StaticFile(f) => Box::pin(async move { f.write().await.close() }),
+              In::Socket(s) => Box::pin(async move { Ok(()) }),
+              In::Handoff(_) => Box::pin(async move { Ok(()) }),
           }
       }
-      fn is_closed(&self) -> bool {
+      fn is_closed(self) -> types::Future<bool> {
           match self {
-              In::StaticFile(f) => f.is_closed(),
-              In::Socket(f) => f.is_closed(),
-              In::Handoff(_) => false,
+              In::StaticFile(f) => Box::pin(async move { f.read().await.is_closed() }),
+              In::Socket(f) => Box::pin(async move { false }), //TODO: actual impls
+              In::Handoff(_) => Box::pin(async move { false }),
+          }
+      }
+  }
+
+  impl Tunnel {
+      fn is_closed(self) -> types::Future<bool> {
+          match self {
+              Tunnel::StaticFile(f) => Box::pin(async move { f.read().await.is_closed() }),
+              Tunnel::Socket(f) => Box::pin(async move { false }),
+              Tunnel::Handoff(_) => Box::pin(async move { false }),
           }
       }
   }
 
   impl Out {
-      fn take(self) -> Result<types::Future<ItemResult>, Error> {
+      fn take(self) -> types::Future<ItemResult> {
           match self {
-              Out::StaticFile(f) => f.take(),
-              Out::Socket(f) => f.take(),
-              Out::ServerSocket(f) => f.take(),
-              Out::Handoff(h) => h.take(),
+              Out::StaticFile(f) => Box::pin(async move { f.write().await.take().await }),
+              Out::Socket(f) => Box::pin(async move { f.write().await.take().await }),
+              Out::ServerSocket(f) => Box::pin(async move { f.write().await.take().await }),
+              Out::Handoff(h) => Box::pin(h.take()),
           }
       }
-      fn close(&mut self) -> Result<(), Error> {
+      fn close(self) -> types::Future<Result<(), Error>> {
           match self {
-              Out::StaticFile(f) => f.close(),
-              Out::Socket(f) => f.close(),
-              Out::ServerSocket(f) => f.close(),
-              Out::Handoff(_) => Ok(()),
+              Out::StaticFile(f) => Box::pin(async move { f.write().await.close() }),
+              Out::Socket(f) => Box::pin(async move { f.write().await.close() }),
+              Out::ServerSocket(f) => Box::pin(async move { f.write().await.close() }),
+              Out::Handoff(_) => Box::pin(future::ready(Ok(()))),
           }
       }
-      fn is_closed(&self) -> bool {
+      fn is_closed(self) -> types::Future<bool> {
           match self {
-              Out::StaticFile(f) => f.is_closed(),
-              Out::Socket(f) => f.is_closed(),
-              Out::ServerSocket(f) => f.is_closed(),
-              Out::Handoff(_) => false,
+              Out::StaticFile(f) => Box::pin(async move { f.read().await.is_closed() }),
+              Out::Socket(f) => Box::pin(async move { f.read().await.is_closed() }),
+              Out::ServerSocket(f) => Box::pin(async move { f.read().await.is_closed() }),
+              Out::Handoff(_) => Box::pin(future::ready(false)),
           }
       }
   }
@@ -3187,8 +3200,8 @@ The basic pipe contracts.
   impl crate::serialize::Display for In {
       fn representation(&self) -> Item {
           match self {
-              In::StaticFile(f) => f.representation(),
-              In::Socket(f) => f.representation(),
+              In::StaticFile(f) => executor::block_on(async move { f.read().await.representation() }),
+              In::Socket(f) => executor::block_on(async move { f.read().await.representation() }),
               In::Handoff(h) => h.representation(),
           }
       }
@@ -3197,9 +3210,13 @@ The basic pipe contracts.
   impl crate::serialize::Display for Out {
       fn representation(&self) -> Item {
           match self {
-              Out::StaticFile(f) => f.representation(),
-              Out::Socket(f) => f.representation(),
-              Out::ServerSocket(f) => f.representation(),
+              Out::StaticFile(f) => {
+                  executor::block_on(async move { f.read().await.representation() })
+              }
+              Out::Socket(f) => executor::block_on(async move { f.read().await.representation() }),
+              Out::ServerSocket(f) => {
+                  executor::block_on(async move { f.read().await.representation() })
+              }
               Out::Handoff(h) => h.representation(),
           }
       }
@@ -3208,8 +3225,10 @@ The basic pipe contracts.
   impl crate::serialize::Display for Tunnel {
       fn representation(&self) -> Item {
           match self {
-              Tunnel::StaticFile(f) => f.representation(),
-              Tunnel::Socket(f) => f.representation(),
+              Tunnel::StaticFile(f) => {
+                  executor::block_on(async move { f.read().await.representation() })
+              }
+              Tunnel::Socket(f) => executor::block_on(async move { f.read().await.representation() }),
               Tunnel::Handoff(h) => h.representation(),
           }
       }
@@ -3265,54 +3284,58 @@ The basic pipe contracts.
       let pipe = env.pop();
       let p2 = pipe.clone();
 
-      let pipe_content = match pipe {
-          Item::In(p) => p.put(item),
-          Item::Tunnel(t) => In::from(t).put(item),
-          _ => return env.push(Item::Error(Error::expected("pipe"))).into(),
-      };
-
-      match pipe_content {
-          Ok(fut) => Box::pin(fut.map(move |_| env.push(p2))),
-          Err(e) => env.push(Item::Error(e)).into(),
-      }
+      Box::pin(
+          match pipe {
+              Item::In(p) => p.put(item),
+              Item::Tunnel(t) => In::from(t).put(item),
+              //TODO: put the pipe back
+              _ => return env.push(Item::Error(Error::expected("pipe"))).into(),
+          }
+          .map(move |r| match r {
+              Ok(_) => env.push(p2),
+              Err(e) => env.push(p2).push(Item::Error(e)),
+          }),
+      )
   }
 
   pub fn take_(mut env: Environment) -> types::Future<Environment> {
       let pipe = env.pop();
       let p2 = pipe.clone();
-      let pipe_content = match pipe {
+      Box::pin(match pipe {
           Item::Out(p) => p.take(),
           Item::Tunnel(t) => Out::from(t).take(),
           _ => return env.push(Item::Error(Error::expected("pipe"))).into(),
-      };
-      match pipe_content {
-          Ok(fut) => Box::pin(async move {
-              let i = fut.await.unwrap();
-              env.push(p2).push(i)
-          }),
-          Err(e) => env.push(Item::Error(e)).into(),
+      })
+      .map(move |r| match r {
+          Ok(_) => env.push(p2),
+          Err(e) => env.push(p2).push(Item::Error(e)),
+      })
+  }
+
+  pub fn is_closed(i: Item) -> types::Future<ItemResult> {
+      match i {
+          Item::In(p) => Box::pin(async move { Ok(Item::from(p.is_closed().await)) }),
+          Item::Out(p) => Box::pin(async move { Ok(Item::from(p.is_closed().await)) }),
+          Item::Tunnel(t) => Box::pin(async move { Ok(Item::from(t.is_closed().await)) }),
+          _ => Box::pin(future::ready(Err(Error::expected("pipe")))),
       }
   }
 
-  pub fn is_closed(i: Item) -> ItemResult {
+  pub fn close(i: Item) -> types::Future<ItemResult> {
       match i {
-          Item::In(p) => Ok(Item::from(p.is_closed())),
-          Item::Out(p) => Ok(Item::from(p.is_closed())),
-          _ => Err(Error::expected("pipe")),
-      }
-  }
-
-  pub fn close(i: Item) -> ItemResult {
-      match i {
-          Item::In(mut p) => Ok({
-              p.close()?;
-              Item::In(p)
+          Item::In(mut p) => Box::pin(async move {
+              Ok({
+                  p.close().await;
+                  Item::In(p)
+              })
           }),
-          Item::Out(mut p) => Ok({
-              p.close()?;
-              Item::Out(p)
+          Item::Out(mut p) => Box::pin(async move {
+              Ok({
+                  p.close().await;
+                  Item::Out(p)
+              })
           }),
-          _ => Err(Error::expected("pipe")),
+          _ => Box::pin(future::ready(Err(Error::expected("pipe")))),
       }
   }
 #+end_src
@@ -3324,51 +3347,55 @@ How to interact with files on disk
   use crate::types::associative::Associative;
   use crate::types::error::Error;
   use crate::types::{self, AssociationContent, Item};
+  use std::future;
   use std::sync::Arc;
   use tokio::fs::File;
   use tokio::io::{AsyncReadExt, AsyncWriteExt};
-  use tokio::sync::Mutex;
+  use tokio::sync::RwLock;
 
-  #[derive(Debug, Clone)]
+  #[derive(Debug)]
   pub struct StaticFile {
-      pub file: Arc<Mutex<File>>,
+      pub file: File,
       pub closed: bool,
       pub path: String,
   }
 
   impl StaticFile {
       pub fn close(&mut self) -> Result<(), Error> {
+          self.closed = true;
           Ok(())
       }
 
       pub fn is_closed(&self) -> bool {
+          println!("checking file closed {}", self.closed);
           self.closed
       }
 
-      pub fn put(self, i: Item) -> Result<types::Future<Result<(), Error>>, Error> {
+      pub fn put(self, i: Item) -> types::Future<Result<(), Error>> {
           match i {
-              Item::Bytes(bs) => Ok(Box::pin(async move {
-                  let mut f = self.file.lock().await;
-                  f.write_all(&bs).await.map_err(|e| e.into())
-              })),
-              _ => Err(Error::expected("bytes")),
+              Item::Bytes(bs) => {
+                  Box::pin(async move { self.file.write_all(&bs).await.map_err(|e| e.into()) })
+              }
+              _ => Box::pin(future::ready(Err(Error::expected("bytes")))),
           }
       }
 
-      pub fn take(mut self) -> Result<types::Future<ItemResult>, Error> {
+      pub fn take(mut self) -> types::Future<ItemResult> {
           if self.is_closed() {
-              return Err(closed_error(true));
+              return Box::pin(future::ready(Err(closed_error(true))));
           }
           let mut bs = [0u8; 1024];
-          Ok(Box::pin(async move {
-              let mut f = self.file.lock().await;
-              let ct = f.read(&mut bs).await?;
+          Box::pin(async move {
+              let ct = self.file.read(&mut bs).await?;
+              println!("Got {} bytes", ct);
               if ct == 0 {
                   // EOF, no more takes since it's static
+                  println!("Closing!");
+
                   self.closed = true;
               }
               Ok(Item::Bytes(bs[0..ct].to_vec()))
-          }))
+          })
       }
   }
 
@@ -3388,21 +3415,25 @@ How to interact with files on disk
           .write(true)
           .create_new(true)
           .open(path.clone())?;
-      Ok(Item::In(super::In::StaticFile(StaticFile {
-          file: Arc::new(Mutex::new(File::from_std(file))),
-          closed: false,
-          path,
-      })))
+      Ok(Item::In(super::In::StaticFile(Arc::new(RwLock::new(
+          StaticFile {
+              file: File::from_std(file),
+              closed: false,
+              path,
+          },
+      )))))
   }
 
   pub fn file_out(i: Item) -> ItemResult {
       let path = String::try_from(i)?;
       let file = std::fs::File::open(path.clone())?;
-      Ok(Item::Out(super::Out::StaticFile(StaticFile {
-          file: Arc::new(Mutex::new(File::from_std(file))),
-          closed: false,
-          path,
-      })))
+      Ok(Item::Out(super::Out::StaticFile(Arc::new(RwLock::new(
+          StaticFile {
+              file: File::from_std(file),
+              closed: false,
+              path,
+          },
+      )))))
   }
 #+end_src
 **** Network
@@ -3438,35 +3469,35 @@ How to interact with the network (TCP/IP sockets)
           self.closed
       }
 
-      pub fn put(self, i: Item) -> Result<types::Future<Result<(), Error>>, Error> {
+      pub fn put(self, i: Item) -> types::Future<Result<(), Error>> {
           match i {
               Item::Bytes(bs) => {
                   //let mut socket = self.socket.clone();
-                  Ok(Box::pin(async move {
+                  Box::pin(async move {
                       self.socket
                           .lock()
                           .await
                           .write_all(&bs)
                           .await
                           .map_err(|e| e.into())
-                  }))
+                  })
               }
-              _ => Err(Error::expected("bytes")),
+              _ => Box::pin(future::ready(Err(Error::expected("bytes")))),
           }
       }
 
-      pub fn take(mut self) -> Result<types::Future<ItemResult>, Error> {
+      pub fn take(mut self) -> types::Future<ItemResult> {
           if self.is_closed() {
-              return Err(closed_error(true));
+              return Box::pin(future::ready(Err(closed_error(true))));
           }
           let mut bs = [0u8; 1024];
-          Ok(Box::pin(async move {
+          Box::pin(async move {
               let n = self.socket.lock().await.read(&mut bs).await?;
               if n == 0 {
                   self.closed = true;
               }
               Ok(Item::Bytes(bs[..n].to_vec()))
-          }))
+          })
       }
   }
 
@@ -3496,11 +3527,11 @@ How to interact with the network (TCP/IP sockets)
           self.closed
       }
 
-      pub fn take(self) -> Result<types::Future<ItemResult>, Error> {
+      pub fn take(self) -> types::Future<ItemResult> {
           if self.is_closed() {
-              return Err(closed_error(true));
+              return Box::pin(future::ready(Err(closed_error(true))));
           }
-          Ok(Box::pin(async move {
+          Box::pin(async move {
               let (socket, addr) = self.socket.lock().await.accept().await?;
 
               Ok(Item::Tunnel(super::Tunnel::Socket(Socket {
@@ -3508,7 +3539,7 @@ How to interact with the network (TCP/IP sockets)
                   addr,
                   closed: false,
               })))
-          }))
+          })
       }
   }
 
@@ -3580,16 +3611,12 @@ Implement the =handoff= type
           Handoff(in_, out)
       }
 
-      pub fn put(self, i: Item) -> Result<types::Future<Result<(), Error>>, Error> {
-          Ok(Box::pin(async move {
-              self.0.send(i).map_err(|_| pipes::closed_error(false))
-          }))
+      pub fn put(self, i: Item) -> types::Future<Result<(), Error>> {
+          Box::pin(async move { self.0.send(i).map_err(|_| pipes::closed_error(false)) })
       }
 
-      pub fn take(self) -> Result<types::Future<ItemResult>, Error> {
-          Ok(Box::pin(async move {
-              self.1.recv().map_err(|_| pipes::closed_error(true))
-          }))
+      pub fn take(self) -> types::Future<ItemResult> {
+          Box::pin(async move { self.1.recv().map_err(|_| pipes::closed_error(true)) })
       }
   }
 
@@ -3812,6 +3839,32 @@ dip
 
 ***** DONE Sockets
 
+***** INPROGRESS Assemble is broken when reading files
+I think it's because =closed?= is broken.
+
+#+begin_src kcats :results code
+"" [string join] [[file "bar"]] pipe-out assemble
+#+end_src
+
+#+begin_src kcats :results code
+"" [string join] [[file "bar"]] pipe-out take discard take discard closed? 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+checking file closed false
+Got 3 bytes
+checking file closed false
+Got 0 bytes
+Closing!
+checking file closed false
+[] [string join] ""
+#+end_src
+
+I see the problem. When we clone the pipe, we also clone the =closed=
+boolean and we shouldn't be doing that. There should only be one copy
+of that. The entire struct should be in an Arc<Mutex> and not just the
+file field. And when we modify the boolean, we shouldn't 
 **** DONE Convert In/Out traits to enums in pipes modules
 Enums seem to work well elsewhere, and since pipes are also a closed
 set, we can use them here too.
@@ -5007,7 +5060,7 @@ out to make it its own autonomous thing.
 
 #+RESULTS:
 : 
-**** INPROGRESS Implement 'future' or equivalent
+**** DONE Implement 'future' or equivalent
 The idea here is to take an expression and run it in its own spawned
 env, and when it's done, snapshot the stack and put it into a
 pipe and close it. The original env gets the other end of the pipe.
