@@ -3086,7 +3086,6 @@ The basic pipe contracts.
   use std::future;
   use std::sync::Arc;
   use tokio::sync::RwLock;
-  //use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
   use futures::executor;
   use futures::future::FutureExt;
@@ -3147,14 +3146,14 @@ The basic pipe contracts.
       fn close(self) -> types::Future<Result<(), Error>> {
           match self {
               In::StaticFile(f) => Box::pin(async move { f.write().await.close() }),
-              In::Socket(s) => Box::pin(async move { Ok(()) }),
+              In::Socket(_) => Box::pin(async move { Ok(()) }),
               In::Handoff(_) => Box::pin(async move { Ok(()) }),
           }
       }
       fn is_closed(self) -> types::Future<bool> {
           match self {
               In::StaticFile(f) => Box::pin(async move { f.read().await.is_closed() }),
-              In::Socket(f) => Box::pin(async move { false }), //TODO: actual impls
+              In::Socket(_) => Box::pin(async move { false }), //TODO: actual impls
               In::Handoff(_) => Box::pin(async move { false }),
           }
       }
@@ -3164,7 +3163,7 @@ The basic pipe contracts.
       fn is_closed(self) -> types::Future<bool> {
           match self {
               Tunnel::StaticFile(f) => Box::pin(async move { f.read().await.is_closed() }),
-              Tunnel::Socket(f) => Box::pin(async move { false }),
+              Tunnel::Socket(_) => Box::pin(async move { false }),
               Tunnel::Handoff(_) => Box::pin(async move { false }),
           }
       }
@@ -3301,15 +3300,17 @@ The basic pipe contracts.
   pub fn take_(mut env: Environment) -> types::Future<Environment> {
       let pipe = env.pop();
       let p2 = pipe.clone();
-      Box::pin(match pipe {
-          Item::Out(p) => p.take(),
-          Item::Tunnel(t) => Out::from(t).take(),
-          _ => return env.push(Item::Error(Error::expected("pipe"))).into(),
-      })
-      .map(move |r| match r {
-          Ok(_) => env.push(p2),
-          Err(e) => env.push(p2).push(Item::Error(e)),
-      })
+      Box::pin(
+          match pipe {
+              Item::Out(p) => p.take(),
+              Item::Tunnel(t) => Out::from(t).take(),
+              _ => return env.push(Item::Error(Error::expected("pipe"))).into(),
+          }
+          .map(move |r| match r {
+              Ok(_) => env.push(p2),
+              Err(e) => env.push(p2).push(Item::Error(e)),
+          }),
+      )
   }
 
   pub fn is_closed(i: Item) -> types::Future<ItemResult> {
@@ -3323,15 +3324,15 @@ The basic pipe contracts.
 
   pub fn close(i: Item) -> types::Future<ItemResult> {
       match i {
-          Item::In(mut p) => Box::pin(async move {
+          Item::In(p) => Box::pin(async move {
               Ok({
-                  p.close().await;
+                  p.clone().close().await.unwrap();
                   Item::In(p)
               })
           }),
-          Item::Out(mut p) => Box::pin(async move {
+          Item::Out(p) => Box::pin(async move {
               Ok({
-                  p.close().await;
+                  p.clone().close().await.unwrap();
                   Item::Out(p)
               })
           }),
@@ -3346,8 +3347,9 @@ How to interact with files on disk
   use crate::pipes::closed_error;
   use crate::types::associative::Associative;
   use crate::types::error::Error;
-  use crate::types::{self, AssociationContent, Item};
+  use crate::types::{AssociationContent, Item};
   use std::future;
+  use std::pin::Pin;
   use std::sync::Arc;
   use tokio::fs::File;
   use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -3371,7 +3373,10 @@ How to interact with files on disk
           self.closed
       }
 
-      pub fn put(self, i: Item) -> types::Future<Result<(), Error>> {
+      pub fn put<'a>(
+          &'a mut self,
+          i: Item,
+      ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
           match i {
               Item::Bytes(bs) => {
                   Box::pin(async move { self.file.write_all(&bs).await.map_err(|e| e.into()) })
@@ -3380,7 +3385,9 @@ How to interact with files on disk
           }
       }
 
-      pub fn take(mut self) -> types::Future<ItemResult> {
+      pub fn take<'a>(
+          &'a mut self,
+      ) -> Pin<Box<dyn std::future::Future<Output = ItemResult> + Send + 'a>> {
           if self.is_closed() {
               return Box::pin(future::ready(Err(closed_error(true))));
           }
@@ -3447,15 +3454,16 @@ How to interact with the network (TCP/IP sockets)
   use futures::future::FutureExt;
   use std::future::{self};
   use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+  use std::pin::Pin;
   use std::str::FromStr;
   use std::sync::Arc;
   use tokio::io::{AsyncReadExt, AsyncWriteExt};
   use tokio::net::{TcpListener, TcpStream};
-  use tokio::sync::Mutex;
+  use tokio::sync::RwLock;
 
-  #[derive(Debug, Clone)]
+  #[derive(Debug)]
   pub struct Socket {
-      pub socket: Arc<Mutex<TcpStream>>,
+      pub socket: TcpStream,
       pub addr: SocketAddr,
       pub closed: bool,
   }
@@ -3469,30 +3477,28 @@ How to interact with the network (TCP/IP sockets)
           self.closed
       }
 
-      pub fn put(self, i: Item) -> types::Future<Result<(), Error>> {
+      pub fn put<'a>(
+          &'a mut self,
+          i: Item,
+      ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
           match i {
               Item::Bytes(bs) => {
                   //let mut socket = self.socket.clone();
-                  Box::pin(async move {
-                      self.socket
-                          .lock()
-                          .await
-                          .write_all(&bs)
-                          .await
-                          .map_err(|e| e.into())
-                  })
+                  Box::pin(async move { self.socket.write_all(&bs).await.map_err(|e| e.into()) })
               }
               _ => Box::pin(future::ready(Err(Error::expected("bytes")))),
           }
       }
 
-      pub fn take(mut self) -> types::Future<ItemResult> {
+      pub fn take<'a>(
+          &'a mut self,
+      ) -> Pin<Box<dyn std::future::Future<Output = ItemResult> + Send + 'a>> {
           if self.is_closed() {
               return Box::pin(future::ready(Err(closed_error(true))));
           }
           let mut bs = [0u8; 1024];
           Box::pin(async move {
-              let n = self.socket.lock().await.read(&mut bs).await?;
+              let n = self.socket.read(&mut bs).await?;
               if n == 0 {
                   self.closed = true;
               }
@@ -3512,9 +3518,9 @@ How to interact with the network (TCP/IP sockets)
   }
 
   // Server sockets
-  #[derive(Debug, Clone)]
+  #[derive(Debug)]
   pub struct ServerSocket {
-      pub socket: Arc<Mutex<TcpListener>>,
+      pub socket: TcpListener,
       pub closed: bool,
   }
 
@@ -3527,18 +3533,22 @@ How to interact with the network (TCP/IP sockets)
           self.closed
       }
 
-      pub fn take(self) -> types::Future<ItemResult> {
+      pub fn take<'a>(
+          &'a mut self,
+      ) -> Pin<Box<dyn std::future::Future<Output = ItemResult> + Send + 'a>> {
           if self.is_closed() {
               return Box::pin(future::ready(Err(closed_error(true))));
           }
           Box::pin(async move {
-              let (socket, addr) = self.socket.lock().await.accept().await?;
+              let (socket, addr) = self.socket.accept().await?;
 
-              Ok(Item::Tunnel(super::Tunnel::Socket(Socket {
-                  socket: Arc::new(Mutex::new(socket)),
-                  addr,
-                  closed: false,
-              })))
+              Ok(Item::Tunnel(super::Tunnel::Socket(Arc::new(RwLock::new(
+                  Socket {
+                      socket,
+                      addr,
+                      closed: false,
+                  },
+              )))))
           })
       }
   }
@@ -3565,10 +3575,12 @@ How to interact with the network (TCP/IP sockets)
   pub fn server_socket(i: Item, j: Item) -> types::Future<ItemResult> {
       match socket_addr(i, j) {
           Ok(addr) => Box::pin(TcpListener::bind(addr).map(|l| {
-              Ok(Item::Out(super::Out::ServerSocket(ServerSocket {
-                  socket: Arc::new(Mutex::new(l.unwrap())),
-                  closed: false,
-              })))
+              Ok(Item::Out(super::Out::ServerSocket(Arc::new(RwLock::new(
+                  ServerSocket {
+                      socket: l.unwrap(),
+                      closed: false,
+                  },
+              )))))
           })),
           Err(e) => Box::pin(future::ready(Err(e))),
       }
