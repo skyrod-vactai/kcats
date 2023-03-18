@@ -1563,6 +1563,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   "file-out",
                   Box::leak(Box::new(f_stack1(crate::pipes::fs::file_out))),
               ),
+              ("filled", Box::leak(Box::new(crate::pipes::channel::filled))),
               ("first", Box::leak(Box::new(f_stack1(first)))),
               ("float", Box::leak(Box::new(float))),
               ("handle", Box::leak(Box::new(f_stack1(handle)))),
@@ -3111,6 +3112,7 @@ The basic pipe contracts.
       Socket(Arc<RwLock<net::Socket>>),
       ServerSocket(Arc<RwLock<net::ServerSocket>>),
       Handoff(channel::Handoff<Item>),
+      Filled(channel::Filled),
   }
 
   #[derive(Debug, Clone)]
@@ -3181,6 +3183,7 @@ The basic pipe contracts.
               Out::Socket(f) => Box::pin(async move { f.write().await.take().await }),
               Out::ServerSocket(f) => Box::pin(async move { f.write().await.take().await }),
               Out::Handoff(h) => Box::pin(h.take()),
+              Out::Filled(f) => Box::pin(f.take()),
           }
       }
       fn close(self) -> types::Future<Result<(), Error>> {
@@ -3189,6 +3192,7 @@ The basic pipe contracts.
               Out::Socket(f) => Box::pin(async move { f.write().await.close() }),
               Out::ServerSocket(f) => Box::pin(async move { f.write().await.close() }),
               Out::Handoff(_) => Box::pin(future::ready(Ok(()))),
+              Out::Filled(_) => Box::pin(future::ready(Ok(()))),
           }
       }
       fn is_closed(self) -> types::Future<bool> {
@@ -3197,6 +3201,7 @@ The basic pipe contracts.
               Out::Socket(f) => Box::pin(async move { f.read().await.is_closed() }),
               Out::ServerSocket(f) => Box::pin(async move { f.read().await.is_closed() }),
               Out::Handoff(_) => Box::pin(future::ready(false)),
+              Out::Filled(_) => Box::pin(future::ready(false)),
           }
       }
   }
@@ -3222,6 +3227,7 @@ The basic pipe contracts.
                   executor::block_on(async move { f.read().await.representation() })
               }
               Out::Handoff(h) => h.representation(),
+              Out::Filled(f) => f.representation(),
           }
       }
   }
@@ -3613,10 +3619,16 @@ Implement the =handoff= type
   use crate::types::error::Error;
   use crate::types::{self, Item};
   use flume;
+  use std::future;
   use std::sync::Arc;
 
   #[derive(Debug, Clone)]
   pub struct Handoff<T>(flume::Sender<T>, flume::Receiver<T>);
+
+  #[derive(Debug, Clone)]
+  pub struct Filled {
+      contents: types::List,
+  }
 
   impl Handoff<Item> {
       pub fn new() -> Handoff<Item> {
@@ -3643,6 +3655,19 @@ Implement the =handoff= type
       }
   }
 
+  impl Filled {
+      pub fn new(l: types::List) -> Filled {
+          Filled { contents: l }
+      }
+
+      pub fn take(mut self) -> types::Future<ItemResult> {
+          let l = Arc::make_mut(&mut self.contents);
+          Box::pin(future::ready(
+              l.pop_front().ok_or(pipes::closed_error(true)),
+          ))
+      }
+  }
+
   impl crate::serialize::Display for Handoff<Item> {
       fn representation(&self) -> Item {
           Item::Assoc(Associative::Assoc(Arc::new(
@@ -3654,8 +3679,25 @@ Implement the =handoff= type
       }
   }
 
+  impl crate::serialize::Display for Filled {
+      fn representation(&self) -> Item {
+          Item::Assoc(Associative::Assoc(Arc::new(
+              types::AssociationContent::from([
+                  ("type".into(), "pipe".into()),
+                  ("filled".into(), "todo: id-or-hash here".into()),
+              ]),
+          )))
+      }
+  }
+
   pub fn handoff(env: Environment) -> types::Future<Environment> {
       env.push(Item::Tunnel(pipes::Tunnel::Handoff(Handoff::new())))
+          .into()
+  }
+
+  pub fn filled(mut env: Environment) -> types::Future<Environment> {
+      let l = types::List::try_from(env.pop()).unwrap();
+      env.push(Item::Out(pipes::Out::Filled(Filled::new(l))))
           .into()
   }
 #+end_src
@@ -3909,6 +3951,16 @@ pipe could take an optional transform. Clojure.core.async channels do this.
 
 Maybe the first thing to do is implement transducers?
 
+**** INPROGRESS Filled pipes
+Mostly for testing purposes, takes a list and creates a buffered pipe
+that offers list items until the list is exhausted and then returns pipe closed errors.
+
+#+begin_src kcats
+[1 2 3] filled take
+#+end_src
+
+#+RESULTS:
+: 1 [[type pipe] [filled todo: id-or-hash here]]
 
 *** DONE 'Fail' is not defined
 We need to be able to throw our own errors (eg lookup tries to do this)
