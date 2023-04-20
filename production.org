@@ -2908,9 +2908,10 @@ We'll also define how to run unit tests.
   mod types;
 
   use crate::types::environment::Environment;
+  use crate::types::error;
   use crate::types::*;
   use std::io;
-  use std::io::BufRead;
+  use std::io::{BufRead, Read};
   use std::sync::Arc;
   use tokio;
 
@@ -2935,19 +2936,83 @@ We'll also define how to run unit tests.
       buf
   }
 
+  // A function that takes a handle to stdin. It reads a length from
+  // stdin, then reads that many bytes and returns a string.
+  async fn read_input() -> Option<String> {
+      //spawn a thread to read from stdin
+      tokio::spawn(async move {
+          let mut stdin = io::stdin().lock();
+          let mut buf = String::new();
+          stdin.read_line(&mut buf).unwrap();
+          // parse an integer from buf
+          let len = buf.trim().parse::<usize>().unwrap();
+          if len == 0 {
+              return None;
+          }
+          // read len bytes from stdin
+          let mut buf = vec![0; len];
+          stdin.read_exact(&mut buf).unwrap();
+
+          // convert the bytes to a string
+          Some(String::from_utf8(buf).unwrap())
+      })
+      .await
+      .unwrap()
+  }
+
+  async fn print(env: &Environment) {
+      let result = serialize::emit_all(&env.stack);
+      // first print the length of the result
+      println!("{}\n{}", result.len(), result);
+  }
+
+  // a function that takes an env, and an input string. Parses the
+  // string, if it parses, returns the env with the input added to the
+  // expression. Otherwise returns Error.
+  fn parse_input(mut env: Environment, input: String) -> Result<Environment, error::Error> {
+      let mut parsed = serialize::parse(input)?;
+      let expr = Arc::make_mut(&mut env.expression);
+      expr.extend(Arc::make_mut(&mut parsed).drain(..));
+      Ok(env)
+  }
+
+  //It converts the bytes to a
+  // string, and then evaluates that string as a kcats program. It then
+  // prints the length of the result, and then the result itself.
+  async fn interactive_mode() {
+      let mut env = axiom::standard_env(None, None);
+
+      loop {
+          if let Some(program) = read_input().await {
+              if let Ok(parsed_env) = parse_input(env, program) {
+                  //env = parsed_env;
+                  env = axiom::eval(parsed_env).await;
+                  print(&env).await;
+              } else {
+                  break;
+              }
+          } else {
+              break;
+          }
+      }
+  }
+
   #[tokio::main]
   async fn main() {
-      let program = get_stdin();
-      let mut env = axiom::standard_env(None, None);
-      let parse_result = serialize::parse(program);
-      match parse_result {
-          Ok(mut program) => {
-              let expr = Arc::make_mut(&mut env.expression);
-              expr.extend(Arc::make_mut(&mut program).drain(..));
-              print_result(axiom::eval(env).await);
-          }
-          Err(e) => {
-              println!("Error parsing input: {:?}", e);
+      // read command line options, to look for -i switch
+      let args: Vec<String> = std::env::args().collect();
+      // if args contains "-i", read via handle_stdin
+      if args.contains(&"-i".to_string()) {
+          interactive_mode().await;
+      } else {
+          // otherwise, read from stdin
+          match parse_input(axiom::standard_env(None, None), get_stdin()) {
+              Ok(env) => {
+                  print_result(axiom::eval(env).await);
+              }
+              Err(e) => {
+                  println!("Error parsing input: {:?}", e);
+              }
           }
       }
   }
