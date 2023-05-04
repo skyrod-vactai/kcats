@@ -64,14 +64,12 @@ We'll start by defining the basic data structures that kcats will use
 internally, to keep track of things like the stack, expression, lists etc.
 #+begin_src rust :tangle src/types.rs
   use crate::pipes::{In, Out, Tunnel};
-  use crate::types::associative as assoc;
-  use crate::types::collection as coll;
   use crate::types::dictionary as dict;
   use crate::types::environment as env;
   use crate::types::error::Error;
   use internment::Intern;
   use lazy_static::lazy_static;
-  use std::collections::{HashMap, VecDeque};
+  use std::collections::{HashMap, HashSet, VecDeque};
   use std::fmt;
   use std::hash::Hash;
   use std::marker::Sync;
@@ -100,9 +98,28 @@ internally, to keep track of things like the stack, expression, lists etc.
 
   pub type Float = f64;
 
-  pub type AssociationContent = HashMap<KeyItem, Item>;
+  pub type Set = Arc<HashSet<Item>>;
 
-  pub type Association = Arc<AssociationContent>;
+  pub struct Nothing;
+
+  pub struct NothingIter;
+
+  impl Iterator for NothingIter {
+      type Item = ();
+
+      fn next(&mut self) -> Option<Self::Item> {
+          None
+      }
+  }
+
+  impl IntoIterator for Nothing {
+      type Item = ();
+      type IntoIter = NothingIter;
+
+      fn into_iter(self) -> Self::IntoIter {
+          NothingIter
+      }
+  }
 
   lazy_static! {
       pub static ref S_ASSOC: Intern<String> = Intern::new("association".to_string());
@@ -135,10 +152,10 @@ internally, to keep track of things like the stack, expression, lists etc.
       Bytes(Bytes),
       String(String),
       Word(Word),
-      Assoc(assoc::Associative),
+      //Assoc(assoc::Associative),
       //Seq(Sequence),
       List(List),
-      Collection(coll::Collection),
+      //Collection(coll::Collection),
       Env(env::Environment),
       Entry(dict::Entry),
       Dictionary(dict::Dictionary),
@@ -146,7 +163,7 @@ internally, to keep track of things like the stack, expression, lists etc.
       In(In),
       Out(Out),
       Tunnel(Tunnel),
-      Nothing,
+      Nothing(Nothing),
   }
 
   #[derive(Debug, Clone, Eq, PartialEq, Hash)]
@@ -156,7 +173,7 @@ internally, to keep track of things like the stack, expression, lists etc.
       String(String),
       Word(Word),
       List(VecDeque<KeyItem>),
-      Nothing,
+      Nothing(Nothing),
   }
 
   pub type Future<T> = Pin<Box<dyn std::future::Future<Output = T> + Send>>;
@@ -182,16 +199,16 @@ internally, to keep track of things like the stack, expression, lists etc.
               //(Item::In(a), Item::In(b)) => a == b,
               //(Item::Out(a), Item::Out(b)) => a == b,
               //(Item::Tunnel(a), Item::Tunnel(b)) => a == b,
-              (Item::Nothing, Item::Nothing) => true,
+              (Item::Nothing(_), Item::Nothing(_)) => true,
               // different types, but can be converted to the same type
-              (Item::Nothing, Item::List(l)) => l.is_empty(),
-              (Item::List(l), Item::Nothing) => l.is_empty(),
+              (Item::Nothing(_), Item::List(l)) => l.is_empty(),
+              (Item::List(l), Item::Nothing(_)) => l.is_empty(),
 
-              (Item::Nothing, Item::Assoc(l)) => l.is_empty(),
-              (Item::Assoc(l), Item::Nothing) => l.is_empty(),
+              (Item::Nothing(_), Item::Assoc(l)) => l.is_empty(),
+              (Item::Assoc(l), Item::Nothing(_)) => l.is_empty(),
 
-              (Item::Nothing, Item::Collection(l)) => l.is_empty(),
-              (Item::Collection(l), Item::Nothing) => l.is_empty(),
+              (Item::Nothing(_), Item::Collection(l)) => l.is_empty(),
+              (Item::Collection(l), Item::Nothing(_)) => l.is_empty(),
 
               (Item::List(l), Item::Assoc(a)) => l.is_empty() && a.is_empty(),
               (Item::Assoc(a), Item::List(l)) => l.is_empty() && a.is_empty(),
@@ -213,10 +230,10 @@ internally, to keep track of things like the stack, expression, lists etc.
       fn try_from(i: Item) -> Result<Self, Self::Error> {
           match i {
               Item::List(l) => Ok(l),
-              //Item::Assoc(a) => List::try_from(Associative::Assoc(a)),
+              //Item::Assoc(a) => List::try_from(a),
               //Item::Error(e) => List::try_from(Item::Assoc(e.data)),
               // 'Nothing' is equivalent to an empty list
-              Item::Nothing => Ok(Arc::new(ListContent::new())),
+              Item::Nothing(_) => Ok(Arc::new(ListContent::new())),
               _ => Err(Error::expected("list")),
           }
       }
@@ -367,7 +384,7 @@ internally, to keep track of things like the stack, expression, lists etc.
               )),
               Item::Word(w) => Ok(KeyItem::Word(w)),
               Item::Bytes(bs) => Ok(KeyItem::Bytes(bs)),
-              Item::Nothing => Ok(KeyItem::Nothing),
+              Item::Nothing(_) => Ok(KeyItem::Nothing),
               _ => Err(Error::expected("KeyItem")),
           }
       }
@@ -385,7 +402,7 @@ internally, to keep track of things like the stack, expression, lists etc.
               )),
               KeyItem::Word(w) => Item::Word(w),
               KeyItem::Bytes(bs) => Item::Bytes(bs),
-              KeyItem::Nothing => Item::Nothing,
+              KeyItem::Nothing(_) => Item::Nothing,
           }
       }
   }
@@ -408,197 +425,276 @@ internally, to keep track of things like the stack, expression, lists etc.
 #+end_src
 *** Collection types
 #+begin_src rust :tangle src/types/collection.rs
-  use crate::types::associative as assoc;
   use crate::types::*;
 
-  #[derive(Debug, Clone)]
-  pub enum Collection {
-      Associative(assoc::Associative),
-      List(List),
-      //Set(Set)
-      Nothing,
+  pub trait Collective<T: Clone>: IntoIterator<Item = T> {
+      fn peek(&self) -> Option<T>;
+      fn pop(&mut self) -> Option<T>;
   }
 
-  impl Collection {
-      pub fn is_empty(&self) -> bool {
-          match self {
-              Collection::Associative(a) => a.is_empty(),
-              Collection::List(l) => l.is_empty(),
-              Collection::Nothing => true,
-          }
+  pub trait FiniteCollective<T: Clone>: Collective<T> {
+      fn len(&self) -> usize;
+      fn is_empty(&self) -> bool {
+          self.len() == 0
       }
   }
 
-  pub enum CollIntoIter {
-      //TODO add other struct types
-      Assoc(assoc::AssocIntoIter),
-      List(std::collections::vec_deque::IntoIter<Item>),
-  }
+  // Impl for VecDeque
+  impl<T: Clone> Collective<T> for Arc<VecDeque<T>> {
+      fn peek(&self) -> Option<T> {
+          let deque = Arc::try_unwrap(Arc::clone(self)).unwrap_or_else(|arc| (*arc).clone());
+          deque.front().cloned()
+      }
 
-  impl Iterator for CollIntoIter {
-      type Item = Item;
-
-      fn next(&mut self) -> Option<Self::Item> {
-          match self {
-              CollIntoIter::Assoc(iter) => iter.next().and_then(|x| Some(x.into())),
-              CollIntoIter::List(iter) => iter.next(),
-          }
+      fn pop(&mut self) -> Option<T> {
+          let deque = Arc::make_mut(self);
+          deque.pop_front()
       }
   }
 
-  impl IntoIterator for Collection {
-      type Item = Item;
-      type IntoIter = CollIntoIter;
+  impl<T: Clone> FiniteCollective<T> for Arc<VecDeque<T>> {
+      fn len(&self) -> usize {
+          rc_inner(self).len()
+      }
+  }
 
-      fn into_iter<'a>(self) -> CollIntoIter {
-          match self {
-              Collection::Associative(a) => CollIntoIter::Assoc(a.into_iter()),
-              Collection::List(l) => CollIntoIter::List(rc_inner(&l).into_iter()),
-              _ => panic!("can't iterate"),
-          }
+  // impl for Nothing
+  impl Collective<()> for Nothing {
+      fn peek(&self) -> Option<()> {
+          None
+      }
+
+      fn pop(&mut self) -> Option<()> {
+          None
+      }
+  }
+
+  impl FiniteCollective<()> for Nothing {
+      fn len(&self) -> usize {
+          0
+      }
+  }
+
+  impl<V: Clone + Eq + Hash> Collective<V> for Arc<HashSet<V>> {
+      fn peek(&self) -> Option<V> {
+          rc_inner(self).iter().next().cloned()
+      }
+
+      fn pop(&mut self) -> Option<V> {
+          let hashset = Arc::make_mut(self);
+          hashset.drain().next()
+      }
+  }
+
+  impl<V: Clone + Eq + Hash> FiniteCollective<V> for Arc<HashSet<V>> {
+      fn len(&self) -> usize {
+          rc_inner(self).len()
       }
   }
 #+end_src
 *** Associative types
 #+begin_src rust :tangle src/types/associative.rs
   use crate::types::dictionary as dict;
-  use crate::types::environment as env;
   use crate::types::*;
+
+  use super::collection::{Collective, FiniteCollective};
 
   type MapEntry = (KeyItem, Item);
 
-  #[derive(Debug, Clone)]
-  pub enum Associative {
-      Assoc(Association),
-      DictEntry(dict::Entry),
-      Env(env::Environment),
-      Error(Error),
-      Dictionary(dict::Dictionary),
-      Nothing,
+  pub struct ArcHashMap<K, V>(pub Arc<HashMap<K, V>>);
+
+  impl<K: Eq + Hash + Clone, V: Clone> From<HashMap<K, V>> for ArcHashMap<K, V> {
+      fn from(map: HashMap<K, V>) -> Self {
+          ArcHashMap(Arc::new(map))
+      }
   }
 
-  impl PartialEq for Associative {
-      fn eq(&self, other: &Self) -> bool {
-          match (self, other) {
-              (Associative::Assoc(a), Associative::Assoc(b)) => a == b,
-              (Associative::DictEntry(a), Associative::DictEntry(b)) => a == b,
-              (Associative::Env(a), Associative::Env(b)) => a == b,
-              (Associative::Error(a), Associative::Error(b)) => a == b,
-              (Associative::Dictionary(a), Associative::Dictionary(b)) => a == b,
-              (Associative::Nothing, Associative::Nothing) => true,
-              //(Associative::Assoc(a), b) => Association::from(a) == Association::from(b),
-              //(a, Associative::Assoc(b)) => Association::from(a) == Association::from(b),
-              _ => false,
+  impl<K: Eq + Hash + Clone, V: Clone> IntoIterator for ArcHashMap<K, V> {
+      type Item = (K, V);
+      type IntoIter = std::collections::hash_map::IntoIter<K, V>;
+
+      fn into_iter(self) -> Self::IntoIter {
+          match Arc::try_unwrap(self.0) {
+              Ok(map) => map.into_iter(),
+              Err(arc) => (*arc).clone().into_iter(),
           }
       }
   }
 
-  impl Associative {
-      pub fn is_empty(&self) -> bool {
-          match self {
-              Associative::Assoc(a) => a.is_empty(),
-              _ => false,
-          }
+  pub type Association = ArcHashMap<KeyItem, Item>;
+
+  pub type AssociationContent = HashMap<KeyItem, Item>;
+
+  pub trait Associative<K: Clone, V: Clone>: Collective<(K, V)> {
+      fn insert(&mut self, key: K, value: V) -> Option<V>;
+      fn remove(&mut self, key: &K) -> Option<V>;
+      fn merge(&mut self, other: Self);
+      fn get(&self, key: &K) -> Option<&V>;
+  }
+
+  impl<K: Clone + Eq + Hash, V: Clone> Collective<(K, V)> for ArcHashMap<K, V> {
+      fn peek(&self) -> Option<(K, V)> {
+          rc_inner(self)
+              .iter()
+              .next()
+              .map(|(k, v)| (k.clone(), v.clone()))
       }
 
-      pub fn insert(self, k: KeyItem, v: Item) -> (Associative, Option<Item>) {
-          match self {
-              Associative::Assoc(mut a) => {
-                  let am = Arc::make_mut(&mut a);
-                  let e = am.insert(k, v);
-                  (Associative::Assoc(a), e)
-              }
-              Associative::Dictionary(mut d) => match (k, v) {
-                  (KeyItem::Word(w), e) => {
-                      let e2 = e.clone();
-                      if let Ok(e) = dict::Entry::try_from(e) {
-                          let dm = Arc::make_mut(&mut d);
-                          let e = dm.insert(w, e).and_then(|e| Some(Item::Entry(e)));
-                          (Associative::Dictionary(d), e)
-                      } else {
-                          // TODO silently failing to insert here is bad
-                          println!("Warning, failed to insert into dictionary: {:?}", e2);
-                          (Associative::Dictionary(d), None)
-                      }
-                  }
-                  _ => (Associative::Dictionary(d), None),
-              },
-              _ => (Associative::Nothing, None),
-          }
-      }
-
-      pub fn join(self, other: Associative) -> Associative {
-          match (self, other) {
-              // same type means 2nd one wins.
-              //TODO: a little more complex for types that can be extended
-              (Associative::DictEntry(_), Associative::DictEntry(other)) => {
-                  Associative::DictEntry(other)
-              }
-              (Associative::Dictionary(mut this), Associative::Dictionary(other)) => {
-                  let thism = Arc::make_mut(&mut this);
-                  thism.extend(rc_inner(&other).into_iter());
-                  Associative::Dictionary(this)
-              }
-              (Associative::Error(_), Associative::Error(other)) => Associative::Error(other),
-              (Associative::Env(_), Associative::Env(other)) => Associative::Env(other),
-              (Associative::Nothing, Associative::Nothing) => Associative::Nothing,
-              (Associative::Assoc(mut this), other) => {
-                  let thism = Arc::make_mut(&mut this);
-                  thism.extend(other.into_iter());
-                  Associative::Assoc(this)
-              }
-              (this, other) => {
-                  let thisa: Association = this.into();
-                  (Associative::Assoc(thisa)).join(other)
-              }
-          }
-      }
-
-      pub fn get(&self, k: &KeyItem) -> Option<Item> {
-          match self {
-              Associative::Assoc(a) => a.get(k).and_then(|x| Some(x.clone())),
-              Associative::Error(e) => e.data.get(k).and_then(|x| Some(x.clone())),
-              Associative::Env(e) => match k {
-                  KeyItem::Word(s) => match s.as_str() {
-                      "stack" => Some(Item::List(e.stack.clone())),
-                      "expression" => Some(Item::List(e.expression.clone())),
-                      "dictionary" => Some(Item::Dictionary(e.dictionary.clone())),
-                      _ => None,
-                  },
-                  _ => None,
-              },
-              Associative::DictEntry(d) => match k {
-                  KeyItem::Word(s) => match s.as_str() {
-                      "spec" => d.spec.clone().and_then(|x| Some(Item::List(x))),
-                      "examples" => d.examples.clone().and_then(|x| Some(Item::List(x))),
-                      "definition" => Some(match d.definition.clone() {
-                          dict::Definition::Axiom(_) => "builtin".into(),
-                          dict::Definition::Derived(d) => Item::List(d),
-                      }),
-                      _ => None,
-                  },
-                  _ => None,
-              },
-              Associative::Dictionary(d) => match k {
-                  KeyItem::Word(w) => d.get(w).and_then(|x| Some(Item::Entry(x.clone()))),
-                  _ => None,
-              },
-              _ => None,
-          }
-      }
-
-      //TODO remove
-      pub fn remove(self, k: &KeyItem) -> (Associative, Option<Item>) {
-          match self {
-              Associative::Assoc(mut a) => {
-                  let am = Arc::make_mut(&mut a);
-                  let v = am.remove(k);
-                  (Associative::Assoc(a), v)
-              }
-              _ => (Associative::Nothing, None),
-          }
+      fn pop(&mut self) -> Option<(K, V)> {
+          let hashmap = Arc::make_mut(self);
+          hashmap.drain().next()
       }
   }
+
+  impl<K: Clone + Eq + Hash, V: Clone> FiniteCollective<(K, V)> for ArcHashMap<K, V> {
+      fn len(&self) -> usize {
+          rc_inner(self).len()
+      }
+  }
+
+  impl<K: Eq + Hash + Clone, V: Clone> Associative<K, V> for ArcHashMap<K, V> {
+      fn insert(&mut self, key: K, value: V) -> Option<V> {
+          let hashmap = Arc::make_mut(self);
+          hashmap.insert(key, value)
+      }
+
+      fn remove(&mut self, key: &K) -> Option<V> {
+          let hashmap = Arc::make_mut(self);
+          hashmap.remove(key)
+      }
+
+      fn merge(&mut self, other: Self) {
+          let hashmap = Arc::make_mut(self);
+          let other_map = Arc::try_unwrap(other).unwrap_or_else(|arc| (*arc).clone());
+
+          for (key, value) in other_map {
+              hashmap.insert(key, value);
+          }
+      }
+
+      fn get(&self, key: &K) -> Option<&V> {
+          let hashmap = Arc::try_unwrap(Arc::clone(self)).unwrap_or_else(|arc| (*arc).clone());
+          hashmap.get(key)
+      }
+  }
+
+  // impl Associative {
+  //     pub fn is_empty(&self) -> bool {
+  //         match self {
+  //             Associative::Assoc(a) => a.is_empty(),
+  //             _ => false,
+  //         }
+  //     }
+
+  //     pub fn insert(self, k: KeyItem, v: Item) -> (Associative, Option<Item>) {
+  //         match self {
+  //             Associative::Assoc(mut a) => {
+  //                 let am = Arc::make_mut(&mut a);
+  //                 let e = am.insert(k, v);
+  //                 (Associative::Assoc(a), e)
+  //             }
+  //             Associative::Dictionary(mut d) => match (k, v) {
+  //                 (KeyItem::Word(w), e) => {
+  //                     let e2 = e.clone();
+  //                     if let Ok(e) = dict::Entry::try_from(e) {
+  //                         let dm = Arc::make_mut(&mut d);
+  //                         let e = dm.insert(w, e).and_then(|e| Some(Item::Entry(e)));
+  //                         (Associative::Dictionary(d), e)
+  //                     } else {
+  //                         // TODO silently failing to insert here is bad
+  //                         println!("Warning, failed to insert into dictionary: {:?}", e2);
+  //                         (Associative::Dictionary(d), None)
+  //                     }
+  //                 }
+  //                 _ => (Associative::Dictionary(d), None),
+  //             },
+  //             _ => (Associative::Nothing, None),
+  //         }
+  //     }
+
+  //     pub fn join(self, other: Associative) -> Associative {
+  //         match (self, other) {
+  //             // same type means 2nd one wins.
+  //             //TODO: a little more complex for types that can be extended
+  //             (Associative::DictEntry(_), Associative::DictEntry(other)) => {
+  //                 Associative::DictEntry(other)
+  //             }
+  //             (Associative::Dictionary(mut this), Associative::Dictionary(other)) => {
+  //                 let thism = Arc::make_mut(&mut this);
+  //                 thism.extend(rc_inner(&other).into_iter());
+  //                 Associative::Dictionary(this)
+  //             }
+  //             (Associative::Error(_), Associative::Error(other)) => Associative::Error(other),
+  //             (Associative::Env(_), Associative::Env(other)) => Associative::Env(other),
+  //             (Associative::Nothing, Associative::Nothing) => Associative::Nothing,
+  //             (Associative::Assoc(mut this), other) => {
+  //                 let thism = Arc::make_mut(&mut this);
+  //                 thism.extend(other.into_iter());
+  //                 Associative::Assoc(this)
+  //             }
+  //             (this, other) => {
+  //                 let thisa: Association = this.into();
+  //                 (Associative::Assoc(thisa)).join(other)
+  //             }
+  //         }
+  //     }
+
+  //     pub fn get(&self, k: &KeyItem) -> Option<Item> {
+  //         match self {
+  //             Associative::Assoc(a) => a.get(k).and_then(|x| Some(x.clone())),
+  //             Associative::Error(e) => e.data.get(k).and_then(|x| Some(x.clone())),
+  //             Associative::Env(e) => match k {
+  //                 KeyItem::Word(s) => match s.as_str() {
+  //                     "stack" => Some(Item::List(e.stack.clone())),
+  //                     "expression" => Some(Item::List(e.expression.clone())),
+  //                     "dictionary" => Some(Item::Dictionary(e.dictionary.clone())),
+  //                     _ => None,
+  //                 },
+  //                 _ => None,
+  //             },
+  //             Associative::DictEntry(d) => match k {
+  //                 KeyItem::Word(s) => match s.as_str() {
+  //                     "spec" => d.spec.clone().and_then(|x| Some(Item::List(x))),
+  //                     "examples" => d.examples.clone().and_then(|x| Some(Item::List(x))),
+  //                     "definition" => Some(match d.definition.clone() {
+  //                         dict::Definition::Axiom(_) => "builtin".into(),
+  //                         dict::Definition::Derived(d) => Item::List(d),
+  //                     }),
+  //                     _ => None,
+  //                 },
+  //                 _ => None,
+  //             },
+  //             Associative::Dictionary(d) => match k {
+  //                 KeyItem::Word(w) => d.get(w).and_then(|x| Some(Item::Entry(x.clone()))),
+  //                 _ => None,
+  //             },
+  //             _ => None,
+  //         }
+  //     }
+
+  //     //TODO remove
+  //     pub fn remove(self, k: &KeyItem) -> (Associative, Option<Item>) {
+  //         match self {
+  //             Associative::Assoc(mut a) => {
+  //                 let am = Arc::make_mut(&mut a);
+  //                 let v = am.remove(k);
+  //                 (Associative::Assoc(a), v)
+  //             }
+  //             _ => (Associative::Nothing, None),
+  //         }
+  //     }
+
+  //     pub fn len(self) -> Int {
+  //         match self {
+  //             Associative::Assoc(a) => a.len() as Int,
+  //             Associative::Dictionary(d) => d.len() as Int,
+  //             Associative::DictEntry(_) => 3 as Int,
+  //             Associative::Error(e) => e.data.len() as Int,
+  //             Associative::Env(_) => 3 as Int,
+  //             Associative::Nothing => 0,
+  //         }
+  //     }
+  // }
 
   impl TryFrom<Item> for MapEntry {
       type Error = Error;
@@ -647,48 +743,48 @@ internally, to keep track of things like the stack, expression, lists etc.
       }
   }
 
-  impl IntoIterator for Associative {
-      type Item = MapEntry;
-      type IntoIter = AssocIntoIter;
+  // impl IntoIterator for Associative {
+  //     type Item = MapEntry;
+  //     type IntoIter = AssocIntoIter;
 
-      fn into_iter<'a>(self) -> AssocIntoIter {
-          match self {
-              Associative::Assoc(a) => AssocIntoIter::Assoc(rc_inner(&a).into_iter()),
-              Associative::DictEntry(e) => {
-                  let mut v: Vec<MapEntry> = vec![("definition".into(), {
-                      match e.definition {
-                          dict::Definition::Derived(l) => Item::List(l),
-                          dict::Definition::Axiom(_) => "builtin-function".into(),
-                      }
-                  })];
-                  if let Some(e) = e.examples {
-                      v.push(("examples".into(), Item::List(e)));
-                  }
-                  if let Some(s) = e.spec {
-                      v.push(("spec".into(), Item::List(s)))
-                  }
-                  AssocIntoIter::DictEntry(v.into_iter())
-              }
-              Associative::Dictionary(d) => AssocIntoIter::Dictionary(
-                  rc_inner(&d)
-                      .into_iter()
-                      .map(|(w, e)| (KeyItem::Word(w), Item::Entry(e))),
-              ),
-              _ => panic!("can't iterate"),
-          }
-      }
-  }
+  //     fn into_iter<'a>(self) -> AssocIntoIter {
+  //         match self {
+  //             Associative::Assoc(a) => AssocIntoIter::Assoc(rc_inner(&a).into_iter()),
+  //             Associative::DictEntry(e) => {
+  //                 let mut v: Vec<MapEntry> = vec![("definition".into(), {
+  //                     match e.definition {
+  //                         dict::Definition::Derived(l) => Item::List(l),
+  //                         dict::Definition::Axiom(_) => "builtin-function".into(),
+  //                     }
+  //                 })];
+  //                 if let Some(e) = e.examples {
+  //                     v.push(("examples".into(), Item::List(e)));
+  //                 }
+  //                 if let Some(s) = e.spec {
+  //                     v.push(("spec".into(), Item::List(s)))
+  //                 }
+  //                 AssocIntoIter::DictEntry(v.into_iter())
+  //             }
+  //             Associative::Dictionary(d) => AssocIntoIter::Dictionary(
+  //                 rc_inner(&d)
+  //                     .into_iter()
+  //                     .map(|(w, e)| (KeyItem::Word(w), Item::Entry(e))),
+  //             ),
+  //             _ => panic!("can't iterate"),
+  //         }
+  //     }
+  // }
 
-  impl TryFrom<Associative> for List {
-      type Error = Error;
-      fn try_from(a: Associative) -> Result<Self, Self::Error> {
-          Ok(Arc::new(
-              a.into_iter().map(|x| x.into()).collect::<ListContent>(),
-          ))
-      }
-  }
+  // impl TryFrom<Association> for List {
+  //     type Error = Error;
+  //     fn try_from(a: Association) -> Result<Self, Self::Error> {
+  //         Ok(Arc::new(
+  //             a.into_iter().map(|x| x.into()).collect::<ListContent>(),
+  //         ))
+  //     }
+  // }
 
-  impl TryFrom<Item> for Associative {
+  impl TryFrom<Item> for Association {
       type Error = Error;
       fn try_from(i: Item) -> Result<Self, Error> {
           match i {
@@ -710,16 +806,16 @@ internally, to keep track of things like the stack, expression, lists etc.
       }
   }
 
-  impl TryFrom<List> for Associative {
-      type Error = Error;
-      fn try_from(l: List) -> Result<Self, Error> {
-          Ok(Associative::Assoc(Arc::new(
-              l.iter()
-                  .map(|i| MapEntry::try_from(i.clone()))
-                  .collect::<Result<HashMap<KeyItem, Item>, Error>>()?,
-          )))
-      }
-  }
+  // impl TryFrom<List> for Association {
+  //     type Error = Error;
+  //     fn try_from(l: List) -> Result<Self, Error> {
+  //         Ok(Associative::Assoc(Arc::new(
+  //             l.iter()
+  //                 .map(|i| MapEntry::try_from(i.clone()))
+  //                 .collect::<Result<HashMap<KeyItem, Item>, Error>>()?,
+  //         )))
+  //     }
+  // }
 
   impl From<(KeyItem, Item)> for Item {
       fn from((k, v): (KeyItem, Item)) -> Item {
@@ -729,27 +825,18 @@ internally, to keep track of things like the stack, expression, lists etc.
           ])))
       }
   }
-
-  impl From<Associative> for Association {
-      fn from(a: Associative) -> Association {
-          match a {
-              Associative::Assoc(a) => a,
-              a => Arc::new(AssociationContent::from_iter(a.into_iter())),
-          }
-      }
-  }
 #+end_src
 *** Error types
 #+begin_src rust :tangle src/types/error.rs
   use crate::types;
   use crate::types::associative as assoc;
-  use crate::types::{Association, Int, Item, KeyItem, List, ListContent, Word};
+  use crate::types::{Int, Item, KeyItem, List, ListContent, Word};
   use std::collections::HashMap;
   use std::sync::Arc;
 
   #[derive(Clone, PartialEq)]
   pub struct Error {
-      pub data: Association,
+      pub data: assoc::Association,
       pub is_handled: bool,
   }
 
@@ -820,8 +907,8 @@ internally, to keep track of things like the stack, expression, lists etc.
       }
   }
 
-  impl From<Error> for Association {
-      fn from(e: Error) -> Association {
+  impl From<Error> for assoc::Association {
+      fn from(e: Error) -> assoc::Association {
           e.data
       }
   }
@@ -838,22 +925,16 @@ internally, to keep track of things like the stack, expression, lists etc.
       }
   }
 
-  impl TryFrom<assoc::Associative> for Error {
+  impl TryFrom<assoc::Association> for Error {
       type Error = Error;
-      fn try_from(a: assoc::Associative) -> Result<Self, Self::Error> {
-          match a {
-              assoc::Associative::Error(e) => Ok(e),
-              assoc::Associative::Assoc(a) => {
-                  if a.get(&KeyItem::from("type")) != Some(&Item::from("error")) {
-                      Err(Error::expected("error"))
-                  } else {
-                      Ok(Error {
-                          data: a.clone(),
-                          is_handled: true,
-                      })
-                  }
-              }
-              _ => Err(Error::expected("error")),
+      fn try_from(a: assoc::Association) -> Result<Self, Self::Error> {
+          if a.get(&KeyItem::from("type")) != Some(&Item::from("error")) {
+              Err(Error::expected("error"))
+          } else {
+              Ok(Error {
+                  data: a.clone(),
+                  is_handled: true,
+              })
           }
       }
   }
@@ -921,9 +1002,9 @@ internally, to keep track of things like the stack, expression, lists etc.
       }
   }
 
-  impl From<Entry> for Associative {
-      fn from(d: Entry) -> Associative {
-          let mut a = AssociationContent::new();
+  impl From<Entry> for assoc::Association {
+      fn from(d: Entry) -> assoc::Association {
+          let mut a = assoc::AssociationContent::new();
           d.examples
               .and_then(|l| a.insert("examples".into(), Item::List(l.clone())));
           d.spec
@@ -934,13 +1015,13 @@ internally, to keep track of things like the stack, expression, lists etc.
               }
               _ => {}
           }
-          Associative::Assoc(Arc::new(a))
+          Arc::new(a)
       }
   }
 
-  impl TryFrom<Associative> for Entry {
+  impl TryFrom<assoc::Association> for Entry {
       type Error = Error;
-      fn try_from(d: Associative) -> Result<Self, Error> {
+      fn try_from(d: assoc::Association) -> Result<Self, Error> {
           // TODO: This should handle cases where there's no def present
           // and return error
           let (d, def) = d.remove(&"definition".into());
@@ -974,36 +1055,36 @@ internally, to keep track of things like the stack, expression, lists etc.
       }
   }
 
-  impl TryFrom<assoc::Associative> for Dictionary {
-      type Error = Error;
-      fn try_from(a: assoc::Associative) -> Result<Self, Self::Error> {
-          match a {
-              assoc::Associative::Dictionary(e) => Ok(e),
-              assoc::Associative::Assoc(a) => {
-                  let h = rc_inner(&a)
-                      .into_iter()
-                      .map(|(k, v)| {
-                          let e: (Word, Entry) = (k.try_into()?, v.try_into()?);
-                          Ok(e)
-                      })
-                      .collect::<Result<HashMap<Word, Entry>, Error>>()?;
-                  Ok(Arc::new(h))
-              }
-              _ => Err(Error::expected("dictionary")),
-          }
-      }
-  }
+  // impl TryFrom<assoc::Association> for Dictionary {
+  //     type Error = Error;
+  //     fn try_from(a: assoc::Association) -> Result<Self, Self::Error> {
+  //         match a {
+  //             assoc::Associative::Dictionary(e) => Ok(e),
+  //             assoc::Associative::Assoc(a) => {
+  //                 let h = rc_inner(&a)
+  //                     .into_iter()
+  //                     .map(|(k, v)| {
+  //                         let e: (Word, Entry) = (k.try_into()?, v.try_into()?);
+  //                         Ok(e)
+  //                     })
+  //                     .collect::<Result<HashMap<Word, Entry>, Error>>()?;
+  //                 Ok(Arc::new(h))
+  //             }
+  //             _ => Err(Error::expected("dictionary")),
+  //         }
+  //     }
+  // }
 
-  impl From<Dictionary> for assoc::Associative {
-      fn from(d: Dictionary) -> Self {
-          Associative::Assoc(Arc::new(
-              rc_inner(&d)
-                  .into_iter()
-                  .map(|(k, v)| (KeyItem::Word(k), Item::Entry(v)))
-                  .collect(),
-          ))
-      }
-  }
+  // impl From<Dictionary> for assoc::Association {
+  //     fn from(d: Dictionary) -> Self {
+  //         Associative::Assoc(Arc::new(
+  //             rc_inner(&d)
+  //                 .into_iter()
+  //                 .map(|(k, v)| (KeyItem::Word(k), Item::Entry(v)))
+  //                 .collect(),
+  //         ))
+  //     }
+  // }
 
   impl TryFrom<Item> for Dictionary {
       type Error = Error;
@@ -1020,7 +1101,7 @@ internally, to keep track of things like the stack, expression, lists etc.
 *** Environment types
 #+begin_src rust :tangle src/types/environment.rs
   use crate::axiom;
-  use crate::types::associative::Associative;
+  use crate::types::associative as assoc;
   use crate::types::dictionary as dict;
   use crate::types::*;
   use std::future;
@@ -1064,8 +1145,8 @@ internally, to keep track of things like the stack, expression, lists etc.
       }
   }
 
-  impl From<Associative> for Environment {
-      fn from(envm: Associative) -> Self {
+  impl From<assoc::Association> for Environment {
+      fn from(envm: assoc::Association) -> Self {
           let (envm, stack) = envm.remove(&"stack".into());
           let (envm, expression) = envm.remove(&"expression".into());
           let (_, dictionary) = envm.remove(&"dictionary".into());
@@ -1076,7 +1157,7 @@ internally, to keep track of things like the stack, expression, lists etc.
               .and_then(|s| List::try_from(s).ok())
               .or(Some(List::new(ListContent::new())));
           let dictionary = dictionary.and_then(|d| {
-              Associative::try_from(d)
+              assoc::Association::try_from(d)
                   .and_then(|d| dict::Dictionary::try_from(d))
                   .ok()
           });
@@ -1095,7 +1176,7 @@ internally, to keep track of things like the stack, expression, lists etc.
           match i {
               Item::Env(e) => Ok(e),
               Item::List(l) => {
-                  let a: Associative = l.try_into()?;
+                  let a: assoc::Association = l.try_into()?;
                   Ok(a.into())
               }
               Item::Assoc(a) => Ok(a.into()),
@@ -1121,7 +1202,7 @@ We'll implement certain cryptography functions in rust and make kcats
 words for them (hashing, encryption, signing)
 #+begin_src rust :tangle src/crypto.rs
   use crate::axiom::ItemResult;
-  use crate::types::{associative::Associative, error::Error, AssociationContent, Bytes, Item};
+  use crate::types::{associative as assoc, error::Error, Bytes, Item};
   use core::ops::Deref;
   use ed25519_dalek as signing;
   use ed25519_dalek::{Signer, Verifier};
@@ -1179,11 +1260,11 @@ words for them (hashing, encryption, signing)
           seed: vec![],
           salt: sbs,
       });
-      let mut keypair = AssociationContent::new();
+      let mut keypair = assoc::AssociationContent::new();
       keypair.insert("type".into(), "elliptic-curve-key".into());
       keypair.insert("secret".into(), Item::Bytes(kp.secret.as_ref().to_vec()));
       keypair.insert("public".into(), Item::Bytes(kp.public.as_ref().to_vec()));
-      Ok(Item::Assoc(Associative::Assoc(Arc::new(keypair))))
+      Ok(Item::Assoc(Arc::new(keypair)))
   }
 
   impl TryFrom<Item> for signing::Keypair {
@@ -1267,7 +1348,7 @@ We'll define how kcats data structure are parsed and written (for
 example, in order to read/write to/from disk).
 #+begin_src rust :tangle src/serialize.rs
   extern crate edn_format;
-  use crate::types::associative::Associative;
+  use crate::types::associative as assoc;
   use crate::types::environment::Environment;
   use crate::types::error::Error;
   use crate::types::*;
@@ -1313,7 +1394,7 @@ example, in order to read/write to/from disk).
       }
   }
 
-  pub fn vectorize(a: Associative) -> Vec<edn_format::Value> {
+  pub fn vectorize(a: assoc::Association) -> Vec<edn_format::Value> {
       a.into_iter()
           .map(|(k, v)| {
               edn_format::Value::Vector(vec![from_item(&Item::from(k.clone())), from_item(&v)])
@@ -1345,9 +1426,7 @@ example, in order to read/write to/from disk).
               Box::new(edn_format::Value::String(base64::encode(bs))),
           ),
           Item::Assoc(h) => edn_format::Value::Vector(vectorize(h.clone())),
-          Item::Error(err) => {
-              edn_format::Value::Vector(vectorize(Associative::Assoc(err.data.clone())))
-          }
+          Item::Error(err) => edn_format::Value::Vector(vectorize(err.data.clone())),
           Item::Env(e) => edn_format::Value::Vector(vec![
               edn_format::Value::Vector(vec![
                   from_item(&"stack".into()),
@@ -1359,10 +1438,10 @@ example, in order to read/write to/from disk).
               ]),
               // TODO emit the non-builtin words of the dictionary
           ]),
-          Item::Nothing => edn_format::Value::Vector(Vec::new()),
-          Item::Dictionary(d) => from_item(&Item::Assoc(Associative::from(d.clone()))),
+          Item::Nothing(_) => edn_format::Value::Vector(Vec::new()),
+          Item::Dictionary(d) => from_item(&Item::Assoc(assoc::Association::from(d.clone()))),
           Item::Entry(d) => {
-              let a: Associative = (*d).clone().into();
+              let a: assoc::Association = (*d).clone().into();
               from_item(&Item::Assoc(a))
           }
           Item::In(i) => from_item(&i.representation()),
@@ -1415,11 +1494,7 @@ example, in order to read/write to/from disk).
 
   impl fmt::Debug for Error {
       fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-          write!(
-              f,
-              "{}",
-              emit(&Item::Assoc(Associative::Assoc(self.data.clone())))
-          )
+          write!(f, "{}", emit(&Item::Assoc(self.data.clone())))
       }
   }
 #+end_src
@@ -1427,8 +1502,7 @@ example, in order to read/write to/from disk).
 We'll define some words as axioms (not in terms of other words, only defined in Rust). 
 #+begin_src rust :tangle src/axiom.rs
   use super::serialize;
-  use crate::types::associative::Associative;
-  use crate::types::collection as coll;
+  use crate::types::associative as assoc;
   use crate::types::dictionary as dict;
   use crate::types::environment::Environment;
   use crate::types::error::Error;
@@ -1631,13 +1705,13 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn read_lexicon(lexicon: String, mut env: Environment) -> Environment {
       let items = serialize::parse(lexicon).unwrap();
-      let vitems: Associative = List::from(items).try_into().unwrap();
+      let vitems: assoc::Association = List::from(items).try_into().unwrap();
       //println!("Items {:?}", vitems);
 
       //let vitemsmut = Arc::make_mut(&mut vitems);
       for (k, def) in vitems.into_iter() {
           //println!("Reading {:?}", k);
-          let h: Associative = List::try_from(def.clone()).unwrap().try_into().unwrap();
+          let h: assoc::Association = List::try_from(def.clone()).unwrap().try_into().unwrap();
           let word: Word = k.try_into().unwrap();
           let newdef = to_lexicon_entry(word, h);
           let newdef2 = newdef.clone();
@@ -1660,7 +1734,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           dict::Entry {
               definition: dict::Definition::Derived(Arc::new(ListContent::from_iter([
                   //Item::Word(*S_LIST),
-                  Item::Assoc(Associative::Assoc(Arc::new(AssociationContent::new()))),
+                  Item::Assoc(Arc::new(assoc::AssociationContent::new())),
               ]))),
               examples: None,
               spec: None,
@@ -1815,10 +1889,11 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               imut.append(Arc::make_mut(&mut j));
               Ok(Item::List(i))
           }
-          (Item::Dictionary(i), Item::Assoc(j)) => match (Associative::Dictionary(i)).join(j) {
-              Associative::Dictionary(d) => Ok(Item::Dictionary(d)),
-              a => Ok(Item::Assoc(a)),
-          },
+          // TODO make join generic
+          // (Item::Dictionary(i), Item::Assoc(j)) => match (dict::Dictionary(i)).join(j) {
+          //     dict::Dictionary(d) => Ok(Item::Dictionary(d)),
+          //     a => Ok(Item::Assoc(a)),
+          // },
           (Item::String(mut i), Item::String(j)) => {
               i.push_str(&j);
               Ok(Item::String(i))
@@ -1889,11 +1964,12 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn count(i: Item) -> ItemResult {
+      //TODO make count generic
       match i {
           Item::List(l) => Ok(Item::Int(l.len() as Int)),
           Item::Assoc(a) => Ok(Item::Int(a.len())),
-          Item::Dictionary(d) => Ok(Item::Int(Associative::Dictionary(d).len())),
-          Item::Nothing => Ok(Item::Int(0 as Int)),
+          //Item::Dictionary(d) => Ok(Item::Int(Associative::Dictionary(d).len())),
+          Item::Nothing(_) => Ok(Item::Int(0 as Int)),
           Item::String(s) => Ok(Item::Int(s.len() as Int)),
           _ => Err(Error::expected("listt")),
       }
@@ -1951,7 +2027,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       Ok(Item::from(
           if let Item::List(_)
           | Item::Collection(_)
-          | Item::Nothing
+          | Item::Nothing(_)
           | Item::Assoc(_)
           | Item::Env(_)
           | Item::Error(_)
@@ -2093,7 +2169,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   fn is_truthy(i: &Item) -> bool {
       match i {
-          Item::Nothing => false,
+          Item::Nothing(_) => false,
           Item::List(l) => !l.is_empty(),
           Item::Assoc(a) => !a.is_empty(),
           _ => true,
@@ -2195,7 +2271,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       env.push(Item::List(l)).into()
   }
 
-  fn to_lexicon_entry(w: Word, def: Associative) -> dict::Entry {
+  fn to_lexicon_entry(w: Word, def: assoc::Association) -> dict::Entry {
       let (def, _) = def.insert("word".into(), Item::Word(w));
       def.try_into().unwrap()
   }
@@ -2217,7 +2293,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       Ok(Item::List(l))
                   }
                   (i, k) => {
-                      let a = Associative::try_from(i)?;
+                      let a = assoc::Association::try_from(i)?;
                       Ok(Item::Assoc(a.insert(k.clone(), v).0))
                   }
               }
@@ -2238,9 +2314,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                           let i = match (inner, nextk) {
                               (Item::List(l), KeyItem::Int(_)) => Item::List(l.clone()),
                               (_, KeyItem::Int(_)) => Item::List(Arc::new(ListContent::new())),
-                              _ => {
-                                  Item::Assoc(Associative::Assoc(Arc::new(AssociationContent::new())))
-                              }
+                              _ => Item::Assoc(Arc::new(assoc::AssociationContent::new())),
                           };
                           assoc_in(i, ks, v)?
                       } else {
@@ -2251,7 +2325,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       Ok(Item::List(l))
                   }
                   (i, k) => {
-                      let a = Associative::try_from(i)?;
+                      let a = assoc::Association::try_from(i)?;
                       let inner = a.get(&k).unwrap_or(Item::Nothing).clone();
                       // if the inner value isn't a map, we're just overwriting whatever it
                       // is with a new map.
@@ -2260,7 +2334,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                           Item::Assoc(inner) => Item::Assoc(inner),
                           Item::List(inner) => Item::List(inner),
                           // TODO: other associative types
-                          _ => Item::Assoc(Associative::Assoc(Arc::new(AssociationContent::new()))),
+                          _ => Item::Assoc(Arc::new(assoc::AssociationContent::new())),
                       };
                       Ok(Item::Assoc(a.insert(k.clone(), assoc_in(i, ks, v)?).0))
                   }
@@ -2285,14 +2359,14 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   //TODO: this should really take a keylist like assign and lookup
   pub fn unassign(m: Item, k: Item) -> ItemResult {
-      let m = Associative::try_from(m).unwrap();
+      let m = assoc::Association::try_from(m).unwrap();
       let k = KeyItem::try_from(k)?;
       let (nm, _) = m.remove(&k);
       Ok(Item::Assoc(nm))
   }
 
   pub fn association(m: Item) -> ItemResult {
-      match Associative::try_from(m) {
+      match assoc::Association::try_from(m) {
           Ok(m) => Ok(Item::Assoc(m)),
           Err(e) => Err(e),
       }
@@ -2307,7 +2381,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               .and_then(|x| Some(x.clone()))
               .unwrap_or(Item::Nothing)),
           (i, k) => {
-              let m = Associative::try_from(i)?;
+              let m = assoc::Association::try_from(i)?;
               Ok(m.get(&k).unwrap_or(Item::Nothing).clone())
           }
       }
@@ -2341,17 +2415,12 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   pub fn is_association(i: Item) -> ItemResult {
       Ok(Item::from(match i {
           Item::Assoc(_) => true,
-          Item::Nothing => true,
+          Item::Nothing(_) => true,
           Item::Env(_) => true,
           Item::Error(_) => true,
           Item::Entry(_) => true,
           Item::Dictionary(_) => true,
-          Item::Collection(i) => match i {
-              coll::Collection::Associative(_) => true,
-              coll::Collection::List(l) => Associative::try_from(Item::List(l)).is_ok(),
-              coll::Collection::Nothing => true,
-          },
-          Item::List(l) => Associative::try_from(Item::List(l)).is_ok(),
+          Item::List(l) => assoc::Association::try_from(Item::List(l)).is_ok(),
           _ => false,
       }))
   }
@@ -2506,7 +2575,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   Err(Error::expected(&w))
               }
           }
-          Item::Nothing => {
+          Item::Nothing(_) => {
               if w == *S_LIST || w == *S_ITEM || w == *S_ASSOC || w == *S_BOOLEAN || w == *S_PROGRAM {
                   Ok(())
               } else {
@@ -2785,7 +2854,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn dictionary(env: Environment) -> Future<Environment> {
       let d = env.dictionary.clone();
-      env.push(Item::Assoc(Associative::Dictionary(d))).into()
+      env.push(d).into()
   }
 
   fn ceil(i: Item) -> ItemResult {
@@ -3527,9 +3596,9 @@ How to interact with files on disk
 #+begin_src rust :tangle src/pipes/fs.rs
   use crate::axiom::ItemResult;
   use crate::pipes::closed_error;
-  use crate::types::associative::Associative;
+  use crate::types::associative as assoc;
   use crate::types::error::Error;
-  use crate::types::{AssociationContent, Item};
+  use crate::types::Item;
   use std::future;
   use std::pin::Pin;
   use std::sync::Arc;
@@ -3586,10 +3655,10 @@ How to interact with files on disk
 
   impl crate::serialize::Display for StaticFile {
       fn representation(&self) -> Item {
-          Item::Assoc(Associative::Assoc(Arc::new(AssociationContent::from([
+          Item::Assoc(Arc::new(assoc::AssociationContent::from([
               ("type".into(), "pipe".into()),
               ("file".into(), Item::String(self.path.clone())),
-          ]))))
+          ])))
       }
   }
 
@@ -3626,9 +3695,9 @@ How to interact with the network (TCP/IP sockets)
 #+begin_src rust :tangle src/pipes/net.rs
   use crate::axiom::ItemResult;
   use crate::pipes::closed_error;
-  use crate::types::associative::Associative;
+  use crate::types::associative as assoc;
   use crate::types::error::Error;
-  use crate::types::{self, wrap, AssociationContent, Int, Item};
+  use crate::types::{self, wrap, Int, Item};
   use futures::future::FutureExt;
   use std::future::{self};
   use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -3687,11 +3756,11 @@ How to interact with the network (TCP/IP sockets)
 
   impl crate::serialize::Display for Socket {
       fn representation(&self) -> Item {
-          Item::Assoc(Associative::Assoc(Arc::new(AssociationContent::from([
+          Item::Assoc(Arc::new(assoc::AssociationContent::from([
               ("type".into(), "tunnel".into()),
               ("realm".into(), "tcp".into()),
               ("address".into(), Item::String(self.addr.to_string())),
-          ]))))
+          ])))
       }
   }
 
@@ -3733,13 +3802,13 @@ How to interact with the network (TCP/IP sockets)
 
   impl crate::serialize::Display for ServerSocket {
       fn representation(&self) -> Item {
-          Item::Assoc(Associative::Assoc(Arc::new(AssociationContent::from([
+          Item::Assoc(Arc::new(assoc::AssociationContent::from([
               ("type".into(), "pipe".into()),
               (
                   "serversocket".into(),
                   "todo: fix serversocket local addr async issue".into(), //Item::String(self.socket.lock().await.local_addr().unwrap().to_string()),
               ),
-          ]))))
+          ])))
       }
   }
 
@@ -3786,6 +3855,7 @@ Implement the =handoff= type
   use crate::associative::Associative;
   use crate::axiom::ItemResult;
   use crate::pipes;
+  use crate::types::associative as assoc;
   use crate::types::environment::Environment;
   use crate::types::error::Error;
   use crate::types::{self, Item};
@@ -3842,7 +3912,7 @@ Implement the =handoff= type
   impl crate::serialize::Display for Handoff<Item> {
       fn representation(&self) -> Item {
           Item::Assoc(Associative::Assoc(Arc::new(
-              types::AssociationContent::from([
+              assoc::AssociationContent::from([
                   ("type".into(), "pipe".into()),
                   ("handoff".into(), "todo: id-or-hash here".into()),
               ]),
@@ -3853,7 +3923,7 @@ Implement the =handoff= type
   impl crate::serialize::Display for Filled {
       fn representation(&self) -> Item {
           Item::Assoc(Associative::Assoc(Arc::new(
-              types::AssociationContent::from([
+              assoc::AssociationContent::from([
                   ("type".into(), "pipe".into()),
                   ("filled".into(), "todo: id-or-hash here".into()),
               ]),
