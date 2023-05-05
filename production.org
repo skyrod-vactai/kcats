@@ -64,6 +64,7 @@ We'll start by defining the basic data structures that kcats will use
 internally, to keep track of things like the stack, expression, lists etc.
 #+begin_src rust :tangle src/types.rs
   use crate::pipes::{In, Out, Tunnel};
+  use crate::types::associative as assoc;
   use crate::types::dictionary as dict;
   use crate::types::environment as env;
   use crate::types::error::Error;
@@ -73,8 +74,9 @@ internally, to keep track of things like the stack, expression, lists etc.
   use std::fmt;
   use std::hash::Hash;
   use std::marker::Sync;
+  use std::ops::{Deref, DerefMut};
   use std::pin::Pin;
-  use std::sync::Arc;
+  use std::sync;
 
   pub mod associative;
   pub mod collection;
@@ -82,11 +84,53 @@ internally, to keep track of things like the stack, expression, lists etc.
   pub mod environment;
   pub mod error;
 
+  // A generic newtype to contain Arcs of various kinds
+  #[derive(PartialEq, Debug)]
+  pub struct Arc<T>(pub sync::Arc<T>);
+
+  // Access the inner value easily
+  impl<T> Deref for Arc<T> {
+      type Target = T;
+
+      fn deref(&self) -> &Self::Target {
+          &self.0
+      }
+  }
+
+  // but still clone the whole thing, not the inner part
+  impl<T> Clone for Arc<T> {
+      fn clone(&self) -> Self {
+          Arc(self.0.clone())
+      }
+  }
+
+  impl<T: Clone> DerefMut for Arc<T> {
+      fn deref_mut(&mut self) -> &mut Self::Target {
+          sync::Arc::make_mut(&mut self.0)
+      }
+  }
+
+  impl<T: Clone> Arc<T> {
+      pub fn new(v: T) -> Arc<T> {
+          Arc(sync::Arc::new(v))
+      }
+
+      pub fn make_mut(&mut self) -> &mut T {
+          sync::Arc::make_mut(&mut self.0)
+      }
+
+      pub fn inner(&mut self) -> T {
+          sync::Arc::try_unwrap(self.0.clone()).unwrap_or_else(|rc| (*rc).clone())
+      }
+  }
+
   pub type Word = Intern<String>;
 
   pub type ListContent = VecDeque<Item>;
 
-  pub type List = Arc<ListContent>;
+  pub type List = collection::List<Item>;
+
+  pub type Association = assoc::Association<KeyItem, Item>;
 
   pub type KeyList = VecDeque<KeyItem>;
 
@@ -100,6 +144,7 @@ internally, to keep track of things like the stack, expression, lists etc.
 
   pub type Set = Arc<HashSet<Item>>;
 
+  #[derive(Debug, Clone, PartialEq, Eq, Hash)]
   pub struct Nothing;
 
   pub struct NothingIter;
@@ -152,7 +197,7 @@ internally, to keep track of things like the stack, expression, lists etc.
       Bytes(Bytes),
       String(String),
       Word(Word),
-      //Assoc(assoc::Associative),
+      Assoc(Association),
       //Seq(Sequence),
       List(List),
       //Collection(coll::Collection),
@@ -418,14 +463,11 @@ internally, to keep track of things like the stack, expression, lists etc.
           Item::Word(Word::from(i))
       }
   }
-
-  pub fn rc_inner<T: Clone>(r: &Arc<T>) -> T {
-      Arc::try_unwrap(r.clone()).unwrap_or_else(|rc| (*rc).clone())
-  }
 #+end_src
 *** Collection types
 #+begin_src rust :tangle src/types/collection.rs
   use crate::types::*;
+  use std::sync;
 
   pub trait Collective<T: Clone>: IntoIterator<Item = T> {
       fn peek(&self) -> Option<T>;
@@ -439,10 +481,61 @@ internally, to keep track of things like the stack, expression, lists etc.
       }
   }
 
+  // Newtype wrapper for Arc<VecDeque<T>>
+  //pub struct List<T>(pub Arc<VecDeque<T>>);
+  pub type List<T> = Arc<VecDeque<T>>;
+
+  impl<T: Clone> From<VecDeque<T>> for List<T> {
+      fn from(deque: VecDeque<T>) -> Self {
+          Arc::new(deque)
+      }
+  }
+
+  impl<T: Clone> IntoIterator for List<T> {
+      type Item = T;
+      type IntoIter = std::collections::vec_deque::IntoIter<T>;
+
+      fn into_iter(self) -> Self::IntoIter {
+          match sync::Arc::try_unwrap(self.0) {
+              Ok(deque) => deque.into_iter(),
+              Err(arc) => (*arc).clone().into_iter(),
+          }
+      }
+  }
+
+  impl<T: Clone> Default for List<T> {
+      fn default() -> Self {
+          Arc::new(VecDeque::new())
+      }
+  }
+
+  // Newtype wrapper for Arc<HashSet<T>>
+  //pub struct Set<T>(pub Arc<HashSet<T>>);
+  pub type Set<T> = Arc<HashSet<T>>;
+
+  impl<T: Clone + Eq + Hash> From<HashSet<T>> for Set<T> {
+      fn from(set: HashSet<T>) -> Self {
+          Arc::new(set)
+      }
+  }
+
+  impl<T: Clone + Eq + Hash> IntoIterator for Set<T> {
+      type Item = T;
+      type IntoIter = std::collections::hash_set::IntoIter<T>;
+
+      fn into_iter(self) -> Self::IntoIter {
+          match sync::Arc::try_unwrap(self.0) {
+              Ok(set) => set.into_iter(),
+              Err(arc) => (*arc).clone().into_iter(),
+          }
+      }
+  }
+
   // Impl for VecDeque
-  impl<T: Clone> Collective<T> for Arc<VecDeque<T>> {
+  impl<T: Clone> Collective<T> for List<T> {
       fn peek(&self) -> Option<T> {
-          let deque = Arc::try_unwrap(Arc::clone(self)).unwrap_or_else(|arc| (*arc).clone());
+          let deque =
+              sync::Arc::try_unwrap(sync::Arc::clone(&self.0)).unwrap_or_else(|arc| (*arc).clone());
           deque.front().cloned()
       }
 
@@ -452,9 +545,9 @@ internally, to keep track of things like the stack, expression, lists etc.
       }
   }
 
-  impl<T: Clone> FiniteCollective<T> for Arc<VecDeque<T>> {
+  impl<T: Clone> FiniteCollective<T> for List<T> {
       fn len(&self) -> usize {
-          rc_inner(self).len()
+          self.inner().len()
       }
   }
 
@@ -475,9 +568,9 @@ internally, to keep track of things like the stack, expression, lists etc.
       }
   }
 
-  impl<V: Clone + Eq + Hash> Collective<V> for Arc<HashSet<V>> {
+  impl<V: Clone + Eq + Hash> Collective<V> for Set<V> {
       fn peek(&self) -> Option<V> {
-          rc_inner(self).iter().next().cloned()
+          self.inner().iter().next().cloned()
       }
 
       fn pop(&mut self) -> Option<V> {
@@ -486,9 +579,9 @@ internally, to keep track of things like the stack, expression, lists etc.
       }
   }
 
-  impl<V: Clone + Eq + Hash> FiniteCollective<V> for Arc<HashSet<V>> {
+  impl<V: Clone + Eq + Hash> FiniteCollective<V> for Set<V> {
       fn len(&self) -> usize {
-          rc_inner(self).len()
+          self.inner().len()
       }
   }
 #+end_src
@@ -496,45 +589,45 @@ internally, to keep track of things like the stack, expression, lists etc.
 #+begin_src rust :tangle src/types/associative.rs
   use crate::types::dictionary as dict;
   use crate::types::*;
+  use std::sync;
 
-  use super::collection::{Collective, FiniteCollective};
+  use super::collection as coll;
 
   type MapEntry = (KeyItem, Item);
 
-  pub struct ArcHashMap<K, V>(pub Arc<HashMap<K, V>>);
+  //pub struct Association<K, V>(pub Arc<HashMap<K, V>>);
+  pub type Association<K, V> = Arc<HashMap<K, V>>;
 
-  impl<K: Eq + Hash + Clone, V: Clone> From<HashMap<K, V>> for ArcHashMap<K, V> {
+  impl<K: Eq + Hash + Clone, V: Clone> From<HashMap<K, V>> for Association<K, V> {
       fn from(map: HashMap<K, V>) -> Self {
-          ArcHashMap(Arc::new(map))
+          Arc::new(map)
       }
   }
 
-  impl<K: Eq + Hash + Clone, V: Clone> IntoIterator for ArcHashMap<K, V> {
+  impl<K: Eq + Hash + Clone, V: Clone> IntoIterator for Association<K, V> {
       type Item = (K, V);
       type IntoIter = std::collections::hash_map::IntoIter<K, V>;
 
       fn into_iter(self) -> Self::IntoIter {
-          match Arc::try_unwrap(self.0) {
+          match sync::Arc::try_unwrap(self.0) {
               Ok(map) => map.into_iter(),
               Err(arc) => (*arc).clone().into_iter(),
           }
       }
   }
 
-  pub type Association = ArcHashMap<KeyItem, Item>;
-
   pub type AssociationContent = HashMap<KeyItem, Item>;
 
-  pub trait Associative<K: Clone, V: Clone>: Collective<(K, V)> {
+  pub trait Associative<K: Clone, V: Clone>: coll::Collective<(K, V)> {
       fn insert(&mut self, key: K, value: V) -> Option<V>;
       fn remove(&mut self, key: &K) -> Option<V>;
       fn merge(&mut self, other: Self);
       fn get(&self, key: &K) -> Option<&V>;
   }
 
-  impl<K: Clone + Eq + Hash, V: Clone> Collective<(K, V)> for ArcHashMap<K, V> {
+  impl<K: Clone + Eq + Hash, V: Clone> coll::Collective<(K, V)> for Association<K, V> {
       fn peek(&self) -> Option<(K, V)> {
-          rc_inner(self)
+          self.inner()
               .iter()
               .next()
               .map(|(k, v)| (k.clone(), v.clone()))
@@ -546,13 +639,13 @@ internally, to keep track of things like the stack, expression, lists etc.
       }
   }
 
-  impl<K: Clone + Eq + Hash, V: Clone> FiniteCollective<(K, V)> for ArcHashMap<K, V> {
+  impl<K: Clone + Eq + Hash, V: Clone> coll::FiniteCollective<(K, V)> for Association<K, V> {
       fn len(&self) -> usize {
-          rc_inner(self).len()
+          self.inner().len()
       }
   }
 
-  impl<K: Eq + Hash + Clone, V: Clone> Associative<K, V> for ArcHashMap<K, V> {
+  impl<K: Eq + Hash + Clone, V: Clone> Associative<K, V> for Association<K, V> {
       fn insert(&mut self, key: K, value: V) -> Option<V> {
           let hashmap = Arc::make_mut(self);
           hashmap.insert(key, value)
@@ -565,7 +658,7 @@ internally, to keep track of things like the stack, expression, lists etc.
 
       fn merge(&mut self, other: Self) {
           let hashmap = Arc::make_mut(self);
-          let other_map = Arc::try_unwrap(other).unwrap_or_else(|arc| (*arc).clone());
+          let other_map = sync::Arc::try_unwrap(other.0).unwrap_or_else(|arc| (*arc).clone());
 
           for (key, value) in other_map {
               hashmap.insert(key, value);
@@ -573,8 +666,35 @@ internally, to keep track of things like the stack, expression, lists etc.
       }
 
       fn get(&self, key: &K) -> Option<&V> {
-          let hashmap = Arc::try_unwrap(Arc::clone(self)).unwrap_or_else(|arc| (*arc).clone());
+          let hashmap =
+              sync::Arc::try_unwrap(sync::Arc::clone(&self.0)).unwrap_or_else(|arc| (*arc).clone());
           hashmap.get(key)
+      }
+  }
+
+  // convert from List
+  // Conversion from Association<K, V to Association<K, V>
+  impl<K: Eq + Hash + Clone, V: Clone> TryFrom<coll::List<Item>> for Association<K, V> {
+      type Error = Error;
+
+      fn try_from(value: coll::List<Item>) -> Result<Self, Self::Error> {
+          let mut hashmap = HashMap::new();
+
+          for elem in value.into_iter() {
+              if let Some((key, value)) = elem.into_pair() {
+                  if let (Some(key), Some(value)) =
+                      (key.downcast::<K>().ok(), value.downcast::<V>().ok())
+                  {
+                      hashmap.insert(key, value);
+                  } else {
+                      return Err(Error::expected("key-value"));
+                  }
+              } else {
+                  return Err(Error::expected("pair"));
+              }
+          }
+
+          Ok(Arc::new(hashmap))
       }
   }
 
@@ -784,7 +904,7 @@ internally, to keep track of things like the stack, expression, lists etc.
   //     }
   // }
 
-  impl TryFrom<Item> for Association {
+  impl TryFrom<Item> for crate::types::Association {
       type Error = Error;
       fn try_from(i: Item) -> Result<Self, Error> {
           match i {
@@ -836,7 +956,7 @@ internally, to keep track of things like the stack, expression, lists etc.
 
   #[derive(Clone, PartialEq)]
   pub struct Error {
-      pub data: assoc::Association,
+      pub data: types::Association,
       pub is_handled: bool,
   }
 
@@ -907,8 +1027,8 @@ internally, to keep track of things like the stack, expression, lists etc.
       }
   }
 
-  impl From<Error> for assoc::Association {
-      fn from(e: Error) -> assoc::Association {
+  impl From<Error> for types::Association {
+      fn from(e: Error) -> types::Association {
           e.data
       }
   }
@@ -917,7 +1037,7 @@ internally, to keep track of things like the stack, expression, lists etc.
       type Error = Error;
       fn try_from(i: Item) -> Result<Self, Self::Error> {
           match i {
-              Item::List(l) => Item::Assoc(assoc::Associative::try_from(l)?).try_into(),
+              Item::List(l) => Item::Assoc(types::Association::try_from(l)?).try_into(),
               Item::Error(e) => Ok(e),
               Item::Assoc(a) => a.try_into(),
               _ => Err(Error::expected("error")),
@@ -925,9 +1045,9 @@ internally, to keep track of things like the stack, expression, lists etc.
       }
   }
 
-  impl TryFrom<assoc::Association> for Error {
+  impl TryFrom<types::Association> for Error {
       type Error = Error;
-      fn try_from(a: assoc::Association) -> Result<Self, Self::Error> {
+      fn try_from(a: types::Association) -> Result<Self, Self::Error> {
           if a.get(&KeyItem::from("type")) != Some(&Item::from("error")) {
               Err(Error::expected("error"))
           } else {
@@ -952,7 +1072,7 @@ internally, to keep track of things like the stack, expression, lists etc.
       pub definition: Definition,
   }
 
-  pub type Dictionary = Arc<HashMap<Word, Entry>>;
+  pub type Dictionary = assoc::Association<Word, Entry>;
 
   #[derive(Clone)]
   pub enum Definition {
@@ -1002,8 +1122,8 @@ internally, to keep track of things like the stack, expression, lists etc.
       }
   }
 
-  impl From<Entry> for assoc::Association {
-      fn from(d: Entry) -> assoc::Association {
+  impl From<Entry> for Association {
+      fn from(d: Entry) -> Association {
           let mut a = assoc::AssociationContent::new();
           d.examples
               .and_then(|l| a.insert("examples".into(), Item::List(l.clone())));
@@ -1019,9 +1139,9 @@ internally, to keep track of things like the stack, expression, lists etc.
       }
   }
 
-  impl TryFrom<assoc::Association> for Entry {
+  impl TryFrom<Association> for Entry {
       type Error = Error;
-      fn try_from(d: assoc::Association) -> Result<Self, Error> {
+      fn try_from(d: Association) -> Result<Self, Error> {
           // TODO: This should handle cases where there's no def present
           // and return error
           let (d, def) = d.remove(&"definition".into());
@@ -1145,8 +1265,8 @@ internally, to keep track of things like the stack, expression, lists etc.
       }
   }
 
-  impl From<assoc::Association> for Environment {
-      fn from(envm: assoc::Association) -> Self {
+  impl From<Association> for Environment {
+      fn from(envm: Association) -> Self {
           let (envm, stack) = envm.remove(&"stack".into());
           let (envm, expression) = envm.remove(&"expression".into());
           let (_, dictionary) = envm.remove(&"dictionary".into());
@@ -1202,14 +1322,13 @@ We'll implement certain cryptography functions in rust and make kcats
 words for them (hashing, encryption, signing)
 #+begin_src rust :tangle src/crypto.rs
   use crate::axiom::ItemResult;
-  use crate::types::{associative as assoc, error::Error, Bytes, Item};
+  use crate::types::{self, associative as assoc, error::Error, Bytes, Item};
   use core::ops::Deref;
   use ed25519_dalek as signing;
   use ed25519_dalek::{Signer, Verifier};
   use rand_core;
   use rand_core::{CryptoRng, RngCore};
   use sha2::{self, Digest};
-  use std::sync::Arc;
 
   pub fn hash(i: Item) -> ItemResult {
       let b = Bytes::try_from(i).unwrap();
@@ -1264,7 +1383,7 @@ words for them (hashing, encryption, signing)
       keypair.insert("type".into(), "elliptic-curve-key".into());
       keypair.insert("secret".into(), Item::Bytes(kp.secret.as_ref().to_vec()));
       keypair.insert("public".into(), Item::Bytes(kp.public.as_ref().to_vec()));
-      Ok(Item::Assoc(Arc::new(keypair)))
+      Ok(Item::Assoc(assoc::Association::new(keypair)))
   }
 
   impl TryFrom<Item> for signing::Keypair {
@@ -1285,13 +1404,12 @@ words for them (hashing, encryption, signing)
           match i {
               Item::Assoc(a) => {
                   if a.get(&"type".into()) == Some("elliptic-curve-key".into()) {
-                      let sk = signing::SecretKey::from_bytes(
-                          &Bytes::try_from(
-                              a.get(&"secret".into())
-                                  .ok_or_else(|| Error::expected("secret"))?,
-                          )?[..],
-                      )
-                      .map_err(|_e| Error::expected("valid-secret-key"))?;
+                      let x = Bytes::try_from(
+                          a.get(&"secret".into())
+                              .ok_or_else(|| Error::expected("secret"))?,
+                      )?;
+                      let sk = signing::SecretKey::from_bytes(&x[..])
+                          .map_err(|_e| Error::expected("valid-secret-key"))?;
                       Ok(sk)
                   } else {
                       Err(Error::expected("keypair"))
@@ -1340,7 +1458,7 @@ words for them (hashing, encryption, signing)
       let sig = signing::Signature::from_bytes(&sbs).map_err(|_e| Error::expected("signature"))?;
       pk.verify(&mbs, &sig)
           .and(Ok(Item::from(true)))
-          .or(Ok(Item::Nothing))
+          .or(Ok(Item::Nothing(types::Nothing)))
   }
 #+end_src
 ** Serialization
@@ -1348,7 +1466,6 @@ We'll define how kcats data structure are parsed and written (for
 example, in order to read/write to/from disk).
 #+begin_src rust :tangle src/serialize.rs
   extern crate edn_format;
-  use crate::types::associative as assoc;
   use crate::types::environment::Environment;
   use crate::types::error::Error;
   use crate::types::*;
@@ -1394,7 +1511,7 @@ example, in order to read/write to/from disk).
       }
   }
 
-  pub fn vectorize(a: assoc::Association) -> Vec<edn_format::Value> {
+  pub fn vectorize(a: Association) -> Vec<edn_format::Value> {
       a.into_iter()
           .map(|(k, v)| {
               edn_format::Value::Vector(vec![from_item(&Item::from(k.clone())), from_item(&v)])
@@ -1408,13 +1525,6 @@ example, in order to read/write to/from disk).
           Item::List(v) => edn_format::Value::Vector(
               v.iter()
                   .map(|i| from_item(i))
-                  .collect::<Vec<edn_format::Value>>(),
-          ),
-
-          Item::Collection(v) => edn_format::Value::Vector(
-              v.clone()
-                  .into_iter()
-                  .map(|i| from_item(&i))
                   .collect::<Vec<edn_format::Value>>(),
           ),
           Item::Word(w) => edn_format::Value::Symbol(edn_format::Symbol::from_name(w)),
@@ -1439,9 +1549,9 @@ example, in order to read/write to/from disk).
               // TODO emit the non-builtin words of the dictionary
           ]),
           Item::Nothing(_) => edn_format::Value::Vector(Vec::new()),
-          Item::Dictionary(d) => from_item(&Item::Assoc(assoc::Association::from(d.clone()))),
+          Item::Dictionary(d) => from_item(&Item::Assoc(Association::from(d.clone()))),
           Item::Entry(d) => {
-              let a: assoc::Association = (*d).clone().into();
+              let a: Association = (*d).clone().into();
               from_item(&Item::Assoc(a))
           }
           Item::In(i) => from_item(&i.representation()),
@@ -1503,6 +1613,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 #+begin_src rust :tangle src/axiom.rs
   use super::serialize;
   use crate::types::associative as assoc;
+  use crate::types::collection as coll;
+  use crate::types::collection::FiniteCollective;
   use crate::types::dictionary as dict;
   use crate::types::environment::Environment;
   use crate::types::error::Error;
@@ -1515,7 +1627,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   //use std::future::Future;
   use std::mem;
   use std::ops::Range;
-  use std::sync::Arc;
+  use std::sync;
 
   pub type ItemResult = Result<Item, Error>;
 
@@ -1705,13 +1817,13 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn read_lexicon(lexicon: String, mut env: Environment) -> Environment {
       let items = serialize::parse(lexicon).unwrap();
-      let vitems: assoc::Association = List::from(items).try_into().unwrap();
+      let vitems: Association = List::from(items).try_into().unwrap();
       //println!("Items {:?}", vitems);
 
       //let vitemsmut = Arc::make_mut(&mut vitems);
       for (k, def) in vitems.into_iter() {
           //println!("Reading {:?}", k);
-          let h: assoc::Association = List::try_from(def.clone()).unwrap().try_into().unwrap();
+          let h: Association = List::try_from(def.clone()).unwrap().try_into().unwrap();
           let word: Word = k.try_into().unwrap();
           let newdef = to_lexicon_entry(word, h);
           let newdef2 = newdef.clone();
@@ -1732,9 +1844,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       d.insert(
           Word::from("derivations"),
           dict::Entry {
-              definition: dict::Definition::Derived(Arc::new(ListContent::from_iter([
+              definition: dict::Definition::Derived(coll::List::new(ListContent::from_iter([
                   //Item::Word(*S_LIST),
-                  Item::Assoc(Arc::new(assoc::AssociationContent::new())),
+                  Item::Assoc(assoc::Association::new(assoc::AssociationContent::new())),
               ]))),
               examples: None,
               spec: None,
@@ -1884,9 +1996,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   pub fn join(i: Item, j: Item) -> ItemResult {
       match (i, j) {
           (Item::List(mut i), Item::List(mut j)) => {
-              let imut = Arc::make_mut(&mut i);
+              let imut = List::make_mut(&mut i);
 
-              imut.append(Arc::make_mut(&mut j));
+              imut.append(List::make_mut(&mut j));
               Ok(Item::List(i))
           }
           // TODO make join generic
@@ -1915,7 +2027,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           }
           (Item::List(mut l), j) => {
               //let mut l = List::try_from(i)?;
-              Arc::make_mut(&mut l).push_back(j);
+              List::make_mut(&mut l).push_back(j);
               Ok(Item::List(l))
           }
           _ => Err(Error::expected("list")),
@@ -1928,7 +2040,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   fn swap2(mut env: Environment, offset: usize) -> Future<Environment> {
-      Arc::make_mut(&mut env.stack).swap(offset, offset + 1);
+      List::make_mut(&mut env.stack).swap(offset, offset + 1);
       env.into()
   }
 
@@ -1941,14 +2053,14 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn sink(mut env: Environment) -> Future<Environment> {
-      let s = Arc::make_mut(&mut env.stack);
+      let s = List::make_mut(&mut env.stack);
       s.swap(0, 2);
       s.swap(0, 1);
       env.into()
   }
 
   pub fn float(mut env: Environment) -> Future<Environment> {
-      let s = Arc::make_mut(&mut env.stack);
+      let s = List::make_mut(&mut env.stack);
       s.swap(0, 2);
       s.swap(1, 2);
       env.into()
@@ -1967,7 +2079,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       //TODO make count generic
       match i {
           Item::List(l) => Ok(Item::Int(l.len() as Int)),
-          Item::Assoc(a) => Ok(Item::Int(a.len())),
+          Item::Assoc(a) => Ok(Item::Int(a.len() as Int)),
           //Item::Dictionary(d) => Ok(Item::Int(Associative::Dictionary(d).len())),
           Item::Nothing(_) => Ok(Item::Int(0 as Int)),
           Item::String(s) => Ok(Item::Int(s.len() as Int)),
@@ -2026,7 +2138,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   pub fn is_list(i: Item) -> ItemResult {
       Ok(Item::from(
           if let Item::List(_)
-          | Item::Collection(_)
           | Item::Nothing(_)
           | Item::Assoc(_)
           | Item::Env(_)
@@ -2046,7 +2157,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       Ok(if let Some(i) = l.front() {
           i.clone()
       } else {
-          Item::Nothing
+          Item::Nothing(Nothing)
       })
   }
 
@@ -2055,7 +2166,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       Ok(if let Some(i) = l.get(1) {
           i.clone()
       } else {
-          Item::Nothing
+          Item::Nothing(Nothing)
       })
   }
 
@@ -2066,7 +2177,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               let f = env.pop();
               if is_truthy(&f) {
                   let p2 = p.clone();
-                  let pm = Arc::make_mut(&mut p);
+                  let pm = List::make_mut(&mut p);
                   pm.push_back(Item::List(p2));
                   pm.push_back("loop".into());
                   env.append_expression(p)
@@ -2091,7 +2202,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let item = env.pop();
       let mut lc = ListContent::new();
       lc.push_front(item);
-      env.push(Item::List(Arc::new(lc))).into()
+      env.push(Item::List(List::new(lc))).into()
   }
 
   pub fn unwrap(mut env: Environment) -> Future<Environment> {
@@ -2115,8 +2226,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               let item = env.pop();
               let mut lc = ListContent::new();
               lc.push_front(item);
-              let v = Arc::new(lc);
-              let expr = Arc::make_mut(&mut env.expression);
+              let v = List::new(lc);
+              let expr = List::make_mut(&mut env.expression);
               expr.push_front("unwrap".into());
               expr.push_front(Item::List(v));
               env.append_expression(program)
@@ -2134,8 +2245,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               let mut lc = ListContent::new();
               lc.push_front(item1);
               lc.push_front(item2);
-              let v = Arc::new(lc);
-              let expr = Arc::make_mut(&mut env.expression);
+              let v = List::new(lc);
+              let expr = List::make_mut(&mut env.expression);
               expr.push_front("unwrap".into());
               expr.push_front(Item::List(v));
               env.append_expression(program)
@@ -2147,16 +2258,16 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn unpack(mut env: Environment) -> Future<Environment> {
       // TODO: handle Nothing case
-      let stack = Arc::make_mut(&mut env.stack);
+      let stack = List::make_mut(&mut env.stack);
       let i = if let Some(s) = stack.front_mut() {
           if let Item::List(ref mut l) = s {
-              if let Some(i) = Arc::make_mut(l).pop_front() {
+              if let Some(i) = List::make_mut(l).pop_front() {
                   i
               } else {
-                  Item::Nothing
+                  Item::Nothing(Nothing)
               }
           } else {
-              Item::from(invalid_type_error(Arc::new(ListContent::from_iter([
+              Item::from(invalid_type_error(List::new(ListContent::from_iter([
                   Item::Word(*S_LIST),
               ]))))
           }
@@ -2204,9 +2315,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   pub fn step(mut env: Environment) -> Future<Environment> {
       let p = List::try_from(env.pop()).unwrap();
       let mut l = List::try_from(env.pop()).unwrap();
-      let lm = Arc::make_mut(&mut l);
+      let lm = List::make_mut(&mut l);
       if let Some(litem) = lm.pop_front() {
-          let expr = Arc::make_mut(&mut env.expression);
+          let expr = List::make_mut(&mut env.expression);
           if !l.is_empty() {
               expr.push_front("step".into());
               expr.push_front(Item::List(p.clone()));
@@ -2223,7 +2334,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let stepby = Int::try_from(env.pop()).unwrap();
       let to = Int::try_from(env.pop()).unwrap();
       let from = Int::try_from(env.pop()).unwrap();
-      env.push(Item::List(Arc::new(
+      env.push(Item::List(List::new(
           (from..to)
               .step_by(stepby as usize)
               .map(|i| Item::Int(i))
@@ -2244,7 +2355,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let then = List::try_from(env.pop()).unwrap();
       let pred = List::try_from(env.pop()).unwrap();
       env = env.push_expr("if".into());
-      let r = Item::List(Arc::new(ListContent::from([
+      let r = Item::List(List::new(ListContent::from([
           Item::List(pred.clone()),
           Item::List(then.clone()),
           Item::List(rec1.clone()),
@@ -2252,13 +2363,13 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           "recur".into(),
       ])));
       let mut e = ListContent::new();
-      e.extend(Arc::make_mut(&mut rec1).drain(..));
+      e.extend(List::make_mut(&mut rec1).drain(..));
       e.push_back(r);
-      e.extend(Arc::make_mut(&mut rec2).drain(..));
+      e.extend(List::make_mut(&mut rec2).drain(..));
 
       env.push(Item::List(pred))
           .push(Item::List(then))
-          .push(Item::List(Arc::new(e)))
+          .push(Item::List(List::new(e)))
           .into()
   }
 
@@ -2271,8 +2382,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       env.push(Item::List(l)).into()
   }
 
-  fn to_lexicon_entry(w: Word, def: assoc::Association) -> dict::Entry {
-      let (def, _) = def.insert("word".into(), Item::Word(w));
+  fn to_lexicon_entry(w: Word, def: Association) -> dict::Entry {
+      def.insert("word".into(), Item::Word(w));
       def.try_into().unwrap()
   }
 
@@ -2282,39 +2393,40 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               match (i, k) {
                   (Item::List(mut l), KeyItem::Int(k)) => {
                       // vector set by index
-                      let lm = Arc::make_mut(&mut l);
+                      let lm = List::make_mut(&mut l);
                       let idx = *k as usize;
                       // extend the size of the vector to be big enough to set
                       // the given index, pad with 'nothing' values.
                       if lm.len() <= idx {
-                          lm.resize(idx + 1, Item::Nothing);
+                          lm.resize(idx + 1, Item::Nothing(Nothing));
                       }
                       lm[*k as usize] = v;
                       Ok(Item::List(l))
                   }
                   (i, k) => {
                       let a = assoc::Association::try_from(i)?;
-                      Ok(Item::Assoc(a.insert(k.clone(), v).0))
+                      a.insert(k.clone(), v);
+                      Ok(Item::Assoc(a))
                   }
               }
               //hm.insert(k.clone(), v);
           } else {
               match (i, k) {
                   (Item::List(mut l), KeyItem::Int(k)) => {
-                      let lm = Arc::make_mut(&mut l);
+                      let lm = List::make_mut(&mut l);
                       let idx = *k as usize;
                       // extend the size of the vector to be big enough to set
                       // the given index, pad with 'nothing' values.
                       if lm.len() <= idx {
-                          lm.resize(idx + 1, Item::Nothing);
+                          lm.resize(idx + 1, Item::Nothing(Nothing));
                       }
                       let inner = &lm[idx];
 
                       lm[*k as usize] = if let [nextk, ..] = ks {
                           let i = match (inner, nextk) {
                               (Item::List(l), KeyItem::Int(_)) => Item::List(l.clone()),
-                              (_, KeyItem::Int(_)) => Item::List(Arc::new(ListContent::new())),
-                              _ => Item::Assoc(Arc::new(assoc::AssociationContent::new())),
+                              (_, KeyItem::Int(_)) => Item::List(List::new(ListContent::new())),
+                              _ => Item::Assoc(Association::new(assoc::AssociationContent::new())),
                           };
                           assoc_in(i, ks, v)?
                       } else {
@@ -2326,7 +2438,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   }
                   (i, k) => {
                       let a = assoc::Association::try_from(i)?;
-                      let inner = a.get(&k).unwrap_or(Item::Nothing).clone();
+                      let inner = a.get(&k).unwrap_or(&Item::Nothing(Nothing)).clone();
                       // if the inner value isn't a map, we're just overwriting whatever it
                       // is with a new map.
 
@@ -2334,9 +2446,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                           Item::Assoc(inner) => Item::Assoc(inner),
                           Item::List(inner) => Item::List(inner),
                           // TODO: other associative types
-                          _ => Item::Assoc(Arc::new(assoc::AssociationContent::new())),
+                          _ => Item::Assoc(Association::new(assoc::AssociationContent::new())),
                       };
-                      Ok(Item::Assoc(a.insert(k.clone(), assoc_in(i, ks, v)?).0))
+                      a.insert(k.clone(), assoc_in(i, ks, v)?);
+                      Ok(Item::Assoc(a))
                   }
               }
           }
@@ -2347,7 +2460,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn assign(m: Item, ks: Item, v: Item) -> ItemResult {
       let mut kit = List::try_from(ks).unwrap();
-      let ks = Arc::make_mut(&mut kit).drain(..);
+      let ks = List::make_mut(&mut kit).drain(..);
       let mut ksvec = ks
           .into_iter()
           .map(|k| KeyItem::try_from(k))
@@ -2361,8 +2474,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   pub fn unassign(m: Item, k: Item) -> ItemResult {
       let m = assoc::Association::try_from(m).unwrap();
       let k = KeyItem::try_from(k)?;
-      let (nm, _) = m.remove(&k);
-      Ok(Item::Assoc(nm))
+      m.remove(&k);
+      Ok(Item::Assoc(m))
   }
 
   pub fn association(m: Item) -> ItemResult {
@@ -2379,10 +2492,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           (Item::List(l), KeyItem::Int(k)) => Ok(l
               .get(k as usize)
               .and_then(|x| Some(x.clone()))
-              .unwrap_or(Item::Nothing)),
+              .unwrap_or(Item::Nothing(Nothing))),
           (i, k) => {
               let m = assoc::Association::try_from(i)?;
-              Ok(m.get(&k).unwrap_or(Item::Nothing).clone())
+              Ok(m.get(&k).unwrap_or(&Item::Nothing(Nothing)).clone())
           }
       }
   }
@@ -2394,7 +2507,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           if is_truthy(&j) {
               j
           } else {
-              Item::Nothing
+              Item::Nothing(Nothing)
           }
       })
       //Ok(Item::from(is_truthy(i) || is_truthy(j)))
@@ -2404,7 +2517,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       Ok(if is_truthy(&i) && is_truthy(&j) {
           j
       } else {
-          Item::Nothing
+          Item::Nothing(Nothing)
       })
   }
 
@@ -2420,7 +2533,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           Item::Error(_) => true,
           Item::Entry(_) => true,
           Item::Dictionary(_) => true,
-          Item::List(l) => assoc::Association::try_from(Item::List(l)).is_ok(),
+          Item::List(l) => Association::try_from(Item::List(l)).is_ok(),
           _ => false,
       }))
   }
@@ -2437,7 +2550,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn decide(mut env: Environment) -> Future<Environment> {
       let mut clauses = List::try_from(env.pop()).unwrap();
-      let clauses_data = Arc::make_mut(&mut clauses);
+      let clauses_data = List::make_mut(&mut clauses);
       let clause = clauses_data.pop_front();
 
       if let Some(clause) = clause {
@@ -2445,7 +2558,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               if clause.len() != 2 {
                   env.push(Item::Error(Error::list_count(2))).into()
               } else {
-                  let clause_data = Arc::make_mut(&mut clause);
+                  let clause_data = List::make_mut(&mut clause);
                   let test = clause_data.pop_front().unwrap();
                   let expr = clause_data.pop_front().unwrap();
 
@@ -2453,12 +2566,12 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       (Item::List(test), Item::List(expr)) => {
                           // construct if
                           let testp =
-                              Arc::new(ListContent::from(vec![Item::List(test), "shield".into()]));
-                          let elsep = Arc::new(ListContent::from(vec![
+                              List::new(ListContent::from(vec![Item::List(test), "shield".into()]));
+                          let elsep = List::new(ListContent::from(vec![
                               Item::List(clauses),
                               "decide".into(),
                           ]));
-                          let newexpr = Arc::new(ListContent::from(vec![
+                          let newexpr = List::new(ListContent::from(vec![
                               Item::List(testp),
                               Item::List(expr),
                               Item::List(elsep),
@@ -2478,7 +2591,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           }
       } else {
           // clauses empty, return nothing
-          env.push(Item::Nothing).into()
+          env.push(Item::Nothing(Nothing)).into()
       }
   }
 
@@ -2506,13 +2619,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               }
           }
           Item::List(_) => {
-              if w == *S_LIST || w == *S_ITEM || w == *S_ASSOC || w == *S_PROGRAM {
-                  Ok(())
-              } else {
-                  Err(Error::expected(&w))
-              }
-          }
-          Item::Collection(_) => {
               if w == *S_LIST || w == *S_ITEM || w == *S_ASSOC || w == *S_PROGRAM {
                   Ok(())
               } else {
@@ -2673,7 +2779,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                           } else {
                               println!("No spec for {}!", word);
                           }
-                          let expr = Arc::make_mut(&mut env.expression);
+                          let expr = List::make_mut(&mut env.expression);
                           expr.pop_front();
 
                           match &dfn.definition {
@@ -2702,7 +2808,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                           return env.into();
                       }
                   }
-                  let expr = Arc::make_mut(&mut env.expression);
+                  let expr = List::make_mut(&mut env.expression);
                   let i = expr.pop_front().unwrap();
                   if let Item::Entry(e) = i {
                       match e.definition {
@@ -2734,8 +2840,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   fn reverse(i: Item) -> ItemResult {
       let mut l = List::try_from(i).unwrap();
       //l.make_contiguous().reverse();
-      let lmut = Arc::make_mut(&mut l);
-      Ok(Item::List(Arc::new(lmut.drain(..).rev().collect())))
+      let lmut = List::make_mut(&mut l);
+      Ok(Item::List(List::new(lmut.drain(..).rev().collect())))
   }
 
   fn bytes(i: Item) -> ItemResult {
@@ -2754,7 +2860,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   fn rest(i: Item) -> ItemResult {
       let mut l = List::try_from(i).unwrap();
-      let ld = Arc::make_mut(&mut l);
+      let ld = List::make_mut(&mut l);
       ld.pop_front();
       Ok(Item::List(l))
   }
@@ -2786,8 +2892,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               }
               // set the is_handled bit
               e.is_handled = true;
-              let em = Arc::make_mut(&mut e.data);
-              em.insert("unwound".into(), Item::List(Arc::new(unwound)));
+              let em = Association::make_mut(&mut e.data);
+              em.insert("unwound".into(), Item::List(List::new(unwound)));
               Item::Error(e)
           }
           i => i,
@@ -2821,7 +2927,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let env = Environment {
           stack: stack.unwrap_or(Stack::new(ListContent::new())),
           expression: prog_expr,
-          dictionary: Arc::new(HashMap::<Word, dict::Entry>::new()),
+          //TODO: make dictionary constructor
+          dictionary: Association::new(HashMap::<Word, dict::Entry>::new()),
       };
       add_standard_dictionary(env)
   }
@@ -2854,7 +2961,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn dictionary(env: Environment) -> Future<Environment> {
       let d = env.dictionary.clone();
-      env.push(d).into()
+      env.push(Item::Dictionary(d)).into()
   }
 
   fn ceil(i: Item) -> ItemResult {
@@ -2891,7 +2998,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   // fn inscription(env: &mut Environment) -> Result<(Word, dict::Entry), Error> {
   //     let d = env.pop();
   //     let mut wl = List::try_from(env.pop())?;
-  //     let w1 = Arc::make_mut(&mut wl).pop_front();
+  //     let w1 = List::make_mut(&mut wl).pop_front();
   //     let x = w1.ok_or(Error::short_list(1))?;
   //     let w = Word::try_from(x.clone())?;
   //     Ok((w, dict::Entry::try_from(d)?))
@@ -2901,7 +3008,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   //     let r = inscription(&mut env);
   //     match r {
   //         Ok((w, def)) => {
-  //             let d = Arc::make_mut(&mut env.dictionary);
+  //             let d = List::make_mut(&mut env.dictionary);
   //             d.insert(KeyItem::Word(w), Item::Entry(def));
   //             env
   //         }
@@ -2922,7 +3029,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   // fn normalize_dictionary(mut d: dict::Dictionary) -> Result<dict::Dictionary, Error> {
-  //     let dm = Arc::make_mut(&mut d);
+  //     let dm = List::make_mut(&mut d);
   //     for (k, v) in dm.iter_mut() {
   //         match v {
   //             Item::Assoc(a) => {
@@ -3074,8 +3181,8 @@ We'll also define how to run unit tests.
   // expression. Otherwise returns Error.
   fn parse_input(mut env: Environment, input: String) -> Result<Environment, error::Error> {
       let mut parsed = serialize::parse(input)?;
-      let expr = Arc::make_mut(&mut env.expression);
-      expr.extend(Arc::make_mut(&mut parsed).drain(..));
+      let expr = Arc::make_mut(&mut env.expression.0);
+      expr.extend(Arc::make_mut(&mut parsed.0).drain(..));
       Ok(env)
   }
 
@@ -3325,6 +3432,7 @@ can be impure. Everything else is a value.
 The basic pipe contracts.
 #+begin_src rust :tangle src/pipes.rs
   use crate::axiom::ItemResult;
+  use crate::types::collection::List;
   use crate::types::environment::Environment;
   use crate::types::error::Error;
   use crate::types::{self, Item};
@@ -3521,7 +3629,7 @@ The basic pipe contracts.
 
   fn closed_error(on_take: bool) -> Error {
       Error::create(
-          Arc::new(ListContent::from_iter([
+          List::new(ListContent::from_iter([
               "close".into(),
               if on_take { "take" } else { "put" }.into(),
           ])),
@@ -3655,7 +3763,7 @@ How to interact with files on disk
 
   impl crate::serialize::Display for StaticFile {
       fn representation(&self) -> Item {
-          Item::Assoc(Arc::new(assoc::AssociationContent::from([
+          Item::Assoc(assoc::Association::new(assoc::AssociationContent::from([
               ("type".into(), "pipe".into()),
               ("file".into(), Item::String(self.path.clone())),
           ])))
@@ -3756,7 +3864,7 @@ How to interact with the network (TCP/IP sockets)
 
   impl crate::serialize::Display for Socket {
       fn representation(&self) -> Item {
-          Item::Assoc(Arc::new(assoc::AssociationContent::from([
+          Item::Assoc(assoc::Association::new(assoc::AssociationContent::from([
               ("type".into(), "tunnel".into()),
               ("realm".into(), "tcp".into()),
               ("address".into(), Item::String(self.addr.to_string())),
@@ -3802,7 +3910,7 @@ How to interact with the network (TCP/IP sockets)
 
   impl crate::serialize::Display for ServerSocket {
       fn representation(&self) -> Item {
-          Item::Assoc(Arc::new(assoc::AssociationContent::from([
+          Item::Assoc(assoc::Association::new(assoc::AssociationContent::from([
               ("type".into(), "pipe".into()),
               (
                   "serversocket".into(),
@@ -3852,7 +3960,6 @@ How to interact with the network (TCP/IP sockets)
 **** Channels
 Implement the =handoff= type
 #+begin_src rust :tangle src/pipes/channel.rs
-  use crate::associative::Associative;
   use crate::axiom::ItemResult;
   use crate::pipes;
   use crate::types::associative as assoc;
@@ -3902,7 +4009,7 @@ Implement the =handoff= type
       }
 
       pub fn take(mut self) -> types::Future<ItemResult> {
-          let l = Arc::make_mut(&mut self.contents);
+          let l = Arc::make_mut(&mut self.contents.0);
           Box::pin(future::ready(
               l.pop_front().ok_or(pipes::closed_error(true)),
           ))
@@ -3911,23 +4018,19 @@ Implement the =handoff= type
 
   impl crate::serialize::Display for Handoff<Item> {
       fn representation(&self) -> Item {
-          Item::Assoc(Associative::Assoc(Arc::new(
-              assoc::AssociationContent::from([
-                  ("type".into(), "pipe".into()),
-                  ("handoff".into(), "todo: id-or-hash here".into()),
-              ]),
-          )))
+          Item::Assoc(assoc::Association::new(assoc::AssociationContent::from([
+              ("type".into(), "pipe".into()),
+              ("handoff".into(), "todo: id-or-hash here".into()),
+          ])))
       }
   }
 
   impl crate::serialize::Display for Filled {
       fn representation(&self) -> Item {
-          Item::Assoc(Associative::Assoc(Arc::new(
-              assoc::AssociationContent::from([
-                  ("type".into(), "pipe".into()),
-                  ("filled".into(), "todo: id-or-hash here".into()),
-              ]),
-          )))
+          Item::Assoc(assoc::Association::new(assoc::AssociationContent::from([
+              ("type".into(), "pipe".into()),
+              ("filled".into(), "todo: id-or-hash here".into()),
+          ])))
       }
   }
 
