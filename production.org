@@ -82,6 +82,8 @@ internally, to keep track of things like the stack, expression, lists etc.
   pub mod collection;
   pub mod dictionary;
   pub mod environment;
+  #[macro_use]
+  pub mod macros;
   pub mod error;
 
   // A generic newtype to contain Arcs of various kinds
@@ -211,6 +213,8 @@ internally, to keep track of things like the stack, expression, lists etc.
       Nothing(Nothing),
   }
 
+  pub const NOTHING: Item = Item::Nothing(Nothing);
+
   #[derive(Debug, Clone, Eq, PartialEq, Hash)]
   pub enum KeyItem {
       Int(Int),
@@ -251,9 +255,6 @@ internally, to keep track of things like the stack, expression, lists etc.
 
               (Item::Nothing(_), Item::Assoc(l)) => l.is_empty(),
               (Item::Assoc(l), Item::Nothing(_)) => l.is_empty(),
-
-              (Item::Nothing(_), Item::Collection(l)) => l.is_empty(),
-              (Item::Collection(l), Item::Nothing(_)) => l.is_empty(),
 
               (Item::List(l), Item::Assoc(a)) => l.is_empty() && a.is_empty(),
               (Item::Assoc(a), Item::List(l)) => l.is_empty() && a.is_empty(),
@@ -395,7 +396,7 @@ internally, to keep track of things like the stack, expression, lists etc.
           if b {
               "true".into()
           } else {
-              Item::Nothing
+              Item::Nothing(Nothing)
           }
       }
   }
@@ -429,7 +430,6 @@ internally, to keep track of things like the stack, expression, lists etc.
               )),
               Item::Word(w) => Ok(KeyItem::Word(w)),
               Item::Bytes(bs) => Ok(KeyItem::Bytes(bs)),
-              Item::Nothing(_) => Ok(KeyItem::Nothing),
               _ => Err(Error::expected("KeyItem")),
           }
       }
@@ -447,7 +447,7 @@ internally, to keep track of things like the stack, expression, lists etc.
               )),
               KeyItem::Word(w) => Item::Word(w),
               KeyItem::Bytes(bs) => Item::Bytes(bs),
-              KeyItem::Nothing(_) => Item::Nothing,
+              KeyItem::Nothing(_) => Item::Nothing(Nothing),
           }
       }
   }
@@ -463,6 +463,12 @@ internally, to keep track of things like the stack, expression, lists etc.
           Item::Word(Word::from(i))
       }
   }
+
+  impl From<Vec<Item>> for List {
+      fn from(v: Vec<Item>) -> Self {
+          List::new(VecDeque::from(v))
+      }
+  }
 #+end_src
 *** Collection types
 #+begin_src rust :tangle src/types/collection.rs
@@ -472,6 +478,7 @@ internally, to keep track of things like the stack, expression, lists etc.
   pub trait Collective<T: Clone>: IntoIterator<Item = T> {
       fn peek(&self) -> Option<T>;
       fn pop(&mut self) -> Option<T>;
+      fn push(&mut self, item: T);
   }
 
   pub trait FiniteCollective<T: Clone>: Collective<T> {
@@ -479,11 +486,27 @@ internally, to keep track of things like the stack, expression, lists etc.
       fn is_empty(&self) -> bool {
           self.len() == 0
       }
+      fn join(
+          self,
+          other: Box<dyn FiniteCollective<T, IntoIter = Self::IntoIter> + 'static>,
+      ) -> Box<dyn FiniteCollective<T, IntoIter = Self::IntoIter> + 'static>;
   }
-
   // Newtype wrapper for Arc<VecDeque<T>>
   //pub struct List<T>(pub Arc<VecDeque<T>>);
   pub type List<T> = Arc<VecDeque<T>>;
+
+  impl TryFrom<Item>
+      for Box<dyn FiniteCollective<Item, IntoIter = Box<dyn Iterator<Item = Item> + 'static>> + '_>
+  {
+      type Error = Error;
+
+      fn try_from(item: Item) -> Result<Self, Self::Error> {
+          match item {
+              Item::List(list) => Ok(Box::new(list)),
+              _ => Err(Error::expected("list")),
+          }
+      }
+  }
 
   impl<T: Clone> From<VecDeque<T>> for List<T> {
       fn from(deque: VecDeque<T>) -> Self {
@@ -493,13 +516,14 @@ internally, to keep track of things like the stack, expression, lists etc.
 
   impl<T: Clone> IntoIterator for List<T> {
       type Item = T;
-      type IntoIter = std::collections::vec_deque::IntoIter<T>;
+      type IntoIter = Box<dyn Iterator<Item = T> + 'static>;
 
       fn into_iter(self) -> Self::IntoIter {
-          match sync::Arc::try_unwrap(self.0) {
-              Ok(deque) => deque.into_iter(),
-              Err(arc) => (*arc).clone().into_iter(),
-          }
+          Box::new(
+              sync::Arc::try_unwrap(self.0)
+                  .unwrap_or_else(|arc| (*arc).clone())
+                  .into_iter(),
+          )
       }
   }
 
@@ -543,15 +567,33 @@ internally, to keep track of things like the stack, expression, lists etc.
           let deque = Arc::make_mut(self);
           deque.pop_front()
       }
+
+      fn push(&mut self, item: T) {
+          let deque = Arc::make_mut(self);
+          deque.push_front(item);
+      }
   }
 
-  impl<T: Clone> FiniteCollective<T> for List<T> {
+  impl<T: Clone + 'static> FiniteCollective<T> for List<T> {
+      //type Iter = std::collections::vec_deque::IntoIter<T>;
       fn len(&self) -> usize {
           self.inner().len()
+      }
+
+      fn join(
+          self,
+          other: Box<dyn FiniteCollective<T, IntoIter = Self::IntoIter> + '_>,
+      ) -> Box<dyn FiniteCollective<T, IntoIter = Self::IntoIter>> {
+          let mut self_mut = Arc::make_mut(&mut self);
+          self_mut.extend(other.into_iter());
+          Box::new(self)
       }
   }
 
   // impl for Nothing
+  // TODO: push needs to return a new Collective,
+  // because like join, if we push into Nothing, we need to get back
+  // something.
   impl Collective<()> for Nothing {
       fn peek(&self) -> Option<()> {
           None
@@ -560,11 +602,20 @@ internally, to keep track of things like the stack, expression, lists etc.
       fn pop(&mut self) -> Option<()> {
           None
       }
+
+      fn push(&mut self, _item: ()) {}
   }
 
   impl FiniteCollective<()> for Nothing {
       fn len(&self) -> usize {
           0
+      }
+
+      fn join(
+          self,
+          other: Box<dyn FiniteCollective<(), IntoIter = Self::IntoIter> + 'static>,
+      ) -> Box<dyn FiniteCollective<(), IntoIter = Self::IntoIter> + 'static> {
+          other
       }
   }
 
@@ -577,18 +628,32 @@ internally, to keep track of things like the stack, expression, lists etc.
           let hashset = Arc::make_mut(self);
           hashset.drain().next()
       }
+
+      fn push(&mut self, item: V) {
+          let hashset = Arc::make_mut(self);
+          hashset.insert(item);
+      }
   }
 
-  impl<V: Clone + Eq + Hash> FiniteCollective<V> for Set<V> {
+  impl<V: Clone + Eq + Hash + 'static> FiniteCollective<V> for Set<V> {
       fn len(&self) -> usize {
           self.inner().len()
+      }
+
+      fn join(
+          self,
+          other: Box<dyn FiniteCollective<V, IntoIter = Self::IntoIter> + '_>,
+      ) -> Box<dyn FiniteCollective<V, IntoIter = Self::IntoIter>> {
+          let mut self_mut = Arc::make_mut(&mut self);
+          self_mut.extend(other.into_iter());
+          Box::new(self)
       }
   }
 #+end_src
 *** Associative types
 #+begin_src rust :tangle src/types/associative.rs
   use crate::types::dictionary as dict;
-  use crate::types::*;
+  use crate::types::{self, *};
   use std::sync;
 
   use super::collection as coll;
@@ -621,7 +686,6 @@ internally, to keep track of things like the stack, expression, lists etc.
   pub trait Associative<K: Clone, V: Clone>: coll::Collective<(K, V)> {
       fn insert(&mut self, key: K, value: V) -> Option<V>;
       fn remove(&mut self, key: &K) -> Option<V>;
-      fn merge(&mut self, other: Self);
       fn get(&self, key: &K) -> Option<&V>;
   }
 
@@ -639,9 +703,20 @@ internally, to keep track of things like the stack, expression, lists etc.
       }
   }
 
-  impl<K: Clone + Eq + Hash, V: Clone> coll::FiniteCollective<(K, V)> for Association<K, V> {
+  impl<K: Clone + Eq + Hash + 'static, V: Clone + 'static> coll::FiniteCollective<(K, V)>
+      for Association<K, V>
+  {
       fn len(&self) -> usize {
           self.inner().len()
+      }
+
+      fn join(
+          self,
+          other: Box<dyn coll::FiniteCollective<(K, V), IntoIter = Self::IntoIter> + '_>,
+      ) -> Box<dyn coll::FiniteCollective<(K, V), IntoIter = Self::IntoIter>> {
+          let mut self_mut = Arc::make_mut(&mut self);
+          self_mut.extend(other.into_iter());
+          Box::new(self)
       }
   }
 
@@ -656,15 +731,6 @@ internally, to keep track of things like the stack, expression, lists etc.
           hashmap.remove(key)
       }
 
-      fn merge(&mut self, other: Self) {
-          let hashmap = Arc::make_mut(self);
-          let other_map = sync::Arc::try_unwrap(other.0).unwrap_or_else(|arc| (*arc).clone());
-
-          for (key, value) in other_map {
-              hashmap.insert(key, value);
-          }
-      }
-
       fn get(&self, key: &K) -> Option<&V> {
           let hashmap =
               sync::Arc::try_unwrap(sync::Arc::clone(&self.0)).unwrap_or_else(|arc| (*arc).clone());
@@ -673,28 +739,16 @@ internally, to keep track of things like the stack, expression, lists etc.
   }
 
   // convert from List
-  // Conversion from Association<K, V to Association<K, V>
-  impl<K: Eq + Hash + Clone, V: Clone> TryFrom<coll::List<Item>> for Association<K, V> {
+  impl TryFrom<types::List> for types::Association {
       type Error = Error;
 
-      fn try_from(value: coll::List<Item>) -> Result<Self, Self::Error> {
-          let mut hashmap = HashMap::new();
-
-          for elem in value.into_iter() {
-              if let Some((key, value)) = elem.into_pair() {
-                  if let (Some(key), Some(value)) =
-                      (key.downcast::<K>().ok(), value.downcast::<V>().ok())
-                  {
-                      hashmap.insert(key, value);
-                  } else {
-                      return Err(Error::expected("key-value"));
-                  }
-              } else {
-                  return Err(Error::expected("pair"));
-              }
-          }
-
-          Ok(Arc::new(hashmap))
+      fn try_from(l: List) -> Result<Self, Self::Error> {
+          Ok(Arc::new(
+              l.inner()
+                  .into_iter()
+                  .map(|i| i.try_into())
+                  .collect::<Result<HashMap<KeyItem, Item>, Error>>()?,
+          ))
       }
   }
 
@@ -909,16 +963,11 @@ internally, to keep track of things like the stack, expression, lists etc.
       fn try_from(i: Item) -> Result<Self, Error> {
           match i {
               Item::Assoc(a) => Ok(a),
-              Item::Error(e) => Ok(Associative::Error(e)),
-              Item::List(l) => Ok(Associative::Assoc(Arc::new(
-                  rc_inner(&l)
-                      .into_iter()
-                      .map(|i| i.try_into())
-                      .collect::<Result<HashMap<KeyItem, Item>, Error>>()?,
-              ))),
-              Item::Env(e) => Ok(Associative::Env(e)),
-              Item::Entry(e) => Ok(Associative::DictEntry(e)),
-              Item::Dictionary(d) => Ok(Associative::Dictionary(d)),
+              //Item::Error(e) => Ok(Associative::Error(e)),
+              Item::List(l) => Ok(l.try_into()?),
+              //Item::Env(e) => Ok(Associative::Env(e)),
+              //Item::Entry(e) => Ok(Associative::DictEntry(e)),
+              //Item::Dictionary(d) => Ok(Associative::Dictionary(d)),
               i => Err(Error::expected(
                   format!("association (unfinished tryfrom impl) {:?}", i).as_str(),
               )),
@@ -948,15 +997,11 @@ internally, to keep track of things like the stack, expression, lists etc.
 #+end_src
 *** Error types
 #+begin_src rust :tangle src/types/error.rs
-  use crate::types;
-  use crate::types::associative as assoc;
-  use crate::types::{Int, Item, KeyItem, List, ListContent, Word};
-  use std::collections::HashMap;
-  use std::sync::Arc;
+  use crate::types::*;
 
   #[derive(Clone, PartialEq)]
   pub struct Error {
-      pub data: types::Association,
+      pub data: Association,
       pub is_handled: bool,
   }
 
@@ -964,7 +1009,7 @@ internally, to keep track of things like the stack, expression, lists etc.
       pub fn create(asked: List, reason: &str) -> Error {
           Error {
               is_handled: false,
-              data: Arc::new(HashMap::from([
+              data: Association::new(HashMap::from([
                   ("type".into(), "error".into()),
                   ("asked".into(), Item::List(asked)),
                   ("reason".into(), Item::String(reason.to_string())),
@@ -973,11 +1018,12 @@ internally, to keep track of things like the stack, expression, lists etc.
       }
 
       pub fn stack_underflow() -> Error {
-          Error::create(types::wrap("consume".into()), "not enough items on stack")
+          //TODO find the From impl that should convert to Arc
+          Error::create(list!["consume"], "not enough items on stack")
       }
 
       pub fn undefined(w: Word) -> Error {
-          Error::create(types::wrap(Item::Word(w)), "word is not defined")
+          Error::create(vec![Item::Word(w)].into(), "word is not defined")
       }
 
       pub fn type_mismatch(asked: List) -> Error {
@@ -985,16 +1031,16 @@ internally, to keep track of things like the stack, expression, lists etc.
       }
 
       pub fn division_by_zero() -> Error {
-          Error::create(types::wrap("/".into()), "division by zero")
+          Error::create(wrap("/".into()), "division by zero")
       }
 
       pub fn expected(typestr: &str) -> Error {
-          Error::type_mismatch(types::wrap(typestr.into()))
+          Error::type_mismatch(wrap(typestr.into()))
       }
 
       pub fn short_list(expected: Int) -> Error {
           Error::create(
-              Arc::new(ListContent::from_iter([
+              List::new(ListContent::from_iter([
                   "count".into(),
                   Item::Int(expected),
                   ">=".into(),
@@ -1015,7 +1061,7 @@ internally, to keep track of things like the stack, expression, lists etc.
       }
 
       pub fn parse(reason: &str) -> Error {
-          Error::create(types::wrap("read".into()), reason)
+          Error::create(wrap("read".into()), reason)
       }
 
       pub fn test_assertion(program: List, expected: List, actual: List) -> Error {
@@ -1027,8 +1073,8 @@ internally, to keep track of things like the stack, expression, lists etc.
       }
   }
 
-  impl From<Error> for types::Association {
-      fn from(e: Error) -> types::Association {
+  impl From<Error> for Association {
+      fn from(e: Error) -> Association {
           e.data
       }
   }
@@ -1037,7 +1083,7 @@ internally, to keep track of things like the stack, expression, lists etc.
       type Error = Error;
       fn try_from(i: Item) -> Result<Self, Self::Error> {
           match i {
-              Item::List(l) => Item::Assoc(types::Association::try_from(l)?).try_into(),
+              Item::List(l) => Item::Assoc(Association::try_from(l)?).try_into(),
               Item::Error(e) => Ok(e),
               Item::Assoc(a) => a.try_into(),
               _ => Err(Error::expected("error")),
@@ -1045,9 +1091,9 @@ internally, to keep track of things like the stack, expression, lists etc.
       }
   }
 
-  impl TryFrom<types::Association> for Error {
+  impl TryFrom<Association> for Error {
       type Error = Error;
-      fn try_from(a: types::Association) -> Result<Self, Self::Error> {
+      fn try_from(a: Association) -> Result<Self, Self::Error> {
           if a.get(&KeyItem::from("type")) != Some(&Item::from("error")) {
               Err(Error::expected("error"))
           } else {
@@ -1116,7 +1162,7 @@ internally, to keep track of things like the stack, expression, lists etc.
           match i {
               Item::Entry(e) => Ok(e),
               Item::Assoc(a) => a.try_into(),
-              Item::List(l) => Associative::try_from(l).and_then(|a| a.try_into()),
+              Item::List(l) => Association::try_from(l).and_then(|a| a.try_into()),
               e => Err(Error::expected(format!("Definition, got {:?}", e).as_str())),
           }
       }
@@ -1170,39 +1216,34 @@ internally, to keep track of things like the stack, expression, lists etc.
   impl TryFrom<List> for Entry {
       type Error = Error;
       fn try_from(l: List) -> Result<Self, Error> {
-          let a: Associative = l.try_into()?;
+          let a: Association = l.try_into()?;
           a.try_into()
       }
   }
 
-  // impl TryFrom<assoc::Association> for Dictionary {
-  //     type Error = Error;
-  //     fn try_from(a: assoc::Association) -> Result<Self, Self::Error> {
-  //         match a {
-  //             assoc::Associative::Dictionary(e) => Ok(e),
-  //             assoc::Associative::Assoc(a) => {
-  //                 let h = rc_inner(&a)
-  //                     .into_iter()
-  //                     .map(|(k, v)| {
-  //                         let e: (Word, Entry) = (k.try_into()?, v.try_into()?);
-  //                         Ok(e)
-  //                     })
-  //                     .collect::<Result<HashMap<Word, Entry>, Error>>()?;
-  //                 Ok(Arc::new(h))
-  //             }
-  //             _ => Err(Error::expected("dictionary")),
-  //         }
-  //     }
-  // }
+  impl TryFrom<Association> for Dictionary {
+      type Error = Error;
+      fn try_from(a: Association) -> Result<Self, Self::Error> {
+          let h = a
+              .inner()
+              .into_iter()
+              .map(|(k, v)| {
+                  let e: (Word, Entry) = (k.try_into()?, v.try_into()?);
+                  Ok(e)
+              })
+              .collect::<Result<HashMap<Word, Entry>, Error>>()?;
+          Ok(Arc::new(h))
+      }
+  }
 
-  // impl From<Dictionary> for assoc::Association {
+  // impl From<Dictionary> for Association {
   //     fn from(d: Dictionary) -> Self {
-  //         Associative::Assoc(Arc::new(
-  //             rc_inner(&d)
+  //         Association::new(
+  //             d.inner()
   //                 .into_iter()
   //                 .map(|(k, v)| (KeyItem::Word(k), Item::Entry(v)))
   //                 .collect(),
-  //         ))
+  //         )
   //     }
   // }
 
@@ -1212,7 +1253,7 @@ internally, to keep track of things like the stack, expression, lists etc.
           match i {
               Item::Dictionary(d) => Ok(d),
               Item::Assoc(a) => a.try_into(),
-              Item::List(l) => Associative::try_from(l).and_then(|a| a.try_into()),
+              Item::List(l) => Association::try_from(l).and_then(|a| a.try_into()),
               _ => Err(Error::expected("dictionary")),
           }
       }
@@ -1284,7 +1325,7 @@ internally, to keep track of things like the stack, expression, lists etc.
           let mut env = axiom::standard_env(expression, stack);
           if let Some(d) = dictionary {
               let edmut = Arc::make_mut(&mut env.dictionary);
-              edmut.extend(rc_inner(&d).into_iter());
+              edmut.extend(d.inner().into_iter());
           }
           env
       }
@@ -1296,7 +1337,7 @@ internally, to keep track of things like the stack, expression, lists etc.
           match i {
               Item::Env(e) => Ok(e),
               Item::List(l) => {
-                  let a: assoc::Association = l.try_into()?;
+                  let a: Association = l.try_into()?;
                   Ok(a.into())
               }
               Item::Assoc(a) => Ok(a.into()),
@@ -1317,7 +1358,24 @@ internally, to keep track of things like the stack, expression, lists etc.
       }
   }
 #+end_src
-*** Cryptographic primitives
+*** Macros
+#+begin_src rust :tangle src/types/macros.rs
+  //use super::List;
+
+  //#[macro_use]
+  macro_rules! list {
+      ($($str:expr),* $(,)?) => {
+          {
+              let mut vec_deque: std::collections::VecDeque<Item> = std::collections::VecDeque::new();
+              $(
+                  vec_deque.push_back($str.into());
+              )*
+              List::new(vec_deque)
+          }
+      };
+  }
+#+end_src
+** Cryptographic primitives
 We'll implement certain cryptography functions in rust and make kcats
 words for them (hashing, encryption, signing)
 #+begin_src rust :tangle src/crypto.rs
@@ -1403,9 +1461,10 @@ words for them (hashing, encryption, signing)
       fn try_from(i: Item) -> Result<Self, Self::Error> {
           match i {
               Item::Assoc(a) => {
-                  if a.get(&"type".into()) == Some("elliptic-curve-key".into()) {
+                  if a.get(&"type".into()) == Some(&("elliptic-curve-key".into())) {
                       let x = Bytes::try_from(
                           a.get(&"secret".into())
+                              .clone()
                               .ok_or_else(|| Error::expected("secret"))?,
                       )?;
                       let sk = signing::SecretKey::from_bytes(&x[..])
@@ -1425,10 +1484,11 @@ words for them (hashing, encryption, signing)
       fn try_from(i: Item) -> Result<Self, Self::Error> {
           match i {
               Item::Assoc(a) => {
-                  if a.get(&"type".into()) == Some("elliptic-curve-key".into()) {
+                  if a.get(&"type".into()) == Some(&("elliptic-curve-key".into())) {
                       let pk = signing::PublicKey::from_bytes(
                           &Bytes::try_from(
                               a.get(&"public".into())
+                                  .clone()
                                   .ok_or_else(|| Error::expected("public"))?,
                           )?[..],
                       )
@@ -1562,7 +1622,7 @@ example, in order to read/write to/from disk).
 
   pub fn parse(s: String) -> Result<List, Error> {
       let parser = edn_format::Parser::from_iter(s.chars(), edn_format::ParserOptions::default());
-      Ok(Arc::new(
+      Ok(List::new(
           parser
               .map(move |r| match r {
                   Ok(expr) => Ok(to_item(&expr)?),
@@ -1620,6 +1680,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   use crate::types::error::Error;
   use crate::types::*;
 
+  use dict::Dictionary;
   use futures::future::FutureExt;
   use num_integer::Roots;
   use std::collections::HashMap;
@@ -1627,7 +1688,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   //use std::future::Future;
   use std::mem;
   use std::ops::Range;
-  use std::sync;
 
   pub type ItemResult = Result<Item, Error>;
 
@@ -2157,7 +2217,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       Ok(if let Some(i) = l.front() {
           i.clone()
       } else {
-          Item::Nothing(Nothing)
+          NOTHING
       })
   }
 
@@ -2166,7 +2226,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       Ok(if let Some(i) = l.get(1) {
           i.clone()
       } else {
-          Item::Nothing(Nothing)
+          NOTHING
       })
   }
 
@@ -2264,7 +2324,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               if let Some(i) = List::make_mut(l).pop_front() {
                   i
               } else {
-                  Item::Nothing(Nothing)
+                  NOTHING
               }
           } else {
               Item::from(invalid_type_error(List::new(ListContent::from_iter([
@@ -2398,13 +2458,13 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       // extend the size of the vector to be big enough to set
                       // the given index, pad with 'nothing' values.
                       if lm.len() <= idx {
-                          lm.resize(idx + 1, Item::Nothing(Nothing));
+                          lm.resize(idx + 1, NOTHING);
                       }
                       lm[*k as usize] = v;
                       Ok(Item::List(l))
                   }
                   (i, k) => {
-                      let a = assoc::Association::try_from(i)?;
+                      let a = Association::try_from(i)?;
                       a.insert(k.clone(), v);
                       Ok(Item::Assoc(a))
                   }
@@ -2418,7 +2478,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       // extend the size of the vector to be big enough to set
                       // the given index, pad with 'nothing' values.
                       if lm.len() <= idx {
-                          lm.resize(idx + 1, Item::Nothing(Nothing));
+                          lm.resize(idx + 1, NOTHING);
                       }
                       let inner = &lm[idx];
 
@@ -2438,7 +2498,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   }
                   (i, k) => {
                       let a = assoc::Association::try_from(i)?;
-                      let inner = a.get(&k).unwrap_or(&Item::Nothing(Nothing)).clone();
+                      let inner = a.get(&k).unwrap_or(&NOTHING).clone();
                       // if the inner value isn't a map, we're just overwriting whatever it
                       // is with a new map.
 
@@ -2492,10 +2552,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           (Item::List(l), KeyItem::Int(k)) => Ok(l
               .get(k as usize)
               .and_then(|x| Some(x.clone()))
-              .unwrap_or(Item::Nothing(Nothing))),
+              .unwrap_or(NOTHING)),
           (i, k) => {
               let m = assoc::Association::try_from(i)?;
-              Ok(m.get(&k).unwrap_or(&Item::Nothing(Nothing)).clone())
+              Ok(m.get(&k).unwrap_or(&NOTHING).clone())
           }
       }
   }
@@ -2507,7 +2567,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           if is_truthy(&j) {
               j
           } else {
-              Item::Nothing(Nothing)
+              NOTHING
           }
       })
       //Ok(Item::from(is_truthy(i) || is_truthy(j)))
@@ -2517,7 +2577,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       Ok(if is_truthy(&i) && is_truthy(&j) {
           j
       } else {
-          Item::Nothing(Nothing)
+          NOTHING
       })
   }
 
@@ -2591,7 +2651,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           }
       } else {
           // clauses empty, return nothing
-          env.push(Item::Nothing(Nothing)).into()
+          env.push(NOTHING).into()
       }
   }
 
@@ -2927,8 +2987,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let env = Environment {
           stack: stack.unwrap_or(Stack::new(ListContent::new())),
           expression: prog_expr,
-          //TODO: make dictionary constructor
-          dictionary: Association::new(HashMap::<Word, dict::Entry>::new()),
+          dictionary: Dictionary::new(HashMap::<Word, dict::Entry>::new()),
       };
       add_standard_dictionary(env)
   }
@@ -3105,10 +3164,12 @@ interpreter process, and prints output.
 
 We'll also define how to run unit tests.
 #+begin_src rust :tangle src/main.rs
+  #![feature(dyn_trait)]
   mod axiom;
   mod crypto;
   mod pipes;
   mod serialize;
+  #[macro_use]
   mod types;
 
   use crate::types::environment::Environment;
