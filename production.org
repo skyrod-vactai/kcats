@@ -213,6 +213,10 @@ internally, to keep track of things like the stack, expression, lists etc.
       Nothing(Nothing),
   }
 
+  pub trait AsItem {
+      fn as_item(&self) -> Item;
+  }
+
   pub const NOTHING: Item = Item::Nothing(Nothing);
 
   #[derive(Debug, Clone, Eq, PartialEq, Hash)]
@@ -495,25 +499,13 @@ internally, to keep track of things like the stack, expression, lists etc.
   //pub struct List<T>(pub Arc<VecDeque<T>>);
   pub type List<T> = Arc<VecDeque<T>>;
 
-  impl TryFrom<Item>
-      for Box<dyn FiniteCollective<Item, IntoIter = Box<dyn Iterator<Item = Item> + 'static>> + '_>
-  {
-      type Error = Error;
-
-      fn try_from(item: Item) -> Result<Self, Self::Error> {
-          match item {
-              Item::List(list) => Ok(Box::new(list)),
-              _ => Err(Error::expected("list")),
-          }
-      }
-  }
-
   impl<T: Clone> From<VecDeque<T>> for List<T> {
       fn from(deque: VecDeque<T>) -> Self {
           Arc::new(deque)
       }
   }
 
+  // get an iterator from the underlying coll type
   impl<T: Clone> IntoIterator for List<T> {
       type Item = T;
       type IntoIter = Box<dyn Iterator<Item = T> + 'static>;
@@ -543,15 +535,17 @@ internally, to keep track of things like the stack, expression, lists etc.
       }
   }
 
-  impl<T: Clone + Eq + Hash> IntoIterator for Set<T> {
+  // Get an iterator from the underlying coll type
+  impl<T: Clone> IntoIterator for Set<T> {
       type Item = T;
-      type IntoIter = std::collections::hash_set::IntoIter<T>;
+      type IntoIter = Box<dyn Iterator<Item = T> + 'static>;
 
       fn into_iter(self) -> Self::IntoIter {
-          match sync::Arc::try_unwrap(self.0) {
-              Ok(set) => set.into_iter(),
-              Err(arc) => (*arc).clone().into_iter(),
-          }
+          Box::new(
+              sync::Arc::try_unwrap(self.0)
+                  .unwrap_or_else(|arc| (*arc).clone())
+                  .into_iter(),
+          )
       }
   }
 
@@ -649,10 +643,41 @@ internally, to keep track of things like the stack, expression, lists etc.
           Box::new(self)
       }
   }
+
+  pub mod items {
+      use super::*;
+
+      pub type BoxedIterator = Box<dyn Iterator<Item = Item> + 'static>;
+      pub type BoxedFiniteCollective =
+          Box<dyn FiniteCollective<Item, IntoIter = BoxedIterator> + 'static>;
+
+      impl TryFrom<Item> for BoxedFiniteCollective {
+          type Error = Error;
+
+          fn try_from(item: Item) -> Result<Self, Self::Error> {
+              match item {
+                  Item::List(list) => Ok(Box::new(list)),
+                  _ => Err(Error::expected("list")),
+              }
+          }
+      }
+
+      impl AsItem for Box<dyn FiniteCollective<Item, IntoIter = BoxedIterator> + 'static> {
+          fn as_item(&self) -> Item {
+              // Perform the conversion using downcast_ref and if/else structure as before
+              if let Some(list) = self.downcast_ref::<List<Item>>() {
+                  Item::List(list.clone())
+              } else if let Some(hashmap) = self.downcast_ref::<HashMap<KeyItem, Item>>() {
+                  // Convert the HashMap<KeyItem, Item> to an appropriate Item variant
+              } else {
+                  // Handle other concrete types if needed
+              }
+          }
+      }
+  }
 #+end_src
 *** Associative types
 #+begin_src rust :tangle src/types/associative.rs
-  use crate::types::dictionary as dict;
   use crate::types::{self, *};
   use std::sync;
 
@@ -669,15 +694,17 @@ internally, to keep track of things like the stack, expression, lists etc.
       }
   }
 
+  // Generic iteration
   impl<K: Eq + Hash + Clone, V: Clone> IntoIterator for Association<K, V> {
       type Item = (K, V);
-      type IntoIter = std::collections::hash_map::IntoIter<K, V>;
+      type IntoIter = Box<dyn Iterator<Item = (K, V)> + 'static>;
 
       fn into_iter(self) -> Self::IntoIter {
-          match sync::Arc::try_unwrap(self.0) {
-              Ok(map) => map.into_iter(),
-              Err(arc) => (*arc).clone().into_iter(),
-          }
+          Box::new(
+              sync::Arc::try_unwrap(self.0)
+                  .unwrap_or_else(|arc| (*arc).clone())
+                  .into_iter(),
+          )
       }
   }
 
@@ -700,6 +727,11 @@ internally, to keep track of things like the stack, expression, lists etc.
       fn pop(&mut self) -> Option<(K, V)> {
           let hashmap = Arc::make_mut(self);
           hashmap.drain().next()
+      }
+
+      fn push(&mut self, item: (K, V)) {
+          let hashmap = Arc::make_mut(self);
+          hashmap.insert(item.0, item.1);
       }
   }
 
@@ -735,20 +767,6 @@ internally, to keep track of things like the stack, expression, lists etc.
           let hashmap =
               sync::Arc::try_unwrap(sync::Arc::clone(&self.0)).unwrap_or_else(|arc| (*arc).clone());
           hashmap.get(key)
-      }
-  }
-
-  // convert from List
-  impl TryFrom<types::List> for types::Association {
-      type Error = Error;
-
-      fn try_from(l: List) -> Result<Self, Self::Error> {
-          Ok(Arc::new(
-              l.inner()
-                  .into_iter()
-                  .map(|i| i.try_into())
-                  .collect::<Result<HashMap<KeyItem, Item>, Error>>()?,
-          ))
       }
   }
 
@@ -870,52 +888,29 @@ internally, to keep track of things like the stack, expression, lists etc.
   //     }
   // }
 
-  impl TryFrom<Item> for MapEntry {
-      type Error = Error;
-      fn try_from(i: Item) -> Result<Self, Error> {
-          match i {
-              Item::List(mut l) => {
-                  if l.len() != 2 {
-                      Err(Error::expected("List[2]"))
-                  } else {
-                      let lm = Arc::make_mut(&mut l);
-                      let v = lm.pop_back();
-                      let k = lm.pop_back();
-                      let e = lm.pop_back();
-                      match (k, v, e) {
-                          (Some(k), Some(v), None) => Ok((KeyItem::try_from(k)?, v)),
-                          _ => Err(Error::expected("List[2]")),
-                      }
-                  }
-              }
-              _ => Err(Error::expected("list")),
-          }
-      }
-  }
+  // pub enum AssocIntoIter {
+  //     //TODO add other struct types
+  //     Assoc(std::collections::hash_map::IntoIter<KeyItem, Item>),
+  //     DictEntry(std::vec::IntoIter<MapEntry>),
+  //     Dictionary(
+  //         std::iter::Map<
+  //             std::collections::hash_map::IntoIter<Word, dict::Entry>,
+  //             fn((Word, dict::Entry)) -> MapEntry,
+  //         >,
+  //     ),
+  // }
 
-  pub enum AssocIntoIter {
-      //TODO add other struct types
-      Assoc(std::collections::hash_map::IntoIter<KeyItem, Item>),
-      DictEntry(std::vec::IntoIter<MapEntry>),
-      Dictionary(
-          std::iter::Map<
-              std::collections::hash_map::IntoIter<Word, dict::Entry>,
-              fn((Word, dict::Entry)) -> MapEntry,
-          >,
-      ),
-  }
+  // impl Iterator for AssocIntoIter {
+  //     type Item = MapEntry;
 
-  impl Iterator for AssocIntoIter {
-      type Item = MapEntry;
-
-      fn next(&mut self) -> Option<Self::Item> {
-          match self {
-              AssocIntoIter::Assoc(iter) => iter.next(),
-              AssocIntoIter::DictEntry(iter) => iter.next(),
-              AssocIntoIter::Dictionary(iter) => iter.next(),
-          }
-      }
-  }
+  //     fn next(&mut self) -> Option<Self::Item> {
+  //         match self {
+  //             AssocIntoIter::Assoc(iter) => iter.next(),
+  //             AssocIntoIter::DictEntry(iter) => iter.next(),
+  //             AssocIntoIter::Dictionary(iter) => iter.next(),
+  //         }
+  //     }
+  // }
 
   // impl IntoIterator for Associative {
   //     type Item = MapEntry;
@@ -958,23 +953,6 @@ internally, to keep track of things like the stack, expression, lists etc.
   //     }
   // }
 
-  impl TryFrom<Item> for crate::types::Association {
-      type Error = Error;
-      fn try_from(i: Item) -> Result<Self, Error> {
-          match i {
-              Item::Assoc(a) => Ok(a),
-              //Item::Error(e) => Ok(Associative::Error(e)),
-              Item::List(l) => Ok(l.try_into()?),
-              //Item::Env(e) => Ok(Associative::Env(e)),
-              //Item::Entry(e) => Ok(Associative::DictEntry(e)),
-              //Item::Dictionary(d) => Ok(Associative::Dictionary(d)),
-              i => Err(Error::expected(
-                  format!("association (unfinished tryfrom impl) {:?}", i).as_str(),
-              )),
-          }
-      }
-  }
-
   // impl TryFrom<List> for Association {
   //     type Error = Error;
   //     fn try_from(l: List) -> Result<Self, Error> {
@@ -986,12 +964,87 @@ internally, to keep track of things like the stack, expression, lists etc.
   //     }
   // }
 
-  impl From<(KeyItem, Item)> for Item {
-      fn from((k, v): (KeyItem, Item)) -> Item {
-          Item::List(Arc::new(ListContent::from(vec![
-              Item::from(k.clone()),
-              Item::from(v.clone()),
-          ])))
+  mod items {
+      use super::*;
+
+      // convert from List
+      impl TryFrom<types::List> for types::Association {
+          type Error = Error;
+
+          fn try_from(l: List) -> Result<Self, Self::Error> {
+              Ok(Arc::new(
+                  l.inner()
+                      .into_iter()
+                      .map(|i| i.try_into())
+                      .collect::<Result<HashMap<KeyItem, Item>, Error>>()?,
+              ))
+          }
+      }
+
+      impl TryFrom<Item> for MapEntry {
+          type Error = Error;
+          fn try_from(i: Item) -> Result<Self, Error> {
+              match i {
+                  Item::List(mut l) => {
+                      if l.len() != 2 {
+                          Err(Error::expected("List[2]"))
+                      } else {
+                          let lm = Arc::make_mut(&mut l);
+                          let v = lm.pop_back();
+                          let k = lm.pop_back();
+                          let e = lm.pop_back();
+                          match (k, v, e) {
+                              (Some(k), Some(v), None) => Ok((KeyItem::try_from(k)?, v)),
+                              _ => Err(Error::expected("List[2]")),
+                          }
+                      }
+                  }
+                  _ => Err(Error::expected("list")),
+              }
+          }
+      }
+
+      impl TryFrom<Item> for crate::types::Association {
+          type Error = Error;
+          fn try_from(i: Item) -> Result<Self, Error> {
+              match i {
+                  Item::Assoc(a) => Ok(a),
+                  //Item::Error(e) => Ok(Associative::Error(e)),
+                  Item::List(l) => Ok(l.try_into()?),
+                  //Item::Env(e) => Ok(Associative::Env(e)),
+                  //Item::Entry(e) => Ok(Associative::DictEntry(e)),
+                  //Item::Dictionary(d) => Ok(Associative::Dictionary(d)),
+                  i => Err(Error::expected(
+                      format!("association (unfinished tryfrom impl) {:?}", i).as_str(),
+                  )),
+              }
+          }
+      }
+
+      impl From<(KeyItem, Item)> for Item {
+          fn from((k, v): (KeyItem, Item)) -> Item {
+              Item::List(Arc::new(ListContent::from(vec![
+                  Item::from(k.clone()),
+                  Item::from(v.clone()),
+              ])))
+          }
+      }
+
+      // Iteration over a Map returning Lists (of pairs)
+      pub struct ItemIter<I: Iterator<Item = (KeyItem, Item)>> {
+          inner: I,
+      }
+
+      impl<I: Iterator<Item = (KeyItem, Item)>> Iterator for ItemIter<I> {
+          type Item = Item;
+
+          fn next(&mut self) -> Option<Self::Item> {
+              self.inner.next().map(|(key, value)| {
+                  Item::List(List::new(
+                      vec![Item::from(key), value].into_iter().collect(),
+                  ))
+              })
+          }
       }
   }
 #+end_src
@@ -1674,6 +1727,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   use super::serialize;
   use crate::types::associative as assoc;
   use crate::types::collection as coll;
+  use crate::types::collection::items::BoxedFiniteCollective;
   use crate::types::collection::FiniteCollective;
   use crate::types::dictionary as dict;
   use crate::types::environment::Environment;
@@ -2054,29 +2108,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn join(i: Item, j: Item) -> ItemResult {
-      match (i, j) {
-          (Item::List(mut i), Item::List(mut j)) => {
-              let imut = List::make_mut(&mut i);
-
-              imut.append(List::make_mut(&mut j));
-              Ok(Item::List(i))
-          }
-          // TODO make join generic
-          // (Item::Dictionary(i), Item::Assoc(j)) => match (dict::Dictionary(i)).join(j) {
-          //     dict::Dictionary(d) => Ok(Item::Dictionary(d)),
-          //     a => Ok(Item::Assoc(a)),
-          // },
-          (Item::String(mut i), Item::String(j)) => {
-              i.push_str(&j);
-              Ok(Item::String(i))
-          }
-          (Item::Bytes(mut i), Item::Bytes(mut j)) => {
-              i.append(&mut j);
-              Ok(Item::Bytes(i))
-          }
-          (Item::Assoc(i), Item::Assoc(j)) => Ok(Item::Assoc(i.join(j))),
-          _ => invalid_type_error(serialize::to_list("[[list?] [string?]] [execute] any?")),
-      }
+      let coll_i: BoxedFiniteCollective = i.try_into()?;
+      let coll_j: BoxedFiniteCollective = i.try_into()?;
+      Ok(coll_i.join(coll_j))
   }
 
   pub fn pack(i: Item, j: Item) -> ItemResult {
@@ -3164,7 +3198,6 @@ interpreter process, and prints output.
 
 We'll also define how to run unit tests.
 #+begin_src rust :tangle src/main.rs
-  #![feature(dyn_trait)]
   mod axiom;
   mod crypto;
   mod pipes;
