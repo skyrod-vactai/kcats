@@ -477,12 +477,14 @@ internally, to keep track of things like the stack, expression, lists etc.
 *** Collection types
 #+begin_src rust :tangle src/types/collection.rs
   use crate::types::*;
+  use std::any::Any;
   use std::sync;
 
-  pub trait Collective<T: Clone>: IntoIterator<Item = T> {
+  pub trait Collective<T: Clone>: Any + IntoIterator<Item = T> {
       fn peek(&self) -> Option<T>;
       fn pop(&mut self) -> Option<T>;
       fn push(&mut self, item: T);
+      fn iter(&self) -> Box<dyn Iterator<Item = T> + '_>;
   }
 
   pub trait FiniteCollective<T: Clone>: Collective<T> {
@@ -490,8 +492,9 @@ internally, to keep track of things like the stack, expression, lists etc.
       fn is_empty(&self) -> bool {
           self.len() == 0
       }
+
       fn join(
-          self,
+          self: Box<Self>, // don't automatically unbox
           other: Box<dyn FiniteCollective<T, IntoIter = Self::IntoIter> + 'static>,
       ) -> Box<dyn FiniteCollective<T, IntoIter = Self::IntoIter> + 'static>;
   }
@@ -506,7 +509,7 @@ internally, to keep track of things like the stack, expression, lists etc.
   }
 
   // get an iterator from the underlying coll type
-  impl<T: Clone> IntoIterator for List<T> {
+  impl<T: Clone + 'static> IntoIterator for List<T> {
       type Item = T;
       type IntoIter = Box<dyn Iterator<Item = T> + 'static>;
 
@@ -536,7 +539,7 @@ internally, to keep track of things like the stack, expression, lists etc.
   }
 
   // Get an iterator from the underlying coll type
-  impl<T: Clone> IntoIterator for Set<T> {
+  impl<T: Clone + 'static> IntoIterator for Set<T> {
       type Item = T;
       type IntoIter = Box<dyn Iterator<Item = T> + 'static>;
 
@@ -550,7 +553,7 @@ internally, to keep track of things like the stack, expression, lists etc.
   }
 
   // Impl for VecDeque
-  impl<T: Clone> Collective<T> for List<T> {
+  impl<T: Clone + 'static> Collective<T> for List<T> {
       fn peek(&self) -> Option<T> {
           let deque =
               sync::Arc::try_unwrap(sync::Arc::clone(&self.0)).unwrap_or_else(|arc| (*arc).clone());
@@ -566,21 +569,25 @@ internally, to keep track of things like the stack, expression, lists etc.
           let deque = Arc::make_mut(self);
           deque.push_front(item);
       }
+
+      fn iter(&self) -> Box<dyn Iterator<Item = T> + '_> {
+          Box::new(self.0.iter().map(|item| item.clone()))
+      }
   }
 
   impl<T: Clone + 'static> FiniteCollective<T> for List<T> {
       //type Iter = std::collections::vec_deque::IntoIter<T>;
       fn len(&self) -> usize {
-          self.inner().len()
+          self.0.len()
       }
 
       fn join(
-          self,
+          mut self: Box<Self>,
           other: Box<dyn FiniteCollective<T, IntoIter = Self::IntoIter> + '_>,
       ) -> Box<dyn FiniteCollective<T, IntoIter = Self::IntoIter>> {
-          let mut self_mut = Arc::make_mut(&mut self);
-          self_mut.extend(other.into_iter());
-          Box::new(self)
+          let self_mut = Arc::make_mut(&mut self);
+          self_mut.extend(other.iter());
+          self
       }
   }
 
@@ -598,6 +605,10 @@ internally, to keep track of things like the stack, expression, lists etc.
       }
 
       fn push(&mut self, _item: ()) {}
+
+      fn iter(&self) -> Box<dyn Iterator<Item = ()> + '_> {
+          Box::new(std::iter::empty())
+      }
   }
 
   impl FiniteCollective<()> for Nothing {
@@ -606,16 +617,16 @@ internally, to keep track of things like the stack, expression, lists etc.
       }
 
       fn join(
-          self,
+          self: Box<Self>,
           other: Box<dyn FiniteCollective<(), IntoIter = Self::IntoIter> + 'static>,
       ) -> Box<dyn FiniteCollective<(), IntoIter = Self::IntoIter> + 'static> {
           other
       }
   }
 
-  impl<V: Clone + Eq + Hash> Collective<V> for Set<V> {
+  impl<V: Clone + Eq + Hash + 'static> Collective<V> for Set<V> {
       fn peek(&self) -> Option<V> {
-          self.inner().iter().next().cloned()
+          self.iter().next()
       }
 
       fn pop(&mut self) -> Option<V> {
@@ -627,20 +638,24 @@ internally, to keep track of things like the stack, expression, lists etc.
           let hashset = Arc::make_mut(self);
           hashset.insert(item);
       }
+
+      fn iter(&self) -> Box<dyn Iterator<Item = V> + '_> {
+          Box::new(self.0.iter().map(|item| item.clone()))
+      }
   }
 
   impl<V: Clone + Eq + Hash + 'static> FiniteCollective<V> for Set<V> {
       fn len(&self) -> usize {
-          self.inner().len()
+          self.0.len()
       }
 
       fn join(
-          self,
+          mut self: Box<Self>,
           other: Box<dyn FiniteCollective<V, IntoIter = Self::IntoIter> + '_>,
       ) -> Box<dyn FiniteCollective<V, IntoIter = Self::IntoIter>> {
-          let mut self_mut = Arc::make_mut(&mut self);
-          self_mut.extend(other.into_iter());
-          Box::new(self)
+          let self_mut = Arc::make_mut(&mut self);
+          self_mut.extend(other.iter());
+          self
       }
   }
 
@@ -664,13 +679,16 @@ internally, to keep track of things like the stack, expression, lists etc.
 
       impl AsItem for Box<dyn FiniteCollective<Item, IntoIter = BoxedIterator> + 'static> {
           fn as_item(&self) -> Item {
+              let any: &dyn Any = self;
+
               // Perform the conversion using downcast_ref and if/else structure as before
-              if let Some(list) = self.downcast_ref::<List<Item>>() {
+              if let Some(list) = any.downcast_ref::<List<Item>>() {
                   Item::List(list.clone())
-              } else if let Some(hashmap) = self.downcast_ref::<HashMap<KeyItem, Item>>() {
-                  // Convert the HashMap<KeyItem, Item> to an appropriate Item variant
+              } else if let Some(hashmap) = any.downcast_ref::<Association>() {
+                  Item::Assoc(hashmap.clone())
               } else {
-                  // Handle other concrete types if needed
+                  // TODO: finish types
+                  NOTHING
               }
           }
       }
@@ -695,7 +713,7 @@ internally, to keep track of things like the stack, expression, lists etc.
   }
 
   // Generic iteration
-  impl<K: Eq + Hash + Clone, V: Clone> IntoIterator for Association<K, V> {
+  impl<K: Eq + Hash + Clone + 'static, V: Clone + 'static> IntoIterator for Association<K, V> {
       type Item = (K, V);
       type IntoIter = Box<dyn Iterator<Item = (K, V)> + 'static>;
 
@@ -716,12 +734,11 @@ internally, to keep track of things like the stack, expression, lists etc.
       fn get(&self, key: &K) -> Option<&V>;
   }
 
-  impl<K: Clone + Eq + Hash, V: Clone> coll::Collective<(K, V)> for Association<K, V> {
+  impl<K: Clone + Eq + Hash + 'static, V: Clone + 'static> coll::Collective<(K, V)>
+      for Association<K, V>
+  {
       fn peek(&self) -> Option<(K, V)> {
-          self.inner()
-              .iter()
-              .next()
-              .map(|(k, v)| (k.clone(), v.clone()))
+          self.iter().next().map(|(k, v)| (k.clone(), v.clone()))
       }
 
       fn pop(&mut self) -> Option<(K, V)> {
@@ -733,26 +750,30 @@ internally, to keep track of things like the stack, expression, lists etc.
           let hashmap = Arc::make_mut(self);
           hashmap.insert(item.0, item.1);
       }
+
+      fn iter(&self) -> Box<dyn Iterator<Item = (K, V)> + '_> {
+          Box::new(self.0.iter().map(|(k, v)| (k.clone(), v.clone())))
+      }
   }
 
   impl<K: Clone + Eq + Hash + 'static, V: Clone + 'static> coll::FiniteCollective<(K, V)>
       for Association<K, V>
   {
       fn len(&self) -> usize {
-          self.inner().len()
+          self.deref().len()
       }
 
       fn join(
-          self,
+          mut self: Box<Self>,
           other: Box<dyn coll::FiniteCollective<(K, V), IntoIter = Self::IntoIter> + '_>,
       ) -> Box<dyn coll::FiniteCollective<(K, V), IntoIter = Self::IntoIter>> {
-          let mut self_mut = Arc::make_mut(&mut self);
-          self_mut.extend(other.into_iter());
-          Box::new(self)
+          let self_mut = Arc::make_mut(&mut self);
+          self_mut.extend(other.iter());
+          self
       }
   }
 
-  impl<K: Eq + Hash + Clone, V: Clone> Associative<K, V> for Association<K, V> {
+  impl<K: Eq + Hash + Clone + 'static, V: Clone + 'static> Associative<K, V> for Association<K, V> {
       fn insert(&mut self, key: K, value: V) -> Option<V> {
           let hashmap = Arc::make_mut(self);
           hashmap.insert(key, value)
@@ -764,9 +785,9 @@ internally, to keep track of things like the stack, expression, lists etc.
       }
 
       fn get(&self, key: &K) -> Option<&V> {
-          let hashmap =
-              sync::Arc::try_unwrap(sync::Arc::clone(&self.0)).unwrap_or_else(|arc| (*arc).clone());
-          hashmap.get(key)
+          //let hashmap =
+          //sync::Arc::try_unwrap(sync::Arc::clone(&self.0)).unwrap_or_else(|arc| (*arc).clone());
+          self.0.get(key)
       }
   }
 
@@ -973,8 +994,7 @@ internally, to keep track of things like the stack, expression, lists etc.
 
           fn try_from(l: List) -> Result<Self, Self::Error> {
               Ok(Arc::new(
-                  l.inner()
-                      .into_iter()
+                  l.into_iter()
                       .map(|i| i.try_into())
                       .collect::<Result<HashMap<KeyItem, Item>, Error>>()?,
               ))
@@ -1240,12 +1260,12 @@ internally, to keep track of things like the stack, expression, lists etc.
 
   impl TryFrom<Association> for Entry {
       type Error = Error;
-      fn try_from(d: Association) -> Result<Self, Error> {
+      fn try_from(mut d: Association) -> Result<Self, Error> {
           // TODO: This should handle cases where there's no def present
           // and return error
-          let (d, def) = d.remove(&"definition".into());
-          let (d, examples) = d.remove(&"examples".into());
-          let (_, spec) = d.remove(&"spec".into());
+          let def = d.remove(&"definition".into());
+          let examples = d.remove(&"examples".into());
+          let spec = d.remove(&"spec".into());
 
           Ok(Entry {
               definition: if let Some(d) = def {
@@ -1278,7 +1298,6 @@ internally, to keep track of things like the stack, expression, lists etc.
       type Error = Error;
       fn try_from(a: Association) -> Result<Self, Self::Error> {
           let h = a
-              .inner()
               .into_iter()
               .map(|(k, v)| {
                   let e: (Word, Entry) = (k.try_into()?, v.try_into()?);
@@ -1315,7 +1334,6 @@ internally, to keep track of things like the stack, expression, lists etc.
 *** Environment types
 #+begin_src rust :tangle src/types/environment.rs
   use crate::axiom;
-  use crate::types::associative as assoc;
   use crate::types::dictionary as dict;
   use crate::types::*;
   use std::future;
@@ -1360,10 +1378,10 @@ internally, to keep track of things like the stack, expression, lists etc.
   }
 
   impl From<Association> for Environment {
-      fn from(envm: Association) -> Self {
-          let (envm, stack) = envm.remove(&"stack".into());
-          let (envm, expression) = envm.remove(&"expression".into());
-          let (_, dictionary) = envm.remove(&"dictionary".into());
+      fn from(mut envm: Association) -> Self {
+          let stack = envm.remove(&"stack".into());
+          let expression = envm.remove(&"expression".into());
+          let dictionary = envm.remove(&"dictionary".into());
           let stack = stack
               .and_then(|s| List::try_from(s).ok())
               .or(Some(List::new(ListContent::new())));
@@ -1371,12 +1389,12 @@ internally, to keep track of things like the stack, expression, lists etc.
               .and_then(|s| List::try_from(s).ok())
               .or(Some(List::new(ListContent::new())));
           let dictionary = dictionary.and_then(|d| {
-              assoc::Association::try_from(d)
+              Association::try_from(d)
                   .and_then(|d| dict::Dictionary::try_from(d))
                   .ok()
           });
           let mut env = axiom::standard_env(expression, stack);
-          if let Some(d) = dictionary {
+          if let Some(mut d) = dictionary {
               let edmut = Arc::make_mut(&mut env.dictionary);
               edmut.extend(d.inner().into_iter());
           }
@@ -1515,11 +1533,11 @@ words for them (hashing, encryption, signing)
           match i {
               Item::Assoc(a) => {
                   if a.get(&"type".into()) == Some(&("elliptic-curve-key".into())) {
-                      let x = Bytes::try_from(
-                          a.get(&"secret".into())
-                              .clone()
-                              .ok_or_else(|| Error::expected("secret"))?,
-                      )?;
+                      let item = a
+                          .get(&"secret".into())
+                          .ok_or_else(|| Error::expected("secret"))?
+                          .clone();
+                      let x = Bytes::try_from(item)?;
                       let sk = signing::SecretKey::from_bytes(&x[..])
                           .map_err(|_e| Error::expected("valid-secret-key"))?;
                       Ok(sk)
@@ -1538,14 +1556,12 @@ words for them (hashing, encryption, signing)
           match i {
               Item::Assoc(a) => {
                   if a.get(&"type".into()) == Some(&("elliptic-curve-key".into())) {
-                      let pk = signing::PublicKey::from_bytes(
-                          &Bytes::try_from(
-                              a.get(&"public".into())
-                                  .clone()
-                                  .ok_or_else(|| Error::expected("public"))?,
-                          )?[..],
-                      )
-                      .map_err(|_e| Error::expected("valid-public-key"))?;
+                      let item = a
+                          .get(&"public".into())
+                          .ok_or_else(|| Error::expected("public"))?
+                          .clone();
+                      let pk = signing::PublicKey::from_bytes(&Bytes::try_from(item)?[..])
+                          .map_err(|_e| Error::expected("valid-public-key"))?;
                       Ok(pk)
                   } else {
                       Err(Error::expected("public-key"))
@@ -1585,7 +1601,6 @@ example, in order to read/write to/from disk).
   use base64;
   use std::collections::VecDeque;
   use std::fmt;
-  use std::sync::Arc;
 
   pub trait Display {
       fn representation(&self) -> Item;
@@ -1597,7 +1612,7 @@ example, in order to read/write to/from disk).
       //println!("to item {:?}", item);
       match item {
           edn_format::Value::Integer(i) => Ok(Item::Int(*i)),
-          edn_format::Value::Vector(v) => Ok(Item::List(Arc::new(
+          edn_format::Value::Vector(v) => Ok(Item::List(List::new(
               v.iter()
                   .map(|i| to_item(i))
                   .collect::<Result<VecDeque<Item>, Error>>()?,
@@ -1662,7 +1677,9 @@ example, in order to read/write to/from disk).
               // TODO emit the non-builtin words of the dictionary
           ]),
           Item::Nothing(_) => edn_format::Value::Vector(Vec::new()),
-          Item::Dictionary(d) => from_item(&Item::Assoc(Association::from(d.clone()))),
+          //TODO Fix this
+          //Item::Dictionary(d) => from_item(&Item::Assoc(Association::from(d.clone()))),
+          Item::Dictionary(d) => from_item(&NOTHING),
           Item::Entry(d) => {
               let a: Association = (*d).clone().into();
               from_item(&Item::Assoc(a))
@@ -2109,8 +2126,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn join(i: Item, j: Item) -> ItemResult {
       let coll_i: BoxedFiniteCollective = i.try_into()?;
-      let coll_j: BoxedFiniteCollective = i.try_into()?;
-      Ok(coll_i.join(coll_j))
+      let coll_j: BoxedFiniteCollective = j.try_into()?;
+      Ok(coll_i.join(coll_j).as_item())
   }
 
   pub fn pack(i: Item, j: Item) -> ItemResult {
@@ -2476,7 +2493,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       env.push(Item::List(l)).into()
   }
 
-  fn to_lexicon_entry(w: Word, def: Association) -> dict::Entry {
+  fn to_lexicon_entry(w: Word, mut def: Association) -> dict::Entry {
       def.insert("word".into(), Item::Word(w));
       def.try_into().unwrap()
   }
@@ -2498,7 +2515,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       Ok(Item::List(l))
                   }
                   (i, k) => {
-                      let a = Association::try_from(i)?;
+                      let mut a = Association::try_from(i)?;
                       a.insert(k.clone(), v);
                       Ok(Item::Assoc(a))
                   }
@@ -2531,7 +2548,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       Ok(Item::List(l))
                   }
                   (i, k) => {
-                      let a = assoc::Association::try_from(i)?;
+                      let mut a = Association::try_from(i)?;
                       let inner = a.get(&k).unwrap_or(&NOTHING).clone();
                       // if the inner value isn't a map, we're just overwriting whatever it
                       // is with a new map.
@@ -2566,7 +2583,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   //TODO: this should really take a keylist like assign and lookup
   pub fn unassign(m: Item, k: Item) -> ItemResult {
-      let m = assoc::Association::try_from(m).unwrap();
+      let mut m = Association::try_from(m).unwrap();
       let k = KeyItem::try_from(k)?;
       m.remove(&k);
       Ok(Item::Assoc(m))
