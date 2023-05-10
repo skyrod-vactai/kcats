@@ -5669,3 +5669,273 @@ leave the args intact. This needs to be consistent.
 I would lean towards leaving the args intact so that =retry= is easily applied.
 **** TODO 'read' on invalid edn consumes the string argument
 It should attempt to parse before popping the item off the stack.
+*** TODO Trait experimentation
+#+begin_src rust
+  use std::collections::HashMap;
+  use std::convert::TryFrom;
+  use std::ops::Add;
+  use std::sync::Arc;
+  use std::any::Any;
+
+  // Concrete types
+  #[derive(Clone)]
+  pub struct MyInt(i32);
+
+  #[derive(Clone)]
+  pub struct MyFloat(f32);
+
+  #[derive(Clone)]
+  pub struct MyVecDeque<T>(std::collections::VecDeque<T>);
+
+  #[derive(Clone)]
+  pub struct MyHashMap<K, V>(std::collections::HashMap<K, V>);
+
+  // Number trait
+  pub trait Number {}
+
+  impl Number for MyInt {}
+  impl Number for MyFloat {}
+
+  // Collection trait
+  pub trait Collection {}
+
+  impl<T: Clone> Collection for MyVecDeque<T> {}
+  impl<K: Clone + std::hash::Hash + Eq, V: Clone> Collection for MyHashMap<K, V> {}
+
+  // Item enum
+  pub enum Item {
+      Number(Arc<Box<dyn Number>>),
+      Collection(Arc<Box<dyn Collection>>),
+  }
+
+  // Implement From for Item and Number
+  impl From<MyInt> for Item {
+      fn from(value: MyInt) -> Self {
+          Item::Number(Arc::new(Box::new(value)))
+      }
+  }
+
+  impl From<MyFloat> for Item {
+      fn from(value: MyFloat) -> Self {
+          Item::Number(Arc::new(Box::new(value)))
+      }
+  }
+
+  // Implement From for Item and Collection
+  impl<T: Clone + 'static> From<MyVecDeque<T>> for Item {
+      fn from(value: MyVecDeque<T>) -> Self {
+          Item::Collection(Arc::new(Box::new(value)))
+      }
+  }
+
+  impl<K: Clone + std::hash::Hash + Eq + 'static, V: Clone + 'static> From<MyHashMap<K, V>> for Item {
+      fn from(value: MyHashMap<K, V>) -> Self {
+          Item::Collection(Arc::new(Box::new(value)))
+      }
+  }
+
+  // Implement TryFrom for Number
+  impl TryFrom<Item> for MyInt {
+      type Error = &'static str;
+
+      fn try_from(item: Item) -> Result<Self, Self::Error> {
+          match item {
+              Item::Number(number) => {
+                  let number = number.clone();
+                  let any = &*number as &dyn Any;
+                  any.downcast_ref::<MyInt>()
+                      .cloned()
+                      .ok_or("Item is not MyInt")
+              }
+              _ => Err("Item is not a Number"),
+          }
+      }
+  }
+
+  impl TryFrom<Item> for MyFloat {
+      type Error = &'static str;
+
+      fn try_from(item: Item) -> Result<Self, Self::Error> {
+          match item {
+              Item::Number(number) => {
+                  let number = number.clone();
+                  let any = &*number as &dyn Any;
+                  any.downcast_ref::<MyFloat>()
+                      .cloned()
+                      .ok_or("Item is not MyFloat")
+              }
+              _ => Err("Item is not a Number"),
+          }
+      }
+  }
+
+  // add and join functions
+  fn add(a: &dyn Number, b: &dyn Number) -> Item {
+      let result = a + b;
+      Item::Number(Arc::new(MyFloat(result)))
+  }
+
+  fn join<T: Clone>(a: &MyVecDeque<T>, b: &MyVecDeque<T>) -> Item {
+      let mut result = a.0.clone();
+      result.extend(b.0.iter().cloned());
+      Item::Collection(Arc::new(MyVecDeque(result)))
+  }
+#+end_src
+
+#+RESULTS:
+: error: Could not compile `cargoC7CxRQ`.
+
+#+begin_src rust
+  #![allow(non_snake_case, unused)]
+  use std::any::Any;
+  use std::collections::HashMap;
+  use std::collections::VecDeque;
+  use std::fmt::{Debug, Display};
+  use std::sync::Arc;
+
+  #[derive(Debug)]
+  pub struct MyInt(i64);
+  #[derive(Debug)]
+  pub struct MyFloat(f64);
+  #[derive(Debug)]
+  pub struct MyVecDeque<T>(VecDeque<T>);
+  #[derive(Debug)]
+  pub struct MyHashMap<K, V>(HashMap<K, V>);
+
+  pub trait Number: Debug + 'static {
+      fn add_numbers(&self, other: &dyn Number) -> Box<dyn Number>;
+      fn as_any(&self) -> &dyn std::any::Any;
+  }
+
+  pub trait Collection: Debug + 'static {
+      fn join_collections(&self, other: &dyn Collection) -> Box<dyn Collection>;
+      fn as_any(&self) -> &dyn std::any::Any;
+  }
+
+  impl Number for MyInt {
+      fn add_numbers(&self, other: &dyn Number) -> Box<dyn Number> {
+          if let Some(other) = other.as_any().downcast_ref::<MyInt>() {
+              Box::new(MyInt(self.0 + other.0))
+          } else if let Some(other) = other.as_any().downcast_ref::<MyFloat>() {
+              Box::new(MyFloat(self.0 as f64 + other.0))
+          } else {
+              unreachable!()
+          }
+      }
+      fn as_any(&self) -> &dyn std::any::Any {
+          self
+      }
+  }
+
+  impl Number for MyFloat {
+      fn add_numbers(&self, other: &dyn Number) -> Box<dyn Number> {
+          if let Some(other) = other.as_any().downcast_ref::<MyInt>() {
+              Box::new(MyFloat(self.0 + other.0 as f64))
+          } else if let Some(other) = other.as_any().downcast_ref::<MyFloat>() {
+              Box::new(MyFloat(self.0 + other.0))
+          } else {
+              unreachable!()
+          }
+      }
+      fn as_any(&self) -> &dyn std::any::Any {
+          self
+      }
+  }
+
+  impl<T: Debug> Collection for MyVecDeque<T>
+  where
+      T: Clone + 'static,
+  {
+      fn join_collections(&self, other: &dyn Collection) -> Box<dyn Collection> {
+          if let Some(other) = other.as_any().downcast_ref::<MyVecDeque<T>>() {
+              let mut new_vecdeque = self.0.clone();
+              new_vecdeque.extend(other.0.clone());
+              Box::new(MyVecDeque(new_vecdeque))
+          } else {
+              unreachable!()
+          }
+      }
+      fn as_any(&self) -> &dyn std::any::Any {
+          self
+      }
+  }
+
+  impl<K: Debug, V: Debug> Collection for MyHashMap<K, V>
+  where
+      K: Eq + std::hash::Hash + Clone + 'static,
+      V: Clone + 'static,
+  {
+      fn join_collections(&self, other: &dyn Collection) -> Box<dyn Collection> {
+          if let Some(other) = other.as_any().downcast_ref::<MyHashMap<K, V>>() {
+              let mut new_hashmap = self.0.clone();
+              new_hashmap.extend(other.0.clone());
+              Box::new(MyHashMap(new_hashmap))
+          } else {
+              unreachable!()
+          }
+      }
+      fn as_any(&self) -> &dyn std::any::Any {
+          self
+      }
+  }
+
+  impl<T> MyVecDeque<T>
+  where
+      T: Clone + 'static,
+  {
+      fn as_any(&self) -> &dyn std::any::Any {
+          self
+      }
+  }
+
+  impl<K, V> MyHashMap<K, V>
+  where
+      K: Eq + std::hash::Hash + Clone + 'static,
+      V: Clone + 'static,
+  {
+      fn as_any(&self) -> &dyn std::any::Any {
+          self
+      }
+  }
+
+  pub fn add(a: &dyn Number, b: &dyn Number) -> Box<dyn Number> {
+      a.add_numbers(b)
+  }
+
+  pub fn join(a: &dyn Collection, b: &dyn Collection) -> Box<dyn Collection> {
+      a.join_collections(b)
+  }
+
+  #[derive(Debug)]
+  pub enum Item {
+      Number(Box<dyn Number>),
+      Collection(Arc<Box<dyn Collection>>),
+  }
+
+  pub fn main() {
+      let x = MyInt(4);
+      let y = MyFloat(3.5);
+      println!("{:?}", add(&x, &y));
+
+      let mut stack = Vec::from([
+          Item::Number(Box::new(MyInt(5))),
+          Item::Number(Box::new(MyFloat(4.01))),
+      ]);
+
+      let x = stack.pop().unwrap();
+      let y = stack.pop().unwrap();
+      match (x, y) {
+          (Item::Number(x), Item::Number(y)) => {
+              let z = add(&*x, &*y);
+              println!("items added: {:?}", z);
+              stack.push(Item::Number(z));
+          }
+          _ => {
+              println!("Wrong types");
+          }
+      }
+      println!("Resulting stack: {:?}", stack);
+  }
+#+end_src
+
+#+RESULTS:
