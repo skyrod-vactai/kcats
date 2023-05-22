@@ -184,6 +184,13 @@ internally, to keep track of things like the stack, expression, lists etc.
       }
   }
 
+  // The default Item is NOTHING.
+  impl Default for Item {
+      fn default() -> Self {
+          coll::NOTHING
+      }
+  }
+
   pub fn wrap(i: Item) -> coll::List {
       coll::Arc::new(coll::ListContent::from_iter([i]))
   }
@@ -418,7 +425,6 @@ internally, to keep track of things like the stack, expression, lists etc.
   }
 
   pub type ListContent = VecDeque<Item>;
-
   pub type List = Arc<ListContent>;
 
   // Most generic collection type, all we know is it can contain
@@ -443,7 +449,8 @@ internally, to keep track of things like the stack, expression, lists etc.
   pub enum Sized {
       Associative(assoc::Associative),
       List(List),
-      //Set(Set)
+      String(String),
+      Bytes(Bytes),
       Nothing,
   }
 
@@ -451,11 +458,11 @@ internally, to keep track of things like the stack, expression, lists etc.
   pub const NOTHING: Item = Item::Iterable(Iterable::Sized(Sized::Nothing));
 
   impl Iterable {
-      pub fn unpack(&mut self) -> Future<Option<Item>> {
+      pub fn unpack(self) -> Future<Result<(Iterable, Item), Error>> {
           match self {
-              Iterable::Sized(s) => Box::pin(future::ready(s.unpack())),
-              Iterable::Out(o) => o.take().map(|i| i.ok()),
-              Iterable::Tunnel(t) => t.next(),
+              Iterable::Sized(s) => Box::pin(future::ready(Ok(s.unpack()))),
+              Iterable::Out(o) => Box::pin(o.take().map(|i| (Iterable::Out(o), i))),
+              Iterable::Tunnel(t) => Box::pin(pipe::Out::from(t).take()),
           }
       }
   }
@@ -469,18 +476,57 @@ internally, to keep track of things like the stack, expression, lists etc.
           match self {
               Sized::Associative(a) => a.len(),
               Sized::List(l) => l.len(),
+              Sized::String(s) => s.len(),
+              Sized::Bytes(b) => b.len(),
               Sized::Nothing => 0,
           }
       }
 
-      pub fn unpack(self) -> Option<Item> {
+      pub fn unpack(self) -> (Iterable, Item) {
           match self {
               Sized::Associative(a) => a.unpack(),
               Sized::List(l) => {
                   let mut lm = l.make_mut();
-                  lm.pop_front()
+                  let i = lm.pop_front().unwrap_or_default();
+                  (Iterable::Sized(Sized::List(l)), i)
               }
-              Sized::Nothing => None,
+              Sized::Nothing => (Iterable::Sized(Sized::Nothing), NOTHING),
+              Sized::String(s) => {
+                  let i = s.pop().unwrap_or_default();
+                  (
+                      Iterable::Sized(Sized::String(s)),
+                      Item::Iterable(Iterable::Sized(Sized::String(i.to_string()))),
+                  )
+              }
+              Sized::Bytes(b) => {
+                  let i = b.pop().unwrap_or_default();
+                  (Iterable::Sized(Sized::Bytes(b)), Item::Bytes(vec![i; 1]))
+              }
+          }
+      }
+
+      pub fn pack(self, other: Item) -> Result<Sized, Error> {
+          match (self, other) {
+              (Sized::List(c), i) => {
+                  c.make_mut().push_back(i);
+                  Ok(Sized::List(c))
+              }
+              (Sized::Associative(a), l) => {
+                  let entry: (KeyItem, Item) = l.try_into()?;
+                  let (new_a, _) = a.insert(entry.0, entry.1);
+                  Ok(Sized::Associative(new_a))
+              }
+              (Sized::Bytes(b), Item::Int(i)) => {
+                  b.push(i as u8);
+                  Ok(Sized::Bytes(b))
+              }
+              (Sized::Nothing, i) => {
+                  let mut l = VecDeque::new();
+                  l.push_back(i);
+                  Ok(Sized::List(List::new(l)))
+              }
+              (Sized::String(s), i) => unimplemented!(),
+              _ => Err(Error::expected("packable")),
           }
       }
 
@@ -492,12 +538,26 @@ internally, to keep track of things like the stack, expression, lists etc.
                   am.extend(b.inner());
                   Sized::List(a)
               }
+              (Sized::String(mut a), Sized::String(b)) => {
+                  a.push_str(&b);
+                  Sized::String(a)
+              }
+              (Sized::Bytes(mut a), Sized::Bytes(b)) => {
+                  a.extend(b);
+                  Sized::Bytes(a)
+              }
               (Sized::Nothing, Sized::Nothing) => Sized::Nothing,
+
               _ => panic!("Cannot join {:?} and {:?}", self, other),
           }
       }
   }
 
+  impl Packable {
+      pub fn pack(mut self, other: Item) -> Result<Packable, Error> {
+          unimplemented!()
+      }
+  }
   impl IntoIterator for Sized {
       type Item = Item;
       type IntoIter = Box<dyn Iterator<Item = Item>>;
@@ -549,8 +609,49 @@ internally, to keep track of things like the stack, expression, lists etc.
 
       fn try_from(item: Item) -> Result<Self, Self::Error> {
           match item {
-              Item::Iterable(c) => Ok(c.try_into()?),
-              _ => Err(Error::expected("collection")),
+              Item::Iterable(c) => c.try_into(),
+              Item::Packable(p) => Iterable::try_from(p)?.try_into(),
+              Item::String(s) => Ok(Sized::String(s)),
+              Item::Bytes(b) => Ok(Sized::Bytes(b)),
+              _ => Err(Error::expected("sized")),
+          }
+      }
+  }
+
+  impl TryFrom<Item> for Packable {
+      type Error = Error;
+
+      fn try_from(item: Item) -> Result<Self, Self::Error> {
+          match item {
+              Item::Packable(p) => Ok(p),
+              Item::Iterable(c) => c.try_into(),
+              Item::String(s) => Ok(Packable::Sized(Sized::String(s))),
+              Item::Bytes(b) => Ok(Packable::Sized(Sized::Bytes(b))),
+              _ => Err(Error::expected("packable")),
+          }
+      }
+  }
+
+  impl TryFrom<Iterable> for Packable {
+      type Error = Error;
+
+      fn try_from(c: Iterable) -> Result<Self, Self::Error> {
+          match c {
+              Iterable::Sized(s) => Ok(Packable::Sized(s)),
+              Iterable::Tunnel(t) => Ok(Packable::Tunnel(t)),
+              _ => Err(Error::expected("packable")),
+          }
+      }
+  }
+
+  impl TryFrom<Packable> for Iterable {
+      type Error = Error;
+
+      fn try_from(c: Packable) -> Result<Self, Self::Error> {
+          match c {
+              Packable::Sized(s) => Ok(Iterable::Sized(s)),
+              Packable::Tunnel(t) => Ok(Iterable::Tunnel(t)),
+              _ => Err(Error::expected("iterable")),
           }
       }
   }
@@ -748,13 +849,15 @@ internally, to keep track of things like the stack, expression, lists etc.
           }
       }
 
-      pub fn unpack(self) -> Option<Item> {
+      pub fn unpack(self) -> (coll::Iterable, Item) {
           match self {
-              Associative::Assoc(a) => a
-                  .drain()
-                  .next()
-                  .map(|v| v.into())
-                  .or_else(|| Some(coll::NOTHING)),
+              Associative::Assoc(a) => {
+                  let i = a.drain().next().map(|v| v.into()).unwrap_or_default();
+                  (
+                      coll::Iterable::Sized(coll::Sized::Associative(Associative::Assoc(a))),
+                      i,
+                  )
+              }
               _ => unimplemented!(),
           }
       }
@@ -791,27 +894,16 @@ internally, to keep track of things like the stack, expression, lists etc.
       }
   }
 
-  // impl TryFrom<Item> for Associative {
-  //     type Error = Error;
-  //     fn try_from(i: Item) -> Result<Self, Error> {
-  //         match i {
-  //             Item::Assoc(a) => Ok(a),
-  //             Item::Error(e) => Ok(Associative::Error(e)),
-  //             Item::List(l) => Ok(Associative::Assoc(coll::Arc::new(
-  //                 l.inner()
-  //                     .into_iter()
-  //                     .map(|i| i.try_into())
-  //                     .collect::<Result<HashMap<KeyItem, Item>, Error>>()?,
-  //             ))),
-  //             Item::Env(e) => Ok(Associative::Env(e)),
-  //             Item::Entry(e) => Ok(Associative::DictEntry(e)),
-  //             Item::Dictionary(d) => Ok(Associative::Dictionary(d)),
-  //             i => Err(Error::expected(
-  //                 format!("association (unfinished tryfrom impl) {:?}", i).as_str(),
-  //             )),
-  //         }
-  //     }
-  // }
+  impl TryFrom<Item> for Associative {
+      type Error = Error;
+      fn try_from(i: Item) -> Result<Self, Error> {
+          let s = coll::Sized::try_from(i)?;
+          match s {
+              coll::Sized::Associative(a) => Ok(a),
+              _ => Err(Error::expected("associative")),
+          }
+      }
+  }
 
   // impl TryFrom<u16> for Associative {
   //     type Error = Error;
@@ -2065,16 +2157,11 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn pack(i: Item, j: Item) -> ItemResult {
-      match (i, j) {
-          (Item::Bytes(mut i), Item::Int(j)) => {
-              i.extend([j as u8]);
-              Ok(Item::Bytes(i))
-          }
-          (Item::List(mut l), j) => {
-              //let mut l = coll::List::try_from(i)?;
-              coll::Arc::make_mut(&mut l).push_back(j);
-              Ok(Item::List(l))
-          }
+      match i {
+          Item::Packable(p) => p.pack(j).map(|i| Item::Packable(i)),
+          i => coll::Packable::try_from(i)?
+              .pack(j)
+              .map(|i| Item::Packable(i)),
           _ => Err(Error::expected("list")),
       }
   }
@@ -2196,7 +2283,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       match p {
           Ok(mut p) => {
               let f = env.pop();
-              if is_truthy(&f) {
+              if is_truthy(f) {
                   let p2 = p.clone();
                   let pm = coll::Arc::make_mut(&mut p);
                   pm.push_back(Item::from(p2));
@@ -2277,35 +2364,32 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       .into()
   }
 
-  pub fn unpack(mut env: Environment) -> Future<Environment> {
+  pub async fn unpack(mut env: Environment) -> Environment {
       // TODO: handle Nothing case
       let stack = coll::Arc::make_mut(&mut env.stack);
-      let i = if let Some(s) = stack.front_mut() {
-          if let Item::List(ref mut l) = s {
-              if let Some(i) = coll::Arc::make_mut(l).pop_front() {
-                  i
-              } else {
-                  coll::NOTHING
+      let coll = stack.pop_front();
+      if let Some(s) = coll {
+          let (newcoll, item) = match s {
+              Item::Iterable(it) => {
+                  let it2 = it.clone();
+                  let r = it.unpack().await;
+                  match r {
+                      Ok((c, i)) => (Item::from(c), i),
+                      Err(e) => (Item::from(it2), e.into()),
+                  }
               }
-          } else {
-              Item::from(invalid_type_error(Arc::new(coll::ListContent::from_iter(
-                  [Item::Word(*S_LIST)],
-              ))))
-          }
+              i => (i, Error::expected("iterable").into()),
+          };
+          stack.push_front(newcoll);
+          stack.push_front(item);
       } else {
-          Item::Error(Error::stack_underflow())
+          stack.push_front(Error::stack_underflow().into())
       };
-      stack.push_front(i);
-      env.into()
+      env
   }
 
-  fn is_truthy(i: &Item) -> bool {
-      match i {
-          coll::NOTHING => false,
-          Item::List(l) => !l.is_empty(),
-          Item::Assoc(a) => !a.is_empty(),
-          _ => true,
-      }
+  fn is_truthy(i: Item) -> bool {
+      coll::Sized::try_from(i).map_or(true, |s| !s.is_empty())
   }
 
   // fn boolean_value(b: bool) -> Item {
@@ -2324,7 +2408,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           (Ok(false_branch), Ok(true_branch)) => {
               let b = env.pop();
 
-              env.append_expression(if is_truthy(&b) {
+              env.append_expression(if is_truthy(b) {
                   true_branch
               } else {
                   false_branch
@@ -2344,11 +2428,11 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           let expr = coll::Arc::make_mut(&mut env.expression);
           if !l.is_empty() {
               expr.push_front("step".into());
-              expr.push_front(Item::List(p.clone()));
-              expr.push_front(Item::List(l));
+              expr.push_front(p.clone().into());
+              expr.push_front(l.into());
           }
           expr.push_front("execute".into());
-          env.push(litem).push(Item::List(p)).into()
+          env.push(litem).push(p.into()).into()
       } else {
           env.into()
       }
@@ -2414,7 +2498,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       if let [k, ks @ ..] = ks {
           if ks.is_empty() {
               match (i, k) {
-                  (Item::List(mut l), KeyItem::Int(k)) => {
+                  (
+                      Item::Iterable(coll::Iterable::Sized(coll::Sized::List(mut l))),
+                      KeyItem::Int(k),
+                  ) => {
                       // vector set by index
                       let lm = coll::Arc::make_mut(&mut l);
                       let idx = *k as usize;
@@ -2424,17 +2511,20 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                           lm.resize(idx + 1, coll::NOTHING);
                       }
                       lm[*k as usize] = v;
-                      Ok(Item::List(l))
+                      Ok(l.into())
                   }
                   (i, k) => {
                       let a = assoc::Associative::try_from(i)?;
-                      Ok(Item::Assoc(a.insert(k.clone(), v).0))
+                      Ok(a.insert(k.clone(), v).0.into())
                   }
               }
               //hm.insert(k.clone(), v);
           } else {
               match (i, k) {
-                  (Item::List(mut l), KeyItem::Int(k)) => {
+                  (
+                      Item::Iterable(coll::Iterable::Sized(coll::Sized::List(mut l))),
+                      KeyItem::Int(k),
+                  ) => {
                       let lm = coll::Arc::make_mut(&mut l);
                       let idx = *k as usize;
                       // extend the size of the vector to be big enough to set
@@ -2445,12 +2535,15 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       let inner = &lm[idx];
 
                       lm[*k as usize] = if let [nextk, ..] = ks {
-                          let i = match (inner, nextk) {
-                              (Item::List(l), KeyItem::Int(_)) => Item::List(l.clone()),
-                              (_, KeyItem::Int(_)) => Item::List(Arc::new(coll::ListContent::new())),
-                              _ => Item::Assoc(assoc::Associative::Assoc(Arc::new(
-                                  assoc::AssociationContent::new(),
-                              ))),
+                          let i: Item = match (inner, nextk) {
+                              (
+                                  Item::Iterable(coll::Iterable::Sized(coll::Sized::List(mut l))),
+                                  KeyItem::Int(_),
+                              ) => l.clone().into(),
+                              (_, KeyItem::Int(_)) => {
+                                  coll::List::new(coll::ListContent::new()).into()
+                              }
+                              _ => assoc::Association::new(assoc::AssociationContent::new()).into(),
                           };
                           assoc_in(i, ks, v)?
                       } else {
@@ -2458,23 +2551,21 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       };
 
                       //if the inner value isn't a list, overwrite it
-                      Ok(Item::List(l))
+                      Ok(l.into())
                   }
                   (i, k) => {
                       let a = assoc::Associative::try_from(i)?;
-                      let inner = a.get(&k).unwrap_or(coll::NOTHING).clone();
+                      let inner = a.get(&k).unwrap_or_default().clone();
                       // if the inner value isn't a map, we're just overwriting whatever it
                       // is with a new map.
 
                       let i = match inner {
-                          Item::Assoc(inner) => Item::Assoc(inner),
-                          Item::List(inner) => Item::List(inner),
-                          // TODO: other associative types
-                          _ => Item::Assoc(assoc::Associative::Assoc(Arc::new(
-                              assoc::AssociationContent::new(),
-                          ))),
+                          Item::Iterable(coll::Iterable::Sized(coll::Sized::Associative(a))) => {
+                              a.clone().into()
+                          }
+                          _ => assoc::Association::new(assoc::AssociationContent::new()).into(),
                       };
-                      Ok(Item::Assoc(a.insert(k.clone(), assoc_in(i, ks, v)?).0))
+                      Ok(a.insert(k.clone(), assoc_in(i, ks, v)?).0.into())
                   }
               }
           }
@@ -2526,10 +2617,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn or(i: Item, j: Item) -> ItemResult {
-      Ok(if is_truthy(&i) {
+      Ok(if is_truthy(i) {
           i
       } else {
-          if is_truthy(&j) {
+          if is_truthy(j) {
               j
           } else {
               coll::NOTHING
@@ -2539,7 +2630,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn and(i: Item, j: Item) -> ItemResult {
-      Ok(if is_truthy(&i) && is_truthy(&j) {
+      Ok(if is_truthy(i) && is_truthy(j.clone()) {
           j
       } else {
           coll::NOTHING
@@ -2547,7 +2638,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn not(i: Item) -> ItemResult {
-      Ok(Item::from(!is_truthy(&i)))
+      Ok(Item::from(!is_truthy(i)))
   }
 
   pub fn is_association(i: Item) -> ItemResult {
@@ -3150,7 +3241,7 @@ We'll also define how to run unit tests.
   mod serialize;
   mod types;
 
-  use crate::types::{collection as coll, environment::Environment, error, *};
+  use crate::types::{environment::Environment, error, *};
   use std::io;
   use std::io::{BufRead, Read};
   use std::sync::Arc;
@@ -5708,4 +5799,12 @@ deeper in the stack).
    #+begin_src kcats
    [[a f] [c d]]
    #+end_src
+*** TODO Support char type
+If we don't support char, that breaks the abstraction of a String as a
+sort of collection. A collection of what? Characters, not 1-length
+strings.
+
+Might have to do something similar with byte, but a byte array can
+also be thought of as an array of ints (8 bit unsigned), and we
+already have an integer type (even though it holds more bits).
 
