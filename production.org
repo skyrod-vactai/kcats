@@ -55,6 +55,8 @@ from stdin and execute it, then print the resulting stack.
   #async-channel = "1.8.0"
   flume = "0.10.14"
 
+  # debugging
+  backtrace = "0.3.61"
   [dev-dependencies]
   test-case = "2.0.0"
 #+end_src
@@ -977,6 +979,7 @@ internally, to keep track of things like the stack, expression, lists etc.
                   Box::new(d.inner().into_iter().map(|(k, v)| (k.into(), v.into())))
               }
               Associative::Error(e) => e.into_iter(),
+              Associative::Env(e) => e.into_iter(),
               _ => unimplemented!(),
           }
       }
@@ -1110,7 +1113,7 @@ internally, to keep track of things like the stack, expression, lists etc.
           let mut data: Vec<(assoc::KeyItem, Item)> = vec![
               ("type".into(), "error".into()),
               ("asked".into(), asked.into()),
-              ("reason".into(), reason.into()),
+              ("reason".into(), Item::String(reason.into())),
           ];
           if let Some(actual) = actual {
               data.push(("actual".into(), actual));
@@ -1569,26 +1572,6 @@ internally, to keep track of things like the stack, expression, lists etc.
       }
   }
 
-  impl From<assoc::Associative> for Environment {
-      fn from(envm: assoc::Associative) -> Self {
-          let (envm, stack) = envm.remove(&"stack".into());
-          let (envm, expression) = envm.remove(&"expression".into());
-          let (_, dictionary) = envm.remove(&"dictionary".into());
-          let stack = stack
-              .and_then(|s| coll::List::try_from(s).ok())
-              .or(Some(coll::List::new()));
-          let expression = expression
-              .and_then(|s| coll::List::try_from(s).ok())
-              .or(Some(coll::List::new()));
-          let mut env = axiom::standard_env(expression, stack);
-          if let Some(mut d) = dictionary.and_then(|d| dict::Dictionary::try_from(d).ok()) {
-              let edmut = coll::Arc::make_mut(&mut env.dictionary);
-              edmut.extend(d.inner().into_iter());
-          }
-          env
-      }
-  }
-
   impl TryFrom<Box<dyn Iterator<Item = Item>>> for Environment {
       type Error = Error;
       fn try_from(iter: Box<dyn Iterator<Item = Item>>) -> Result<Self, Error> {
@@ -1607,17 +1590,12 @@ internally, to keep track of things like the stack, expression, lists etc.
                   continue;
               }
           }
-          match (stack, expression, dictionary) {
-              (Some(stack), Some(expression), Some(dictionary)) => Ok(Environment {
-                  stack,
-                  expression,
-                  dictionary,
-              }),
-              _ => Err(Error::expected(
-                  "environment must have stack, expression, and dictionary",
-                  Default::default(),
-              )),
+          let mut env = axiom::standard_env(expression, stack);
+          if let Some(mut d) = dictionary {
+              let edmut = env.dictionary.make_mut();
+              edmut.extend(d.inner().into_iter());
           }
+          Ok(env)
       }
   }
   impl TryFrom<Item> for Environment {
@@ -1642,6 +1620,20 @@ internally, to keep track of things like the stack, expression, lists etc.
   impl From<Environment> for Future<Environment> {
       fn from(env: Environment) -> Future<Environment> {
           Box::pin(future::ready(env))
+      }
+  }
+
+  impl IntoIterator for Environment {
+      type Item = assoc::Entry;
+      type IntoIter = Box<dyn Iterator<Item = assoc::Entry>>;
+
+      fn into_iter(self) -> Self::IntoIter {
+          let v: Vec<(assoc::KeyItem, Item)> = vec![
+              ("stack".into(), self.stack.into()),
+              ("expression".into(), self.expression.into()),
+              ("dictionary".into(), self.dictionary.into()),
+          ];
+          Box::new(v.into_iter().map(|kv| kv.into()))
       }
   }
 #+end_src
