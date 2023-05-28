@@ -520,8 +520,22 @@ internally, to keep track of things like the stack, expression, lists etc.
           }
       }
 
-      pub fn join(self, other: Sized) -> Sized {
-          match (self, other) {
+      pub fn join(self, other: Sized) -> Result<Sized, Error> {
+          Ok(match (self, other) {
+              (Sized::Associative(a), Sized::List(l)) => Sized::Associative({
+                  let mut a: assoc::Association = a.into();
+                  let mut more = assoc::Association::try_from_iter(l.clone().inner().into_iter())?;
+                  let am = a.make_mut();
+                  am.extend(more.inner().into_iter());
+                  assoc::Associative::Assoc(a)
+              }),
+              (Sized::List(l), Sized::Associative(a)) => {
+                  let mut a: assoc::Association = a.into();
+                  let mut la = assoc::Association::try_from_iter(l.clone().inner().into_iter())?;
+                  let lam = la.make_mut();
+                  lam.extend(a.inner().into_iter());
+                  Sized::Associative(assoc::Associative::Assoc(la))
+              }
               (Sized::Associative(a), Sized::Associative(b)) => Sized::Associative(a.join(b)),
               (Sized::List(mut a), Sized::List(mut b)) => {
                   let am = a.make_mut();
@@ -539,7 +553,7 @@ internally, to keep track of things like the stack, expression, lists etc.
               (Sized::Nothing, Sized::Nothing) => Sized::Nothing,
 
               (s, other) => panic!("Cannot join {:?} and {:?}", s, other),
-          }
+          })
       }
   }
 
@@ -547,8 +561,15 @@ internally, to keep track of things like the stack, expression, lists etc.
       pub fn pack(self, i: Item) -> Future<Result<Packable, Error>> {
           match self {
               Packable::Sized(s) => Box::pin(future::ready(s.pack(i).map(Packable::Sized))),
-              Packable::In(_) => unimplemented!(), //Box::pin(p.put(i).map(|r| r.map(|_| Packable::In(p)))),
-              Packable::Tunnel(_) => unimplemented!(),
+              Packable::In(p) => {
+                  let p2 = p.clone();
+                  Box::pin(p.put(i).map(|r| r.map(|_| Packable::In(p2))))
+              }
+              Packable::Tunnel(t) => {
+                  let t2 = t.clone();
+                  let p = pipe::In::from(t);
+                  Box::pin(p.put(i).map(|r| r.map(|_| Packable::Tunnel(t2))))
+              }
           }
       }
   }
@@ -710,6 +731,18 @@ internally, to keep track of things like the stack, expression, lists etc.
   impl From<Sized> for Item {
       fn from(s: Sized) -> Self {
           Iterable::Sized(s).into()
+      }
+  }
+
+  impl TryFrom<Item> for Iterable {
+      type Error = Error;
+
+      fn try_from(item: Item) -> Result<Self, Self::Error> {
+          match item {
+              Item::Iterable(c) => Ok(c),
+              Item::Packable(p) => Ok(Iterable::try_from(p)?),
+              i => Err(Error::expected("iterable", i)),
+          }
       }
   }
 #+end_src
@@ -1110,10 +1143,12 @@ internally, to keep track of things like the stack, expression, lists etc.
 
   impl Error {
       pub fn create(asked: coll::List, reason: &str, actual: Option<Item>) -> Error {
+          // let bt = backtrace::Backtrace::new();
           let mut data: Vec<(assoc::KeyItem, Item)> = vec![
               ("type".into(), "error".into()),
               ("asked".into(), asked.into()),
               ("reason".into(), Item::String(reason.into())),
+              //("backtrace".into(), Item::String(format!("{:?}", bt))),
           ];
           if let Some(actual) = actual {
               data.push(("actual".into(), actual));
@@ -1378,9 +1413,10 @@ internally, to keep track of things like the stack, expression, lists etc.
   impl TryFrom<Item> for Entry {
       type Error = Error;
       fn try_from(i: Item) -> Result<Self, Self::Error> {
-          match i {
-              Item::Iterable(coll::Iterable::Sized(c)) => c.into_iter().try_into(),
-              e => Err(Error::expected("definition", e)),
+          let s = coll::Sized::try_from(i)?;
+          match s {
+              coll::Sized::Associative(assoc::Associative::DictEntry(d)) => Ok(d),
+              c => c.into_iter().try_into(),
           }
       }
   }
@@ -1472,12 +1508,10 @@ internally, to keep track of things like the stack, expression, lists etc.
   impl TryFrom<Item> for Dictionary {
       type Error = Error;
       fn try_from(i: Item) -> Result<Self, Self::Error> {
-          match i {
-              Item::Iterable(coll::Iterable::Sized(coll::Sized::Associative(
-                  assoc::Associative::Dictionary(d),
-              ))) => Ok(d),
-              Item::Iterable(coll::Iterable::Sized(c)) => c.into_iter().try_into(),
-              i => Err(Error::expected("dictionary", i)),
+          let s = coll::Sized::try_from(i)?;
+          match s {
+              coll::Sized::Associative(assoc::Associative::Dictionary(d)) => Ok(d),
+              c => c.into_iter().try_into(),
           }
       }
   }
@@ -1523,6 +1557,7 @@ internally, to keep track of things like the stack, expression, lists etc.
 *** Environment types
 #+begin_src rust :tangle src/types/environment.rs
   use crate::axiom;
+  use crate::serialize;
   use crate::types::*;
   use crate::types::{associative as assoc, collection as coll, dictionary as dict};
   use std::future;
@@ -1601,12 +1636,11 @@ internally, to keep track of things like the stack, expression, lists etc.
   impl TryFrom<Item> for Environment {
       type Error = Error;
       fn try_from(i: Item) -> Result<Self, Self::Error> {
-          match i {
-              Item::Iterable(coll::Iterable::Sized(coll::Sized::Associative(
-                  assoc::Associative::Env(e),
-              ))) => Ok(e),
-              Item::Iterable(coll::Iterable::Sized(l)) => l.into_iter().try_into(),
-              i => Err(Error::expected("environment", i)),
+          let s = coll::Sized::try_from(i)?;
+
+          match s {
+              coll::Sized::Associative(assoc::Associative::Env(e)) => Ok(e),
+              l => l.into_iter().try_into(),
           }
       }
   }
@@ -1634,6 +1668,15 @@ internally, to keep track of things like the stack, expression, lists etc.
               ("dictionary".into(), self.dictionary.into()),
           ];
           Box::new(v.into_iter().map(|kv| kv.into()))
+      }
+  }
+
+  impl serialize::Display for Environment {
+      fn representation(&self) -> Item {
+          let mut assoc = assoc::Association::from_iter(self.clone());
+          let am = assoc.make_mut();
+          am.remove(&("dictionary".into()));
+          assoc.into()
       }
   }
 #+end_src
@@ -1782,7 +1825,7 @@ example, in order to read/write to/from disk).
 #+begin_src rust :tangle src/serialize.rs
   extern crate edn_format;
   use crate::types::environment::Environment;
-  use crate::types::{collection as coll, error::Error, *};
+  use crate::types::{associative as assoc, collection as coll, error::Error, *};
   use base64;
   use std::collections::VecDeque;
   use std::fmt;
@@ -1827,6 +1870,11 @@ example, in order to read/write to/from disk).
 
   pub fn from_item(item: &Item) -> edn_format::Value {
       match item {
+          // dictionaries are big and it's ugly to print them for
+          // environments.
+          Item::Iterable(coll::Iterable::Sized(coll::Sized::Associative(
+              assoc::Associative::Env(e),
+          ))) => from_item(&e.representation()),
           Item::Int(i) => edn_format::Value::Integer(*i),
           Item::Iterable(coll::Iterable::Sized(v)) => edn_format::Value::Vector(
               v.clone()
@@ -1845,7 +1893,10 @@ example, in order to read/write to/from disk).
               edn_format::Symbol::from_name("b64"),
               Box::new(edn_format::Value::String(base64::encode(bs))),
           ),
-          _ => unimplemented!(),
+          Item::Iterable(coll::Iterable::Out(o)) => from_item(&o.representation()),
+          Item::Iterable(coll::Iterable::Tunnel(t)) => from_item(&t.representation()),
+          Item::Packable(coll::Packable::In(i)) => from_item(&i.representation()),
+          Item::Packable(coll::Packable::Tunnel(t)) => from_item(&t.representation()),
       }
   }
 
@@ -2038,7 +2089,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   "file-out",
                   Box::leak(Box::new(f_stack1(crate::pipes::fs::file_out))),
               ),
-              ("filled", Box::leak(Box::new(crate::pipes::channel::filled))),
               ("first", Box::leak(Box::new(f_stack1(first)))),
               ("float", Box::leak(Box::new(float))),
               ("handle", Box::leak(Box::new(f_stack1(handle)))),
@@ -2060,7 +2110,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               ("or", Box::leak(Box::new(f_stack2(or)))),
               ("pack", Box::leak(Box::new(pack))),
               ("pipe?", Box::leak(Box::new(f_stack1(is_pipe)))),
-              //("put", Box::leak(Box::new(crate::pipes::put_))),
               ("range", Box::leak(Box::new(range))),
               ("read", Box::leak(Box::new(read))),
               ("recur", Box::leak(Box::new(recur))),
@@ -2081,7 +2130,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               ("string?", Box::leak(Box::new(f_stack1(is_string)))),
               ("swap", Box::leak(Box::new(swap))),
               ("swapdown", Box::leak(Box::new(swapdown))),
-              //("take", Box::leak(Box::new(crate::pipes::take_))),
               ("true", Box::leak(Box::new(true_))),
               ("unassign", Box::leak(Box::new(f_stack2(unassign)))),
               ("unpack", Box::leak(Box::new(unpack))),
@@ -2274,7 +2322,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           (i, j) => {
               let i = coll::Sized::try_from(i)?;
               let j = coll::Sized::try_from(j)?;
-              Ok(i.join(j).into())
+              Ok(i.join(j)?.into())
           }
       }
   }
@@ -2426,7 +2474,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn execute(mut env: Environment) -> Future<Environment> {
-      match coll::List::try_from(env.pop()) {
+      let i = env.pop();
+      match coll::List::try_from(i) {
           Ok(program) => env.append_expression(program),
           Err(e) => env.push(e.into()),
       }
@@ -2485,28 +2534,34 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   pub fn unpack(mut env: Environment) -> Future<Environment> {
       // TODO: handle Nothing case
       let coll = {
-          let stack = coll::Arc::make_mut(&mut env.stack);
+          let stack = env.stack.make_mut();
           stack.pop_front()
       };
       match coll {
-          Some(Item::Iterable(it)) => {
-              let f = it.unpack();
-              Box::pin(async move {
-                  let (c, i) = f.await;
-                  let stack = coll::Arc::make_mut(&mut env.stack);
-                  stack.push_front(c.into());
-                  stack.push_front(i);
-                  env
-              })
-          }
           Some(i) => {
-              let stack = coll::Arc::make_mut(&mut env.stack);
-              stack.push_front(i.clone());
-              stack.push_front(Error::expected("iterable", i).into());
-              env.into()
+              let i2 = i.clone();
+              let r = coll::Iterable::try_from(i);
+              match r {
+                  Ok(it) => {
+                      let f = it.unpack();
+                      Box::pin(async move {
+                          let (c, i) = f.await;
+                          let stack = env.stack.make_mut();
+                          stack.push_front(c.into());
+                          stack.push_front(i);
+                          env
+                      })
+                  }
+                  Err(e) => {
+                      let stack = env.stack.make_mut();
+                      stack.push_front(i2);
+                      stack.push_front(e.into());
+                      env.into()
+                  }
+              }
           }
           None => {
-              let stack = coll::Arc::make_mut(&mut env.stack);
+              let stack = env.stack.make_mut();
               stack.push_front(Error::stack_underflow().into());
               env.into()
           }
@@ -2875,7 +2930,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               ))),
           ) if w == *S_ERROR => Ok(()),
 
-          (w, Item::Iterable(coll::Iterable::Sized(_))) if w == *S_ASSOC => Ok(()),
+          (
+              w,
+              Item::Iterable(coll::Iterable::Sized(_)) | Item::Packable(coll::Packable::Sized(_)),
+          ) if w == *S_ASSOC => Ok(()),
 
           (
               w,
@@ -2886,7 +2944,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   assoc::Associative::Env(_),
               ))),
           ) if w == *S_ENVIRONMENT => Ok(()),
-          (w, i) => Err(Error::expected(&w, i.clone())),
+          (w, i) => {
+              //println!("Type check failed! wanted {} got {:?}", w, i);
+              Err(Error::expected(&w, i.clone()))
+          }
       }
   }
 
@@ -2921,7 +2982,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   Item::Iterable(coll::Iterable::Sized(coll::Sized::List(named))) => {
                       match named.get(0).unwrap() {
                           Item::Word(w) => check_type(item, *w),
-                          i => Err(Error::expected("list", i.clone())),
+                          i => {
+                              println!("Expected word, got {:?}", i);
+                              Err(Error::expected("list", i.clone()))
+                          }
                       }
                   }
                   Item::Word(w) => check_type(item, *w),
@@ -3641,7 +3705,6 @@ The basic pipe contracts.
       Socket(Arc<RwLock<net::Socket>>),
       ServerSocket(Arc<RwLock<net::ServerSocket>>),
       Handoff(channel::Handoff<Item>),
-      Filled(channel::Filled),
   }
 
   impl PartialEq for Out {
@@ -3651,7 +3714,6 @@ The basic pipe contracts.
               (Out::Socket(s1), Out::Socket(s2)) => Arc::ptr_eq(s1, s2),
               (Out::ServerSocket(s1), Out::ServerSocket(s2)) => Arc::ptr_eq(s1, s2),
               (Out::Handoff(h1), Out::Handoff(h2)) => h1 == h2,
-              (Out::Filled(f1), Out::Filled(f2)) => f1 == f2,
               _ => false,
           }
       }
@@ -3736,7 +3798,6 @@ The basic pipe contracts.
               Out::Socket(f) => Box::pin(async move { f.write().await.take().await }),
               Out::ServerSocket(f) => Box::pin(async move { f.write().await.take().await }),
               Out::Handoff(h) => Box::pin(h.take()),
-              Out::Filled(f) => Box::pin(f.take()),
           }
       }
       pub fn close(self) -> types::Future<Result<(), Error>> {
@@ -3745,7 +3806,6 @@ The basic pipe contracts.
               Out::Socket(f) => Box::pin(async move { f.write().await.close() }),
               Out::ServerSocket(f) => Box::pin(async move { f.write().await.close() }),
               Out::Handoff(_) => Box::pin(future::ready(Ok(()))),
-              Out::Filled(_) => Box::pin(future::ready(Ok(()))),
           }
       }
       pub fn is_closed(self) -> types::Future<bool> {
@@ -3754,7 +3814,6 @@ The basic pipe contracts.
               Out::Socket(f) => Box::pin(async move { f.read().await.is_closed() }),
               Out::ServerSocket(f) => Box::pin(async move { f.read().await.is_closed() }),
               Out::Handoff(_) => Box::pin(future::ready(false)),
-              Out::Filled(_) => Box::pin(future::ready(false)),
           }
       }
   }
@@ -3780,7 +3839,6 @@ The basic pipe contracts.
                   executor::block_on(async move { f.read().await.representation() })
               }
               Out::Handoff(h) => h.representation(),
-              Out::Filled(f) => f.representation(),
           }
       }
   }
@@ -4221,7 +4279,6 @@ Implement the =handoff= type
   use crate::types::error::Error;
   use crate::types::{self, Item};
   use flume;
-  use std::future;
   use std::ptr;
 
   #[derive(Debug, Clone)]
@@ -4264,19 +4321,6 @@ Implement the =handoff= type
       }
   }
 
-  impl Filled {
-      pub fn new(l: coll::List) -> Filled {
-          Filled { contents: l }
-      }
-
-      pub fn take(mut self) -> types::Future<ItemResult> {
-          let l = self.contents.make_mut();
-          Box::pin(future::ready(
-              l.pop_front().ok_or(pipes::closed_error(true)),
-          ))
-      }
-  }
-
   impl crate::serialize::Display for Handoff<Item> {
       fn representation(&self) -> Item {
           assoc::Association::from_iter([
@@ -4287,24 +4331,9 @@ Implement the =handoff= type
       }
   }
 
-  impl crate::serialize::Display for Filled {
-      fn representation(&self) -> Item {
-          assoc::Association::from_iter([
-              ("type".into(), "pipe".into()),
-              ("filled".into(), "todo: id-or-hash here".into()),
-          ])
-          .into()
-      }
-  }
-
   pub fn handoff(env: Environment) -> types::Future<Environment> {
       env.push(pipes::Tunnel::Handoff(Handoff::new()).into())
           .into()
-  }
-
-  pub fn filled(mut env: Environment) -> types::Future<Environment> {
-      let l = coll::List::try_from(env.pop()).unwrap();
-      env.push(pipes::Out::Filled(Filled::new(l)).into()).into()
   }
 #+end_src
 ** Issues
@@ -5841,4 +5870,10 @@ strings.
 Might have to do something similar with byte, but a byte array can
 also be thought of as an array of ints (8 bit unsigned), and we
 already have an integer type (even though it holds more bits).
+*** TODO handoff unpack
+#+begin_src kcats
+handoff unpack
+#+end_src
 
+#+RESULTS:
+: [[reason "type mismatch"] [unwound [unpack]] [type error] [asked [list]] [actual [[type pipe] [handoff todo: id-or-hash here]]] [handled true]] [[handoff todo: id-or-hash here] [type pipe]]
