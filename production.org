@@ -130,10 +130,13 @@ internally, to keep track of things like the stack, expression, lists etc.
 
   pub type Float = f64;
 
+  pub type Char = char;
+
   lazy_static! {
       pub static ref S_ASSOC: Intern<String> = Intern::new("association".to_string());
       pub static ref S_BOOLEAN: Intern<String> = Intern::new("boolean".to_string());
       pub static ref S_BYTES: Intern<String> = Intern::new("bytes".to_string());
+      pub static ref S_CHAR: Intern<String> = Intern::new("character".to_string());
       pub static ref S_ENVIRONMENT: Intern<String> = Intern::new("environment".to_string());
       pub static ref S_ERROR: Intern<String> = Intern::new("error".to_string());
       pub static ref S_FLOAT: Intern<String> = Intern::new("float".to_string());
@@ -158,9 +161,8 @@ internally, to keep track of things like the stack, expression, lists etc.
   pub enum Item {
       Int(Int),
       Float(Float),
-      Bytes(Bytes),
-      String(String),
       Word(Word),
+      Char(Char),
       Iterable(coll::Iterable),
       Packable(coll::Packable),
   }
@@ -174,8 +176,6 @@ internally, to keep track of things like the stack, expression, lists etc.
               // same types, just use their own eq
               (Item::Int(a), Item::Int(b)) => a == b,
               (Item::Float(a), Item::Float(b)) => a == b,
-              (Item::Bytes(a), Item::Bytes(b)) => a == b,
-              (Item::String(a), Item::String(b)) => a == b,
               (Item::Word(a), Item::Word(b)) => a == b,
               (
                   Item::Iterable(coll::Iterable::Sized(a)),
@@ -186,6 +186,7 @@ internally, to keep track of things like the stack, expression, lists etc.
                   Item::Iterable(coll::Iterable::Sized(b)),
               ) => a == b,
               (Item::Iterable(a), Item::Iterable(b)) => a == b,
+              (Item::Char(a), Item::Char(b)) => a == b,
               // (Item::Assoc(a), Item::Assoc(b)) => a == b,
               // (Item::List(a), Item::List(b)) => a == b,
               // //TODO: (Item::Collection(a), Item::Collection(b)) => a == b,
@@ -253,9 +254,10 @@ internally, to keep track of things like the stack, expression, lists etc.
   impl TryFrom<Item> for String {
       type Error = Error;
       fn try_from(i: Item) -> Result<Self, Self::Error> {
-          match i {
-              Item::String(i) => Ok(i),
-              i => Err(Error::expected("string", i)),
+          let s = coll::Sized::try_from(i)?;
+          match s {
+              coll::Sized::String(i) => Ok(i),
+              i => Err(Error::expected("string", i.into())),
           }
       }
   }
@@ -272,10 +274,11 @@ internally, to keep track of things like the stack, expression, lists etc.
 
   impl TryFrom<Item> for Bytes {
       type Error = Error;
-      fn try_from(b: Item) -> Result<Self, Self::Error> {
-          match b {
-              Item::Bytes(b) => Ok(b),
-              b => Err(Error::expected("bytes", b)),
+      fn try_from(i: Item) -> Result<Self, Self::Error> {
+          let s = coll::Sized::try_from(i)?;
+          match s {
+              coll::Sized::Bytes(b) => Ok(b),
+              b => Err(Error::expected("bytes", b.into())),
           }
       }
   }
@@ -349,6 +352,18 @@ internally, to keep track of things like the stack, expression, lists etc.
   impl From<&str> for Item {
       fn from(i: &str) -> Self {
           Item::Word(Word::from(i))
+      }
+  }
+
+  impl From<String> for Item {
+      fn from(i: String) -> Self {
+          Item::Iterable(coll::Iterable::Sized(coll::Sized::String(i)))
+      }
+  }
+
+  impl From<Bytes> for Item {
+      fn from(b: Bytes) -> Self {
+          Item::Iterable(coll::Iterable::Sized(coll::Sized::Bytes(b)))
       }
   }
 #+end_src
@@ -498,7 +513,7 @@ internally, to keep track of things like the stack, expression, lists etc.
               }
               Sized::Bytes(mut b) => {
                   let i = b.pop().unwrap_or_default();
-                  (Iterable::Sized(Sized::Bytes(b)), Item::Bytes(vec![i; 1]))
+                  (Iterable::Sized(Sized::Bytes(b)), vec![i; 1].into())
               }
           }
       }
@@ -641,8 +656,6 @@ internally, to keep track of things like the stack, expression, lists etc.
           match item {
               Item::Iterable(c) => c.try_into(),
               Item::Packable(p) => Iterable::try_from(p)?.try_into(),
-              Item::String(s) => Ok(Sized::String(s)),
-              Item::Bytes(b) => Ok(Sized::Bytes(b)),
               i => {
                   // let bt = backtrace::Backtrace::new();
                   // println!("try from item {:?},\n {:?}", i, bt);
@@ -659,8 +672,6 @@ internally, to keep track of things like the stack, expression, lists etc.
           match item {
               Item::Packable(p) => Ok(p),
               Item::Iterable(c) => c.try_into(),
-              Item::String(s) => Ok(Packable::Sized(Sized::String(s))),
-              Item::Bytes(b) => Ok(Packable::Sized(Sized::Bytes(b))),
               i => Err(Error::expected("packable", i)),
           }
       }
@@ -783,12 +794,12 @@ internally, to keep track of things like the stack, expression, lists etc.
       fn from(i: KeyItem) -> Self {
           match i {
               KeyItem::Int(i) => Item::Int(i),
-              KeyItem::String(i) => Item::String(i),
+              KeyItem::String(i) => i.into(),
               KeyItem::List(mut l) => {
                   coll::List::from_iter(l.inner().into_iter().map(Item::from)).into()
               }
               KeyItem::Word(w) => Item::Word(w),
-              KeyItem::Bytes(bs) => Item::Bytes(bs),
+              KeyItem::Bytes(bs) => bs.into(),
           }
       }
   }
@@ -810,12 +821,14 @@ internally, to keep track of things like the stack, expression, lists etc.
       fn try_from(i: Item) -> Result<Self, Error> {
           match i {
               Item::Int(i) => Ok(KeyItem::Int(i)),
-              Item::String(i) => Ok(KeyItem::String(i)),
+              Item::Iterable(coll::Iterable::Sized(coll::Sized::String(i))) => Ok(KeyItem::String(i)),
+              Item::Packable(coll::Packable::Sized(coll::Sized::String(i))) => Ok(KeyItem::String(i)),
+              Item::Iterable(coll::Iterable::Sized(coll::Sized::Bytes(i))) => Ok(KeyItem::Bytes(i)),
+              Item::Packable(coll::Packable::Sized(coll::Sized::Bytes(i))) => Ok(KeyItem::Bytes(i)),
               Item::Iterable(coll::Iterable::Sized(coll::Sized::List(mut l))) => Ok(KeyItem::List(
                   KeyList::try_from_iter(l.inner().into_iter())?,
               )),
               Item::Word(w) => Ok(KeyItem::Word(w)),
-              Item::Bytes(bs) => Ok(KeyItem::Bytes(bs)),
               i => Err(Error::expected("KeyItem", i.into())),
           }
       }
@@ -1030,6 +1043,8 @@ internally, to keep track of things like the stack, expression, lists etc.
           let s = coll::Sized::try_from(i)?;
           match s {
               coll::Sized::Associative(a) => Ok(a),
+              coll::Sized::String(i) => Err(Error::expected("associative", i.into())),
+              coll::Sized::Bytes(i) => Err(Error::expected("associative", i.into())),
               s => Ok(Associative::Assoc(Association::try_from_iter(s)?)),
           }
       }
@@ -1147,7 +1162,7 @@ internally, to keep track of things like the stack, expression, lists etc.
           let mut data: Vec<(assoc::KeyItem, Item)> = vec![
               ("type".into(), "error".into()),
               ("asked".into(), asked.into()),
-              ("reason".into(), Item::String(reason.into())),
+              ("reason".into(), reason.to_string().into()),
               //("backtrace".into(), Item::String(format!("{:?}", bt))),
           ];
           if let Some(actual) = actual {
@@ -1229,6 +1244,12 @@ internally, to keep track of things like the stack, expression, lists etc.
               Item::Iterable(coll::Iterable::Sized(coll::Sized::Associative(
                   assoc::Associative::Error(e),
               ))) => Ok(e),
+              Item::Iterable(coll::Iterable::Sized(coll::Sized::String(_)))
+              | Item::Iterable(coll::Iterable::Sized(coll::Sized::Bytes(_)))
+              | Item::Packable(coll::Packable::Sized(coll::Sized::String(_)))
+              | Item::Packable(coll::Packable::Sized(coll::Sized::Bytes(_))) => {
+                  Err(Error::expected("error", Default::default()))
+              }
               Item::Iterable(coll::Iterable::Sized(c)) => c.into_iter().try_into(),
               i => Err(Error::expected("error", i)),
           }
@@ -1685,7 +1706,7 @@ We'll implement certain cryptography functions in rust and make kcats
 words for them (hashing, encryption, signing)
 #+begin_src rust :tangle src/crypto.rs
   use crate::axiom::ItemResult;
-  use crate::types::{associative as assoc, collection as coll, error::Error, Bytes, Item};
+  use crate::types::{associative as assoc, error::Error, Bytes, Item};
   use core::ops::Deref;
   use ed25519_dalek as signing;
   use ed25519_dalek::{Signer, Verifier};
@@ -1695,7 +1716,7 @@ words for them (hashing, encryption, signing)
 
   pub fn hash(i: Item) -> ItemResult {
       let b = Bytes::try_from(i).unwrap();
-      Ok(Item::Bytes(sha2::Sha256::digest(b).deref().to_vec()))
+      Ok(sha2::Sha256::digest(b).deref().to_vec().into())
   }
 
   type Value = Vec<u8>;
@@ -1744,8 +1765,8 @@ words for them (hashing, encryption, signing)
       });
       Ok(assoc::Association::from_iter([
           ("type".into(), "elliptic-curve-key".into()),
-          ("secret".into(), Item::Bytes(kp.secret.as_ref().to_vec())),
-          ("public".into(), Item::Bytes(kp.public.as_ref().to_vec())),
+          ("secret".into(), kp.secret.as_ref().to_vec().into()),
+          ("public".into(), kp.public.as_ref().to_vec().into()),
       ])
       .into())
   }
@@ -1805,7 +1826,7 @@ words for them (hashing, encryption, signing)
       let kp: signing::Keypair = k.try_into()?;
       let message: Bytes = m.try_into()?;
       let signature: signing::Signature = kp.sign(&message);
-      Ok(Item::Bytes(signature.as_ref().to_vec()))
+      Ok(signature.as_ref().to_vec().into())
   }
 
   pub fn verify(k: Item, m: Item, s: Item) -> ItemResult {
@@ -1814,9 +1835,10 @@ words for them (hashing, encryption, signing)
       let sbs: Bytes = s.try_into()?;
       let sig = signing::Signature::from_bytes(&sbs)
           .map_err(|_e| Error::expected("signature", Default::default()))?;
-      pk.verify(&mbs, &sig)
-          .and(Ok(Item::from(true)))
-          .or(Ok(coll::NOTHING))
+      Ok(pk
+          .verify(&mbs, &sig)
+          .map(|_| Item::from(true))
+          .unwrap_or_default())
   }
 #+end_src
 ** Serialization
@@ -1851,12 +1873,12 @@ example, in order to read/write to/from disk).
           // is the word false which is not defined in the base
           // language, but might be user-defined later.
           edn_format::Value::Boolean(b) => Ok(if *b { "true".into() } else { "false".into() }),
-          edn_format::Value::String(s) => Ok(Item::String(s.to_string())),
+          edn_format::Value::String(s) => Ok(s.to_string().into()),
           edn_format::Value::Float(f) => Ok(Item::Float(f.into_inner())),
           edn_format::Value::TaggedElement(tag, e) => {
               if *tag == edn_format::Symbol::from_name(BYTE_TAG) {
                   if let edn_format::Value::String(s) = &**e {
-                      Ok(Item::Bytes(base64::decode(s).unwrap()))
+                      Ok(base64::decode(s).unwrap().into())
                   } else {
                       Err(Error::parse("Invalid tag datatype for byte literal"))
                   }
@@ -1876,6 +1898,26 @@ example, in order to read/write to/from disk).
               assoc::Associative::Env(e),
           ))) => from_item(&e.representation()),
           Item::Int(i) => edn_format::Value::Integer(*i),
+          Item::Float(f) => edn_format::Value::from(*f),
+          Item::Char(c) => edn_format::Value::Character(*c),
+          Item::Iterable(coll::Iterable::Sized(coll::Sized::String(s))) => {
+              edn_format::Value::String(s.to_string())
+          }
+          Item::Iterable(coll::Iterable::Sized(coll::Sized::Bytes(bs))) => {
+              edn_format::Value::TaggedElement(
+                  edn_format::Symbol::from_name("b64"),
+                  Box::new(edn_format::Value::String(base64::encode(bs))),
+              )
+          }
+          Item::Packable(coll::Packable::Sized(coll::Sized::String(s))) => {
+              edn_format::Value::String(s.to_string())
+          }
+          Item::Packable(coll::Packable::Sized(coll::Sized::Bytes(bs))) => {
+              edn_format::Value::TaggedElement(
+                  edn_format::Symbol::from_name("b64"),
+                  Box::new(edn_format::Value::String(base64::encode(bs))),
+              )
+          }
           Item::Iterable(coll::Iterable::Sized(v)) => edn_format::Value::Vector(
               v.clone()
                   .into_iter()
@@ -1887,12 +1929,6 @@ example, in order to read/write to/from disk).
           }
           Item::Word(w) => edn_format::Value::Symbol(edn_format::Symbol::from_name(w)),
           //Item::Entry(w) => edn_format::Value::Symbol(edn_format::Symbol::from_name(&w.word)),
-          Item::String(s) => edn_format::Value::String(s.to_string()),
-          Item::Float(f) => edn_format::Value::from(*f),
-          Item::Bytes(bs) => edn_format::Value::TaggedElement(
-              edn_format::Symbol::from_name("b64"),
-              Box::new(edn_format::Value::String(base64::encode(bs))),
-          ),
           Item::Iterable(coll::Iterable::Out(o)) => from_item(&o.representation()),
           Item::Iterable(coll::Iterable::Tunnel(t)) => from_item(&t.representation()),
           Item::Packable(coll::Packable::In(i)) => from_item(&i.representation()),
@@ -2310,21 +2346,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn join(i: Item, j: Item) -> ItemResult {
-      match (i, j) {
-          (Item::String(mut i), Item::String(j)) => {
-              i.push_str(&j);
-              Ok(Item::String(i))
-          }
-          (Item::Bytes(mut i), Item::Bytes(mut j)) => {
-              i.append(&mut j);
-              Ok(Item::Bytes(i))
-          }
-          (i, j) => {
-              let i = coll::Sized::try_from(i)?;
-              let j = coll::Sized::try_from(j)?;
-              Ok(i.join(j)?.into())
-          }
-      }
+      let i = coll::Sized::try_from(i)?;
+      let j = coll::Sized::try_from(j)?;
+      Ok(i.join(j)?.into())
   }
 
   pub fn pack(mut env: Environment) -> Future<Environment> {
@@ -2390,11 +2414,19 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn is_string(i: Item) -> ItemResult {
-      Ok(Item::from(matches!(i, Item::String(_))))
+      Ok(Item::from(matches!(
+          i,
+          Item::Iterable(coll::Iterable::Sized(coll::Sized::String(_)))
+              | Item::Packable(coll::Packable::Sized(coll::Sized::String(_)))
+      )))
   }
 
   pub fn is_bytes(i: Item) -> ItemResult {
-      Ok(Item::from(matches!(i, Item::Bytes(_))))
+      Ok(Item::from(matches!(
+          i,
+          Item::Iterable(coll::Iterable::Sized(coll::Sized::Bytes(_)))
+              | Item::Packable(coll::Packable::Sized(coll::Sized::Bytes(_)))
+      )))
   }
 
   pub fn is_error(i: Item) -> ItemResult {
@@ -2894,7 +2926,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn emit(i: Item) -> ItemResult {
-      Ok(Item::String(serialize::emit(&i)))
+      Ok(Item::Iterable(coll::Iterable::Sized(coll::Sized::String(
+          serialize::emit(&i),
+      ))))
   }
 
   fn check_type(i: &Item, w: Word) -> Result<(), Error> {
@@ -2903,8 +2937,17 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           (w, Item::Int(_)) if w == *S_INTEGER || w == *S_NUMBER => Ok(()),
           (w, Item::Float(_)) if w == *S_FLOAT || w == *S_NUMBER => Ok(()),
           // TODO: also handle cases where bytes/string is a list
-          (w, Item::Bytes(_)) if w == *S_BYTES => Ok(()),
-          (w, Item::String(_)) if w == *S_STRING => Ok(()),
+          (
+              w,
+              Item::Iterable(coll::Iterable::Sized(coll::Sized::Bytes(_)))
+              | Item::Packable(coll::Packable::Sized(coll::Sized::Bytes(_))),
+          ) if w == *S_BYTES => Ok(()),
+
+          (
+              w,
+              Item::Iterable(coll::Iterable::Sized(coll::Sized::String(_)))
+              | Item::Packable(coll::Packable::Sized(coll::Sized::String(_))),
+          ) if w == *S_STRING => Ok(()),
           (w, Item::Word(_)) if w == *S_WORD => Ok(()),
 
           (
@@ -3077,15 +3120,31 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   fn bytes(i: Item) -> ItemResult {
       match i {
-          Item::String(s) => Ok(Item::Bytes(Bytes::from(s.as_bytes()))),
-          i => Ok(Item::Bytes(Bytes::from(serialize::emit(&i)))),
+          Item::Iterable(coll::Iterable::Sized(coll::Sized::String(s))) => {
+              Ok(s.as_bytes().to_vec().into())
+          }
+          Item::Packable(coll::Packable::Sized(coll::Sized::String(s))) => {
+              Ok(s.as_bytes().to_vec().into())
+          }
+          i => Ok(Bytes::from(serialize::emit(&i)).into()),
       }
   }
 
   fn string(i: Item) -> ItemResult {
       match i {
-          Item::Bytes(b) => Ok(Item::String(std::str::from_utf8(&b).unwrap().to_string())),
-          i => Ok(Item::String(serialize::emit(&i))),
+          Item::Iterable(coll::Iterable::Sized(coll::Sized::Bytes(b))) => {
+              Ok(Item::Iterable(coll::Iterable::Sized(coll::Sized::String(
+                  std::str::from_utf8(&b).unwrap().to_string(),
+              ))))
+          }
+          Item::Packable(coll::Packable::Sized(coll::Sized::Bytes(b))) => {
+              Ok(Item::Packable(coll::Packable::Sized(coll::Sized::String(
+                  std::str::from_utf8(&b).unwrap().to_string(),
+              ))))
+          }
+          i => Ok(Item::Iterable(coll::Iterable::Sized(coll::Sized::String(
+              serialize::emit(&i),
+          )))),
       }
   }
 
@@ -3097,7 +3156,15 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   fn get_error(env: &Environment) -> Option<Error> {
-      env.stack.front().and_then(|i| i.clone().try_into().ok())
+      env.stack.front().and_then(|i| match i {
+          Item::Iterable(coll::Iterable::Sized(coll::Sized::Associative(
+              assoc::Associative::Error(e),
+          ))) => Some(e.clone()),
+          Item::Packable(coll::Packable::Sized(coll::Sized::Associative(
+              assoc::Associative::Error(e),
+          ))) => Some(e.clone()),
+          _ => None,
+      })
   }
 
   fn unwind(mut env: Environment) -> Environment {
@@ -3308,29 +3375,38 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           Err(e) => env.push(e.into()).into(),
       }
   }
-
+  fn xor_(i: Bytes, j: Bytes) -> Bytes {
+      let len = std::cmp::max(i.len(), j.len());
+      let mut result = Vec::with_capacity(len);
+      for (byte_i, byte_j) in i
+          .iter()
+          .chain(std::iter::repeat(&0).take(len - i.len()))
+          .zip(j.iter().chain(std::iter::repeat(&0).take(len - j.len())))
+      {
+          result.push(byte_i ^ byte_j);
+      }
+      result
+  }
   pub fn xor(i: Item, j: Item) -> ItemResult {
       match (i, j) {
           (Item::Int(i), Item::Int(j)) => Ok(Item::Int(i ^ j)),
-          (Item::Bytes(i), Item::Bytes(j)) => Ok(Item::Bytes({
-              let len = std::cmp::max(i.len(), j.len());
-              let mut result = Vec::with_capacity(len);
-              for (byte_i, byte_j) in i
-                  .iter()
-                  .chain(std::iter::repeat(&0).take(len - i.len()))
-                  .zip(j.iter().chain(std::iter::repeat(&0).take(len - j.len())))
-              {
-                  result.push(byte_i ^ byte_j);
-              }
-              result
-          })),
+          (
+              Item::Iterable(coll::Iterable::Sized(coll::Sized::Bytes(i))),
+              Item::Iterable(coll::Iterable::Sized(coll::Sized::Bytes(j))),
+          ) => Ok(xor_(i, j).into()),
+          (
+              Item::Packable(coll::Packable::Sized(coll::Sized::Bytes(i))),
+              Item::Packable(coll::Packable::Sized(coll::Sized::Bytes(j))),
+          ) => Ok(xor_(i, j).into()),
           (i, j) => Err(Error::expected("integers", pair(i, j))),
       }
   }
 
   pub fn inspect(i: Item) -> ItemResult {
       let s = format!("{:?}", i);
-      Ok(Item::String(s))
+      Ok(Item::Iterable(coll::Iterable::Sized(coll::Sized::String(
+          s,
+      ))))
   }
 #+end_src
 ** Top level execution
@@ -3959,7 +4035,7 @@ How to interact with files on disk
   use crate::pipes::closed_error;
   use crate::types::associative as assoc;
   use crate::types::error::Error;
-  use crate::types::Item;
+  use crate::types::*;
   use futures::Stream;
   use std::future;
   use std::pin::Pin;
@@ -3999,11 +4075,11 @@ How to interact with files on disk
           &'a mut self,
           i: Item,
       ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
-          match i {
-              Item::Bytes(bs) => {
-                  Box::pin(async move { self.file.write_all(&bs).await.map_err(|e| e.into()) })
-              }
-              i => Box::pin(future::ready(Err(Error::expected("bytes", i)))),
+          let b = Bytes::try_from(i);
+
+          match b {
+              Ok(bs) => Box::pin(async move { self.file.write_all(&bs).await.map_err(|e| e.into()) }),
+              Err(e) => Box::pin(future::ready(Err(e))),
           }
       }
 
@@ -4020,7 +4096,7 @@ How to interact with files on disk
                   // EOF, no more takes since it's static
                   self.closed = true;
               }
-              Ok(Item::Bytes(bs[0..ct].to_vec()))
+              Ok(bs[0..ct].to_vec().into())
           })
       }
   }
@@ -4043,7 +4119,7 @@ How to interact with files on disk
                       self.closed = true;
                       Poll::Ready(None)
                   } else {
-                      Poll::Ready(Some(Ok(Item::Bytes(read_buf.filled().to_owned()))))
+                      Poll::Ready(Some(Ok(read_buf.filled().to_owned().into())))
                   }
               }
               Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e.into()))),
@@ -4056,7 +4132,7 @@ How to interact with files on disk
       fn representation(&self) -> Item {
           assoc::Association::from_iter([
               ("type".into(), "pipe".into()),
-              ("file".into(), Item::String(self.path.clone())),
+              ("file".into(), self.path.clone().into()),
           ])
           .into()
       }
@@ -4140,12 +4216,12 @@ How to interact with the network (TCP/IP sockets)
           &'a mut self,
           i: Item,
       ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
-          match i {
-              Item::Bytes(bs) => {
-                  //let mut socket = self.socket.clone();
+          let b = types::Bytes::try_from(i);
+          match b {
+              Ok(bs) => {
                   Box::pin(async move { self.socket.write_all(&bs).await.map_err(|e| e.into()) })
               }
-              i => Box::pin(future::ready(Err(Error::expected("bytes", i)))),
+              Err(e) => Box::pin(future::ready(Err(e))),
           }
       }
 
@@ -4161,7 +4237,7 @@ How to interact with the network (TCP/IP sockets)
               if n == 0 {
                   self.closed = true;
               }
-              Ok(Item::Bytes(bs[..n].to_vec()))
+              Ok(bs[..n].to_vec().into())
           })
       }
   }
@@ -4171,7 +4247,7 @@ How to interact with the network (TCP/IP sockets)
           assoc::Association::from_iter([
               ("type".into(), "tunnel".into()),
               ("realm".into(), "tcp".into()),
-              ("address".into(), Item::String(self.addr.to_string())),
+              ("address".into(), self.addr.to_string().into()),
           ])
           .into()
       }
