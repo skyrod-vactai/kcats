@@ -2799,21 +2799,64 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }
   }
 
-  pub fn assign(m: Item, ks: Item, v: Item) -> ItemResult {
-      let mut kit = coll::List::try_from(ks).unwrap();
-      let ks = coll::Arc::make_mut(&mut kit).drain(..);
-      let mut ksvec: assoc::KeyList = assoc::KeyList::try_from_iter(ks)?;
-      ksvec.make_mut().make_contiguous();
-      let (ks, _) = ksvec.as_slices();
-      Ok(assoc_in(m, ks, v)?)
+  fn unassoc_in(i: Item, ks: &[assoc::KeyItem]) -> Result<Item, Error> {
+      if let [k, ks @ ..] = ks {
+          if ks.is_empty() {
+              let a = assoc::Associative::try_from(i)?;
+              Ok(a.remove(&k).0.into())
+          } else {
+              match (i, k) {
+                  (
+                      Item::Iterable(coll::Iterable::Sized(coll::Sized::List(mut l))),
+                      assoc::KeyItem::Int(k),
+                  ) => {
+                      let lm = l.make_mut();
+                      let old_value = if let Some(item) = lm.get_mut(*k as usize) {
+                          mem::replace(item, coll::NOTHING)
+                      } else {
+                          return Err(Error::short_list(k.clone())); // replace with your error
+                      };
+                      let new_value = unassoc_in(old_value, ks)?;
+                      lm[*k as usize] = new_value;
+                      Ok(l.into())
+                  }
+                  (a, k) => {
+                      let a: assoc::Associative = a.try_into()?;
+                      let mut a: assoc::Association = a.into_iter().collect();
+                      let am = a.make_mut();
+                      let mut res: Option<Result<_, Error>> = None;
+                      am.entry(k.clone()).and_modify(|v| {
+                          let new_value = unassoc_in(v.clone(), ks);
+                          res = Some(new_value.map(|nv| {
+                              ,*v = nv;
+                          }));
+                      });
+                      if let Some(Err(e)) = res {
+                          return Err(e);
+                      }
+                      Ok(a.into())
+                  }
+              }
+          }
+      } else {
+          Ok(i)
+      }
   }
 
-  //TODO: this should really take a keylist like assign and lookup
-  pub fn unassign(m: Item, k: Item) -> ItemResult {
-      let m = assoc::Associative::try_from(m).unwrap();
-      let k = assoc::KeyItem::try_from(k)?;
-      let (nm, _) = m.remove(&k);
-      Ok(nm.into())
+  pub fn assign(m: Item, ks: Item, v: Item) -> ItemResult {
+      let mut kit = coll::List::try_from(ks)?;
+      let mut ksvec: assoc::KeyList = assoc::KeyList::try_from_iter(kit.inner().into_iter())?;
+      ksvec.make_mut().make_contiguous();
+      let (ks, _) = ksvec.as_slices();
+      assoc_in(m, ks, v)
+  }
+
+  pub fn unassign(m: Item, ks: Item) -> ItemResult {
+      let mut kit = coll::List::try_from(ks)?;
+      let mut ksvec: assoc::KeyList = assoc::KeyList::try_from_iter(kit.inner().into_iter())?;
+      ksvec.make_mut().make_contiguous();
+      let (ks, _) = ksvec.as_slices();
+      unassoc_in(m, ks)
   }
 
   pub fn association(m: Item) -> ItemResult {
