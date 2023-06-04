@@ -3893,18 +3893,27 @@ The basic pipe contracts.
   }
 
   impl In {
-      pub fn put(self, i: Item) -> types::Future<Result<(), Error>> {
+      pub fn put(&mut self, i: Item) -> types::Future<Result<(), Error>> {
           match self {
-              In::StaticFile(f) => Box::pin(async move { f.write().await.put(i).await }),
-              In::Socket(f) => Box::pin(async move { f.write().await.put(i).await }),
-              In::Handoff(f) => Box::pin(f.put(i)), //_ => Err(Error::expected("foo")),
+              In::StaticFile(f) => {
+                  let f = f.clone();
+                  Box::pin(async move { f.write().await.put(i).await })
+              }
+              In::Socket(f) => {
+                  let f = f.clone();
+                  Box::pin(async move { f.write().await.put(i).await })
+              }
+              In::Handoff(ref mut h) => Box::pin(h.put(i)), //_ => Err(Error::expected("foo")),
           }
       }
-      fn close(self) -> types::Future<Result<(), Error>> {
+      fn close(self) -> types::Future<Result<Self, Error>> {
           match self {
-              In::StaticFile(f) => Box::pin(async move { f.write().await.close() }),
-              In::Socket(_) => Box::pin(async move { Ok(()) }),
-              In::Handoff(_) => Box::pin(async move { Ok(()) }),
+              In::Handoff(mut h) => Box::pin(async move {
+                  //println!("Closing (dropping sender)!");
+                  h.sender = None;
+                  Ok(In::Handoff(h))
+              }),
+              i => Box::pin(future::ready(Ok(i))),
           }
       }
       fn is_closed(self) -> types::Future<bool> {
@@ -3921,26 +3930,67 @@ The basic pipe contracts.
           match self {
               Tunnel::StaticFile(f) => Box::pin(async move { f.read().await.is_closed() }),
               Tunnel::Socket(_) => Box::pin(async move { false }),
-              Tunnel::Handoff(_) => Box::pin(async move { false }),
+              Tunnel::Handoff(_) => Box::pin(async move { false }), //TODO: fix this
+          }
+      }
+
+      pub fn put(&mut self, i: Item) -> types::Future<Result<(), Error>> {
+          match self {
+              Tunnel::StaticFile(f) => {
+                  let f = f.clone();
+                  Box::pin(async move { f.write().await.put(i).await })
+              }
+              Tunnel::Socket(f) => {
+                  let f = f.clone();
+                  Box::pin(async move { f.write().await.put(i).await })
+              }
+              Tunnel::Handoff(ref mut h) => Box::pin(h.put(i)),
+          }
+      }
+
+      pub fn take(&mut self) -> types::Future<Result<Option<Item>, Error>> {
+          match self {
+              Tunnel::StaticFile(f) => {
+                  let f = f.clone();
+                  Box::pin(async move { f.write().await.take().await })
+              }
+              Tunnel::Socket(f) => {
+                  let f = f.clone();
+                  Box::pin(async move { f.write().await.take().await })
+              }
+              Tunnel::Handoff(ref mut h) => Box::pin(h.take()),
           }
       }
   }
 
   impl Out {
-      pub fn take(self) -> types::Future<ItemResult> {
+      pub fn take(&mut self) -> types::Future<Result<Option<Item>, Error>> {
           match self {
-              Out::StaticFile(f) => Box::pin(async move { f.write().await.take().await }),
-              Out::Socket(f) => Box::pin(async move { f.write().await.take().await }),
-              Out::ServerSocket(f) => Box::pin(async move { f.write().await.take().await }),
-              Out::Handoff(h) => Box::pin(h.take()),
+              Out::StaticFile(f) => {
+                  let f = f.clone();
+                  Box::pin(async move { f.write().await.take().await })
+              }
+              Out::Socket(f) => {
+                  let f = f.clone();
+                  Box::pin(async move { f.write().await.take().await })
+              }
+              Out::ServerSocket(f) => {
+                  let f = f.clone();
+                  Box::pin(async move { f.write().await.take().await })
+              }
+              Out::Handoff(ref mut h) => Box::pin(h.take()),
           }
       }
-      pub fn close(self) -> types::Future<Result<(), Error>> {
+
+      pub fn close(self) -> types::Future<Result<Self, Error>> {
           match self {
-              Out::StaticFile(f) => Box::pin(async move { f.write().await.close() }),
-              Out::Socket(f) => Box::pin(async move { f.write().await.close() }),
-              Out::ServerSocket(f) => Box::pin(async move { f.write().await.close() }),
-              Out::Handoff(_) => Box::pin(future::ready(Ok(()))),
+              Out::Handoff(mut h) => Box::pin(async move {
+                  //println!("Closing (dropping receiver)!");
+                  h.receiver = None; //drop this instance of the handoff, signaling close
+                  Ok(Out::Handoff(h))
+              }),
+              // TODO: make sockets use Option to drop on close
+              o => Box::pin(future::ready(Ok(o))),
           }
       }
       pub fn is_closed(self) -> types::Future<bool> {
@@ -4055,14 +4105,14 @@ The basic pipe contracts.
       match i {
           Item::Packable(coll::Packable::In(p)) => Box::pin(async move {
               Ok({
-                  p.clone().close().await.unwrap();
-                  p.into()
+                  println!("Closing In");
+                  p.close().await.unwrap().into()
               })
           }),
           Item::Iterable(coll::Iterable::Out(p)) => Box::pin(async move {
               Ok({
-                  p.clone().close().await.unwrap();
-                  p.into()
+                  println!("Closing Out");
+                  p.close().await.unwrap().into()
               })
           }),
           i => Box::pin(future::ready(Err(Error::expected("pipe", i)))),
@@ -4121,9 +4171,9 @@ How to interact with files on disk
   }
 
   impl StaticFile {
-      pub fn close(&mut self) -> Result<(), Error> {
+      pub fn close(mut self) -> Result<Self, Error> {
           self.closed = true;
-          Ok(())
+          Ok(self)
       }
 
       pub fn is_closed(&self) -> bool {
@@ -4144,7 +4194,7 @@ How to interact with files on disk
 
       pub fn take<'a>(
           &'a mut self,
-      ) -> Pin<Box<dyn std::future::Future<Output = ItemResult> + Send + 'a>> {
+      ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Item>, Error>> + Send + 'a>> {
           if self.is_closed() {
               return Box::pin(future::ready(Err(closed_error(true))));
           }
@@ -4154,8 +4204,10 @@ How to interact with files on disk
               if ct == 0 {
                   // EOF, no more takes since it's static
                   self.closed = true;
+                  Ok(None)
+              } else {
+                  Ok(Some(bs[0..ct].to_vec().into()))
               }
-              Ok(bs[0..ct].to_vec().into())
           })
       }
   }
@@ -4286,7 +4338,7 @@ How to interact with the network (TCP/IP sockets)
 
       pub fn take<'a>(
           &'a mut self,
-      ) -> Pin<Box<dyn std::future::Future<Output = ItemResult> + Send + 'a>> {
+      ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Item>, Error>> + Send + 'a>> {
           if self.is_closed() {
               return Box::pin(future::ready(Err(closed_error(true))));
           }
@@ -4295,8 +4347,10 @@ How to interact with the network (TCP/IP sockets)
               let n = self.socket.read(&mut bs).await?;
               if n == 0 {
                   self.closed = true;
+                  Ok(None)
+              } else {
+                  Ok(Some(bs[..n].to_vec().into()))
               }
-              Ok(bs[..n].to_vec().into())
           })
       }
   }
@@ -4337,19 +4391,21 @@ How to interact with the network (TCP/IP sockets)
 
       pub fn take<'a>(
           &'a mut self,
-      ) -> Pin<Box<dyn std::future::Future<Output = ItemResult> + Send + 'a>> {
+      ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Item>, Error>> + Send + 'a>> {
           if self.is_closed() {
               return Box::pin(future::ready(Err(closed_error(true))));
           }
           Box::pin(async move {
               let (socket, addr) = self.socket.accept().await?;
 
-              Ok(super::Tunnel::Socket(Arc::new(RwLock::new(Socket {
-                  socket,
-                  addr,
-                  closed: false,
-              })))
-              .into())
+              Ok(Some(
+                  super::Tunnel::Socket(Arc::new(RwLock::new(Socket {
+                      socket,
+                      addr,
+                      closed: false,
+                  })))
+                  .into(),
+              ))
           })
       }
   }
@@ -4406,53 +4462,73 @@ How to interact with the network (TCP/IP sockets)
 **** Channels
 Implement the =handoff= type
 #+begin_src rust :tangle src/pipes/channel.rs
-  use crate::axiom::ItemResult;
   use crate::pipes;
   use crate::types::associative as assoc;
-  use crate::types::collection as coll;
   use crate::types::environment::Environment;
   use crate::types::error::Error;
   use crate::types::{self, Item};
   use flume;
+  use std::future;
   use std::ptr;
 
   #[derive(Debug, Clone)]
-  pub struct Handoff<T>(flume::Sender<T>, flume::Receiver<T>);
+  // Use Option because we want to be able to drop senders/receivers to
+  // close the channel
+  pub struct Handoff<T> {
+      pub receiver: Option<flume::Receiver<T>>,
+      pub sender: Option<flume::Sender<T>>,
+  }
 
   impl<T> PartialEq for Handoff<T> {
       fn eq(&self, other: &Self) -> bool {
           // Check if the 'file' fields of both structs are the same by reference
-          ptr::eq(&self.0, &other.0) && ptr::eq(&self.1, &other.1)
+          match (&self.receiver, &other.receiver, &self.sender, &other.sender) {
+              (Some(sr), Some(or), Some(ss), Some(os)) => ptr::eq(&sr, &or) && ptr::eq(&ss, &os),
+              _ => false,
+          }
       }
-  }
-
-  #[derive(Debug, Clone, PartialEq)]
-  pub struct Filled {
-      contents: coll::List,
   }
 
   impl Handoff<Item> {
       pub fn new() -> Handoff<Item> {
-          let (in_, out) = flume::bounded::<Item>(0);
-          Handoff(in_, out)
+          let (sender, receiver) = flume::bounded::<Item>(0);
+          Handoff::<Item> {
+              sender: Some(sender),
+              receiver: Some(receiver),
+          }
       }
 
-      pub fn put(self, i: Item) -> types::Future<Result<(), Error>> {
-          Box::pin(async move {
-              self.0
-                  .send_async(i)
-                  .await
-                  .map_err(|_| pipes::closed_error(false))
-          })
+      pub fn put(&mut self, i: Item) -> types::Future<Result<(), Error>> {
+          if let Some(ch) = self.sender.clone() {
+              // Can't send and receive in the same channel in same thread
+              if !self.receiver.is_none() {
+                  //println!("Dropping receiver");
+                  self.receiver = None;
+              }
+              Box::pin(async move {
+                  ch.send_async(i)
+                      .await
+                      .map_err(|_| pipes::closed_error(false))
+              })
+          } else {
+              Box::pin(future::ready(Err(pipes::closed_error(false))))
+          }
       }
 
-      pub fn take(self) -> types::Future<ItemResult> {
-          Box::pin(async move {
-              self.1
-                  .recv_async()
-                  .await
-                  .map_err(|_| pipes::closed_error(true))
-          })
+      pub fn take(&mut self) -> types::Future<Result<Option<Item>, Error>> {
+          if let Some(ch) = self.receiver.clone() {
+              // Can't send and receive in the same channel in same thread
+              if !self.sender.is_none() {
+                  //println!("Dropping sender");
+                  self.sender = None;
+              }
+              Box::pin(async move {
+                  //println!("Receiving");
+                  ch.recv_async().await.map(Some).or_else(|_| Ok(None))
+              })
+          } else {
+              Box::pin(future::ready(Ok(None)))
+          }
       }
   }
 
@@ -5713,7 +5789,7 @@ It's still implemented as generic Hashmap data field.
 #+end_src
 
 #+RESULTS:
-: [[secret #b64 "LCa0a2j/xo/5m0U8HTBBNBNCLXBkg7+g+YpeiGJm564="] [public #b64 "NNJledu0Vmk+VAZyz5IvUt3g1lMuNb8GvgE6fFMvIOA="] [type ec-keypair]]
+: [[public #b64 "NNJledu0Vmk+VAZyz5IvUt3g1lMuNb8GvgE6fFMvIOA="] [type elliptic-curve-key] [secret #b64 "LCa0a2j/xo/5m0U8HTBBNBNCLXBkg7+g+YpeiGJm564="]]
 
 **** DONE Signing
 #+begin_src kcats :results code
@@ -5970,7 +6046,29 @@ The possibility that these words might block, and you don't know
 except by the argument type, is a bit off-putting, and maybe these
 should be different words? I don't know, the contract is to "take
 thing out of other thing" and sometimes that's instant and sometimes
-it isn't. There should be a nonblocking version
+it isn't. (You can ask if the object is a pipe before taking)
+
+=step= should work on pipes. It continues until the pipe closes. How do
+we write step in terms of take? The problem is we don't know when to
+stop. We know if a collection is empty, but we need to know if a pipe
+is closed. The way pipes work now is that if something goes wrong, it
+produces an error from the pipe. That's ok for pipes, where we're ok
+with the limitation that you can't tell whether the error was
+generated during the take or was the actual data sent. However when
+dealing with lists, errors are never generated, they're always the
+item in the list. We want step to treat both errors and =nothing= as
+actual items and not a flag value for error conditions
+
+OK here's a plan: Result<Option<Item>>.  If the pipe is closed, return
+Ok(None), if error return Err. The way we differentiate between Errors
+in a list and Errors that just happened, is already implemented: via
+the 'handled' field of the Error. So if there's a error in the list,
+it'll have handled=true and it won't cause the expression to
+unwind. If it's an actual error reading from the underlying data,
+it'll have handled=false and unwind. This will also allow us to
+support Nothing in lists and pipes, we won't reserve it as a sentinel
+value.
+
 **** INPROGRESS make a polymorphic 'join'
 :LOGBOOK:
 CLOCK: [2023-01-04 Wed 05:48]--[2023-01-04 Wed 07:26] =>  1:38
@@ -6011,6 +6109,8 @@ strings.
 Might have to do something similar with byte, but a byte array can
 also be thought of as an array of ints (8 bit unsigned), and we
 already have an integer type (even though it holds more bits).
+*** TODO implement sleep
+helps with debugging multithreading
 *** TODO handoff take
 This should block, not error
 #+begin_src kcats
@@ -6019,3 +6119,36 @@ handoff take
 
 #+RESULTS:
 : [[reason "type mismatch"] [unwound [unpack]] [type error] [asked [list]] [actual [[type pipe] [handoff todo: id-or-hash here]]] [handled true]] [[handoff todo: id-or-hash here] [type pipe]]
+
+#+begin_src kcats
+  handoff [1 2 +] future take 
+#+end_src
+
+#+RESULTS:
+: [3 [[type pipe] [handoff todo: id-or-hash here]]] [[handoff todo: id-or-hash here] [type pipe]] [[handoff todo: id-or-hash here] [type pipe]]
+
+#+begin_src kcats
+handoff clone [snapshot] dip swap [1 put 2 put] join [[] [expression]] dip assign environment animate take [take] dip +
+#+end_src
+
+#+RESULTS:
+: 3 [[type pipe] [handoff todo: id-or-hash here]] [[type pipe] [handoff todo: id-or-hash here]]
+
+#+begin_src kcats
+  [[1 2 3] [put] step close] handoff clone ; p h h
+  [wrap swap join [[] [expression]] dip assign environment animate] dip
+  take discard 
+  take discard 
+  take discard
+  take
+  ;;[snapshot] dip swap  join [[] [expression]] dip assign environment animate take [take] dip +
+#+end_src
+
+#+RESULTS:
+: Dropping sender
+: Receiving
+: Dropping receiver
+: Receiving
+: Receiving
+: Receiving
+: [] [[type pipe] [handoff todo: id-or-hash here]]
