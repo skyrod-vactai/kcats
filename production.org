@@ -26,7 +26,7 @@ from stdin and execute it, then print the resulting stack.
 #+begin_src toml :tangle Cargo.toml
   [package]
   name = "kcats"
-  version = "0.1.2"
+  version = "0.2.0"
   edition = "2021"
 
   # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -476,17 +476,34 @@ internally, to keep track of things like the stack, expression, lists etc.
   pub const NOTHING: Item = Item::Iterable(Iterable::Sized(Sized::Nothing));
 
   impl Iterable {
-      pub fn take(self) -> Future<(Iterable, Item)> {
+      pub fn take(self) -> Future<(Iterable, Option<Item>)> {
           match self {
               Iterable::Sized(s) => Box::pin(future::ready(s.take())),
-              Iterable::Out(o) => Box::pin({
-                  let o2 = o.clone();
-                  o.take().map(|r| (Iterable::Out(o2), r.into()))
+              Iterable::Out(mut o) => Box::pin({
+                  let i = o.take();
+                  i.map(|r| {
+                      (
+                          Iterable::Out(o),
+                          match r {
+                              Ok(Some(i)) => Some(i),
+                              Ok(None) => None,
+                              Err(e) => Some(Item::from(e)),
+                          },
+                      )
+                  })
               }),
-              Iterable::Tunnel(t) => Box::pin({
-                  let t2 = t.clone();
-                  let o: Out = t.into();
-                  o.take().map(|r| (Iterable::Tunnel(t2), r.into()))
+              Iterable::Tunnel(mut t) => Box::pin({
+                  let i = t.take();
+                  i.map(|r| {
+                      (
+                          Iterable::Tunnel(t),
+                          match r {
+                              Ok(Some(i)) => Some(i),
+                              Ok(None) => None,
+                              Err(e) => Some(Item::from(e)),
+                          },
+                      )
+                  })
               }),
           }
       }
@@ -507,22 +524,22 @@ internally, to keep track of things like the stack, expression, lists etc.
           }
       }
 
-      pub fn take(self) -> (Iterable, Item) {
+      pub fn take(self) -> (Iterable, Option<Item>) {
           match self {
               Sized::Associative(a) => a.take(),
               Sized::List(mut l) => {
                   let lm = l.make_mut();
-                  let i = lm.pop_front().unwrap_or_default();
+                  let i = lm.pop_front();
                   (Iterable::Sized(Sized::List(l)), i)
               }
-              Sized::Nothing => (Iterable::Sized(Sized::Nothing), NOTHING),
+              Sized::Nothing => (Iterable::Sized(Sized::Nothing), None),
               Sized::String(mut s) => {
-                  let i = s.pop().unwrap_or_default();
-                  (Iterable::Sized(Sized::String(s)), Item::Char(i))
+                  let i = s.pop().map(Item::Char);
+                  (Iterable::Sized(Sized::String(s)), i)
               }
               Sized::Bytes(mut b) => {
-                  let i = b.pop().unwrap_or_default();
-                  (Iterable::Sized(Sized::Bytes(b)), (i as Int).into())
+                  let i = b.pop().map(|b| Item::Int(b as i64));
+                  (Iterable::Sized(Sized::Bytes(b)), i)
               }
           }
       }
@@ -585,14 +602,10 @@ internally, to keep track of things like the stack, expression, lists etc.
       pub fn put(self, i: Item) -> Future<Result<Packable, Error>> {
           match self {
               Packable::Sized(s) => Box::pin(future::ready(s.put(i).map(Packable::Sized))),
-              Packable::In(p) => {
-                  let p2 = p.clone();
-                  Box::pin(p.put(i).map(|r| r.map(|_| Packable::In(p2))))
-              }
-              Packable::Tunnel(t) => {
-                  let t2 = t.clone();
-                  let p = pipe::In::from(t);
-                  Box::pin(p.put(i).map(|r| r.map(|_| Packable::Tunnel(t2))))
+              Packable::In(mut p) => Box::pin(p.put(i).map(|r| r.map(|_| Packable::In(p)))),
+              Packable::Tunnel(mut t) => {
+                  let p = t.put(i);
+                  Box::pin(p.map(|r| r.map(|_| Packable::Tunnel(t))))
               }
           }
       }
@@ -1010,18 +1023,14 @@ internally, to keep track of things like the stack, expression, lists etc.
           }
       }
 
-      pub fn take(self) -> (coll::Iterable, Item) {
+      pub fn take(self) -> (coll::Iterable, Option<Item>) {
           match self {
               Associative::Assoc(mut a) => {
-                  let i = a
-                      .inner()
-                      .drain()
-                      .next()
-                      .map(|v| v.into())
-                      .unwrap_or_default();
+                  let maybe_key = a.inner().keys().next().cloned();
+                  let maybe_value = maybe_key.and_then(|key| a.inner().remove(&key));
                   (
                       coll::Iterable::Sized(coll::Sized::Associative(Associative::Assoc(a))),
-                      i,
+                      maybe_value.map(|v| v.into()),
                   )
               }
               _ => unimplemented!(),
@@ -2596,7 +2605,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                           let (c, i) = f.await;
                           let stack = env.stack.make_mut();
                           stack.push_front(c.into());
-                          stack.push_front(i);
+                          stack.push_front(i.unwrap_or_default());
                           env
                       })
                   }
@@ -2650,20 +2659,22 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn step(mut env: Environment) -> Future<Environment> {
       let p = coll::List::try_from(env.pop()).unwrap();
-      let mut l = coll::List::try_from(env.pop()).unwrap();
-      let lm = l.make_mut();
-      if let Some(litem) = lm.pop_front() {
-          let expr = coll::Arc::make_mut(&mut env.expression);
-          if !l.is_empty() {
+      let it = coll::Iterable::try_from(env.pop()).unwrap();
+      Box::pin(async move {
+          if let (it, Some(litem)) = it.take().await {
+              let expr = env.expression.make_mut();
+              // prepare the next iteration, even if the iterator is now
+              // empty
               expr.push_front("step".into());
               expr.push_front(p.clone().into());
-              expr.push_front(l.into());
+              expr.push_front(it.into());
+              expr.push_front("execute".into());
+
+              env.push(litem).push(p.into()).into()
+          } else {
+              env.into()
           }
-          expr.push_front("execute".into());
-          env.push(litem).push(p.into()).into()
-      } else {
-          env.into()
-      }
+      })
   }
 
   pub fn range(mut env: Environment) -> Future<Environment> {
@@ -3762,7 +3773,6 @@ We'll also define how to run unit tests.
       #[test_case("times")]
       #[test_case("type")]
       #[test_case("unassign")]
-      #[test_case("take")]
       #[test_case("unwrap")]
       #[test_case("update")]
       #[test_case("value")]
@@ -6031,7 +6041,7 @@ read-write. Pipes in general do not support peeking.
 Collections (lists, maps, sets etc) support all of them.
 
 It's not clear how to support overlapping functionality in an enum.
-**** TODO pipe as list-like thing
+**** INPROGRESS pipe as list-like thing
 Are both words =put= and =pack= needed (similarly =take= and =unpack=)? Seems
 like the former should be all that's needed. That starts to address
 that pack/unpack aren't inverse (they shouldn't be because it's really
@@ -6068,6 +6078,10 @@ unwind. If it's an actual error reading from the underlying data,
 it'll have handled=false and unwind. This will also allow us to
 support Nothing in lists and pipes, we won't reserve it as a sentinel
 value.
+**** DONE Step accepts pipes
+**** TODO Set close = discard
+**** TODO Remove closed? 
+***** TODO Write assemble in terms of step
 
 **** INPROGRESS make a polymorphic 'join'
 :LOGBOOK:
@@ -6135,20 +6149,11 @@ handoff clone [snapshot] dip swap [1 put 2 put] join [[] [expression]] dip assig
 : 3 [[type pipe] [handoff todo: id-or-hash here]] [[type pipe] [handoff todo: id-or-hash here]]
 
 #+begin_src kcats
-  [[1 2 3] [put] step close] handoff clone ; p h h
-  [wrap swap join [[] [expression]] dip assign environment animate] dip
-  take discard 
-  take discard 
-  take discard
-  take
+    [[1 2 3] [put] step close] handoff clone ; p h h
+    [wrap swap join [[] [expression]] dip assign environment animate] dip
+    0 swap [+] step
   ;;[snapshot] dip swap  join [[] [expression]] dip assign environment animate take [take] dip +
 #+end_src
 
 #+RESULTS:
-: Dropping sender
-: Receiving
-: Dropping receiver
-: Receiving
-: Receiving
-: Receiving
-: [] [[type pipe] [handoff todo: id-or-hash here]]
+: 6
