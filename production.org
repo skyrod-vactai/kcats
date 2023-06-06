@@ -662,6 +662,7 @@ internally, to keep track of things like the stack, expression, lists etc.
           match s {
               Sized::List(l) => Ok(l),
               Sized::Nothing => Ok(List::new()),
+              Sized::Associative(a) => Ok(List::from_iter(a.into_iter().map(Item::from))),
               i => Err(Error::expected("list", i.into())),
           }
       }
@@ -2058,15 +2059,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }
   }
 
-  fn f_stack1_async(
-      f: fn(Item) -> Future<ItemResult>,
-  ) -> impl Fn(Environment) -> Future<Environment> {
-      move |mut env: Environment| {
-          let x = env.pop();
-          Box::pin(f(x).map(|r| env.push(Item::from(r))))
-      }
-  }
-
   fn f_stack2_async(
       f: fn(Item, Item) -> Future<ItemResult>,
   ) -> impl Fn(Environment) -> Future<Environment> {
@@ -2117,15 +2109,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               ("bytes", Box::leak(Box::new(f_stack1(bytes)))),
               ("bytes?", Box::leak(Box::new(f_stack1(is_bytes)))),
               ("clone", Box::leak(Box::new(clone))),
-              (
-                  "close",
-                  Box::leak(Box::new(f_stack1_async(crate::pipes::close))),
-              ),
               ("ceil", Box::leak(Box::new(f_stack1(ceil)))),
-              (
-                  "closed?",
-                  Box::leak(Box::new(f_stack1_async(crate::pipes::is_closed))),
-              ),
               ("count", Box::leak(Box::new(f_stack1(count)))),
               ("dec", Box::leak(Box::new(f_stack1(dec)))),
               ("decide", Box::leak(Box::new(decide))),
@@ -3812,7 +3796,6 @@ can be impure. Everything else is a value.
 **** Basic Types
 The basic pipe contracts.
 #+begin_src rust :tangle src/pipes.rs
-  use crate::axiom::ItemResult;
   use crate::types::collection as coll;
   use crate::types::error::Error;
   use crate::types::{self, Item};
@@ -3916,34 +3899,9 @@ The basic pipe contracts.
               In::Handoff(ref mut h) => Box::pin(h.put(i)), //_ => Err(Error::expected("foo")),
           }
       }
-      fn close(self) -> types::Future<Result<Self, Error>> {
-          match self {
-              In::Handoff(mut h) => Box::pin(async move {
-                  //println!("Closing (dropping sender)!");
-                  h.sender = None;
-                  Ok(In::Handoff(h))
-              }),
-              i => Box::pin(future::ready(Ok(i))),
-          }
-      }
-      fn is_closed(self) -> types::Future<bool> {
-          match self {
-              In::StaticFile(f) => Box::pin(async move { f.read().await.is_closed() }),
-              In::Socket(_) => Box::pin(async move { false }), //TODO: actual impls
-              In::Handoff(_) => Box::pin(async move { false }),
-          }
-      }
   }
 
   impl Tunnel {
-      fn is_closed(self) -> types::Future<bool> {
-          match self {
-              Tunnel::StaticFile(f) => Box::pin(async move { f.read().await.is_closed() }),
-              Tunnel::Socket(_) => Box::pin(async move { false }),
-              Tunnel::Handoff(_) => Box::pin(async move { false }), //TODO: fix this
-          }
-      }
-
       pub fn put(&mut self, i: Item) -> types::Future<Result<(), Error>> {
           match self {
               Tunnel::StaticFile(f) => {
@@ -4094,39 +4052,6 @@ The basic pipe contracts.
           "attempt to use closed pipe",
           None,
       )
-  }
-
-  pub fn is_closed(i: Item) -> types::Future<ItemResult> {
-      match i {
-          Item::Packable(coll::Packable::In(p)) => {
-              Box::pin(async move { Ok(Item::from(p.is_closed().await)) })
-          }
-          Item::Iterable(coll::Iterable::Out(p)) => {
-              Box::pin(async move { Ok(Item::from(p.is_closed().await)) })
-          }
-          Item::Iterable(coll::Iterable::Tunnel(t)) => {
-              Box::pin(async move { Ok(Item::from(t.is_closed().await)) })
-          }
-          i => Box::pin(future::ready(Err(Error::expected("pipe", i)))),
-      }
-  }
-
-  pub fn close(i: Item) -> types::Future<ItemResult> {
-      match i {
-          Item::Packable(coll::Packable::In(p)) => Box::pin(async move {
-              Ok({
-                  println!("Closing In");
-                  p.close().await.unwrap().into()
-              })
-          }),
-          Item::Iterable(coll::Iterable::Out(p)) => Box::pin(async move {
-              Ok({
-                  println!("Closing Out");
-                  p.close().await.unwrap().into()
-              })
-          }),
-          i => Box::pin(future::ready(Err(Error::expected("pipe", i)))),
-      }
   }
 
   impl From<Tunnel> for Item {
@@ -6163,6 +6088,37 @@ Should make a word that creates an inner env with access to a handoff also prese
 
 #+RESULTS:
 : 6
+
+#+begin_src kcats
+    [[1 2 3] [put] step close] handoff clone ; p h h
+    [wrap swap join [[] [expression]] dip assign environment animate] dip
+    0 swap [+] step
+  ;;[snapshot] dip swap  join [[] [expression]] dip assign environment animate take [take] dip +
+#+end_src
+
+Read from one file and write to another 
+#+begin_src kcats
+  [[file "/tmp/bar"]] pipe-in
+  [[file "/tmp/foo"]] pipe-out 
+  [put] step
+#+end_src
+
+#+RESULTS:
+: [[type pipe] [file "/tmp/bar"]]
+
+As a library function
+#+begin_src kcats :results code
+  "/tmp/bar" "/tmp/foo" file-out [file-in] dip
+  [put] step close
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+Closing In
+[[file "/tmp/bar"] [type pipe]]
+#+end_src
+
+
 *** TODO Performance optimizations
 **** TODO Compile programs
 Here is how it could maybe be done. We already have a type StepFn
