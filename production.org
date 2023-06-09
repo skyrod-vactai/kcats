@@ -3873,8 +3873,6 @@ The basic pipe contracts.
   use crate::types::collection as coll;
   use crate::types::error::Error;
   use crate::types::{self, Item};
-  //use crate::ListContent;
-  use std::future;
   use std::sync::Arc;
   use tokio::sync::RwLock;
 
@@ -4023,26 +4021,6 @@ The basic pipe contracts.
               Out::Handoff(ref mut h) => Box::pin(h.take()),
           }
       }
-
-      pub fn close(self) -> types::Future<Result<Self, Error>> {
-          match self {
-              Out::Handoff(mut h) => Box::pin(async move {
-                  //println!("Closing (dropping receiver)!");
-                  h.receiver = None; //drop this instance of the handoff, signaling close
-                  Ok(Out::Handoff(h))
-              }),
-              // TODO: make sockets use Option to drop on close
-              o => Box::pin(future::ready(Ok(o))),
-          }
-      }
-      pub fn is_closed(self) -> types::Future<bool> {
-          match self {
-              Out::StaticFile(f) => Box::pin(async move { f.read().await.is_closed() }),
-              Out::Socket(f) => Box::pin(async move { f.read().await.is_closed() }),
-              Out::ServerSocket(f) => Box::pin(async move { f.read().await.is_closed() }),
-              Out::Handoff(_) => Box::pin(future::ready(false)),
-          }
-      }
   }
 
   impl crate::serialize::Display for In {
@@ -4150,7 +4128,6 @@ The basic pipe contracts.
 How to interact with files on disk
 #+begin_src rust :tangle src/pipes/fs.rs
   use crate::axiom::ItemResult;
-  use crate::pipes::closed_error;
   use crate::types::associative as assoc;
   use crate::types::error::Error;
   use crate::types::*;
@@ -4168,7 +4145,6 @@ How to interact with files on disk
   #[derive(Debug)]
   pub struct StaticFile {
       pub file: File,
-      pub closed: bool,
       pub path: String,
   }
 
@@ -4180,15 +4156,6 @@ How to interact with files on disk
   }
 
   impl StaticFile {
-      pub fn close(mut self) -> Result<Self, Error> {
-          self.closed = true;
-          Ok(self)
-      }
-
-      pub fn is_closed(&self) -> bool {
-          self.closed
-      }
-
       pub fn put<'a>(
           &'a mut self,
           i: Item,
@@ -4204,15 +4171,11 @@ How to interact with files on disk
       pub fn take<'a>(
           &'a mut self,
       ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Item>, Error>> + Send + 'a>> {
-          if self.is_closed() {
-              return Box::pin(future::ready(Err(closed_error(true))));
-          }
           let mut bs = [0u8; 1024];
           Box::pin(async move {
               let ct = self.file.read(&mut bs).await?;
               if ct == 0 {
                   // EOF, no more takes since it's static
-                  self.closed = true;
                   Ok(None)
               } else {
                   Ok(Some(bs[0..ct].to_vec().into()))
@@ -4225,10 +4188,6 @@ How to interact with files on disk
       type Item = Result<Item, Error>;
 
       fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-          if self.is_closed() {
-              return Poll::Ready(None);
-          }
-
           let mut buf = vec![0u8; 1024];
           let mut read_buf = ReadBuf::new(&mut buf);
 
@@ -4236,7 +4195,6 @@ How to interact with files on disk
               Poll::Ready(Ok(())) => {
                   let bytes_read = read_buf.filled().len();
                   if bytes_read == 0 {
-                      self.closed = true;
                       Poll::Ready(None)
                   } else {
                       Poll::Ready(Some(Ok(read_buf.filled().to_owned().into())))
@@ -4267,7 +4225,6 @@ How to interact with files on disk
           .open(path.clone())?;
       Ok(super::In::StaticFile(Arc::new(RwLock::new(StaticFile {
           file: File::from_std(file),
-          closed: false,
           path,
       })))
       .into())
@@ -4278,7 +4235,6 @@ How to interact with files on disk
       let file = std::fs::File::open(path.clone())?;
       Ok(super::Out::StaticFile(Arc::new(RwLock::new(StaticFile {
           file: File::from_std(file),
-          closed: false,
           path,
       })))
       .into())
@@ -4294,7 +4250,6 @@ How to interact with files on disk
 How to interact with the network (TCP/IP sockets)
 #+begin_src rust :tangle src/pipes/net.rs
   use crate::axiom::ItemResult;
-  use crate::pipes::closed_error;
   use crate::types::associative as assoc;
   use crate::types::error::Error;
   use crate::types::{self, wrap, Int, Item};
@@ -4313,7 +4268,6 @@ How to interact with the network (TCP/IP sockets)
   pub struct Socket {
       pub socket: TcpStream,
       pub addr: SocketAddr,
-      pub closed: bool,
   }
 
   impl PartialEq for Socket {
@@ -4324,14 +4278,6 @@ How to interact with the network (TCP/IP sockets)
   }
 
   impl Socket {
-      pub fn close(&mut self) -> Result<(), Error> {
-          Ok(())
-      }
-
-      pub fn is_closed(&self) -> bool {
-          self.closed
-      }
-
       pub fn put<'a>(
           &'a mut self,
           i: Item,
@@ -4348,15 +4294,10 @@ How to interact with the network (TCP/IP sockets)
       pub fn take<'a>(
           &'a mut self,
       ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Item>, Error>> + Send + 'a>> {
-          if self.is_closed() {
-              return Box::pin(future::ready(Err(closed_error(true))));
-          }
-          println!("Reading from socket");
           let mut bs = [0u8; 1024];
           Box::pin(async move {
               let n = self.socket.read(&mut bs).await?;
               if n == 0 {
-                  self.closed = true;
                   Ok(None)
               } else {
                   Ok(Some(bs[..n].to_vec().into()))
@@ -4380,7 +4321,6 @@ How to interact with the network (TCP/IP sockets)
   #[derive(Debug)]
   pub struct ServerSocket {
       pub socket: TcpListener,
-      pub closed: bool,
   }
 
   impl PartialEq for ServerSocket {
@@ -4391,30 +4331,14 @@ How to interact with the network (TCP/IP sockets)
   }
 
   impl ServerSocket {
-      pub fn close(&mut self) -> Result<(), Error> {
-          Ok(())
-      }
-
-      pub fn is_closed(&self) -> bool {
-          self.closed
-      }
-
       pub fn take<'a>(
           &'a mut self,
       ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Item>, Error>> + Send + 'a>> {
-          if self.is_closed() {
-              return Box::pin(future::ready(Err(closed_error(true))));
-          }
           Box::pin(async move {
               let (socket, addr) = self.socket.accept().await?;
 
               Ok(Some(
-                  super::Tunnel::Socket(Arc::new(RwLock::new(Socket {
-                      socket,
-                      addr,
-                      closed: false,
-                  })))
-                  .into(),
+                  super::Tunnel::Socket(Arc::new(RwLock::new(Socket { socket, addr }))).into(),
               ))
           })
       }
@@ -4442,13 +4366,14 @@ How to interact with the network (TCP/IP sockets)
 
   pub fn server_socket(i: Item, j: Item) -> types::Future<ItemResult> {
       match socket_addr(i, j) {
-          Ok(addr) => Box::pin(TcpListener::bind(addr).map(|l| {
-              Ok(super::Out::ServerSocket(Arc::new(RwLock::new(ServerSocket {
-                  socket: l.unwrap(),
-                  closed: false,
-              })))
-              .into())
-          })),
+          Ok(addr) => {
+              Box::pin(TcpListener::bind(addr).map(|l| {
+                  Ok(super::Out::ServerSocket(Arc::new(RwLock::new(ServerSocket {
+                      socket: l.unwrap(),
+                  })))
+                  .into())
+              }))
+          }
           Err(e) => Box::pin(future::ready(Err(e))),
       }
   }
@@ -4823,6 +4748,13 @@ should transfer 1 object. Maybe use protocol buffers or similar
 This could be done using a network pipe, and an assemble function that
 pulls byte chunks and builds objects when there are enough bytes for
 one object, and puts them into a handoff pipe.
+
+**** Pipe take outcome table
+|               | List    | Handoff | Socket  | StaticFile |
+|---------------+---------+---------+---------+------------|
+| take Items    | Item    | Item    | Bytes   | Bytes      |
+| take Past EOF | Nothing | Nothing | Nothing | Nothing    |
+| step Past EOF | Exit    | Exit    | Exit    | Exit       |
 *** DONE 'Fail' is not defined
 We need to be able to throw our own errors (eg lookup tries to do this)
 
@@ -5999,9 +5931,6 @@ I think the new env should probably inherit the current env's stack.
 
 #+RESULTS:
 : [3] 1
-*** TODO Division by zero consumes stack items
-=5 0 /= shouldn't consume the =5= and =0= - compare to =1 "2" += behavior
-(which leaves items on stack).
 *** TODO retry should have opposite argument order
 Currently it expects an error on ToS and then a program beneath. But
 it seems like we'd nearly always have to =dip= the program beneath the
@@ -6011,7 +5940,7 @@ the issue on top, and the error beneath.
 **** DONE XOR
 We have a node id (maybe just the i2p destination address?) and we
 want to calculate the distance to another node as the XOR
-**** TODO Simple API server
+**** INPROGRESS Simple API server
 Construct a socket listener, and serve something from a trivial local
 database. Disable exploitable words.
 
@@ -6051,6 +5980,9 @@ database. Disable exploitable words.
   [association] map
 
   [] ;; dictionary modifications 
+
+  ;; API Server code begins here
+
   dictionary swap execute ;; -> new-dict db sock
 
   ;; start building the environment
@@ -6059,8 +5991,11 @@ database. Disable exploitable words.
                 [string ;; translate to a string -> req-str db
                  read ;; the request program into a data structure -> prog db
                  execute ;; the program -> items*
-                 snapshot] dip
-                swap emit bytes put ;; the snapshot into the pipe
+                 snapshot] dip ;; under the pipe so the user's code has no access
+                swap ;; -> response pipe
+                emit ;; -> response-str pipe
+                bytes ;; -> response-bytes pipe
+                put ;; the response into the pipe
                 discard ;; close the connection
                ]]] environment ;; -> env new-dict db sock 
   [dictionary] float ;; -> new-dict [dictionary] env db sock
@@ -6076,12 +6011,11 @@ database. Disable exploitable words.
     assign ;; -> env
     environment
     animate ;; let it fly  
-   ] shielddown  ;; shielded to not consume the env each time
+   ] shielddown  ;; shielded so as not to consume the db each time
    discard ;; drop whatever the result is of this iteration, we don't need it
   ]
 
-  step
-
+  step ;; accepts incoming connections until killed
 #+end_src
 *** DONE Implement print (opposite of read)
 We don't have a way to convert objects to their string serialization
@@ -6100,6 +6034,10 @@ leave the args intact. This needs to be consistent.
 I would lean towards leaving the args intact so that =retry= is easily applied.
 **** TODO 'read' on invalid edn consumes the string argument
 It should attempt to parse before popping the item off the stack.
+**** TODO Division by zero consumes stack items
+=5 0 /= shouldn't consume the =5= and =0= - compare to =1 "2" += behavior
+(which leaves items on stack).
+
 *** INPROGRESS logical enum hierarchy
 **** DONE Collection hierarchy
 There are read (peek/first) and write operations (pack/put/conj).
@@ -6152,10 +6090,12 @@ support Nothing in lists and pipes, we won't reserve it as a sentinel
 value.
 **** DONE Step accepts pipes
 **** DONE Set close = discard
-**** DONE Remove closed? 
+**** INPROGRESS Remove closed? 
 ***** DONE Write assemble in terms of step
 I don't think we actually need assemble anymore, since this is just a
 regular =step= (same as reducing any other iterable).
+***** TODO Do something with network pipes
+I think this does have a notion of closing.
 **** DONE make a polymorphic 'join'
 :LOGBOOK:
 CLOCK: [2023-01-04 Wed 05:48]--[2023-01-04 Wed 07:26] =>  1:38
@@ -6206,7 +6146,7 @@ also be thought of as an array of ints (8 bit unsigned), and we
 already have an integer type (even though it holds more bits).
 *** TODO implement sleep
 helps with debugging multithreading
-*** TODO handoff tests
+*** DONE handoff tests
 This should block, not error
 #+begin_src kcats
 handoff take
@@ -6269,7 +6209,6 @@ Closing In
 [[file "/tmp/bar"] [type pipe]]
 #+end_src
 
-
 *** TODO Performance optimizations
 **** TODO Compile programs
 Here is how it could maybe be done. We already have a type StepFn
@@ -6304,4 +6243,8 @@ unless we look ahead in the expression. Even then we can only know
 what arguments end up being passed to join and execute by examining
 the words' specs, and even that is not foolproof, as we have wildcard
 specs like dip where the stack change is arbitrary.
+*** TODO Debugging method for animated envs
+When we =animate= an env, we lose all contact with it if anything goes
+wrong. It's supposed to send stuff back via pipes, but if it doesn't,
+how do we know what went wrong? 
 
