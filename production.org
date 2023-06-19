@@ -2082,6 +2082,7 @@ example, in order to read/write to/from disk).
 We'll define some words as axioms (not in terms of other words, only defined in Rust). 
 #+begin_src rust :tangle src/axiom.rs
   use super::serialize;
+  use crate::pipes;
   use crate::types::associative as assoc;
   use crate::types::collection as coll;
   use crate::types::dictionary as dict;
@@ -2247,6 +2248,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               ("string?", Box::leak(Box::new(f_stack1(is_string)))),
               ("swap", Box::leak(Box::new(swap))),
               ("swapdown", Box::leak(Box::new(swapdown))),
+              ("timestamps", Box::leak(Box::new(timestamps))),
               ("true", Box::leak(Box::new(true_))),
               ("unassign", Box::leak(Box::new(f_stack2(unassign)))),
               ("take", Box::leak(Box::new(take))),
@@ -3536,6 +3538,11 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           s,
       ))))
   }
+
+  pub fn timestamps(env: Environment) -> Future<Environment> {
+      env.push(Item::Iterable(coll::Iterable::Out(pipes::Out::Time)))
+          .into()
+  }
 #+end_src
 ** Top level execution
 We'll define the main module which reads input for the kcats
@@ -3880,6 +3887,7 @@ The basic pipe contracts.
   pub mod channel;
   pub mod fs;
   pub mod net;
+  pub mod time;
 
   #[derive(Debug, Clone)]
   pub enum In {
@@ -3905,6 +3913,7 @@ The basic pipe contracts.
       Socket(Arc<RwLock<net::Socket>>),
       ServerSocket(Arc<RwLock<net::ServerSocket>>),
       Handoff(channel::Handoff<Item>),
+      Time,
   }
 
   impl PartialEq for Out {
@@ -4019,6 +4028,7 @@ The basic pipe contracts.
                   Box::pin(async move { f.write().await.take().await })
               }
               Out::Handoff(ref mut h) => Box::pin(h.take()),
+              Out::Time => Box::pin(time::take()),
           }
       }
   }
@@ -4044,6 +4054,7 @@ The basic pipe contracts.
                   executor::block_on(async move { f.read().await.representation() })
               }
               Out::Handoff(h) => h.representation(),
+              Out::Time => time::representation(),
           }
       }
   }
@@ -4392,6 +4403,33 @@ How to interact with the network (TCP/IP sockets)
       fn from(err: std::net::AddrParseError) -> Error {
           Error::create(wrap("addrparse".into()), &err.to_string(), None)
       }
+  }
+#+end_src
+**** Time
+#+begin_src rust :tangle src/pipes/time.rs
+  use crate::types::associative as assoc;
+  use crate::types::error::Error;
+  use crate::types::*;
+  use std::{
+      future,
+      time::{SystemTime, UNIX_EPOCH},
+  };
+
+  pub fn take() -> Future<Result<Option<Item>, Error>> {
+      let t = SystemTime::now()
+          .duration_since(UNIX_EPOCH)
+          .unwrap()
+          .as_millis() as Int;
+      Box::pin(future::ready(Ok(Some(Item::Int(t)))))
+  }
+
+  pub fn representation() -> Item {
+      assoc::Association::from_iter([
+          ("type".into(), "out".into()),
+          ("source".into(), "systemtime".into()),
+          ("units".into(), "milliseconds".into()),
+      ])
+      .into()
   }
 #+end_src
 **** Channels
