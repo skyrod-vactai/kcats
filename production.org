@@ -2243,6 +2243,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               ("sign", Box::leak(Box::new(f_stack2(crate::crypto::sign)))),
               ("sink", Box::leak(Box::new(sink))),
               ("sqrt", Box::leak(Box::new(f_stack1(sqrt)))),
+              ("standard", Box::leak(Box::new(standard))),
               ("step", Box::leak(Box::new(step))),
               ("string", Box::leak(Box::new(f_stack1(string)))),
               ("string?", Box::leak(Box::new(f_stack1(is_string)))),
@@ -3543,6 +3544,13 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       env.push(Item::Iterable(coll::Iterable::Out(pipes::Out::Time)))
           .into()
   }
+
+  pub fn standard(env: Environment) -> Future<Environment> {
+      env.push(Item::Iterable(coll::Iterable::Tunnel(
+          pipes::Tunnel::Standard,
+      )))
+      .into()
+  }
 #+end_src
 ** Top level execution
 We'll define the main module which reads input for the kcats
@@ -3887,6 +3895,7 @@ The basic pipe contracts.
   pub mod channel;
   pub mod fs;
   pub mod net;
+  pub mod standard;
   pub mod time;
 
   #[derive(Debug, Clone)]
@@ -3894,6 +3903,7 @@ The basic pipe contracts.
       StaticFile(Arc<RwLock<fs::StaticFile>>),
       Socket(Arc<RwLock<net::Socket>>),
       Handoff(channel::Handoff<Item>),
+      Standard,
   }
 
   impl PartialEq for In {
@@ -3914,6 +3924,7 @@ The basic pipe contracts.
       ServerSocket(Arc<RwLock<net::ServerSocket>>),
       Handoff(channel::Handoff<Item>),
       Time,
+      Standard,
   }
 
   impl PartialEq for Out {
@@ -3923,6 +3934,8 @@ The basic pipe contracts.
               (Out::Socket(s1), Out::Socket(s2)) => Arc::ptr_eq(s1, s2),
               (Out::ServerSocket(s1), Out::ServerSocket(s2)) => Arc::ptr_eq(s1, s2),
               (Out::Handoff(h1), Out::Handoff(h2)) => h1 == h2,
+              (Out::Time, Out::Time) => true,
+              (Out::Standard, Out::Standard) => true,
               _ => false,
           }
       }
@@ -3933,6 +3946,7 @@ The basic pipe contracts.
       StaticFile(Arc<RwLock<fs::StaticFile>>),
       Socket(Arc<RwLock<net::Socket>>),
       Handoff(channel::Handoff<Item>),
+      Standard,
   }
 
   impl PartialEq for Tunnel {
@@ -3941,6 +3955,7 @@ The basic pipe contracts.
               (Tunnel::StaticFile(s1), Tunnel::StaticFile(s2)) => Arc::ptr_eq(s1, s2),
               (Tunnel::Socket(s1), Tunnel::Socket(s2)) => Arc::ptr_eq(s1, s2),
               (Tunnel::Handoff(h1), Tunnel::Handoff(h2)) => h1 == h2,
+              (Tunnel::Standard, Tunnel::Standard) => true,
               _ => false,
           }
       }
@@ -3952,6 +3967,7 @@ The basic pipe contracts.
               Tunnel::StaticFile(f) => Out::StaticFile(f),
               Tunnel::Socket(s) => Out::Socket(s),
               Tunnel::Handoff(h) => Out::Handoff(h),
+              Tunnel::Standard => Out::Standard,
           }
       }
   }
@@ -3962,6 +3978,7 @@ The basic pipe contracts.
               Tunnel::StaticFile(f) => In::StaticFile(f),
               Tunnel::Socket(s) => In::Socket(s),
               Tunnel::Handoff(h) => In::Handoff(h),
+              Tunnel::Standard => In::Standard,
           }
       }
   }
@@ -3978,6 +3995,7 @@ The basic pipe contracts.
                   Box::pin(async move { f.write().await.put(i).await })
               }
               In::Handoff(ref mut h) => Box::pin(h.put(i)), //_ => Err(Error::expected("foo")),
+              In::Standard => standard::put(i),
           }
       }
   }
@@ -3994,6 +4012,7 @@ The basic pipe contracts.
                   Box::pin(async move { f.write().await.put(i).await })
               }
               Tunnel::Handoff(ref mut h) => Box::pin(h.put(i)),
+              Tunnel::Standard => standard::put(i),
           }
       }
 
@@ -4008,6 +4027,7 @@ The basic pipe contracts.
                   Box::pin(async move { f.write().await.take().await })
               }
               Tunnel::Handoff(ref mut h) => Box::pin(h.take()),
+              Tunnel::Standard => standard::take(),
           }
       }
   }
@@ -4029,6 +4049,7 @@ The basic pipe contracts.
               }
               Out::Handoff(ref mut h) => Box::pin(h.take()),
               Out::Time => Box::pin(time::take()),
+              Out::Standard => standard::take(),
           }
       }
   }
@@ -4039,6 +4060,7 @@ The basic pipe contracts.
               In::StaticFile(f) => executor::block_on(async move { f.read().await.representation() }),
               In::Socket(f) => executor::block_on(async move { f.read().await.representation() }),
               In::Handoff(h) => h.representation(),
+              In::Standard => standard::representation(),
           }
       }
   }
@@ -4055,6 +4077,7 @@ The basic pipe contracts.
               }
               Out::Handoff(h) => h.representation(),
               Out::Time => time::representation(),
+              Out::Standard => standard::representation(),
           }
       }
   }
@@ -4067,6 +4090,7 @@ The basic pipe contracts.
               }
               Tunnel::Socket(f) => executor::block_on(async move { f.read().await.representation() }),
               Tunnel::Handoff(h) => h.representation(),
+              Tunnel::Standard => standard::representation(),
           }
       }
   }
@@ -4220,8 +4244,15 @@ How to interact with files on disk
   impl crate::serialize::Display for StaticFile {
       fn representation(&self) -> Item {
           assoc::Association::from_iter([
-              ("type".into(), "pipe".into()),
-              ("file".into(), self.path.clone().into()),
+              ("type".into(), "tunnel".into()),
+              (
+                  "values".into(),
+                  assoc::Association::from_iter([("type".into(), "bytes".into())]).into(),
+              ),
+              (
+                  "to".into(),
+                  assoc::Association::from_iter([("file".into(), self.path.clone().into())]).into(),
+              ),
           ])
           .into()
       }
@@ -4293,6 +4324,7 @@ How to interact with the network (TCP/IP sockets)
           &'a mut self,
           i: Item,
       ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
+          println!("Putting {:?}", i);
           let b = types::Bytes::try_from(i);
           match b {
               Ok(bs) => {
@@ -4426,8 +4458,53 @@ How to interact with the network (TCP/IP sockets)
   pub fn representation() -> Item {
       assoc::Association::from_iter([
           ("type".into(), "out".into()),
-          ("source".into(), "systemtime".into()),
-          ("units".into(), "milliseconds".into()),
+          ("from".into(), "systemtime".into()),
+          (
+              "values".into(),
+              assoc::Association::from_iter([
+                  ("type".into(), "integer".into()),
+                  ("units".into(), "milliseconds".into()),
+              ])
+              .into(),
+          ),
+      ])
+      .into()
+  }
+#+end_src
+**** Standard in/out
+#+begin_src rust :tangle src/pipes/standard.rs
+  use crate::types::associative as assoc;
+  use crate::types::error::Error;
+  use crate::types::{self, *};
+  use std::future;
+  use std::io::{self, Read, Write};
+
+  pub fn take() -> Future<Result<Option<Item>, Error>> {
+      let mut buf = [0u8];
+      let n = io::stdin().read(&mut buf);
+      let f = match n {
+          Ok(0) => Ok(None),
+          Ok(n) => Ok(Some(buf[..n].to_vec().into())),
+          Err(e) => Err(e.into()),
+      };
+      Box::pin(future::ready(f))
+  }
+
+  pub fn put(i: Item) -> types::Future<Result<(), Error>> {
+      let bs = Bytes::try_from(i);
+      match bs {
+          Ok(bs) => {
+              let f = io::stdout().write(&bs);
+              Box::pin(future::ready(f.map_err(|e| e.into()).map(|_| ())))
+          }
+          Err(e) => Box::pin(future::ready(Err(e))),
+      }
+  }
+
+  pub fn representation() -> Item {
+      assoc::Association::from_iter([
+          ("type".into(), "tunnel".into()),
+          ("peer".into(), "standard".into()),
       ])
       .into()
   }
@@ -4789,17 +4866,35 @@ one object, and puts them into a handoff pipe.
 
 This should be possible to do entirely in kcats.
 
-**** TODO Time pipe
+**** DONE Time pipe
 Each take from the pipe return the current unix time in ms.  Should be
 a "singleton" - probably using Box::leak, so that we can insert a copy
 of this pipe whenever we want and it's always a reference to the same
 object. Might be an Arc for compatibility even though we don't need to
 ref count. (But I suspect we don't need the Arc).
 
-**** TODO stdin/stdout pipes
+#+begin_src kcats
+timestamps take
+#+end_src
+
+#+RESULTS:
+: 1687273991929 [[from systemtime] [values [[type integer] [units milliseconds]]] [type out]]
+
+**** DONE stdin/stdout pipes
 Should also be singleton. Should it always be a tunnel or should we
 allow separate access to in or out?
-**** Pipe take outcome
+
+#+begin_src kcats
+standard "foo" bytes put
+#+end_src
+
+#+RESULTS:
+: foo[[type tunnel] [peer standard]]
+
+Stdin is not tested, since currently the interpreter reads the program
+from stdin. May need to change that (read the program from filesystem
+and let the program itself access stdin).
+**** TODO Pipe take outcome
 There is some inconsistency with what happens when there's nothing
 left - empty lists just return nothing on take, but closed pipes
 return an error. May need to resolve this inconsistency.
