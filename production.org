@@ -6654,11 +6654,11 @@ Now implement 'keep' which returns only an item that passes the filter
 dropper (almost got it, doesn't detect end of parent stream yet)
 #+begin_src kcats :results code
   [0 20 1 range liberate
-  5 dropper
-  10 taker
-  [5 *] each
-  [odd?] keep
-  collect] shield
+   5 dropper
+   10 taker
+   [5 *] each
+   [odd?] keep
+   collect] shield
 #+end_src
 
 #+RESULTS:
@@ -6690,7 +6690,112 @@ Collect fix
 **** TODO partition
 **** TODO catenate
 **** TODO groupby
- 
+**** CANCELED Map/filter can't access lower stack items
+***** Problem
+this doesn't work:
+
+#+begin_src kcats :results code
+10 [1 2 3] liberate [+] each
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[generate [[+] bail] shielddown] [take] [1 2 3] 10
+#+end_src
+
+We should get =[11 12 13]= but it errors out.
+
+The reason is that when + runs, the generators are still on the stack,
+in between this mapping function, and the original stack arguments.
+
+We need a way to break out of the generation part of the stack and let
+the mapping function access the arguments below it.
+
+I can't immediately think of a good way to do it.
+
+Actually I think that instead of recursively calling generate, and
+passing the values back up the stack, there might be a way to build up
+the program recursively, and then execute it in one swoop? 
+
+Perhaps we can split each stage into several parts:
+
++ Generate from the layer below (in which case we obviously need the
+  layers below to get the next value)
++ dip underneath the layers to calculate the next value using lower stack items
++ swap the new value to the top of stack
++
+***** Debug session
+#+begin_src kcats :results code
+[[expression [10 [1 2 3] liberate [+] each generate]]] environment
+advance advance advance advance eval-step [advance] 5 times eval-step
+[advance] 2 times [eval-step] 99 times 
+#+end_src
+
+#+begin_src kcats
+10 [1 2 3] liberate [+] each generate
+#+end_src
+
+#+RESULTS:
+: [[asked [number]] [reason "type mismatch"] [unwound [+ [[1 [take] [2 3] 10]] unwrap evert first swap discard [[generate [[+] bail] shielddown]] unwrap swap]] [actual [take]] [type error] [handled true]] 1 [take] [2 3] 10
+
+
+#+begin_src kcats :results code
+  [[expression [[[expression [+]]] environment advance]]] environment advance advance eval-step
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[expression [[[expression] lookup count] shield swap [[expression] lookup count [[positive?] [<=]] [execute] every?] [eval-step] while swap discard]] [stack [[[stack []] [expression [+]]]]]]
+#+end_src
+***** Resolution
+After thinking about this some more, my conclusion:
+
+This is supporting multi-arity mapping functions, which did work in
+the original map implementation but they are not supported in other
+languages. The way you access multiple values there is by closing over
+them. So the way you'd do it in kcats is like so:
+
+#+begin_src kcats
+  10 [1 2 3] ;; the extra arg and the list
+  [-] ;; the multi-arity map fn
+  [clone] dipdown ;; clone the 10
+  [swap] unwrap prepend ;; prepend the word swap to the fn so that the 10 ends up beneath the list item
+  float prepend ;; prepend the 10
+  map
+#+end_src
+
+#+RESULTS:
+: [9 8 7] 10
+
+In theory we could write a helper function called =capture1= or something that does this for us, so you can write
+
+#+begin_src 
+10 [1 2 3] [-] capture1 map
+#+end_src
+
+#+begin_src kcats
+  10 [1 2 3  4 5 6] ;; the extra arg and the list
+  [-] ;; the multi-arity map fn
+
+  [swapdown ;; f i
+   [swap] unwrap prepend
+   swap prepend] shielddown
+  [liberate] dip each collect
+#+end_src
+
+#+RESULTS:
+: [9 8 7] [generate [[10 swap -] bail] shielddown] [take] [] 10
+
+#+begin_src kcats
+  [1 2 "oh fudge"]
+  [[5 +]
+   [discard 5]
+   recover]
+  map
+#+end_src
+
+#+RESULTS:
+: [6 7 5]
 
 *** DONE Investigate simpler map/filter impls
 #+begin_src kcats :results code
@@ -6714,3 +6819,4 @@ Collect fix
 *** TODO Implement hashset
 Once we have this, we can implement stuff like the =distinct= transform
 function.
+
