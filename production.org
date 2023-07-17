@@ -386,10 +386,16 @@ internally, to keep track of things like the stack, expression, lists etc.
   use crate::pipes as pipe;
   use crate::types::associative as assoc;
   use crate::types::*;
-  use std::{future, sync};
+  use std::{collections::HashSet, future, sync};
 
   pub type Arc<T> = Newtype<sync::Arc<T>>;
   pub type Listy<I> = Newtype<VecDeque<I>>;
+  pub type Setty<I> = Newtype<HashSet<I>>;
+  // impl<T: PartialEq> PartialEq for Newtype<Arc<T>> {
+  //     fn eq(&self, other: &Self) -> bool {
+  //         **self.0 == **other.0
+  //     }
+  // }
 
   impl<T: Clone> Arc<T> {
       pub fn make_mut(&mut self) -> &mut T {
@@ -407,15 +413,22 @@ internally, to keep track of things like the stack, expression, lists etc.
 
   pub type ListContent = Listy<Item>;
   pub type List = Arc<ListContent>;
+  pub type Set = Arc<Setty<assoc::KeyItem>>;
 
   impl List {
       pub fn new() -> List {
           Newtype(sync::Arc::new(Newtype(VecDeque::new())))
       }
+  }
 
-      // pub fn from_iter<I: IntoIterator<Item = Item>>(iter: I) -> List {
-      //     Newtype(sync::Arc::new(Newtype(iter.into_iter().collect())))
-      // }
+  impl Set {
+      pub fn from(h: HashSet<assoc::KeyItem>) -> Set {
+          Newtype(sync::Arc::new(Newtype(h)))
+      }
+
+      pub fn new() -> Set {
+          Set::from(HashSet::new())
+      }
   }
 
   impl FromIterator<Item> for List {
@@ -451,6 +464,7 @@ internally, to keep track of things like the stack, expression, lists etc.
   pub enum Sized {
       Associative(assoc::Associative),
       List(List),
+      Set(Set),
       String(String),
       Bytes(Bytes),
       Nothing,
@@ -458,16 +472,18 @@ internally, to keep track of things like the stack, expression, lists etc.
 
   impl PartialEq for Sized {
       fn eq(&self, other: &Self) -> bool {
+          if self.is_empty() && other.is_empty() {
+              return true;
+          }
           match (self, other) {
               (Sized::Associative(a), Sized::Associative(b)) => a == b,
               (Sized::List(a), Sized::List(b)) => a == b,
               (Sized::String(a), Sized::String(b)) => a == b,
               (Sized::Bytes(a), Sized::Bytes(b)) => a == b,
+              (Sized::Set(a), Sized::Set(b)) => a == b,
               (Sized::Nothing, Sized::Nothing) => true,
               (Sized::Nothing, l) => l.is_empty(),
               (l, Sized::Nothing) => l.is_empty(),
-              (Sized::Associative(a), Sized::List(b)) => a.is_empty() && b.is_empty(),
-              (Sized::List(a), Sized::Associative(b)) => a.is_empty() && b.is_empty(),
               _ => false,
           }
       }
@@ -520,6 +536,7 @@ internally, to keep track of things like the stack, expression, lists etc.
               Sized::List(l) => l.len(),
               Sized::String(s) => s.len(),
               Sized::Bytes(b) => b.len(),
+              Sized::Set(s) => s.len(),
               Sized::Nothing => 0,
           }
       }
@@ -541,6 +558,10 @@ internally, to keep track of things like the stack, expression, lists etc.
                   let i = b.pop().map(|b| Item::Int(b as i64));
                   (Iterable::Sized(Sized::Bytes(b)), i)
               }
+              Sized::Set(mut s) => {
+                  let i = s.make_mut().drain().next().map(Item::from);
+                  (Iterable::Sized(Sized::Set(s)), i)
+              }
           }
       }
 
@@ -551,6 +572,10 @@ internally, to keep track of things like the stack, expression, lists etc.
                   Ok(Sized::List(c))
               }
               (Sized::Associative(a), l) => Ok(Sized::Associative(a.put(l)?)),
+              (Sized::Set(mut s), i) => {
+                  s.make_mut().insert(assoc::KeyItem::try_from(i)?);
+                  Ok(Sized::Set(s))
+              }
               (Sized::Bytes(mut b), Item::Int(i)) => {
                   b.push(i as u8);
                   Ok(Sized::Bytes(b))
@@ -582,6 +607,35 @@ internally, to keep track of things like the stack, expression, lists etc.
                   let am = a.make_mut();
                   am.extend(b.inner());
                   Sized::List(a)
+              }
+              (Sized::Set(mut a), Sized::Set(mut b)) => {
+                  let am = a.make_mut();
+                  am.extend(b.inner());
+                  Sized::Set(a)
+              }
+              (Sized::List(mut a), Sized::Set(mut b)) => {
+                  let bm = b.make_mut();
+
+                  bm.extend(
+                      a.inner()
+                          .into_iter()
+                          .map(assoc::KeyItem::try_from)
+                          .collect::<Result<Vec<assoc::KeyItem>, Error>>()?
+                          .into_iter(),
+                  );
+                  Sized::Set(b)
+              }
+              (Sized::Set(mut a), Sized::List(mut b)) => {
+                  let am = a.make_mut();
+
+                  am.extend(
+                      b.inner()
+                          .into_iter()
+                          .map(assoc::KeyItem::try_from)
+                          .collect::<Result<Vec<assoc::KeyItem>, Error>>()?
+                          .into_iter(),
+                  );
+                  Sized::Set(a)
               }
               (Sized::String(mut a), Sized::String(b)) => {
                   a.push_str(&b);
@@ -628,6 +682,7 @@ internally, to keep track of things like the stack, expression, lists etc.
                   let vec: Vec<Item> = b.into_iter().map(|byte| Item::from(byte as Int)).collect();
                   Box::new(vec.into_iter())
               }
+              Sized::Set(mut s) => Box::new(s.inner().into_iter().map(|i| i.into())),
           }
       }
   }
@@ -784,6 +839,19 @@ internally, to keep track of things like the stack, expression, lists etc.
               Item::Packable(p) => Ok(Iterable::try_from(p)?),
               i => Err(Error::expected("iterable", i)),
           }
+      }
+  }
+
+  impl TryFrom<Item> for Set {
+      type Error = Error;
+
+      fn try_from(item: Item) -> Result<Self, Self::Error> {
+          let s = Sized::try_from(item)?;
+          let hs: HashSet<assoc::KeyItem> = s
+              .into_iter()
+              .map(|i| i.try_into())
+              .collect::<Result<HashSet<assoc::KeyItem>, Error>>()?;
+          Ok(Set::from(hs))
       }
   }
 #+end_src
@@ -2246,6 +2314,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   "serversocket",
                   Box::leak(Box::new(f_stack2_async(crate::pipes::net::server_socket))),
               ),
+              ("set", Box::leak(Box::new(f_stack1(set)))),
               ("sign", Box::leak(Box::new(f_stack2(crate::crypto::sign)))),
               ("sink", Box::leak(Box::new(sink))),
               ("sqrt", Box::leak(Box::new(f_stack1(sqrt)))),
@@ -3024,6 +3093,14 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }))
   }
 
+  pub fn is_set(i: Item) -> ItemResult {
+      Ok(Item::from(match i {
+          Item::Iterable(coll::Iterable::Sized(coll::Sized::Set(_))) => true,
+          Item::Packable(coll::Packable::Sized(coll::Sized::Set(_))) => true,
+          i => coll::Set::try_from(i).is_ok(),
+      }))
+  }
+
   pub fn is_odd(i: Item) -> ItemResult {
       let i = Int::try_from(i)?;
       Ok(Item::from(i & 1 == 1))
@@ -3582,6 +3659,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       )))
       .into()
   }
+
+  pub fn set(i: Item) -> ItemResult {
+      coll::Set::try_from(i).map(|s| Item::Iterable(coll::Iterable::Sized(coll::Sized::Set(s))))
+  }
 #+end_src
 ** Top level execution
 We'll define the main module which reads input for the kcats
@@ -3843,7 +3924,7 @@ We'll also define how to run unit tests.
       #[test_case("future")]
       #[test_case("generate")]
       #[test_case("if")]
-      #[test_case("inc"])
+      #[test_case("inc")]
       #[test_case("inject")]
       #[test_case("inscribe")]
       #[test_case("join")]
@@ -3874,6 +3955,7 @@ We'll also define how to run unit tests.
       #[test_case("rest")]
       #[test_case("retry")]
       #[test_case("reverse")]
+      #[test_case("set")]
       #[test_case("shield")]
       #[test_case("shielddown")]
       #[test_case("shielddowndown")]
