@@ -652,8 +652,8 @@ internally, to keep track of things like the stack, expression, lists etc.
                   a.extend(b);
                   Sized::Bytes(a)
               }
-              (Sized::Nothing, Sized::Nothing) => Sized::Nothing,
-
+              (Sized::Nothing, x) => x,
+              (x, Sized::Nothing) => x,
               (s, other) => panic!("Cannot join {:?} and {:?}", s, other),
           })
       }
@@ -2064,12 +2064,18 @@ example, in order to read/write to/from disk).
       //println!("to item {:?}", item);
       match item {
           edn_format::Value::Integer(i) => Ok(Item::Int(*i)),
-          edn_format::Value::Vector(v) => Ok(coll::List::from_iter(
-              v.iter()
-                  .map(|i| to_item(i))
-                  .collect::<Result<Vec<Item>, Error>>()?,
-          )
-          .into()),
+          edn_format::Value::Vector(v) => Ok({
+              if v.is_empty() {
+                  coll::NOTHING
+              } else {
+                  coll::List::from_iter(
+                      v.iter()
+                          .map(|i| to_item(i))
+                          .collect::<Result<Vec<Item>, Error>>()?,
+                  )
+                  .into()
+              }
+          }),
           edn_format::Value::Symbol(s) => Ok(Item::Word(s.to_string().into())),
           // we don't have booleans in kcats, so if we see 'false' that
           // is the word false which is not defined in the base
@@ -2347,6 +2353,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   Box::leak(Box::new(f_stack2_async(crate::pipes::net::server_socket))),
               ),
               ("set", Box::leak(Box::new(f_stack1(set)))),
+              ("set?", Box::leak(Box::new(f_stack1(is_set)))),
               ("sign", Box::leak(Box::new(f_stack2(crate::crypto::sign)))),
               ("sink", Box::leak(Box::new(sink))),
               ("sqrt", Box::leak(Box::new(f_stack1(sqrt)))),
@@ -3118,19 +3125,17 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn is_association(i: Item) -> ItemResult {
-      Ok(Item::from(match i {
-          Item::Iterable(coll::Iterable::Sized(coll::Sized::Associative(_))) => true,
-          Item::Packable(coll::Packable::Sized(coll::Sized::Associative(_))) => true,
-          i => assoc::Associative::try_from(i).is_ok(),
-      }))
+      Ok(coll::Sized::try_from(i)
+          .map(|s| matches!(s, coll::Sized::Associative(_) | coll::Sized::Nothing))
+          .unwrap_or(false)
+          .into())
   }
 
   pub fn is_set(i: Item) -> ItemResult {
-      Ok(Item::from(match i {
-          Item::Iterable(coll::Iterable::Sized(coll::Sized::Set(_))) => true,
-          Item::Packable(coll::Packable::Sized(coll::Sized::Set(_))) => true,
-          i => coll::Set::try_from(i).is_ok(),
-      }))
+      Ok(coll::Sized::try_from(i)
+          .map(|s| matches!(s, coll::Sized::Set(_) | coll::Sized::Nothing))
+          .unwrap_or(false)
+          .into())
   }
 
   pub fn is_odd(i: Item) -> ItemResult {
@@ -3239,8 +3244,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           (
               w,
               Item::Iterable(coll::Iterable::Sized(coll::Sized::List(_)))
-              | Item::Packable(coll::Packable::Sized(coll::Sized::List(_))),
-          ) if w == *S_LIST || w == *S_ORDERED || w == *S_PROGRAM => Ok(()),
+              | Item::Packable(coll::Packable::Sized(coll::Sized::List(_)))
+              | Item::Iterable(coll::Iterable::Sized(coll::Sized::Nothing))
+              | Item::Packable(coll::Packable::Sized(coll::Sized::Nothing)),
+          ) if w == *S_LIST || w == *S_PROGRAM => Ok(()),
 
           (
               w,
@@ -3996,6 +4003,7 @@ We'll also define how to run unit tests.
       #[test_case("retry")]
       #[test_case("reverse")]
       #[test_case("set")]
+      #[test_case("set?" ; "is_set")]
       #[test_case("shield")]
       #[test_case("shielddown")]
       #[test_case("shielddowndown")]
