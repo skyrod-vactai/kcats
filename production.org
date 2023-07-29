@@ -86,7 +86,7 @@ internally, to keep track of things like the stack, expression, lists etc.
   pub mod error;
 
   // A generic newtype to contain various kinds
-  #[derive(PartialEq, Eq, Hash, Debug)]
+  #[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
   pub struct Newtype<T>(pub T);
 
   // Access the inner value easily
@@ -883,16 +883,19 @@ internally, to keep track of things like the stack, expression, lists etc.
   use crate::types::environment as env;
   use crate::types::*;
   use std::iter::FromIterator;
+  use std::sync;
   pub type Associationy<K, V> = Newtype<HashMap<K, V>>;
   pub type AssociationContent = Associationy<KeyItem, Item>;
   pub type Association = coll::Arc<AssociationContent>;
 
-  #[derive(Debug, Clone, Eq, PartialEq, Hash)]
+  #[derive(Debug, Clone, Eq, PartialEq, Hash, PartialOrd, Ord)]
   pub enum KeyItem {
+      // Order matters here, for comparison purposes - changing the
+      // order will change the result of how eg int compares to word.
       Int(Int),
+      Word(Word),
       Bytes(Bytes),
       String(String),
-      Word(Word),
       List(KeyList),
   }
 
@@ -947,7 +950,9 @@ internally, to keep track of things like the stack, expression, lists etc.
               Item::Iterable(coll::Iterable::Sized(coll::Sized::List(mut l))) => Ok(KeyItem::List(
                   KeyList::try_from_iter(l.inner().into_iter())?,
               )),
+
               Item::Word(w) => Ok(KeyItem::Word(w)),
+
               i => Err(Error::expected("KeyItem", i.into())),
           }
       }
@@ -1238,6 +1243,17 @@ internally, to keep track of things like the stack, expression, lists etc.
                   .map(|e| e.into())
                   .collect::<VecDeque<Item>>(),
           ))
+      }
+  }
+
+  impl FromIterator<KeyItem> for KeyList {
+      fn from_iter<I>(iter: I) -> Self
+      where
+          I: IntoIterator<Item = KeyItem>,
+      {
+          Newtype(sync::Arc::new(Newtype(
+              iter.into_iter().collect::<VecDeque<KeyItem>>(),
+          )))
       }
   }
 
@@ -2319,6 +2335,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               ("*", Box::leak(Box::new(f_stack2(mult)))),
               ("+", Box::leak(Box::new(f_stack2(plus)))),
               ("++lookup", Box::leak(Box::new(f_stack2(lookup)))),
+              ("++sort", Box::leak(Box::new(f_stack1(sort_by_key)))),
               ("-", Box::leak(Box::new(f_stack2(minus)))),
               ("/", Box::leak(Box::new(f_stack2(div)))),
               ("<", Box::leak(Box::new(f_stack2(lt)))),
@@ -2339,8 +2356,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               ("bytes", Box::leak(Box::new(f_stack1(bytes)))),
               ("bytes?", Box::leak(Box::new(f_stack1(is_bytes)))),
               ("clone", Box::leak(Box::new(clone))),
-              ("ceil", Box::leak(Box::new(f_stack1(ceil)))),
               ("contains?", Box::leak(Box::new(f_stack2(contains)))),
+              ("ceil", Box::leak(Box::new(f_stack1(ceil)))),
+              ("compare", Box::leak(Box::new(f_stack2(compare)))),
               ("count", Box::leak(Box::new(f_stack1(count)))),
               ("dec", Box::leak(Box::new(f_stack1(dec)))),
               ("decide", Box::leak(Box::new(decide))),
@@ -3762,6 +3780,36 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   pub fn set(i: Item) -> ItemResult {
       coll::Set::try_from(i).map(|s| Item::Iterable(coll::Iterable::Sized(coll::Sized::Set(s))))
   }
+
+  pub fn compare(i: Item, j: Item) -> ItemResult {
+      let ki = assoc::KeyItem::try_from(i)?;
+      let kj = assoc::KeyItem::try_from(j)?;
+      match ki.partial_cmp(&kj) {
+          Some(std::cmp::Ordering::Less) => Ok("less".into()),
+          Some(std::cmp::Ordering::Equal) => Ok("equal".into()),
+          Some(std::cmp::Ordering::Greater) => Ok("greater".into()),
+          None => Err(Error::expected("comparable", pair(ki.into(), kj.into()))),
+      }
+  }
+
+  fn as_pair(i: Item) -> Result<(Item, assoc::KeyItem), Error> {
+      let mut i = coll::List::try_from(i)?;
+      let im = i.make_mut();
+      let j = im.pop_front().ok_or(Error::short_list(1))?;
+      let k = im
+          .pop_front()
+          .ok_or(Error::short_list(2))
+          .and_then(assoc::KeyItem::try_from)?;
+      Ok((j, k))
+  }
+
+  pub fn sort_by_key(i: Item) -> ItemResult {
+      let mut l = coll::List::try_from(i)?;
+      let it = l.inner().into_iter().map(as_pair);
+      let mut it = it.collect::<Result<Vec<(Item, assoc::KeyItem)>, Error>>()?;
+      it.sort_unstable_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Less));
+      Ok(coll::List::from_iter(it.into_iter().map(|(k, _)| k)).into())
+  }
 #+end_src
 ** Top level execution
 We'll define the main module which reads input for the kcats
@@ -3998,6 +4046,7 @@ We'll also define how to run unit tests.
       #[test_case("ceil")]
       #[test_case("clone")]
       #[test_case("collect")]
+      #[test_case("compare")]
       #[test_case("contains?" ; "contains")]
       #[test_case("count")]
       #[test_case("dec")]
@@ -7245,3 +7294,112 @@ joiner
 
 **** TODO Implement partialord
 Each type needs to be comparable to another.
+
+#+begin_src kcats
+  [["b" 2]["g" 5]["a", 1]["d" 4] ["c" 3]] association ++sort
+#+end_src
+
+#+RESULTS:
+: [1 2 3 4 5]
+
+#+begin_src kcats
+  [-2 10 -8 -12 8 0 1 20]
+  [5 - abs]
+  [clone] swap join
+  [ pair] join
+  map  ++sort 
+#+end_src
+
+#+RESULTS:
+: Pair is (Int(-2), Int(7))
+: Pair is (Int(10), Int(5))
+: Pair is (Int(-8), Int(13))
+: Pair is (Int(-12), Int(17))
+: Pair is (Int(8), Int(3))
+: Pair is (Int(0), Int(5))
+: Pair is (Int(1), Int(4))
+: Pair is (Int(20), Int(15))
+: [8 1 10 0 -2 -8 20 -12]
+
+UHOH
+#+begin_src kcats
+  ["hi" "there" "what" "is" "your" "birthdate" "homeboy"]
+  []
+  [clone] swap join
+  [pair] join
+  map  ++sort 
+#+end_src
+
+#+RESULTS:
+: Pair is (Iterable(Sized(String("hi"))), String("hi"))
+: Pair is (Iterable(Sized(String("there"))), String("there"))
+: Pair is (Iterable(Sized(String("what"))), String("what"))
+: Pair is (Iterable(Sized(String("is"))), String("is"))
+: Pair is (Iterable(Sized(String("your"))), String("your"))
+: Pair is (Iterable(Sized(String("birthdate"))), String("birthdate"))
+: Pair is (Iterable(Sized(String("homeboy"))), String("homeboy"))
+: ["birthdate" "hi" "homeboy" "is" "there" "what" "your"]
+
+#+begin_src kcats
+8 5 - 
+#+end_src
+
+#+RESULTS:
+: 3
+
+#+begin_src kcats
+1 2 [inc] both
+#+end_src
+
+#+RESULTS:
+: [[reason "word is not defined"] [unwound [both]] [type error] [asked [both]] [handled true]] [inc] 2 1
+
+**** TODO Make floats hashable
+This will allow floats to be added to the =KeyItem= enum. Floats are not
+normally hashable, because mathematically identical numbers are not
+always represented the same way in memory and wouldn't hash the
+same. But for the purposes of kcats, I think this doesn't matter. We
+can document that you can't expect (10.0 + 10.0) and (15.0 + 5.0) to
+be the same map key.
+
+This will then allow a list that contains floats, to be sorted, or be
+able to use float values as a sort-by key.
+
+**** TODO Implement compare
+Should expose Rust's comparison function. That will allow a native
+sort function, for max flexibility (but not performance).
+
+#+begin_src kcats
+  "a" "b" compare
+#+end_src
+
+#+RESULTS:
+: less
+
+#+begin_src kcats
+"a" "a" compare
+#+end_src
+
+#+RESULTS:
+: equal
+
+#+begin_src kcats
+["a" "b"] ["a" "c"] compare
+#+end_src
+
+#+RESULTS:
+: less
+
+#+begin_src kcats
+"foo" bytes [1] compare
+#+end_src
+
+#+RESULTS:
+: less
+
+#+begin_src kcats
+[] [] compare
+#+end_src
+
+#+RESULTS:
+: [[type error] [unwound []] [actual []] [asked [KeyItem]] [reason "type mismatch"] [handled true]]
