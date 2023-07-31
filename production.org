@@ -26,7 +26,7 @@ from stdin and execute it, then print the resulting stack.
 #+begin_src toml :tangle Cargo.toml
   [package]
   name = "kcats"
-  version = "0.3.0"
+  version = "0.3.1"
   edition = "2021"
 
   # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -166,6 +166,7 @@ internally, to keep track of things like the stack, expression, lists etc.
       Float(Float),
       Word(Word),
       Char(Char),
+      Program(coll::Program),
       Dispenser(coll::Dispenser),
       Receptacle(coll::Receptacle),
   }
@@ -445,6 +446,15 @@ internally, to keep track of things like the stack, expression, lists etc.
       }
   }
 
+  impl FromIterator<Item> for Program {
+      fn from_iter<I>(iter: I) -> Self
+      where
+          I: IntoIterator<Item = Item>,
+      {
+          Program::new(iter.into_iter().collect::<Vec<Item>>())
+      }
+  }
+
   // Most generic collection type, all we know is it can contain
   // multiple items.
   #[derive(Debug, Clone, PartialEq)]
@@ -473,42 +483,115 @@ internally, to keep track of things like the stack, expression, lists etc.
       Nothing,
   }
 
-  pub struct Iterable<'a, T> {
-      data: Arc<Vec<T>>,
-      index: usize,
-      phantom: std::marker::PhantomData<&'a T>,
+  #[derive(Debug, Clone, PartialEq)]
+  pub struct Iterable<T> {
+      pub data: sync::Arc<Vec<T>>,
+      pub index: usize,
   }
 
-  impl<'a, T> Iterable<'a, T> {
-      pub fn new(data: Arc<Vec<T>>) -> Self {
+  impl<T: Clone> Iterable<T> {
+      pub fn new(data: Vec<T>) -> Self {
+          let index = data.len();
           Self {
-              data,
-              index: 0,
-              phantom: std::marker::PhantomData,
+              data: sync::Arc::new(data),
+              index,
+          }
+      }
+
+      pub fn make_mut(&mut self) -> &mut Vec<T> {
+          sync::Arc::make_mut(&mut self.data)
+      }
+
+      pub fn is_empty(&self) -> bool {
+          self.data.is_empty()
+      }
+
+      pub fn push(&mut self, item: T) {
+          self.make_mut().push(item);
+          self.index += 1;
+      }
+
+      pub fn copy(&self) -> Self {
+          Self {
+              data: self.data.clone(),
+              index: self.data.len(),
           }
       }
   }
 
-  impl<'a, T> Iterator for Iterable<'a, T> {
-      type Item = &'a T;
+  impl<T: Clone> Iterator for Iterable<T> {
+      type Item = T;
 
+      // iterate over the vec in reverse (use it as a stack)
       fn next(&mut self) -> Option<Self::Item> {
-          if self.index >= self.data.len() {
+          if self.index == 0 {
               return None;
           }
+          let item = self.data[self.index - 1].clone();
 
-          let item = unsafe {
-              // SAFETY: We have ensured that the index is within bounds
-              // of the vector, and we ensure that the vector is not
-              // modified during iteration, by always using make_mut to
-              // modify (which copies on write), so this pointer
-              // dereference should always be safe.
-              let ptr: *const T = &self.data[self.index];
-              &*ptr
-          };
-
-          self.index += 1;
+          self.index -= 1;
           Some(item)
+      }
+  }
+
+  pub type Program = Iterable<Item>;
+
+  impl Program {
+      // Advance the program, returning the next expression element. If
+      // there is a non-program element, return it. If the top element
+      // is another program, return the element at the current index of
+      // that program. If the program index is at 0, pop the item off
+      // and look at the next item.
+      pub fn step(&mut self) -> Option<Item> {
+          println!("Step: {:?}", self);
+          let top = self.pop();
+
+          match top {
+              Some(Item::Program(mut prog)) => {
+                  if prog.is_finished() {
+                      self.step()
+                  } else {
+                      let i = prog.next();
+                      self.push(prog.into());
+                      i
+                  }
+              }
+              Some(i) => {
+                  self.index += 1;
+                  Some(i.clone())
+              }
+              None => None,
+          }
+      }
+
+      pub fn pop(&mut self) -> Option<Item> {
+          println!("pop: {:?}", self);
+          let i = self.make_mut().pop();
+          if i.is_some() {
+              self.index -= 1;
+          }
+          i
+      }
+
+      pub fn is_finished(&self) -> bool {
+          self.index == 0
+      }
+
+      pub fn fresh() -> Self {
+          Self::new(Vec::new())
+      }
+
+      // wrap the program as a single item in another program
+      pub fn quoted(self) -> Self {
+          let mut prog = Program::fresh();
+          prog.push(Item::Program(self));
+          prog
+      }
+  }
+
+  impl Default for Program {
+      fn default() -> Self {
+          Self::fresh()
       }
   }
 
@@ -912,6 +995,43 @@ internally, to keep track of things like the stack, expression, lists etc.
               .map(|i| i.try_into())
               .collect::<Result<HashSet<assoc::KeyItem>, Error>>()?;
           Ok(Set::from(hs))
+      }
+  }
+
+  impl From<Program> for Item {
+      fn from(p: Program) -> Self {
+          Item::Program(p)
+      }
+  }
+
+  impl From<List> for Program {
+      fn from(mut l: List) -> Self {
+          Iterable {
+              data: sync::Arc::new(l.inner().into_iter().rev().collect()),
+              index: l.len(),
+          }
+      }
+  }
+
+  impl From<Program> for List {
+      fn from(p: Program) -> Self {
+          let v = p.collect::<Vec<Item>>();
+
+          List::from_iter(v.into_iter().map(Item::from).rev())
+      }
+  }
+
+  impl TryFrom<Item> for Program {
+      type Error = Error;
+
+      fn try_from(item: Item) -> Result<Self, Self::Error> {
+          match item {
+              Item::Program(p) => Ok(p),
+              i => {
+                  let l = List::try_from(i)?;
+                  Ok(l.into())
+              }
+          }
       }
   }
 #+end_src
@@ -1562,7 +1682,7 @@ internally, to keep track of things like the stack, expression, lists etc.
   #[derive(Clone)]
   pub enum Definition {
       Axiom(&'static StepFn),
-      Derived(coll::List),
+      Derived(coll::Program),
   }
 
   impl PartialEq for Definition {
@@ -1588,7 +1708,7 @@ internally, to keep track of things like the stack, expression, lists etc.
               Definition::Axiom(_) => f.write_str("Builtin"),
               Definition::Derived(d) => {
                   let mut ds = f.debug_list();
-                  ds.entries(d.iter());
+                  ds.entries(d.clone());
                   ds.finish()
               }
           }
@@ -1637,7 +1757,7 @@ internally, to keep track of things like the stack, expression, lists etc.
           }
           Ok(Entry {
               examples,
-              definition: definition.unwrap_or(Definition::Derived(coll::List::new())),
+              definition: definition.unwrap_or(Definition::Derived(Default::default())),
               spec,
           })
       }
@@ -1656,7 +1776,7 @@ internally, to keep track of things like the stack, expression, lists etc.
   impl TryFrom<Item> for Definition {
       type Error = Error;
       fn try_from(i: Item) -> Result<Self, Self::Error> {
-          coll::List::try_from(i).and_then(|l| Ok(Definition::Derived(l)))
+          coll::Program::try_from(i).and_then(|l| Ok(Definition::Derived(l)))
       }
   }
 
@@ -1811,11 +1931,12 @@ internally, to keep track of things like the stack, expression, lists etc.
   use crate::types::*;
   use crate::types::{associative as assoc, collection as coll, dictionary as dict};
   use std::future;
+  use std::sync;
 
   #[derive(Clone, PartialEq)]
   pub struct Environment {
       pub stack: Stack,
-      pub expression: Stack,
+      pub expression: coll::Program,
       pub dictionary: dict::Dictionary,
   }
 
@@ -1829,22 +1950,14 @@ internally, to keep track of things like the stack, expression, lists etc.
           coll::Arc::make_mut(&mut self.stack).pop_front().unwrap()
       }
 
+      //TODO: deprecate
       pub fn push_expr(mut self, i: Item) -> Environment {
-          coll::Arc::make_mut(&mut self.expression).push_front(i);
+          self.expression.push(i);
           self
       }
 
-      pub fn pop_expr(&mut self) -> Item {
-          coll::Arc::make_mut(&mut self.expression)
-              .pop_front()
-              .unwrap()
-      }
-
-      pub fn append_expression(mut self, mut items: coll::List) -> Environment {
-          let expr = self.expression.make_mut();
-          let ct = expr.len();
-          expr.append(items.make_mut());
-          expr.rotate_left(ct);
+      pub fn append_expression(mut self, mut i: Item) -> Environment {
+          sync::Arc::make_mut(&mut self.expression.data).push(i);
           self
       }
 
@@ -1893,11 +2006,11 @@ internally, to keep track of things like the stack, expression, lists etc.
                       }
                   }
                   "expression" => {
-                      let l = coll::List::try_from(v.clone());
-                      match l {
-                          Ok(l) => {
+                      let p = coll::Program::try_from(v.clone());
+                      match p {
+                          Ok(p) => {
                               let old = self.expression.clone();
-                              self.expression = l;
+                              self.expression = p;
                               (assoc::Associative::Env(self), Some(old.into()))
                           }
                           Err(_) => {
@@ -1941,7 +2054,7 @@ internally, to keep track of things like the stack, expression, lists etc.
       type Error = Error;
       fn try_from(iter: Box<dyn Iterator<Item = Item>>) -> Result<Self, Error> {
           let mut stack: Option<coll::List> = None;
-          let mut expression: Option<coll::List> = None;
+          let mut expression: Option<coll::Program> = None;
           let mut dictionary: Option<dict::Dictionary> = None;
           for i in iter {
               let (k, v): (assoc::KeyItem, Item) = i.try_into()?;
@@ -2216,6 +2329,9 @@ example, in order to read/write to/from disk).
           Item::Int(i) => edn_format::Value::Integer(*i),
           Item::Float(f) => edn_format::Value::from(*f),
           Item::Char(c) => edn_format::Value::Character(*c),
+          Item::Program(p) => {
+              edn_format::Value::Vector(p.data[p.index..].into_iter().map(from_item).collect())
+          }
           Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(s))) => {
               edn_format::Value::String(s.to_string())
           }
@@ -2792,16 +2908,20 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn loop_(mut env: Environment) -> Future<Environment> {
-      let p = coll::List::try_from(env.pop());
+      let p = coll::Program::try_from(env.pop());
       match p {
-          Ok(mut p) => {
+          Ok(p) => {
               let f = env.pop();
               if is_truthy(f) {
-                  let p2 = p.clone();
-                  let pm = coll::Arc::make_mut(&mut p);
-                  pm.push_back(Item::from(p2));
-                  pm.push_back("loop".into());
-                  env.append_expression(p)
+                  // need to put onto the expression:
+                  // the word loop
+                  // a program with one item, p,
+                  // p
+                  let mut next = coll::Program::fresh();
+                  next.push(Item::Program(p.copy()));
+                  next.push("loop".into());
+                  env.append_expression(next.into())
+                      .append_expression(p.into())
               } else {
                   env
               }
@@ -2813,8 +2933,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn execute(mut env: Environment) -> Future<Environment> {
       let i = env.pop();
-      match coll::List::try_from(i) {
-          Ok(program) => env.append_expression(program),
+      match coll::Program::try_from(i) {
+          Ok(program) => env.append_expression(program.into()),
           Err(e) => env.push(e.into()),
       }
       .into()
@@ -2845,10 +2965,11 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       match coll::List::try_from(env.pop()) {
           Ok(program) => {
               let item = env.pop();
-              let expr = env.expression.make_mut();
-              expr.push_front("unwrap".into());
-              expr.push_front(coll::List::from_iter([item]).into());
-              env.append_expression(program)
+              let mut p = coll::Program::fresh();
+              p.push("unwrap".into());
+              p.push(coll::List::from_iter([item]).into());
+              env.append_expression(p.into())
+                  .append_expression(program.into())
           }
           Err(e) => env.push(e.into()),
       }
@@ -2856,14 +2977,15 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn dipdown(mut env: Environment) -> Future<Environment> {
-      match coll::List::try_from(env.pop()) {
+      match coll::Program::try_from(env.pop()) {
           Ok(program) => {
               let item1 = env.pop();
               let item2 = env.pop();
-              let expr = env.expression.make_mut();
-              expr.push_front("unwrap".into());
-              expr.push_front(coll::List::from_iter([item2, item1]).into());
-              env.append_expression(program)
+              let mut p = coll::Program::fresh();
+              p.push("unwrap".into());
+              p.push(coll::List::from_iter([item2, item1]).into());
+              env.append_expression(p.into())
+                  .append_expression(program.into())
           }
           Err(e) => env.push(e.into()),
       }
@@ -2955,16 +3077,16 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn branch(mut env: Environment) -> Future<Environment> {
       match (
-          coll::List::try_from(env.pop()),
-          coll::List::try_from(env.pop()),
+          coll::Program::try_from(env.pop()),
+          coll::Program::try_from(env.pop()),
       ) {
           (Ok(false_branch), Ok(true_branch)) => {
               let b = env.pop();
 
               env.append_expression(if is_truthy(b) {
-                  true_branch
+                  true_branch.into()
               } else {
-                  false_branch
+                  false_branch.into()
               })
           }
           (Err(e), _) => env.push(e.into()),
@@ -2974,19 +3096,18 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn step(mut env: Environment) -> Future<Environment> {
-      let p = coll::List::try_from(env.pop()).unwrap();
+      let p = coll::Program::try_from(env.pop()).unwrap();
       let it = coll::Dispenser::try_from(env.pop()).unwrap();
       Box::pin(async move {
           if let (it, Some(litem)) = it.take().await {
-              let expr = env.expression.make_mut();
               // prepare the next iteration, even if the iterator is now
               // empty
-              expr.push_front("step".into());
-              expr.push_front(p.clone().into());
-              expr.push_front(it.into());
-              expr.push_front("execute".into());
-
-              env.push(litem).push(p.into()).into()
+              env.append_expression("step".into())
+                  .append_expression(p.copy().quoted().into())
+                  .append_expression(it.into())
+                  .append_expression(p.into())
+                  .push(litem)
+                  .into()
           } else {
               env.into()
           }
@@ -3288,16 +3409,17 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       match (test, expr) {
                           (Ok(test), Ok(expr)) => {
                               // construct if
-                              let testp = coll::List::from_iter([Item::from(test), "shield".into()]);
+                              let testp =
+                                  coll::Program::from_iter([Item::from(test), "shield".into()]);
                               let elsep =
-                                  coll::List::from_iter([Item::from(clauses), "decide".into()]);
-                              let newexpr = coll::List::from_iter([
+                                  coll::Program::from_iter([Item::from(clauses), "decide".into()]);
+                              let newexpr = coll::Program::from_iter([
                                   Item::from(testp),
                                   expr.into(),
                                   elsep.into(),
                                   "if".into(),
                               ]);
-                              env.append_expression(newexpr).into()
+                              env.append_expression(newexpr.into()).into()
                           }
                           (Err(test), _) => env.push(test.into()).into(),
                           (_, Err(expr)) => env.push(expr.into()).into(),
@@ -3450,12 +3572,12 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn eval_step(mut env: Environment) -> Future<Environment> {
       //println!("{:?}", env);
-      let next_item = env.expression.front();
+      let next_item = env.expression.step();
 
       if let Some(val) = next_item {
           match val {
               Item::Word(word) => {
-                  if let Some(dfn) = env.dictionary.get(word) {
+                  if let Some(dfn) = env.dictionary.get(&word) {
                       {
                           if let Some(spec) = &dfn.spec {
                               if let Err(e) = check_input_spec(&spec, &env) {
@@ -3465,8 +3587,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                           } else {
                               println!("No spec for {}!", word);
                           }
-                          let expr = coll::Arc::make_mut(&mut env.expression);
-                          expr.pop_front();
 
                           match &dfn.definition {
                               dict::Definition::Axiom(a) => {
@@ -3478,13 +3598,12 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                               }
                               dict::Definition::Derived(d) => {
                                   let items = d.clone();
-                                  env.append_expression(items).into()
+                                  env.append_expression(items.into()).into()
                               }
                           }
                       }
                   } else {
-                      let w = *word;
-                      env.push(Error::undefined(w).into()).into()
+                      env.push(Error::undefined(word.clone()).into()).into()
                   }
               }
               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
@@ -3496,24 +3615,21 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                           return env.into();
                       }
                   }
-                  let expr = coll::Arc::make_mut(&mut env.expression);
-                  let e: dict::Entry = expr.pop_front().unwrap().try_into().unwrap();
 
-                  match e.definition {
+                  match entry.definition {
                       dict::Definition::Axiom(builtin) => {
                           //let b = dict::Axiom::try_from(env.pop_expr()).unwrap();
                           (builtin)(env)
                       }
                       dict::Definition::Derived(d) => {
                           let d = d.clone();
-                          env.append_expression(d).into()
+                          env.append_expression(d.into()).into()
                       }
                   }
               }
-              _ => {
+              i => {
                   // not a word, just push onto stack
-                  let i = env.pop_expr();
-                  env.push(i).into()
+                  env.push(i.clone()).into()
               }
           }
       } else {
@@ -3569,33 +3685,34 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   fn unwind(mut env: Environment) -> Environment {
-      let err = env.pop();
-      let w: &Item = &"handle".into();
+      todo!("unwind implementation")
+      // let err = env.pop();
+      // let w: &Item = &"handle".into();
 
-      let err = match err {
-          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
-              assoc::Associative::Error(mut e),
-          ))) => {
-              let mut next = env.expression.front();
-              let mut unwound = Vec::<Item>::new();
-              while next.is_some() && next.unwrap() != w {
-                  let i = env.pop_expr();
-                  unwound.push(i);
-                  next = env.expression.front();
-              }
-              if next.is_some() {
-                  env.pop_expr();
-              }
-              // set the is_handled bit
-              e.is_handled = true;
-              let em = coll::Arc::make_mut(&mut e.data);
-              em.insert("unwound".into(), coll::List::from_iter(unwound).into());
-              e.into()
-          }
-          i => i,
-      };
-      env = env.push(err);
-      return env;
+      // let err = match err {
+      //     Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
+      //         assoc::Associative::Error(mut e),
+      //     ))) => {
+      //         let mut next = env.expression.front();
+      //         let mut unwound = Vec::<Item>::new();
+      //         while next.is_some() && next.unwrap() != w {
+      //             let i = env.pop_expr();
+      //             unwound.push(i);
+      //             next = env.expression.front();
+      //         }
+      //         if next.is_some() {
+      //             env.pop_expr();
+      //         }
+      //         // set the is_handled bit
+      //         e.is_handled = true;
+      //         let em = coll::Arc::make_mut(&mut e.data);
+      //         em.insert("unwound".into(), coll::List::from_iter(unwound).into());
+      //         e.into()
+      //     }
+      //     i => i,
+      // };
+      // env = env.push(err);
+      // return env;
   }
 
   pub async fn eval(mut env: Environment) -> Environment {
@@ -3614,11 +3731,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       env
   }
 
-  pub fn standard_env(program: Option<coll::List>, stack: Option<coll::List>) -> Environment {
-      let prog_expr = match program {
-          Some(p) => Stack::from(p),
-          _ => Stack::new(),
-      };
+  pub fn standard_env(program: Option<coll::Program>, stack: Option<coll::List>) -> Environment {
+      let prog_expr = program.unwrap_or_default().into();
 
       let env = Environment {
           stack: stack.unwrap_or(Stack::new()),
@@ -3863,7 +3977,7 @@ interpreter process, and prints output.
 
 We'll also define how to run unit tests.
 #+begin_src rust :tangle src/main.rs
-  ''mod axiom;
+  mod axiom;
   mod crypto;
   mod pipes;
   mod serialize;
@@ -3872,7 +3986,6 @@ We'll also define how to run unit tests.
   use crate::types::{environment::Environment, error, *};
   use std::io;
   use std::io::{BufRead, Read};
-  use std::sync::Arc;
   use tokio;
 
   fn print_result(env: Environment) {
@@ -3935,11 +4048,9 @@ We'll also define how to run unit tests.
   // a function that takes an env, and an input string. Parses the
   // string, if it parses, returns the env with the input added to the
   // expression. Otherwise returns Error.
-  fn parse_input(mut env: Environment, input: String) -> Result<Environment, error::Error> {
-      let mut parsed = serialize::parse(input)?;
-      let expr = Arc::make_mut(&mut env.expression);
-      expr.extend(Arc::make_mut(&mut parsed).drain(..));
-      Ok(env)
+  fn parse_input(env: Environment, input: String) -> Result<Environment, error::Error> {
+      let parsed = serialize::parse(input)?;
+      Ok(env.append_expression(parsed.into()))
   }
 
   //It converts the bytes to a
@@ -4008,12 +4119,12 @@ We'll also define how to run unit tests.
       #[tokio::main]
       async fn test_example(
           mut prog_env: Environment,
-          program: coll::List,
-          expected: coll::List,
+          program: coll::Program,
+          expected: coll::Program,
       ) -> Option<Error> {
           let mut exp_env = prog_env.clone();
-          prog_env = prog_env.append_expression(program.clone());
-          exp_env = exp_env.append_expression(expected.clone());
+          prog_env = prog_env.append_expression(program.clone().into());
+          exp_env = exp_env.append_expression(expected.clone().into());
 
           let p_fut = tokio::spawn(async move { axiom::eval(prog_env).await });
 
@@ -4039,7 +4150,11 @@ We'll also define how to run unit tests.
               //     "Debug: expected {:?} got {:?}",
               //     exp_env.stack, prog_env.stack
               // );
-              Some(Error::test_assertion(program, expected, prog_env.stack))
+              Some(Error::test_assertion(
+                  program.into(),
+                  expected.into(),
+                  prog_env.stack,
+              ))
           }
       }
 
@@ -4057,7 +4172,7 @@ We'll also define how to run unit tests.
                           (
                               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(p))),
                               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(exp))),
-                          ) => test_example(standard_env.clone(), p.clone(), exp.clone()),
+                          ) => test_example(standard_env.clone(), p.into(), exp.into()),
                           (i, _) => Some(Error::expected("list", i.into())),
                       }
                   })
