@@ -543,29 +543,23 @@ internally, to keep track of things like the stack, expression, lists etc.
       // that program. If the program index is at 0, pop the item off
       // and look at the next item.
       pub fn step(&mut self) -> Option<Item> {
-          println!("Step: {:?}", self);
           let top = self.pop();
 
           match top {
               Some(Item::Program(mut prog)) => {
-                  if prog.is_finished() {
-                      self.step()
-                  } else {
-                      let i = prog.next();
+                  let i = prog.next();
+
+                  if !prog.is_finished() {
                       self.push(prog.into());
-                      i
                   }
+                  i
               }
-              Some(i) => {
-                  self.index += 1;
-                  Some(i.clone())
-              }
+              Some(i) => Some(i),
               None => None,
           }
       }
 
       pub fn pop(&mut self) -> Option<Item> {
-          println!("pop: {:?}", self);
           let i = self.make_mut().pop();
           if i.is_some() {
               self.index -= 1;
@@ -574,7 +568,7 @@ internally, to keep track of things like the stack, expression, lists etc.
       }
 
       pub fn is_finished(&self) -> bool {
-          self.index == 0
+          self.data.is_empty() || self.index == 0
       }
 
       pub fn fresh() -> Self {
@@ -1931,7 +1925,6 @@ internally, to keep track of things like the stack, expression, lists etc.
   use crate::types::*;
   use crate::types::{associative as assoc, collection as coll, dictionary as dict};
   use std::future;
-  use std::sync;
 
   #[derive(Clone, PartialEq)]
   pub struct Environment {
@@ -1956,8 +1949,8 @@ internally, to keep track of things like the stack, expression, lists etc.
           self
       }
 
-      pub fn append_expression(mut self, mut i: Item) -> Environment {
-          sync::Arc::make_mut(&mut self.expression.data).push(i);
+      pub fn append_expression(mut self, i: Item) -> Environment {
+          self.expression.push(i);
           self
       }
 
@@ -2918,8 +2911,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   // a program with one item, p,
                   // p
                   let mut next = coll::Program::fresh();
-                  next.push(Item::Program(p.copy()));
                   next.push("loop".into());
+                  next.push(Item::Program(p.copy()));
                   env.append_expression(next.into())
                       .append_expression(p.into())
               } else {
@@ -2962,7 +2955,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn dip(mut env: Environment) -> Future<Environment> {
-      match coll::List::try_from(env.pop()) {
+      match coll::Program::try_from(env.pop()) {
           Ok(program) => {
               let item = env.pop();
               let mut p = coll::Program::fresh();
@@ -3456,6 +3449,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           (w, Item::Dispenser(_) | Item::Receptacle(_)) if w == *S_DISPENSER => Ok(()),
           (w, Item::Int(_)) if w == *S_INTEGER || w == *S_NUMBER => Ok(()),
           (w, Item::Float(_)) if w == *S_FLOAT || w == *S_NUMBER => Ok(()),
+          (w, Item::Program(_)) if w == *S_PROGRAM => Ok(()),
           // TODO: also handle cases where bytes/string is a list
           (
               w,
@@ -3571,9 +3565,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn eval_step(mut env: Environment) -> Future<Environment> {
-      //println!("{:?}", env);
+      //println!("{:?}, {:?}", env.stack, env.expression);
       let next_item = env.expression.step();
-
+      //println!("Next instruction: {:?}", next_item);
       if let Some(val) = next_item {
           match val {
               Item::Word(word) => {
@@ -3629,7 +3623,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               }
               i => {
                   // not a word, just push onto stack
-                  env.push(i.clone()).into()
+                  env.push(i).into()
               }
           }
       } else {
@@ -3684,7 +3678,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       })
   }
 
-  fn unwind(mut env: Environment) -> Environment {
+  fn unwind(_env: Environment) -> Environment {
       todo!("unwind implementation")
       // let err = env.pop();
       // let w: &Item = &"handle".into();
@@ -3722,7 +3716,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   env = unwind(env); // TODO: this should be done in eval_step
               };
           }
-          if !env.expression.is_empty() {
+          if !env.expression.is_finished() {
               env = eval_step(env).await;
           } else {
               break;
@@ -3983,7 +3977,7 @@ We'll also define how to run unit tests.
   mod serialize;
   mod types;
 
-  use crate::types::{environment::Environment, error, *};
+  use crate::types::{collection as coll, environment::Environment, error, *};
   use std::io;
   use std::io::{BufRead, Read};
   use tokio;
@@ -4050,7 +4044,7 @@ We'll also define how to run unit tests.
   // expression. Otherwise returns Error.
   fn parse_input(env: Environment, input: String) -> Result<Environment, error::Error> {
       let parsed = serialize::parse(input)?;
-      Ok(env.append_expression(parsed.into()))
+      Ok(env.append_expression(coll::Program::from(parsed).into()))
   }
 
   //It converts the bytes to a
