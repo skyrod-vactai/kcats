@@ -1,0 +1,12 @@
+(progn
+  (defun org-babel-tangle-single-block (oldfun block-counter &optional only-this-block)
+    (let ((orig-output-dir default-directory))
+      (cd (if (file-name-absolute-p (cdr (assq :tangle (nth 4 (org-babel-get-src-block-info))))) 
+              (file-name-directory (cdr (assq :tangle (nth 4 (org-babel-get-src-block-info)))))
+            default-directory))
+      (unless (file-exists-p default-directory)
+        (make-directory default-directory t))
+      (cd orig-output-dir)
+      (funcall oldfun block-counter only-this-block)))
+  (advice-add 'org-babel-tangle-single-block :around #'org-babel-tangle-single-block))
+(org-babel-tangle-file "production.org")
