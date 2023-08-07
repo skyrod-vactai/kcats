@@ -1,3 +1,5 @@
+(setq org-export-use-babel nil)
+
 (defface kcats-brackets 
   '((((class color)) (:foreground "DimGrey" :weight bold)))
   "kcats brackets" :group 'faces)
@@ -61,6 +63,12 @@
   (setq font-lock-defaults '(kcats-font-lock-keywords)))
 
 (add-to-list 'auto-mode-alist '("\\.kcats\\'" . kcats-mode))
+
+(defun org-babel-execute:kcats (body params)
+  "Execute a block of kcats code with org-babel."
+  (org-babel-eval
+   kcats-babel-executable
+   body))
 
 (defun org-is-result-block-p (src-block)
   "Check if the given SRC-BLOCK is a results block."
