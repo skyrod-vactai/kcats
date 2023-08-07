@@ -1,4 +1,5 @@
 (setq org-export-use-babel nil)
+(setq org-html-htmlize-output-type 'css)
 
 (require 'package)
 (add-to-list 'package-archives '("melpa" . "https://melpa.org/packages/") t)
