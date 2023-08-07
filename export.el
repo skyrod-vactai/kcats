@@ -1,3 +1,11 @@
+(defun org-is-result-block-p (src-block)
+  "Check if the given SRC-BLOCK is a results block."
+  (save-excursion
+    (goto-char (org-element-property :begin src-block))
+    ;;(forward-line -1)
+    (beginning-of-line)
+    (looking-at-p "^#\\+RESULTS:")))
+
 (defun org-html-src-block-modified (src-block _contents info)
   "Transcode a SRC-BLOCK element from Org to HTML.
 CONTENTS holds the contents of the item.  INFO is a plist holding
