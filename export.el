@@ -57,6 +57,8 @@
 
     table))
 
+(require 'smie) ;; indentation engine
+
 (define-derived-mode kcats-mode fundamental-mode "kcats"
   "major mode for editing kcats."
   (set-syntax-table kcats-mode-syntax-table)
