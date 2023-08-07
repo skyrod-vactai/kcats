@@ -1,3 +1,5 @@
+(setq org-export-use-babel nil)
+
 (defface kcats-brackets 
   '((((class color)) (:foreground "DimGrey" :weight bold)))
   "kcats brackets" :group 'faces)
