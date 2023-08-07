@@ -1,5 +1,13 @@
 (setq org-export-use-babel nil)
 
+(require 'package)
+(add-to-list 'package-archives '("melpa" . "https://melpa.org/packages/") t)
+;; Comment/uncomment this line to enable MELPA Stable if desired.  See `package-archive-priorities`
+;; and `package-pinned-packages`. Most users will not need or want to do this.
+;;(add-to-list 'package-archives '("melpa-stable" . "https://stable.melpa.org/packages/") t)
+(package-initialize)
+(package-install 'htmlize)
+
 (defface kcats-brackets 
   '((((class color)) (:foreground "DimGrey" :weight bold)))
   "kcats brackets" :group 'faces)
@@ -19,8 +27,6 @@
         ("#?\"" 0 'double-quote prepend)))
 
 (add-hook 'kcats-mode-hook (lambda () (font-lock-add-keywords nil kcats-font-lock-keywords)))
-
-(require 'smie) ;; indentation engine
 
 (setq kcats-mode-syntax-table (let ((table (make-syntax-table)))
     ;; Initialize ASCII charset as symbol syntax
