@@ -130,7 +130,28 @@ contextual information."
 		  (format "<pre class=\"src src-%s\"%s>%s</pre>"
                           lang label code)))))))
 
+(defun get-tangle-from-src-block (src-block)
+  "Get the :tangle value from the header arguments of a SRC-BLOCK."
+  (let* ((header-args (nth 2 (org-babel-get-src-block-info nil src-block)))
+        (tangle (cdr (assoc :tangle header-args))))
+    (message "tangle: %s %s" tangle (type-of tangle))
+    (if (equal tangle "no") nil tangle)))
+
+(defun org-html-src-block-modified-tangle (orig-fn src-block contents info)
+  "Transcode a SRC-BLOCK element from Org to HTML with tangle information.
+CONTENTS holds the contents of the item.  INFO is a plist holding
+contextual information."
+  ;;(message "block at %d" (org-element-property :begin src-block))
+  (let ((tangle (get-tangle-from-src-block src-block)))
+    (let* ((original-result (funcall orig-fn src-block contents info)))
+      (if tangle
+          (concat "<div class='tangle-wrapper' data-tangle='" tangle "'>" original-result "</div>")
+        original-result))))
+
 (advice-add 'org-html-src-block :override #'org-html-src-block-modified)
+
+;;(advice-remove 'org-html-src-block #'org-html-src-block-modified-tangle)
+(advice-add 'org-html-src-block :around #'org-html-src-block-modified-tangle)
 
 (save-excursion
   (find-file "book-of-kcats.org")
