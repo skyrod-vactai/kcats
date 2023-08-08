@@ -136,7 +136,7 @@ contextual information."
   "Get the :tangle value from the header arguments of a SRC-BLOCK."
   (let* ((header-args (nth 2 (org-babel-get-src-block-info nil src-block)))
         (tangle (cdr (assoc :tangle header-args))))
-    (message "tangle: %s %s" tangle (type-of tangle))
+    ;(message "tangle: %s %s" tangle (type-of tangle))
     (if (equal tangle "no") nil tangle)))
 
 (defun org-html-src-block-modified-tangle (orig-fn src-block contents info)
