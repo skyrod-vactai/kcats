@@ -8,6 +8,8 @@
 ;;(add-to-list 'package-archives '("melpa-stable" . "https://stable.melpa.org/packages/") t)
 (package-initialize)
 (package-install 'htmlize)
+(package-install 'rust-mode)
+(require 'rust-mode)
 
 (defface kcats-brackets 
   '((((class color)) (:foreground "DimGrey" :weight bold)))
