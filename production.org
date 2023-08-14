@@ -46,7 +46,7 @@ the location where you installed the kcats binary.
 #+BEGIN_SRC toml :tangle Cargo.toml
   [package]
   name = "kcats"
-  version = "0.3.2"
+  version = "0.3.3"
   edition = "2021"
 
   # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -2259,17 +2259,17 @@ example, in order to read/write to/from disk).
   }
 
   pub fn emit(item: &Item) -> String {
-      edn_format::emit_str(&from_item(item))
+      auto_format(edn_format::emit_str(&from_item(item)).as_str(), 20, 80)
   }
 
   pub fn emit_all(items: &VecDeque<Item>) -> String {
       let mut s: String = String::new();
       for i in items {
-          s.push_str(&emit(&i));
+          s.push_str(edn_format::emit_str(&from_item(i)).as_str());
           s.push_str(" ".into());
       }
       s.pop();
-      return s;
+      auto_format(&s, 20, 80)
   }
 
   // print out envs in error messages
@@ -2287,6 +2287,163 @@ example, in order to read/write to/from disk).
   impl fmt::Debug for Error {
       fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
           write!(f, "{}", emit(&Item::from(self.data.clone())))
+      }
+  }
+
+  fn insert_line_breaks(input: &str, max_items: usize, max_chars: usize) -> String {
+      let mut result = String::new();
+      let mut current_line_length = 0;
+      let mut open_list_stack: Vec<(usize, usize)> = Vec::new();
+      open_list_stack.push((0, 0));
+      let mut last_char: char = '\n';
+      let mut in_string: bool = false;
+      let mut chars = input.chars().peekable(); // Convert to a Peekable iterator
+
+      while let Some(c) = chars.next() {
+          current_line_length += 1;
+
+          match c {
+              '"' => {
+                  if last_char != '\\' {
+                      in_string = !in_string;
+                  }
+                  result.push(c);
+              }
+              '[' => {
+                  if !in_string {
+                      open_list_stack.push((0, 0)); // Start a new list
+                  }
+                  result.push(c);
+              }
+              ']' => {
+                  result.push(c);
+                  if !in_string {
+                      let (last_count, break_count) = open_list_stack.pop().unwrap();
+                      //println!("items, breaks: {}, {}", last_count, break_count);
+                      if (last_count == 1 || break_count > 0) && chars.peek() != Some(&']') {
+                          // Only add a newline if the next character is not a closing bracket
+                          result.push('\n');
+                          let (_, break_count) = open_list_stack.last_mut().unwrap();
+                          ,*break_count += 1;
+                          current_line_length = 0;
+                      }
+                  }
+              }
+              ' ' => {
+                  if !in_string {
+                      let (last_count, break_count) = open_list_stack.last_mut().unwrap();
+                      ,*last_count += 1;
+                      if (*last_count % max_items) == 0 || current_line_length > max_chars {
+                          result.push('\n');
+                          ,*break_count += 1;
+                          current_line_length = 0;
+                          //*last_count = 0;
+                      }
+                  }
+                  result.push(c);
+              }
+              _ => {
+                  result.push(c);
+              }
+          }
+          last_char = c;
+      }
+      if result.ends_with('\n') {
+          result.pop();
+      }
+      //println!("broken output: {:?}", result);
+      result
+  }
+
+  fn parse_indent(stack: &mut Vec<usize>, input: &str) {
+      let mut in_string = false;
+      let mut escaped = false;
+
+      for (idx, c) in input.chars().enumerate() {
+          if in_string {
+              match c {
+                  '"' if !escaped => in_string = false,
+                  // TODO handle \\ (escaped backslash char)
+                  '\\' if !escaped => escaped = true,
+                  _ => escaped = false,
+              }
+          } else {
+              match c {
+                  '[' => {
+                      stack.push(idx);
+                  }
+                  ']' => {
+                      stack.pop();
+                  }
+                  '"' => {
+                      in_string = true;
+                  }
+                  ';' => {
+                      break;
+                  }
+                  _ => {}
+              }
+          }
+      }
+  }
+
+  fn format_indentation(input: &str) -> String {
+      let mut result = String::new();
+      let mut indentations = Vec::<usize>::new();
+
+      for line in input.lines() {
+          let trimmed = line.trim();
+
+          // Deduce the new indentation based on the last item in the indentations stack
+          let new_indent = indentations.last().copied().map(|x| x + 1).unwrap_or(0);
+          let padded_line = format!("{}{}\n", " ".repeat(new_indent), trimmed);
+          result.push_str(padded_line.as_str());
+          parse_indent(&mut indentations, &padded_line);
+          //println!("indentations: {:?}: {:?}", padded_line, indentations);
+      }
+      result.pop(); // Remove the last newline
+      result
+  }
+
+  fn auto_format(input: &str, max_items: usize, max_chars: usize) -> String {
+      let with_breaks = insert_line_breaks(input, max_items, max_chars);
+      format_indentation(&with_breaks)
+  }
+
+  #[cfg(test)]
+  mod tests {
+      use super::*;
+
+      #[test]
+      fn test_insert_line_breaks() {
+          let input = "[[foo bar][baz [[quux floop][toop poop]]]]";
+          let expected = "[[foo bar]\n[baz [[quux floop]\n[toop poop]]]]";
+          let output = insert_line_breaks(input, 6, 80);
+          assert_eq!(output, expected);
+
+          let input = "[[[1 2 3] b][c d]]";
+          let expected = "[[[1 2 3] b]\n[c d]]";
+          let output = insert_line_breaks(input, 6, 80);
+          assert_eq!(output, expected);
+
+          // multiline list
+          let input = "[[a b] [c d]] 5";
+          let expected = "[[a b]\n [c d]]\n 5";
+          let output = insert_line_breaks(input, 6, 80);
+          assert_eq!(output, expected);
+      }
+
+      #[test]
+      fn test_indentation() {
+          let input = "[[foo bar]\n[baz [[quux floop]\n[toop poop]]]]";
+          let expected = "[[foo bar]\n [baz [[quux floop]\n       [toop poop]]]]";
+          let output = format_indentation(input);
+          assert_eq!(output, expected);
+
+          let input = "\"hello\" [[a b]\n[c d]]";
+          let expected = "\"hello\" [[a b]\n         [c d]]";
+          let output = format_indentation(input);
+          assert_eq!(output, expected);
       }
   }
 #+end_src
@@ -6923,7 +7080,8 @@ passes the filter. I think filter needs to keep calling =generate= on the xf bel
 
 #+RESULTS:
 #+begin_src kcats
-[[reason "type mismatch"] [unwound [positive? [[[2 * clone] 1]] unwrap evert first [[dec drop] [[generate] dip swap []]] unwrap branch [[[positive?] [dec drop] [[generate] dip swap []] if]] unwrap swap [8] unwrap swap [[[positive?] [dec [generate] dip swap] [drop []] if]] unwrap swap clone [[[generate [[3 * 3 -] bail] shielddown]]] unwrap swap put swap [[generate clone] dip swap put swap] loop pop drop [[]] unwrap evert first]] [type error] [asked [number]] [actual [2 * clone]] [handled true]] [2 * clone] 1
+[64 128 256 512 1024 2048 4096 8192
+ 16384 32768]
 #+end_src
 
 #+begin_src kcats
@@ -6950,7 +7108,15 @@ Now express the debugger interface in terms of generated environment states!
 
 #+RESULTS:
 #+begin_src kcats
-  [[9] 36] [generate [] swap [] [swap drop [generate] dip swap] while drop] [[positive?] [dec [generate] dip swap] [drop []] if] [generate [[[stack] lookup] bail] shielddown] [[[expression] lookup something?] [eval-step clone] [[]] if] [[stack [[9] 36]] [expression [[+] step]]]
+[[reason word is not defined]
+ [unwound [laster generate]]
+ [type error]
+ [asked [laster]]
+ [handled true]] [[positive?] [dec [generate] dive] [[]] if] 50 [generate [[[stack] lookup]
+           bail]
+ shielddown] [[[expression] lookup something?] [eval-step clone]
+ [[]] if] [[stack []]
+ [expression [0 0 10 1 range [+] step]]]
 #+end_src
 
 implement 'laster' which returns only the last in the seq
@@ -7247,7 +7413,7 @@ In theory we could write a helper function called =capture1= or something that d
 
 #+RESULTS:
 #+begin_src kcats
-6 [[positive?] [dec [generate] dive] [drop []] if] [inc clone] 3
+6 [[positive?] [dec [generate] dive] [[]] if] 0 [inc clone] 3
 #+end_src
 
 #+begin_src kcats
@@ -7599,3 +7765,76 @@ very hard to read.
 
 I am not sure exactly how to determine where line breaks should occur
 but literally anything is better than how it is now.
+#+begin_src kcats :results code
+[[foo bar][baz [[quux floop][toop poop]]]]
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[foo bar]
+ [baz [[quux floop]
+       [toop poop]]]]
+#+end_src
+
+now test decreasing indent
+#+begin_src kcats :results code
+  [[foo bar] [baz [[quux floop] [toop poop]]] goop]
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[foo bar]
+ [baz [[quux floop]
+       [toop poop]]]
+ goop]
+#+end_src
+
+#+begin_src kcats :results code
+  [[[1 2 3] [4 5 6] [7 8 9]] liberate [] [] [nothing?] [drop [generate] dip swap clone [join] dip] until  generate] reverse
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[generate until [drop [generate] dip swap clone [join] dip] [nothing?] [] [] liberate
+ [[1 2 3] [4 5 6] [7 8 9]]]
+#+end_src
+
+#+begin_src kcats :results code
+[blahblah blah [blah blah foop foop [toopy] foop foop] toop [blah foop] toopy]
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[blahblah blah [blah blah foop foop [toopy] foop foop] toop [blah foop]
+ toopy]
+#+end_src
+
+#+begin_src kcats :results code
+[[[1 2 =] [false]] [[1 1 =] [true]]]
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[[1 2 =] [false]]
+ [[1 1 =] [true]]]
+#+end_src
+
+#+begin_src kcats :results code
+[[[] b] [c d]]
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[[] b]
+ [c d]]
+#+end_src
+
+#+begin_src kcats :results code
+ [[a b] [c d]] "hello"
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+"hello" [[a b]
+         [c d]]
+#+end_src
