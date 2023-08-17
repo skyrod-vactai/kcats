@@ -3239,8 +3239,22 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       lm[*k as usize] = v;
                       Ok(l.into())
                   }
+                  (
+                      Item::Receptacle(coll::Receptacle::Sized(coll::Sized::List(mut l))),
+                      assoc::KeyItem::Int(k),
+                  ) => {
+                      // vector set by index
+                      let lm = coll::Arc::make_mut(&mut l);
+                      let idx = *k as usize;
+                      // extend the size of the vector to be big enough to set
+                      // the given index, pad with 'nothing' values.
+                      if lm.len() <= idx {
+                          lm.resize(idx + 1, coll::NOTHING);
+                      }
+                      lm[*k as usize] = v;
+                      Ok(l.into())
+                  }
                   (i, k) => {
-                      //println!("assoc_in: {:?} {:?}", i, k);
                       let a = assoc::Associative::try_from(i)?;
                       Ok(a.insert(k.clone(), v).0.into())
                   }
@@ -3279,16 +3293,30 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       Ok(l.into())
                   }
                   (i, k) => {
-                      //println!("assoc_in morekeys: {:?} {:?}", i, k);
                       let a = assoc::Associative::try_from(i)?;
                       let inner = a.get(&k).unwrap_or_default().clone();
-                      // if the inner value isn't a map, we're just overwriting whatever it
-                      // is with a new map.
 
-                      let i = match inner {
-                          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(a))) => {
-                              a.clone().into()
-                          }
+                      // if the inner value is a map, recurse. If it's a
+                      // list and the next key is a number,
+                      // recurse. Otherwise, overwrite the value with a new map.
+                      let next_key = ks[0].clone();
+                      let i = match (next_key, inner) {
+                          (
+                              assoc::KeyItem::Int(_),
+                              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(l))),
+                          ) => l.clone().into(),
+                          (
+                              assoc::KeyItem::Int(_),
+                              Item::Receptacle(coll::Receptacle::Sized(coll::Sized::List(l))),
+                          ) => l.clone().into(),
+                          (
+                              _,
+                              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(a))),
+                          ) => a.clone().into(),
+                          (
+                              _,
+                              Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(a))),
+                          ) => a.clone().into(),
                           _ => assoc::Association::new().into(),
                       };
                       Ok(a.insert(k.clone(), assoc_in(i, ks, v)?).0.into())
@@ -3807,8 +3835,15 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   pub fn eval_step_outer(mut env: Environment) -> Future<Environment> {
       let tos = env.pop();
       let inner_env = Environment::try_from(tos);
+
       match inner_env {
-          Ok(inner) => Box::pin(eval_step(inner).map(|inner_next| env.push(inner_next.into()))),
+          Ok(inner) => {
+              if inner.expression.is_empty() {
+                  Box::pin(async move { env.push(coll::NOTHING).into() })
+              } else {
+                  Box::pin(eval_step(inner).map(|inner_next| env.push(inner_next.into())))
+              }
+          }
           Err(e) => env.push(e.into()).into(),
       }
   }
