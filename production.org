@@ -709,6 +709,19 @@ internally, to keep track of things like the stack, expression, lists etc.
               _ => todo!("contains not implemented for {:?}", self),
           }
       }
+
+      pub fn iter(&self) -> Box<dyn Iterator<Item = &Item> + '_> {
+          match self {
+              Sized::Associative(map) => unimplemented!("iter not implemented for {:?}", map),
+              //Box::new(map.iter().map(|kv| kv.into())),
+              Sized::List(list) => Box::new(list.inner().iter()),
+              Sized::Nothing => Box::new(std::iter::empty()),
+              Sized::String(s) => Box::new(s.chars().map(|c| &c.into())), // Note: This would actually create temporary values and won't work directly. Need more information on your types to adjust.
+              Sized::Bytes(b) => Box::new(b.iter().map(|&byte| &Item::from(byte as Int))), // Similar note as above for temporary values
+              Sized::Set(s) => unimplemented!("iter not implemented for {:?}", s),
+              //Box::new(s.inner().iter().map(|i| i.into())),
+          }
+      }
   }
 
   impl Receptacle {
@@ -5067,10 +5080,12 @@ How to interact with the network (TCP/IP sockets)
 ***** Channels
 Implement the =handoff= type
 #+begin_src rust :tangle src/pipes/channel.rs :mkdirp yes
+  use crate::axiom;
   use crate::pipes;
   use crate::types::associative as assoc;
+  use crate::types::collection as coll;
   use crate::types::environment::Environment;
-  use crate::types::error::Error;
+  use crate::types::error;
   use crate::types::{self, Item};
   use flume;
   use std::future;
@@ -5086,7 +5101,6 @@ Implement the =handoff= type
 
   impl<T> PartialEq for Handoff<T> {
       fn eq(&self, other: &Self) -> bool {
-          // Check if the 'file' fields of both structs are the same by reference
           match (&self.receiver, &other.receiver, &self.sender, &other.sender) {
               (Some(sr), Some(or), Some(ss), Some(os)) => ptr::eq(&sr, &or) && ptr::eq(&ss, &os),
               _ => false,
@@ -5103,13 +5117,8 @@ Implement the =handoff= type
           }
       }
 
-      pub fn put(&mut self, i: Item) -> types::Future<Result<(), Error>> {
+      pub fn put(&mut self, i: Item) -> types::Future<Result<(), error::Error>> {
           if let Some(ch) = self.sender.clone() {
-              // Can't send and receive in the same channel in same thread
-              if !self.receiver.is_none() {
-                  //println!("Dropping receiver");
-                  self.receiver = None;
-              }
               Box::pin(async move {
                   ch.send_async(i)
                       .await
@@ -5120,19 +5129,28 @@ Implement the =handoff= type
           }
       }
 
-      pub fn take(&mut self) -> types::Future<Result<Option<Item>, Error>> {
+      pub fn take(&mut self) -> types::Future<Result<Option<Item>, error::Error>> {
           if let Some(ch) = self.receiver.clone() {
-              // Can't send and receive in the same channel in same thread
-              if !self.sender.is_none() {
-                  //println!("Dropping sender");
-                  self.sender = None;
-              }
               Box::pin(async move {
                   //println!("Receiving");
                   ch.recv_async().await.map(Some).or_else(|_| Ok(None))
               })
           } else {
               Box::pin(future::ready(Ok(None)))
+          }
+      }
+
+      pub fn close_take(&mut self) {
+          if !self.receiver.is_none() {
+              //println!("Dropping receiver");
+              self.receiver = None;
+          }
+      }
+
+      pub fn close_put(&mut self) {
+          if !self.sender.is_none() {
+              //println!("Dropping sender");
+              self.sender = None;
           }
       }
   }
@@ -5150,6 +5168,84 @@ Implement the =handoff= type
   pub fn handoff(env: Environment) -> types::Future<Environment> {
       env.push(pipes::Tunnel::Handoff(Handoff::new()).into())
           .into()
+  }
+
+  // Given a list of pipes (channels) on top of stack, use flume's
+  // selector to choose the next ready pipe.  A pipe means it's a
+  // receive, a pipe/item pair means it's a send.
+  pub fn select(i: Item) -> axiom::ItemResult {
+      let l = coll::Sized::try_from(i)?;
+      let mut selector = flume::Selector::new();
+      //let mut receivers = Vec::new();
+      //let mut senders = Vec::new();
+
+      for i in l.iter() {
+          //TODO support timeouts
+          match i {
+              Item::Dispenser(coll::Dispenser::Out(pipes::Out::Handoff(p))) => {
+                  selector = selector.recv(p.receiver.as_ref().unwrap(), move |i| {
+                      Item::from(coll::List::from_iter(vec![
+                          Item::Dispenser(coll::Dispenser::Out(pipes::Out::Handoff(p.clone()))),
+                          i.unwrap(), //TODO convert RecvError to Error
+                      ]))
+                  });
+              }
+              Item::Dispenser(coll::Dispenser::Tunnel(pipes::Tunnel::Handoff(p))) => {
+                  selector = selector.recv(p.receiver.as_ref().unwrap(), move |i| {
+                      Item::from(coll::List::from_iter(vec![
+                          Item::Dispenser(coll::Dispenser::Tunnel(pipes::Tunnel::Handoff(p.clone()))),
+                          i.unwrap(),
+                      ]))
+                  });
+              }
+              i => {
+                  let lt = coll::Sized::try_from(i.clone())?.clone();
+                  let mut lti = lt.iter();
+                  let p = lti.next();
+                  let i = lti.next().clone();
+                  match (p, i) {
+                      (Some(p), Some(i)) => match (p, i) {
+                          (Item::Receptacle(coll::Receptacle::In(pipes::In::Handoff(p))), i) => {
+                              selector =
+                                  selector.send(p.sender.as_ref().unwrap(), i.clone(), move |i| {
+                                      match i.clone() {
+                                          Ok(_) => Item::Receptacle(coll::Receptacle::In(
+                                              pipes::In::Handoff(p.clone()),
+                                          )),
+                                          Err(_) => Item::from(coll::List::from_iter(vec![
+                                              Item::Receptacle(coll::Receptacle::In(
+                                                  pipes::In::Handoff(p.clone()),
+                                              )),
+                                          ])),
+                                      }
+                                  });
+                          }
+                          (
+                              Item::Receptacle(coll::Receptacle::Tunnel(pipes::Tunnel::Handoff(p))),
+                              i,
+                          ) => {
+                              selector =
+                                  selector.send(p.sender.as_ref().unwrap(), i.clone(), move |i| {
+                                      match i {
+                                          Ok(_) => Item::Receptacle(coll::Receptacle::Tunnel(
+                                              pipes::Tunnel::Handoff(p.clone()),
+                                          )),
+                                          Err(_) => Item::from(coll::List::from_iter(vec![
+                                              Item::Receptacle(coll::Receptacle::Tunnel(
+                                                  pipes::Tunnel::Handoff(p.clone()),
+                                              )),
+                                          ])),
+                                      }
+                                  });
+                          }
+                          (p, i) => return Err(error::Error::expected("handoff", p.clone())),
+                      },
+                      _ => return Err(error::Error::short_list(2)),
+                  }
+              }
+          }
+      }
+      Ok(selector.wait())
   }
 #+end_src
 ** Issues
