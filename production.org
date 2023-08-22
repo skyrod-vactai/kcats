@@ -5170,82 +5170,99 @@ Implement the =handoff= type
           .into()
   }
 
+  impl From<flume::RecvError> for error::Error {
+      fn from(_: flume::RecvError) -> Self {
+          pipes::closed_error(false) // todo fix this
+      }
+  }
+
+  impl From<flume::SendError<Item>> for error::Error {
+      fn from(_: flume::SendError<Item>) -> Self {
+          pipes::closed_error(false)
+      }
+  }
+
+  enum ChannelOp<T> {
+      Send(flume::Sender<T>, usize, T),
+      Receive(flume::Receiver<T>, usize),
+  }
   // Given a list of pipes (channels) on top of stack, use flume's
   // selector to choose the next ready pipe.  A pipe means it's a
   // receive, a pipe/item pair means it's a send.
   pub fn select(i: Item) -> axiom::ItemResult {
-      let l = coll::Sized::try_from(i)?;
-      let mut selector = flume::Selector::new();
-      //let mut receivers = Vec::new();
-      //let mut senders = Vec::new();
+      let mut l = coll::List::try_from(i)?;
+      let original = l.clone();
 
-      for i in l.iter() {
-          //TODO support timeouts
-          match i {
+      //Create references out of any [pipe item] pairs
+      let lr = l
+          .inner()
+          .into_iter()
+          .enumerate()
+          .map(move |(idx, i)| match i {
               Item::Dispenser(coll::Dispenser::Out(pipes::Out::Handoff(p))) => {
-                  selector = selector.recv(p.receiver.as_ref().unwrap(), move |i| {
-                      Item::from(coll::List::from_iter(vec![
-                          Item::Dispenser(coll::Dispenser::Out(pipes::Out::Handoff(p.clone()))),
-                          i.unwrap(), //TODO convert RecvError to Error
-                      ]))
-                  });
+                  Ok(ChannelOp::Receive(p.receiver.unwrap(), idx))
               }
               Item::Dispenser(coll::Dispenser::Tunnel(pipes::Tunnel::Handoff(p))) => {
-                  selector = selector.recv(p.receiver.as_ref().unwrap(), move |i| {
-                      Item::from(coll::List::from_iter(vec![
-                          Item::Dispenser(coll::Dispenser::Tunnel(pipes::Tunnel::Handoff(p.clone()))),
-                          i.unwrap(),
-                      ]))
-                  });
+                  Ok(ChannelOp::Receive(p.receiver.unwrap(), idx))
               }
               i => {
-                  let lt = coll::Sized::try_from(i.clone())?.clone();
-                  let mut lti = lt.iter();
-                  let p = lti.next();
-                  let i = lti.next().clone();
+                  let l = coll::List::try_from(i.clone())?;
+                  let p = l.get(0);
+                  let i = l.get(1);
                   match (p, i) {
                       (Some(p), Some(i)) => match (p, i) {
-                          (Item::Receptacle(coll::Receptacle::In(pipes::In::Handoff(p))), i) => {
-                              selector =
-                                  selector.send(p.sender.as_ref().unwrap(), i.clone(), move |i| {
-                                      match i.clone() {
-                                          Ok(_) => Item::Receptacle(coll::Receptacle::In(
-                                              pipes::In::Handoff(p.clone()),
-                                          )),
-                                          Err(_) => Item::from(coll::List::from_iter(vec![
-                                              Item::Receptacle(coll::Receptacle::In(
-                                                  pipes::In::Handoff(p.clone()),
-                                              )),
-                                          ])),
-                                      }
-                                  });
-                          }
+                          (Item::Receptacle(coll::Receptacle::In(pipes::In::Handoff(p))), i) => Ok(
+                              ChannelOp::Send(p.sender.as_ref().unwrap().clone(), idx, i.clone()),
+                          ),
                           (
                               Item::Receptacle(coll::Receptacle::Tunnel(pipes::Tunnel::Handoff(p))),
                               i,
-                          ) => {
-                              selector =
-                                  selector.send(p.sender.as_ref().unwrap(), i.clone(), move |i| {
-                                      match i {
-                                          Ok(_) => Item::Receptacle(coll::Receptacle::Tunnel(
-                                              pipes::Tunnel::Handoff(p.clone()),
-                                          )),
-                                          Err(_) => Item::from(coll::List::from_iter(vec![
-                                              Item::Receptacle(coll::Receptacle::Tunnel(
-                                                  pipes::Tunnel::Handoff(p.clone()),
-                                              )),
-                                          ])),
-                                      }
-                                  });
-                          }
-                          (p, i) => return Err(error::Error::expected("handoff", p.clone())),
+                          ) => Ok(ChannelOp::Send(
+                              p.sender.as_ref().unwrap().clone(),
+                              idx,
+                              i.clone(),
+                          )),
+                          (p, _i) => Err(error::Error::expected("handoff", p.clone())),
                       },
-                      _ => return Err(error::Error::short_list(2)),
+                      _ => Err(error::Error::short_list(2)),
+                  }
+              }
+          })
+          .collect::<Result<Vec<ChannelOp<Item>>, error::Error>>()?;
+
+      let (res, idx) = {
+          let mut selector = flume::Selector::new();
+
+          // loop over the operations and add them to the selector. Each one
+          // returns the original index in the list, so we can use that to
+          // fetch the original item from the list.
+          for i in lr {
+              match i {
+                  ChannelOp::Receive(r, idx) => {
+                      selector = selector.recv(&r, |i| {
+                          (i.map(Some).map_err(|e| error::Error::from(e)), idx)
+                      });
+                  }
+                  ChannelOp::Send(s, idx, i) => {
+                      selector = selector.send(&s, i, move |i| {
+                          (i.map(|_| None).map_err(|e| error::Error::from(e)), idx)
+                      });
+
+                      //senders.push(s);
                   }
               }
           }
+          selector.wait()
+      };
+      let selected = original.get(idx).unwrap().clone();
+      match res {
+          Ok(Some(i)) => {
+              let l: Item = coll::List::from_iter(vec![selected, i]).into();
+              Ok(l)
+          }
+          Ok(None) => Ok(selected),
+          Err(e) => Err(e.into()),
       }
-      Ok(selector.wait())
   }
 #+end_src
 ** Issues
