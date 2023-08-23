@@ -46,7 +46,7 @@ the location where you installed the kcats binary.
 #+BEGIN_SRC toml :tangle Cargo.toml
   [package]
   name = "kcats"
-  version = "0.3.3"
+  version = "0.3.5"
   edition = "2021"
 
   # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -106,7 +106,7 @@ internally, to keep track of things like the stack, expression, lists etc.
   pub mod error;
 
   // A generic newtype to contain various kinds
-  #[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+  #[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
   pub struct Newtype<T>(pub T);
 
   // Access the inner value easily
@@ -137,6 +137,15 @@ internally, to keep track of things like the stack, expression, lists etc.
   impl<T: Clone> Clone for Newtype<T> {
       fn clone(&self) -> Self {
           Newtype(self.0.clone())
+      }
+  }
+
+  // Implement Debug trait for Newtype, so it hides
+  // itself and only prints the inner type.
+  impl<T: fmt::Debug> fmt::Debug for Newtype<T> {
+      fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+          // Directly print the wrapped value
+          write!(f, "{:?}", self.0)
       }
   }
 
@@ -2558,6 +2567,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   "association?",
                   Box::leak(Box::new(f_stack1(is_association))),
               ),
+              (
+                  "attend",
+                  Box::leak(Box::new(f_stack1(crate::pipes::channel::select))),
+              ),
               ("branch", Box::leak(Box::new(branch))),
               ("bytes", Box::leak(Box::new(f_stack1(bytes)))),
               ("bytes?", Box::leak(Box::new(f_stack1(is_bytes)))),
@@ -2638,6 +2651,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               ("string?", Box::leak(Box::new(f_stack1(is_string)))),
               ("swap", Box::leak(Box::new(swap))),
               ("swapdown", Box::leak(Box::new(swapdown))),
+              (
+                  "timer",
+                  Box::leak(Box::new(f_stack1(crate::pipes::channel::timer))),
+              ),
               ("timestamps", Box::leak(Box::new(timestamps))),
               ("true", Box::leak(Box::new(true_))),
               ("unassign", Box::leak(Box::new(f_stack2(unassign)))),
@@ -3230,8 +3247,22 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       lm[*k as usize] = v;
                       Ok(l.into())
                   }
+                  (
+                      Item::Receptacle(coll::Receptacle::Sized(coll::Sized::List(mut l))),
+                      assoc::KeyItem::Int(k),
+                  ) => {
+                      // vector set by index
+                      let lm = coll::Arc::make_mut(&mut l);
+                      let idx = *k as usize;
+                      // extend the size of the vector to be big enough to set
+                      // the given index, pad with 'nothing' values.
+                      if lm.len() <= idx {
+                          lm.resize(idx + 1, coll::NOTHING);
+                      }
+                      lm[*k as usize] = v;
+                      Ok(l.into())
+                  }
                   (i, k) => {
-                      //println!("assoc_in: {:?} {:?}", i, k);
                       let a = assoc::Associative::try_from(i)?;
                       Ok(a.insert(k.clone(), v).0.into())
                   }
@@ -3270,16 +3301,30 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       Ok(l.into())
                   }
                   (i, k) => {
-                      //println!("assoc_in morekeys: {:?} {:?}", i, k);
                       let a = assoc::Associative::try_from(i)?;
                       let inner = a.get(&k).unwrap_or_default().clone();
-                      // if the inner value isn't a map, we're just overwriting whatever it
-                      // is with a new map.
 
-                      let i = match inner {
-                          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(a))) => {
-                              a.clone().into()
-                          }
+                      // if the inner value is a map, recurse. If it's a
+                      // list and the next key is a number,
+                      // recurse. Otherwise, overwrite the value with a new map.
+                      let next_key = ks[0].clone();
+                      let i = match (next_key, inner) {
+                          (
+                              assoc::KeyItem::Int(_),
+                              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(l))),
+                          ) => l.clone().into(),
+                          (
+                              assoc::KeyItem::Int(_),
+                              Item::Receptacle(coll::Receptacle::Sized(coll::Sized::List(l))),
+                          ) => l.clone().into(),
+                          (
+                              _,
+                              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(a))),
+                          ) => a.clone().into(),
+                          (
+                              _,
+                              Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(a))),
+                          ) => a.clone().into(),
                           _ => assoc::Association::new().into(),
                       };
                       Ok(a.insert(k.clone(), assoc_in(i, ks, v)?).0.into())
@@ -3798,8 +3843,15 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   pub fn eval_step_outer(mut env: Environment) -> Future<Environment> {
       let tos = env.pop();
       let inner_env = Environment::try_from(tos);
+
       match inner_env {
-          Ok(inner) => Box::pin(eval_step(inner).map(|inner_next| env.push(inner_next.into()))),
+          Ok(inner) => {
+              if inner.expression.is_empty() {
+                  Box::pin(async move { env.push(coll::NOTHING).into() })
+              } else {
+                  Box::pin(eval_step(inner).map(|inner_next| env.push(inner_next.into())))
+              }
+          }
           Err(e) => env.push(e.into()).into(),
       }
   }
@@ -4324,6 +4376,7 @@ We'll also define how to run unit tests.
       #[test_case("step")]
       #[test_case("string")]
       #[test_case("string?" ; "is_string")]
+      #[test_case("spawn")]
       #[test_case("swap")]
       #[test_case("swapdown")]
       #[test_case("take")]
@@ -4409,6 +4462,7 @@ The basic pipe contracts.
       Socket(Arc<RwLock<net::Socket>>),
       ServerSocket(Arc<RwLock<net::ServerSocket>>),
       Handoff(channel::Handoff<Item>),
+      Timer(channel::Timer<Item>),
       Time,
       Standard,
   }
@@ -4534,6 +4588,7 @@ The basic pipe contracts.
                   Box::pin(async move { f.write().await.take().await })
               }
               Out::Handoff(ref mut h) => Box::pin(h.take()),
+              Out::Timer(ref mut t) => Box::pin(t.take()),
               Out::Time => Box::pin(time::take()),
               Out::Standard => standard::take(),
           }
@@ -4562,6 +4617,7 @@ The basic pipe contracts.
                   executor::block_on(async move { f.read().await.representation() })
               }
               Out::Handoff(h) => h.representation(),
+              Out::Timer(t) => t.representation(),
               Out::Time => time::representation(),
               Out::Standard => standard::representation(),
           }
@@ -5023,14 +5079,19 @@ How to interact with the network (TCP/IP sockets)
 ***** Channels
 Implement the =handoff= type
 #+begin_src rust :tangle src/pipes/channel.rs :mkdirp yes
+  use crate::axiom;
   use crate::pipes;
   use crate::types::associative as assoc;
+  use crate::types::collection as coll;
   use crate::types::environment::Environment;
-  use crate::types::error::Error;
-  use crate::types::{self, Item};
+  use crate::types::error;
+  use crate::types::{self, Int, Item};
   use flume;
   use std::future;
   use std::ptr;
+  use std::sync::Arc;
+  use tokio::task::JoinHandle;
+  use tokio::time::{sleep, Duration};
 
   #[derive(Debug, Clone)]
   // Use Option because we want to be able to drop senders/receivers to
@@ -5042,7 +5103,6 @@ Implement the =handoff= type
 
   impl<T> PartialEq for Handoff<T> {
       fn eq(&self, other: &Self) -> bool {
-          // Check if the 'file' fields of both structs are the same by reference
           match (&self.receiver, &other.receiver, &self.sender, &other.sender) {
               (Some(sr), Some(or), Some(ss), Some(os)) => ptr::eq(&sr, &or) && ptr::eq(&ss, &os),
               _ => false,
@@ -5059,13 +5119,8 @@ Implement the =handoff= type
           }
       }
 
-      pub fn put(&mut self, i: Item) -> types::Future<Result<(), Error>> {
+      pub fn put(&mut self, i: Item) -> types::Future<Result<(), error::Error>> {
           if let Some(ch) = self.sender.clone() {
-              // Can't send and receive in the same channel in same thread
-              if !self.receiver.is_none() {
-                  //println!("Dropping receiver");
-                  self.receiver = None;
-              }
               Box::pin(async move {
                   ch.send_async(i)
                       .await
@@ -5076,19 +5131,28 @@ Implement the =handoff= type
           }
       }
 
-      pub fn take(&mut self) -> types::Future<Result<Option<Item>, Error>> {
+      pub fn take(&mut self) -> types::Future<Result<Option<Item>, error::Error>> {
           if let Some(ch) = self.receiver.clone() {
-              // Can't send and receive in the same channel in same thread
-              if !self.sender.is_none() {
-                  //println!("Dropping sender");
-                  self.sender = None;
-              }
               Box::pin(async move {
                   //println!("Receiving");
                   ch.recv_async().await.map(Some).or_else(|_| Ok(None))
               })
           } else {
               Box::pin(future::ready(Ok(None)))
+          }
+      }
+
+      pub fn close_take(&mut self) {
+          if !self.receiver.is_none() {
+              //println!("Dropping receiver");
+              self.receiver = None;
+          }
+      }
+
+      pub fn close_put(&mut self) {
+          if !self.sender.is_none() {
+              //println!("Dropping sender");
+              self.sender = None;
           }
       }
   }
@@ -5106,6 +5170,179 @@ Implement the =handoff= type
   pub fn handoff(env: Environment) -> types::Future<Environment> {
       env.push(pipes::Tunnel::Handoff(Handoff::new()).into())
           .into()
+  }
+
+  impl From<flume::RecvError> for error::Error {
+      fn from(_: flume::RecvError) -> Self {
+          pipes::closed_error(false) // todo fix this
+      }
+  }
+
+  impl From<flume::SendError<Item>> for error::Error {
+      fn from(_: flume::SendError<Item>) -> Self {
+          pipes::closed_error(false)
+      }
+  }
+
+  enum ChannelOp<T> {
+      Send(Arc<flume::Sender<T>>, usize, T),
+      Receive(Arc<flume::Receiver<T>>, usize),
+  }
+  // Given a list of pipes (channels) on top of stack, use flume's
+  // selector to choose the next ready pipe.  A pipe means it's a
+  // receive, a pipe/item pair means it's a send.
+  pub fn select(i: Item) -> axiom::ItemResult {
+      let mut l = coll::List::try_from(i)?;
+      let original = l.clone();
+
+      //Create references out of any [pipe item] pairs
+      let lr = l
+          .inner()
+          .into_iter()
+          .enumerate()
+          .map(move |(idx, i)| match i {
+              Item::Dispenser(coll::Dispenser::Out(pipes::Out::Handoff(p))) => {
+                  Ok(ChannelOp::Receive(Arc::new(p.receiver.unwrap()), idx))
+              }
+              Item::Dispenser(coll::Dispenser::Tunnel(pipes::Tunnel::Handoff(p))) => {
+                  Ok(ChannelOp::Receive(Arc::new(p.receiver.unwrap()), idx))
+              }
+              // Handle timeout channels - start the timer and add receive op
+              Item::Dispenser(coll::Dispenser::Out(pipes::Out::Timer(t))) => {
+                  let mut t = t.clone();
+                  t.start();
+                  Ok(ChannelOp::Receive(Arc::new(t.receiver.unwrap()), idx))
+              }
+              i => {
+                  let l = coll::List::try_from(i.clone())?;
+                  let p = l.get(0);
+                  let i = l.get(1);
+                  match (p, i) {
+                      (Some(p), Some(i)) => match (p, i) {
+                          (Item::Receptacle(coll::Receptacle::In(pipes::In::Handoff(p))), i) => Ok(
+                              ChannelOp::Send(Arc::new(p.sender.clone().unwrap()), idx, i.clone()),
+                          ),
+                          (
+                              Item::Receptacle(coll::Receptacle::Tunnel(pipes::Tunnel::Handoff(p))),
+                              i,
+                          ) => Ok(ChannelOp::Send(
+                              Arc::new(p.sender.clone().unwrap()),
+                              idx,
+                              i.clone(),
+                          )),
+                          (p, _i) => Err(error::Error::expected("handoff", p.clone())),
+                      },
+                      _ => Err(error::Error::short_list(2)),
+                  }
+              }
+          })
+          .collect::<Result<Vec<ChannelOp<Item>>, error::Error>>()?;
+
+      let (res, idx) = {
+          let mut selector = flume::Selector::new();
+
+          // loop over the operations and add them to the selector. Each one
+          // returns the original index in the list, so we can use that to
+          // fetch the original item from the list.
+          for idx in 0..lr.len() {
+              let idx_clone = idx;
+              match &lr[idx] {
+                  ChannelOp::Receive(r, _) => {
+                      selector = selector.recv(&**r, move |i| {
+                          (i.map(Some).map_err(|e| error::Error::from(e)), idx_clone)
+                      });
+                  }
+                  ChannelOp::Send(s, _, i) => {
+                      selector = selector.send(&**s, i.clone(), move |i| {
+                          (i.map(|_| None).map_err(|e| error::Error::from(e)), idx)
+                      });
+                  }
+              }
+          }
+
+          selector.wait()
+      };
+      let selected = original.get(idx).unwrap().clone();
+      match res {
+          Ok(Some(i)) => {
+              let l: Item = coll::List::from_iter(vec![selected, i]).into();
+              Ok(l)
+          }
+          Ok(None) => Ok(selected),
+          Err(e) => Err(e.into()),
+      }
+  }
+
+  #[derive(Debug)]
+  pub struct Timer<T> {
+      receiver: Option<flume::Receiver<T>>,
+      handle: Option<JoinHandle<()>>,
+      duration: Duration,
+  }
+
+  // Cloning a timeout makes a new one, clears state
+  impl Clone for Timer<Item> {
+      fn clone(&self) -> Self {
+          Self {
+              receiver: None,
+              handle: None,
+              duration: self.duration,
+          }
+      }
+  }
+
+  impl Timer<Item> {
+      fn new(duration: Duration) -> Timer<Item> {
+          Timer {
+              receiver: None,
+              handle: None,
+              duration,
+          }
+      }
+
+      fn start(&mut self) {
+          if self.handle.is_none() {
+              let (sender, receiver) = flume::bounded(1);
+              let duration = self.duration;
+              self.receiver = Some(receiver);
+              self.handle = Some(tokio::spawn(async move {
+                  sleep(duration).await;
+                  //TODO handle error condition on send
+                  let _ = sender.send(coll::NOTHING);
+              }));
+          }
+      }
+
+      pub fn take(&mut self) -> types::Future<Result<Option<Item>, error::Error>> {
+          self.start();
+          let receiver = self.receiver.clone().unwrap();
+          Box::pin(async move {
+              //println!("Receiving");
+              receiver.recv_async().await.map(Some).or_else(|_| Ok(None))
+          })
+      }
+  }
+
+  impl From<Timer<Item>> for Item {
+      fn from(t: Timer<Item>) -> Self {
+          Item::Dispenser(coll::Dispenser::Out(pipes::Out::Timer(t)))
+      }
+  }
+
+  impl crate::serialize::Display for Timer<Item> {
+      fn representation(&self) -> Item {
+          assoc::Association::from_iter([
+              ("type".into(), "pipe".into()),
+              ("timeout".into(), (self.duration.as_millis() as Int).into()),
+          ])
+          .into()
+      }
+  }
+
+  pub fn timer(i: Item) -> axiom::ItemResult {
+      let ms = Int::try_from(i)?;
+      //TODO: check for negative values
+      Ok(Timer::new(Duration::from_millis(ms as u64)).into())
   }
 #+end_src
 ** Issues
@@ -7770,7 +8007,7 @@ item yet), or Item (got a new item), or some signal for end of stream,
 or Error. So it would have some program with a while loop to
 iterate. All such transforms would probably have the same program.
 
-*** TODO [#A] Auto code formatter
+*** INPROGRESS [#A] Auto code formatter
 This is desperately needed, as a big blob of output line-wrapped is
 very hard to read.
 
@@ -7849,3 +8086,28 @@ now test decreasing indent
 "hello" [[a b]
          [c d]]
 #+end_src
+
+*** DONE Have eval-step return nothing when program is done
+That means eval needs to keep the input until it checks the output.
+
+That may make normal runtime a little less efficient but it means
+debuggers and step generators are easy and more efficient.
+
+At that point =stepper= can be removed and we can use =eval-step= in its place. 
+
+(actually stepper still has a use, it just doesn't need to check for =nothing= anymore)
+
+*** INPROGRESS Select from multiple pipes
+A basic select (which I call =attend=) is in place. 
+
+**** TODO Attend should leave the pipe list argument
+A lot of callers would want to re-use that argument so it shouldn't
+need to be shielded by default.
+
+**** TODO Better error handling
+There's lots of places where flume could throw an error and we don't
+do anything about it.
+
+*** TODO print
+It's probably just an alias for something like =[standard] dip bytes put
+drop= (write to stdout and then drop the pipe).
