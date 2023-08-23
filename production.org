@@ -46,7 +46,7 @@ the location where you installed the kcats binary.
 #+BEGIN_SRC toml :tangle Cargo.toml
   [package]
   name = "kcats"
-  version = "0.3.4"
+  version = "0.3.5"
   edition = "2021"
 
   # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -2629,6 +2629,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               ("reverse", Box::leak(Box::new(f_stack1(reverse)))),
               ("second", Box::leak(Box::new(f_stack1(second)))),
               (
+                  "select",
+                  Box::leak(Box::new(f_stack1(crate::pipes::channel::select))),
+              ),
+              (
                   "serversocket",
                   Box::leak(Box::new(f_stack2_async(crate::pipes::net::server_socket))),
               ),
@@ -2647,6 +2651,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               ("string?", Box::leak(Box::new(f_stack1(is_string)))),
               ("swap", Box::leak(Box::new(swap))),
               ("swapdown", Box::leak(Box::new(swapdown))),
+              (
+                  "timeout",
+                  Box::leak(Box::new(f_stack1(crate::pipes::channel::timeout))),
+              ),
               ("timestamps", Box::leak(Box::new(timestamps))),
               ("true", Box::leak(Box::new(true_))),
               ("unassign", Box::leak(Box::new(f_stack2(unassign)))),
@@ -4368,6 +4376,7 @@ We'll also define how to run unit tests.
       #[test_case("step")]
       #[test_case("string")]
       #[test_case("string?" ; "is_string")]
+      #[test_case("spawn")]
       #[test_case("swap")]
       #[test_case("swapdown")]
       #[test_case("take")]
@@ -4453,6 +4462,7 @@ The basic pipe contracts.
       Socket(Arc<RwLock<net::Socket>>),
       ServerSocket(Arc<RwLock<net::ServerSocket>>),
       Handoff(channel::Handoff<Item>),
+      Timeout(channel::Timeout<Item>),
       Time,
       Standard,
   }
@@ -4578,6 +4588,7 @@ The basic pipe contracts.
                   Box::pin(async move { f.write().await.take().await })
               }
               Out::Handoff(ref mut h) => Box::pin(h.take()),
+              Out::Timeout(ref mut t) => Box::pin(t.take()),
               Out::Time => Box::pin(time::take()),
               Out::Standard => standard::take(),
           }
@@ -4606,6 +4617,7 @@ The basic pipe contracts.
                   executor::block_on(async move { f.read().await.representation() })
               }
               Out::Handoff(h) => h.representation(),
+              Out::Timeout(t) => t.representation(),
               Out::Time => time::representation(),
               Out::Standard => standard::representation(),
           }
@@ -5073,11 +5085,14 @@ Implement the =handoff= type
   use crate::types::collection as coll;
   use crate::types::environment::Environment;
   use crate::types::error;
-  use crate::types::{self, Item};
+  use crate::types::{self, Int, Item};
   use flume;
   use std::future;
   use std::ptr;
   use std::sync::Arc;
+  use tokio::task::JoinHandle;
+  use tokio::time::{sleep, Duration};
+
   #[derive(Debug, Clone)]
   // Use Option because we want to be able to drop senders/receivers to
   // close the channel
@@ -5192,6 +5207,12 @@ Implement the =handoff= type
               Item::Dispenser(coll::Dispenser::Tunnel(pipes::Tunnel::Handoff(p))) => {
                   Ok(ChannelOp::Receive(Arc::new(p.receiver.unwrap()), idx))
               }
+              // Handle timeout channels - start the timer and add receive op
+              Item::Dispenser(coll::Dispenser::Out(pipes::Out::Timeout(t))) => {
+                  let mut t = t.clone();
+                  t.start();
+                  Ok(ChannelOp::Receive(Arc::new(t.receiver.unwrap()), idx))
+              }
               i => {
                   let l = coll::List::try_from(i.clone())?;
                   let p = l.get(0);
@@ -5250,6 +5271,78 @@ Implement the =handoff= type
           Ok(None) => Ok(selected),
           Err(e) => Err(e.into()),
       }
+  }
+
+  #[derive(Debug)]
+  pub struct Timeout<T> {
+      receiver: Option<flume::Receiver<T>>,
+      handle: Option<JoinHandle<()>>,
+      duration: Duration,
+  }
+
+  // Cloning a timeout makes a new one, clears state
+  impl Clone for Timeout<Item> {
+      fn clone(&self) -> Self {
+          Self {
+              receiver: None,
+              handle: None,
+              duration: self.duration,
+          }
+      }
+  }
+
+  impl Timeout<Item> {
+      fn new(duration: Duration) -> Timeout<Item> {
+          Timeout {
+              receiver: None,
+              handle: None,
+              duration,
+          }
+      }
+
+      fn start(&mut self) {
+          if self.handle.is_none() {
+              let (sender, receiver) = flume::bounded(1);
+              let duration = self.duration;
+              self.receiver = Some(receiver);
+              self.handle = Some(tokio::spawn(async move {
+                  sleep(duration).await;
+                  //TODO handle error condition on send
+                  let _ = sender.send(coll::NOTHING);
+              }));
+          }
+      }
+
+      pub fn take(&mut self) -> types::Future<Result<Option<Item>, error::Error>> {
+          self.start();
+          let receiver = self.receiver.clone().unwrap();
+          Box::pin(async move {
+              //println!("Receiving");
+              receiver.recv_async().await.map(Some).or_else(|_| Ok(None))
+          })
+      }
+  }
+
+  impl From<Timeout<Item>> for Item {
+      fn from(t: Timeout<Item>) -> Self {
+          Item::Dispenser(coll::Dispenser::Out(pipes::Out::Timeout(t)))
+      }
+  }
+
+  impl crate::serialize::Display for Timeout<Item> {
+      fn representation(&self) -> Item {
+          assoc::Association::from_iter([
+              ("type".into(), "pipe".into()),
+              ("timeout".into(), (self.duration.as_millis() as Int).into()),
+          ])
+          .into()
+      }
+  }
+
+  pub fn timeout(i: Item) -> axiom::ItemResult {
+      let ms = Int::try_from(i)?;
+      //TODO: check for negative values
+      Ok(Timeout::new(Duration::from_millis(ms as u64)).into())
   }
 #+end_src
 ** Issues
