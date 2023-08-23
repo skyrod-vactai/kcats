@@ -709,19 +709,6 @@ internally, to keep track of things like the stack, expression, lists etc.
               _ => todo!("contains not implemented for {:?}", self),
           }
       }
-
-      pub fn iter(&self) -> Box<dyn Iterator<Item = &Item> + '_> {
-          match self {
-              Sized::Associative(map) => unimplemented!("iter not implemented for {:?}", map),
-              //Box::new(map.iter().map(|kv| kv.into())),
-              Sized::List(list) => Box::new(list.inner().iter()),
-              Sized::Nothing => Box::new(std::iter::empty()),
-              Sized::String(s) => Box::new(s.chars().map(|c| &c.into())), // Note: This would actually create temporary values and won't work directly. Need more information on your types to adjust.
-              Sized::Bytes(b) => Box::new(b.iter().map(|&byte| &Item::from(byte as Int))), // Similar note as above for temporary values
-              Sized::Set(s) => unimplemented!("iter not implemented for {:?}", s),
-              //Box::new(s.inner().iter().map(|i| i.into())),
-          }
-      }
   }
 
   impl Receptacle {
@@ -5090,7 +5077,7 @@ Implement the =handoff= type
   use flume;
   use std::future;
   use std::ptr;
-
+  use std::sync::Arc;
   #[derive(Debug, Clone)]
   // Use Option because we want to be able to drop senders/receivers to
   // close the channel
@@ -5183,8 +5170,8 @@ Implement the =handoff= type
   }
 
   enum ChannelOp<T> {
-      Send(flume::Sender<T>, usize, T),
-      Receive(flume::Receiver<T>, usize),
+      Send(Arc<flume::Sender<T>>, usize, T),
+      Receive(Arc<flume::Receiver<T>>, usize),
   }
   // Given a list of pipes (channels) on top of stack, use flume's
   // selector to choose the next ready pipe.  A pipe means it's a
@@ -5200,10 +5187,10 @@ Implement the =handoff= type
           .enumerate()
           .map(move |(idx, i)| match i {
               Item::Dispenser(coll::Dispenser::Out(pipes::Out::Handoff(p))) => {
-                  Ok(ChannelOp::Receive(p.receiver.unwrap(), idx))
+                  Ok(ChannelOp::Receive(Arc::new(p.receiver.unwrap()), idx))
               }
               Item::Dispenser(coll::Dispenser::Tunnel(pipes::Tunnel::Handoff(p))) => {
-                  Ok(ChannelOp::Receive(p.receiver.unwrap(), idx))
+                  Ok(ChannelOp::Receive(Arc::new(p.receiver.unwrap()), idx))
               }
               i => {
                   let l = coll::List::try_from(i.clone())?;
@@ -5212,13 +5199,13 @@ Implement the =handoff= type
                   match (p, i) {
                       (Some(p), Some(i)) => match (p, i) {
                           (Item::Receptacle(coll::Receptacle::In(pipes::In::Handoff(p))), i) => Ok(
-                              ChannelOp::Send(p.sender.as_ref().unwrap().clone(), idx, i.clone()),
+                              ChannelOp::Send(Arc::new(p.sender.clone().unwrap()), idx, i.clone()),
                           ),
                           (
                               Item::Receptacle(coll::Receptacle::Tunnel(pipes::Tunnel::Handoff(p))),
                               i,
                           ) => Ok(ChannelOp::Send(
-                              p.sender.as_ref().unwrap().clone(),
+                              Arc::new(p.sender.clone().unwrap()),
                               idx,
                               i.clone(),
                           )),
@@ -5236,22 +5223,22 @@ Implement the =handoff= type
           // loop over the operations and add them to the selector. Each one
           // returns the original index in the list, so we can use that to
           // fetch the original item from the list.
-          for i in lr {
-              match i {
-                  ChannelOp::Receive(r, idx) => {
-                      selector = selector.recv(&r, |i| {
-                          (i.map(Some).map_err(|e| error::Error::from(e)), idx)
+          for idx in 0..lr.len() {
+              let idx_clone = idx;
+              match &lr[idx] {
+                  ChannelOp::Receive(r, _) => {
+                      selector = selector.recv(&**r, move |i| {
+                          (i.map(Some).map_err(|e| error::Error::from(e)), idx_clone)
                       });
                   }
-                  ChannelOp::Send(s, idx, i) => {
-                      selector = selector.send(&s, i, move |i| {
+                  ChannelOp::Send(s, _, i) => {
+                      selector = selector.send(&**s, i.clone(), move |i| {
                           (i.map(|_| None).map_err(|e| error::Error::from(e)), idx)
                       });
-
-                      //senders.push(s);
                   }
               }
           }
+
           selector.wait()
       };
       let selected = original.get(idx).unwrap().clone();
