@@ -2567,6 +2567,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   "association?",
                   Box::leak(Box::new(f_stack1(is_association))),
               ),
+              (
+                  "attend",
+                  Box::leak(Box::new(f_stack1(crate::pipes::channel::select))),
+              ),
               ("branch", Box::leak(Box::new(branch))),
               ("bytes", Box::leak(Box::new(f_stack1(bytes)))),
               ("bytes?", Box::leak(Box::new(f_stack1(is_bytes)))),
@@ -2629,10 +2633,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               ("reverse", Box::leak(Box::new(f_stack1(reverse)))),
               ("second", Box::leak(Box::new(f_stack1(second)))),
               (
-                  "select",
-                  Box::leak(Box::new(f_stack1(crate::pipes::channel::select))),
-              ),
-              (
                   "serversocket",
                   Box::leak(Box::new(f_stack2_async(crate::pipes::net::server_socket))),
               ),
@@ -2652,8 +2652,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               ("swap", Box::leak(Box::new(swap))),
               ("swapdown", Box::leak(Box::new(swapdown))),
               (
-                  "timeout",
-                  Box::leak(Box::new(f_stack1(crate::pipes::channel::timeout))),
+                  "timer",
+                  Box::leak(Box::new(f_stack1(crate::pipes::channel::timer))),
               ),
               ("timestamps", Box::leak(Box::new(timestamps))),
               ("true", Box::leak(Box::new(true_))),
@@ -4462,7 +4462,7 @@ The basic pipe contracts.
       Socket(Arc<RwLock<net::Socket>>),
       ServerSocket(Arc<RwLock<net::ServerSocket>>),
       Handoff(channel::Handoff<Item>),
-      Timeout(channel::Timeout<Item>),
+      Timer(channel::Timer<Item>),
       Time,
       Standard,
   }
@@ -4588,7 +4588,7 @@ The basic pipe contracts.
                   Box::pin(async move { f.write().await.take().await })
               }
               Out::Handoff(ref mut h) => Box::pin(h.take()),
-              Out::Timeout(ref mut t) => Box::pin(t.take()),
+              Out::Timer(ref mut t) => Box::pin(t.take()),
               Out::Time => Box::pin(time::take()),
               Out::Standard => standard::take(),
           }
@@ -4617,7 +4617,7 @@ The basic pipe contracts.
                   executor::block_on(async move { f.read().await.representation() })
               }
               Out::Handoff(h) => h.representation(),
-              Out::Timeout(t) => t.representation(),
+              Out::Timer(t) => t.representation(),
               Out::Time => time::representation(),
               Out::Standard => standard::representation(),
           }
@@ -5208,7 +5208,7 @@ Implement the =handoff= type
                   Ok(ChannelOp::Receive(Arc::new(p.receiver.unwrap()), idx))
               }
               // Handle timeout channels - start the timer and add receive op
-              Item::Dispenser(coll::Dispenser::Out(pipes::Out::Timeout(t))) => {
+              Item::Dispenser(coll::Dispenser::Out(pipes::Out::Timer(t))) => {
                   let mut t = t.clone();
                   t.start();
                   Ok(ChannelOp::Receive(Arc::new(t.receiver.unwrap()), idx))
@@ -5274,14 +5274,14 @@ Implement the =handoff= type
   }
 
   #[derive(Debug)]
-  pub struct Timeout<T> {
+  pub struct Timer<T> {
       receiver: Option<flume::Receiver<T>>,
       handle: Option<JoinHandle<()>>,
       duration: Duration,
   }
 
   // Cloning a timeout makes a new one, clears state
-  impl Clone for Timeout<Item> {
+  impl Clone for Timer<Item> {
       fn clone(&self) -> Self {
           Self {
               receiver: None,
@@ -5291,9 +5291,9 @@ Implement the =handoff= type
       }
   }
 
-  impl Timeout<Item> {
-      fn new(duration: Duration) -> Timeout<Item> {
-          Timeout {
+  impl Timer<Item> {
+      fn new(duration: Duration) -> Timer<Item> {
+          Timer {
               receiver: None,
               handle: None,
               duration,
@@ -5323,13 +5323,13 @@ Implement the =handoff= type
       }
   }
 
-  impl From<Timeout<Item>> for Item {
-      fn from(t: Timeout<Item>) -> Self {
-          Item::Dispenser(coll::Dispenser::Out(pipes::Out::Timeout(t)))
+  impl From<Timer<Item>> for Item {
+      fn from(t: Timer<Item>) -> Self {
+          Item::Dispenser(coll::Dispenser::Out(pipes::Out::Timer(t)))
       }
   }
 
-  impl crate::serialize::Display for Timeout<Item> {
+  impl crate::serialize::Display for Timer<Item> {
       fn representation(&self) -> Item {
           assoc::Association::from_iter([
               ("type".into(), "pipe".into()),
@@ -5339,10 +5339,10 @@ Implement the =handoff= type
       }
   }
 
-  pub fn timeout(i: Item) -> axiom::ItemResult {
+  pub fn timer(i: Item) -> axiom::ItemResult {
       let ms = Int::try_from(i)?;
       //TODO: check for negative values
-      Ok(Timeout::new(Duration::from_millis(ms as u64)).into())
+      Ok(Timer::new(Duration::from_millis(ms as u64)).into())
   }
 #+end_src
 ** Issues
@@ -8007,7 +8007,7 @@ item yet), or Item (got a new item), or some signal for end of stream,
 or Error. So it would have some program with a while loop to
 iterate. All such transforms would probably have the same program.
 
-*** TODO [#A] Auto code formatter
+*** INPROGRESS [#A] Auto code formatter
 This is desperately needed, as a big blob of output line-wrapped is
 very hard to read.
 
@@ -8087,10 +8087,27 @@ now test decreasing indent
          [c d]]
 #+end_src
 
-*** TODO Have eval-step return nothing when program is done
+*** DONE Have eval-step return nothing when program is done
 That means eval needs to keep the input until it checks the output.
 
 That may make normal runtime a little less efficient but it means
 debuggers and step generators are easy and more efficient.
 
 At that point =stepper= can be removed and we can use =eval-step= in its place. 
+
+(actually stepper still has a use, it just doesn't need to check for =nothing= anymore)
+
+*** INPROGRESS Select from multiple pipes
+A basic select (which I call =attend=) is in place. 
+
+**** TODO Attend should leave the pipe list argument
+A lot of callers would want to re-use that argument so it shouldn't
+need to be shielded by default.
+
+**** TODO Better error handling
+There's lots of places where flume could throw an error and we don't
+do anything about it.
+
+*** TODO print
+It's probably just an alias for something like =[standard] dip bytes put
+drop= (write to stdout and then drop the pipe).
