@@ -3123,7 +3123,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }
   }
 
-  fn is_truthy(i: Item) -> bool {
+  pub fn is_truthy(i: Item) -> bool {
       coll::Sized::try_from(i).map_or(true, |s| !s.is_empty())
   }
 
@@ -5088,7 +5088,9 @@ Implement the =handoff= type
   use flume;
   use std::future;
   use std::ptr;
+  use std::sync::atomic::{AtomicUsize, Ordering};
   use std::sync::Arc;
+  use std::thread;
   use tokio::task::JoinHandle;
   use tokio::time::{sleep, Duration};
 
@@ -5098,6 +5100,7 @@ Implement the =handoff= type
   pub struct Handoff<T> {
       pub receiver: Option<flume::Receiver<T>>,
       pub sender: Option<flume::Sender<T>>,
+      pub id: usize,
   }
 
   impl<T> PartialEq for Handoff<T> {
@@ -5109,32 +5112,63 @@ Implement the =handoff= type
       }
   }
 
+  static ID: AtomicUsize = AtomicUsize::new(0);
+
   impl Handoff<Item> {
       pub fn new() -> Handoff<Item> {
           let (sender, receiver) = flume::bounded::<Item>(0);
+          let id = ID.fetch_add(1, Ordering::Relaxed);
           Handoff::<Item> {
               sender: Some(sender),
               receiver: Some(receiver),
+              id,
           }
       }
 
       pub fn put(&mut self, i: Item) -> types::Future<Result<(), error::Error>> {
+          // println!(
+          //     "Putting into channel: {} into {:?} on {:?}",
+          //     i.clone(),
+          //     self,
+          //     thread::current().id()
+          // );
           if let Some(ch) = self.sender.clone() {
-              Box::pin(async move {
-                  ch.send_async(i)
-                      .await
-                      .map_err(|_| pipes::closed_error(false))
-              })
+              if axiom::is_truthy(i.clone()) {
+                  Box::pin(async move {
+                      let r = ch
+                          .send_async(i)
+                          .await
+                          .map_err(|_| pipes::closed_error(false));
+                      //println!("Sent: {:?} on {:?}", r, thread::current().id());
+                      r
+                  })
+              } else {
+                  // If we're putting 'nothing', that indicates end of
+                  // input, so we drop the sender.
+                  self.close_put();
+                  Box::pin(future::ready(Ok(())))
+              }
           } else {
               Box::pin(future::ready(Err(pipes::closed_error(false))))
           }
       }
 
       pub fn take(&mut self) -> types::Future<Result<Option<Item>, error::Error>> {
+          // println!(
+          //     "Taking from channel: {:?} on {:?}",
+          //     self,
+          //     thread::current().id()
+          // );
           if let Some(ch) = self.receiver.clone() {
               Box::pin(async move {
                   //println!("Receiving");
-                  ch.recv_async().await.map(Some).or_else(|_| Ok(None))
+                  let i = ch.recv_async().await.map(Some).or_else(|_| Ok(None));
+                  // println!(
+                  //     "Received: {} on {:?}",
+                  //     i.clone().unwrap().unwrap(),
+                  //     thread::current().id()
+                  // );
+                  i
               })
           } else {
               Box::pin(future::ready(Ok(None)))
@@ -5160,7 +5194,7 @@ Implement the =handoff= type
       fn representation(&self) -> Item {
           assoc::Association::from_iter([
               ("type".into(), "pipe".into()),
-              ("handoff".into(), "todo: id-or-hash here".into()),
+              ("handoff".into(), (self.id as Int).into()),
           ])
           .into()
       }
