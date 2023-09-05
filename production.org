@@ -85,7 +85,6 @@ the location where you installed the kcats binary.
 We'll start by defining the basic data structures that kcats will use
 internally, to keep track of things like the stack, program, lists etc.
 #+begin_src rust :tangle src/types.rs :mkdirp yes
-  use crate::pipes::{In, Out};
   use crate::types::collection as coll;
   use crate::types::dictionary as dict;
   use crate::types::environment as env;
@@ -331,26 +330,6 @@ internally, to keep track of things like the stack, program, lists etc.
   //         }
   //     }
   // }
-
-  impl TryFrom<Item> for In {
-      type Error = Error;
-      fn try_from(i: Item) -> Result<Self, Self::Error> {
-          match i {
-              Item::Receptacle(coll::Receptacle::In(i)) => Ok(i),
-              i => Err(Error::expected("pipe", i)),
-          }
-      }
-  }
-
-  impl TryFrom<Item> for Out {
-      type Error = Error;
-      fn try_from(i: Item) -> Result<Self, Self::Error> {
-          match i {
-              Item::Dispenser(coll::Dispenser::Out(o)) => Ok(o),
-              i => Err(Error::expected("pipe", i)),
-          }
-      }
-  }
 
   // As there are no real booleans, we use the word 'true' but literally
   // any value except the empty list is truthy. If we read a value
@@ -2627,11 +2606,19 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               ("pipe?", Box::leak(Box::new(f_stack1(is_pipe)))),
               ("range", Box::leak(Box::new(range))),
               ("read", Box::leak(Box::new(read))),
+              (
+                  "receiver",
+                  Box::leak(Box::new(f_stack1(crate::pipes::channel::receiver))),
+              ),
               ("recur", Box::leak(Box::new(recur))),
               ("redefine", Box::leak(Box::new(redefine))),
               ("resume", Box::leak(Box::new(identity))),
               ("reverse", Box::leak(Box::new(f_stack1(reverse)))),
               ("second", Box::leak(Box::new(f_stack1(second)))),
+              (
+                  "sender",
+                  Box::leak(Box::new(f_stack1(crate::pipes::channel::sender))),
+              ),
               (
                   "serversocket",
                   Box::leak(Box::new(f_stack2_async(crate::pipes::net::server_socket))),
@@ -4708,6 +4695,30 @@ The basic pipe contracts.
           Item::Receptacle(coll::Receptacle::In(t))
       }
   }
+
+  impl TryFrom<Item> for In {
+      type Error = Error;
+      fn try_from(i: Item) -> Result<Self, Self::Error> {
+          match i {
+              Item::Receptacle(coll::Receptacle::In(i)) => Ok(i),
+              Item::Receptacle(coll::Receptacle::Tunnel(t)) => Ok(t.into()),
+              Item::Dispenser(coll::Dispenser::Tunnel(t)) => Ok(t.into()),
+              i => Err(Error::expected("pipe", i)),
+          }
+      }
+  }
+
+  impl TryFrom<Item> for Out {
+      type Error = Error;
+      fn try_from(i: Item) -> Result<Self, Self::Error> {
+          match i {
+              Item::Dispenser(coll::Dispenser::Out(o)) => Ok(o),
+              Item::Dispenser(coll::Dispenser::Tunnel(t)) => Ok(t.into()),
+              Item::Receptacle(coll::Receptacle::Tunnel(t)) => Ok(t.into()),
+              i => Err(Error::expected("pipe", i)),
+          }
+      }
+  }
 #+end_src
 ***** Files
 How to interact with files on disk
@@ -5099,7 +5110,6 @@ Implement the =handoff= type
   use std::ptr;
   use std::sync::atomic::{AtomicUsize, Ordering};
   use std::sync::Arc;
-  use std::thread;
   use tokio::task::JoinHandle;
   use tokio::time::{sleep, Duration};
 
@@ -5172,11 +5182,7 @@ Implement the =handoff= type
               Box::pin(async move {
                   //println!("Receiving");
                   let i = ch.recv_async().await.map(Some).or_else(|_| Ok(None));
-                  // println!(
-                  //     "Received: {} on {:?}",
-                  //     i.clone().unwrap().unwrap(),
-                  //     thread::current().id()
-                  // );
+                  //println!("Received: {:?}", i.clone().unwrap().unwrap());
                   i
               })
           } else {
@@ -5201,8 +5207,14 @@ Implement the =handoff= type
 
   impl crate::serialize::Display for Handoff<Item> {
       fn representation(&self) -> Item {
+          let t = match (&self.sender, &self.receiver) {
+              (Some(_), Some(_)) => "tunnel",
+              (Some(_), None) => "in",
+              (None, Some(_)) => "out",
+              (None, None) => "closed",
+          };
           assoc::Association::from_iter([
-              ("type".into(), "pipe".into()),
+              ("type".into(), t.into()),
               ("handoff".into(), (self.id as Int).into()),
           ])
           .into()
@@ -5313,6 +5325,34 @@ Implement the =handoff= type
           Ok(None) => Ok(selected),
           Err(e) => Err(e.into()),
       }
+  }
+
+  impl TryFrom<Item> for Handoff<Item> {
+      type Error = error::Error;
+
+      fn try_from(i: Item) -> Result<Self, Self::Error> {
+          match i {
+              Item::Dispenser(coll::Dispenser::Out(pipes::Out::Handoff(p))) => Ok(p),
+              Item::Receptacle(coll::Receptacle::In(pipes::In::Handoff(p))) => Ok(p),
+              Item::Receptacle(coll::Receptacle::Tunnel(pipes::Tunnel::Handoff(p))) => Ok(p),
+              Item::Dispenser(coll::Dispenser::Tunnel(pipes::Tunnel::Handoff(p))) => Ok(p),
+              i => Err(error::Error::expected("handoff", i)),
+          }
+      }
+  }
+
+  // drop the receiver side of the handoff and return the handoff item
+  pub fn sender(i: Item) -> axiom::ItemResult {
+      let mut h = Handoff::try_from(i)?;
+      h.close_take();
+      Ok(Item::Receptacle(coll::Receptacle::In(pipes::In::Handoff(h))).into())
+  }
+
+  // drop the sender side of the handoff and return the handoff item
+  pub fn receiver(i: Item) -> axiom::ItemResult {
+      let mut h = Handoff::try_from(i)?;
+      h.close_put();
+      Ok(Item::Dispenser(coll::Dispenser::Out(pipes::Out::Handoff(h))).into())
   }
 
   #[derive(Debug)]
