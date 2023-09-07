@@ -1229,7 +1229,7 @@ We can fix the problem and continue, but only if we can stop the
 unwinding before our entire program is unwound. We can do that using
 the word =recover=, which takes two programs: =p= and =r=, =p= is run and if
 it results in an error, the unwinding is limited to =p= and then =r= is
-run. When =r= runs, the error object is on the top of stack. If there is no
+run. When =r= runs, the error item is on the top of stack. If there is no
 error, =r= does not run.
 
 In the program below, we recover by discarding the error and the
@@ -1353,6 +1353,7 @@ whatever alterations you want in a separate file, let's say
   "square.kcats" slurp read [9 square] lingo
 #+end_src
 ** Generators
+*** Overview
 Sometimes in programming, having the concept of an indefinite sequence
 is handy. You have part of your program producing data, and another
 consuming it, but the producer doesn't know how much the consumer will
@@ -1363,10 +1364,10 @@ produce, but the producer still retains all the logic of how that's done.
 
 In kcats there's no special sauce for generators, we can implement
 them as a pattern with just the standard words we've already seen.
-
-Here's an example: Let's say you want to create the fibonacci
-sequence. Let's see how we can code that without worrying about how
-many items in the sequence we'll eventually need.
+*** Example
+Let's say you want to create the fibonacci sequence. Let's see how we
+can code that without worrying about how many items in the sequence
+we'll eventually need.
 
 A generator consists of two things: state, and a program. Each time
 we want to generate a value, we run the program. The program should
@@ -1573,7 +1574,7 @@ and repeat that until there are no items left:
 #+begin_src kcats
 135
 #+end_src
-
+*** Compatibility
 Let's say you go to the trouble of making a beautiful stack of
 transformations and you want to re-use it, but you don't have a
 generator, you have a list! Our transformation stack needs a
@@ -1588,6 +1589,92 @@ generators are a state and a program. If we already have a list or
 pipe, we can just treat that as the state. And =[take]= as the program
 does exactly what we want, removes an item from the list and returns
 it, leaving the state with one fewer item.
+*** Capturing values from the stack
+One pitfall with generators is that sometimes you want to transform
+generated values and use some item from the stack to help do it. The
+problem with this is that generators can be arbitrarily deep and you
+won't know exactly how deep that item is.
+
+The solution is to =capture= the items you want.
+
+Let's look at a simple example. Let's say we want to generate every
+multiple of n (where n is some number on the stack). We can already
+generate every integer, we just need to multiply each one by n. A naive
+solution would be to just use =each=, but it doesn't work:
+
+#+begin_src kcats
+  3 integers
+  [*] each
+  1 dropper ;; drop 0
+  10 taker collect
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[unwound [* [[0 [inc clone]
+               0 3]] unwrap evert first dropdown [[generate [[*] bail]
+                                                   shielddown]] unwrap swap drop [1] unwrap dec [positive?] shield [[generate drop]
+                                                                                                                    dip dec [positive?] shield]
+           loop [generate swap]
+           dip float
+           [[[[positive?] [[generate drop]
+                           dip dec]
+              while [generate swap]
+              dip float]
+             bail]] unwrap swap [9] unwrap swap [[[positive?] [dec [generate] dive] [[]] if]]
+           unwrap swap [] swap clone [put [generate] dip swap clone] loop drop]]
+ [reason "type mismatch"]
+ [type error]
+ [actual [inc clone]]
+ [asked [number]]
+ [handled true]]
+0 [inc clone]
+0 3
+#+end_src
+
+This doesn't work because n and the last integer we generated aren't
+next to each other on the stack, there's a bunch of generator
+machinery in between. We could try to guess exactly how deep the
+machinery is, but then our generators aren't composable anymore - we
+couldn't move that call to =each= somewhere else in the generator stack,
+without having to change the program. What we really should do is
+create our program for =each= first, before we start stacking up
+generators, and =capture= n:
+
+#+begin_src kcats
+  3 wrap ;; capture takes a list of items to capture, we just want [3]
+  [*] capture
+  [integers] dip ;; insert the integers generator below the each program
+  each
+  1 dropper
+  10 taker collect
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[3 6 9 12 15 18 21 24 27 30]
+[[positive?] [dec [generate] dive] [[]] if] 0 [[[positive?] [[generate drop]
+                                                             dip dec]
+                                                while [generate swap]
+                                                dip float]
+                                               bail]
+0 [generate [[[3] swap [restore] dip *] bail]
+   shielddown]
+[inc clone]
+10
+#+end_src
+
+What exactly is this doing? =capture= takes a program and a list, and
+sets that list as the stack for the program when it runs. You can
+=capture= the entire stack with =snapshot=, or you can build the list
+however you like. You can grab the top item with =wrap=, the top two
+items with =pair= or the top 3 with =triplet=. Note that these steal the
+values from the stack and embed them in the program. If you just want
+to copy the values, use =shield= to prevent them from being consumed
+from the stack.
+
+If you're familiar with *closures* in other languages, =capture= is the
+same concept in kcats. 
 ** Coordination and Input/Output
 *** Basics
 In kcats, both coordination and input/output are done with =pipes=. See
@@ -1609,16 +1696,7 @@ other environment to take something out so there's space to put, or
 put something in so that there's something to take out.
 
 All pipes share the =put= and =take= operations but they can differ in
-other ways. For example, the pipe you get when writing to a file will
-only accept bytes. Trying to put any other type will cause an
-error. Pipes also have varying capacity to hold items. Imagine a pipe
-that has no length at all, it's just a hole in a thin wall. It doesn't
-hold anything - you can only pass an item through if there's someone
-on the other side of the wall already waiting to accept it. That's
-called a =handoff=, and is the most common coordination pipe. Other
-pipes have a capacity. Imagine a pipe where even if no one is taking
-anything out of it, you can still put 10 items into it before it will
-stop accepting more. That is a pipe with a capacity of 10 items.
+other ways. 
 
 Note that =put= and =take= can also be used on plain lists. =put= adds to
 the end, and =take= removes the first item. Neither will ever block when
@@ -1714,12 +1792,392 @@ been fully read from. So you can do this:
 "Hello World!"
 #+end_src
 
+*** Coordination of simultaneous programs
+**** Basics
+The way kcats handles parallel processing (aka multithreading) is by
+allowing you to create multiple environments, each with their own
+programs, that run simultaneously.
+
+Often you need the environments to communicate with each other, and
+not just with the outside world. That's done with channels. Channels
+let you send items from one environment to another.
+**** Channels
+Channels are a type of pipe. They are different from other pipes, like
+files or network sockets, in that while files and sockets only deal
+with bytes, channels can pass any kind of item (numbers, strings,
+words, lists, and even other pipes). If you can put an item on the
+stack, you can also pass it through a channel.
+***** Handoff
+This is the most common type of channel. Think of it as a pipe with no
+length or capacity. It's more like a hole in a wall, than an actual
+pipe. You can pass items through the hole, but only if someone is
+already on the other side waiting to take it. If your program tries to
+pass an item through the handoff, but no other program running
+simultaneously is already waiting to take it, your program will
+*block*. That means it stops and waits. The same goes for receiving
+items - if your program tries to receive but no one is sending yet,
+your program will wait until someone sends. Handoffs support multiple
+senders and receivers through the same "hole" - imagine multiple
+people standing on either side of the wall, holding items they need to
+pass through, and others empty handed waiting to receive. Only one
+person can receive per send - it's a direct handoff and not a
+broadcast.
+
+You pass values from one environment to another by giving both
+environments a copy of the handoff pipe. One environment calls =put=
+(with a value) and the other calls =take=. If they're doing that at the
+same time, the value moves from one environment to the other and both
+the =put= and =take= complete at the same time.
+
+You can pass as many values through the handoff as you want.
+***** Buffered
+This channel works similarly to a Handoff, but instead of having no
+capacity, it has a fixed capacity that you specify when you create
+it. Let's say you give it a capacity of 10. That means the sender can
+put 10 items in, even when no one is receiving yet. On the 11th item,
+sending will block just like a handoff would.
+
+If a receiver takes an item out, that frees up space for one more item
+that the sender can put in without blocking.
+***** Signaling when you're done
+It's common for a program to keep taking from a pipe until there's
+nothing left to take, and then stop. How does it know there's nothing
+left (in other words, nothing more will ever arrive, no matter how
+long it waits)? With channels there's 2 ways to know:
+
++ One of the senders sends the value =nothing=. All the standard library
+  words that pull from a channel repeatedly, will stop when they
+  receive =nothing=.
++ All the senders copies of the channel are dropped.
+
+How is a sender dropped? That can happen several ways:
+
++ The channel item is dropped from the stack with the word =drop= or
+  its variants, or otherwise consumed.
++ The entire environment is dropped (as often happens when its program
+  is finished)
++ A program receives on this copy of the channel. By default, channels
+  are one direction only. As soon as you send, the receiver is
+  dropped, and vice versa. Bidirectional channels (where the same
+  program can send and receive on the same channel) are possible but
+  currently not supported because they take a bit more care to use
+  properly.
+
+When writing a program that needs to know about the end of a stream,
+you must take care to not leave extra copies of channels lying
+around. Any extra channel copy that you don't =drop= when finished, will
+keep the stream open forever and will result in a *deadlock*. A deadlock
+is when some program is waiting for a condition that can never
+occur. In this case, a receiver is waiting for the end of the stream,
+and it will never get it. The primary symptom of a deadlock is a
+program that appears to be stuck or doing nothing, doesn't produce the
+intended result, doesn't produce an error, and doesn't exit.
+
+Note that it's also possible for receivers to signal they have
+everything they want, by dropping their copy of the channel. After all
+receivers are dropped, all senders will get errors when they try to
+send.
+
+**** Multiple environments
+Parallel processing is done with multiple environments running
+simultaneously, but how exactly do we set that up? And how do we
+enable them to communicate with each other? How do we create two
+environments with a copy of the same channel, so one can send and the
+other receive?
+
+One handy way is to use the word =spawn=. It takes a program and creates
+a new environment, such that its program is the given program and the
+stack is a copy of the current environment's stack. That way, you end
+up with two environments, with different programs but the same stack.
+
+Once the new environment is created, it doesn't actually do anything,
+it's just another item inside the current environment. To make it
+actually run the program, we need to =animate= it. At that point it
+disappears from this environment and goes off on its own.
+
+#+begin_src kcats
+handoff [5 put] spawn animate take
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+5 [[type out]
+   [handoff 0]]
+#+end_src
+
+Here we create a handoff, and then create a new environment that
+inherits that handoff in its stack. That new environment will =put= the
+number =5= into the channel. Then we call =take= on the other copy of the
+channel to receive the number =5=.
+
+Note that when you =animate= a new environment, you can't debug it using
+the same debugging tools we saw earlier. You actually lose all contact
+with it, except for whatever pipe communication you program it to
+do. Debugging simultaneous programs is a bit more involved and this
+will be covered later.
+**** Example
+We'll show how parallel programming (multithreading) works in kcats,
+with an example. Let's say we have a database of books, and we have 3
+librarians checking in returned books. Let's say for simplicity that
+*all* the books in the database were checked out and have now been
+returned and are ready for checkin. We want to update the database so
+that each book has a =last-checkin= property with the timestamp the
+librarian processed it, and =checked-in-by= with the librarian's
+name. We want all the books to be processed exactly once, with 3
+librarians working in parallel.
+
+We'll create chunks of our program and put it all together
+later. Here's one chunk.  Let's read in our database and parse it into
+a list:
+
+#+begin_src kcats
+"examples/books.kcats" file-out slurp read
+#+end_src
+
+So that's our database of unprocessed books. Now let's feed our
+database into a pipe, in a separate environment. We could also have
+used a buffered channel here.
+
+#+begin_src kcats
+  [[put] step] spawn animate
+  drop ;; this copy of the library as the task to feed it is already running
+#+end_src
+
+Now we can create two channels - one to carry unstamped books (the input for the librarian), and one to
+carry stamped books (the librarian's output). Then we create another pipe that gives the current time.
+#+begin_src kcats
+  handoff ;; a pipe for unprocessed books
+  handoff ;; a pipe to collect completed work
+  timestamps ;; pipe for the librarians to stamp their books with
+#+end_src
+
+Now we specify what each librarian should do. This is the meat of the
+program. 
+
+#+begin_src kcats
+  ;; the spawn prog should see: n ts po pi (librarian-name, timestamps, output-pipe, input-pipe)
+  ;; the book each prog should see: book n ts po pi
+  snapshot ; capture n, ts, po, pi
+  [[pair ; capture n, ts.
+    [[take dropdown ;; get a timestamp and then drop the ts pipe
+      pair [checked-in-by last-checkin] swap zip] dip join]
+    capture
+    [[take]] dip ;; make a generator out of pi
+    each ;; book, do the stamping
+    float siphon] ;; from the each generator to the output pipe 
+   spawn animate] ;; launch a separate environment
+  capture
+  ;; now that we've already captured the pipes to the workers we
+  ;; can drop pi and ts
+  dropdown dropdeep
+#+end_src
+
+Now that we've specified what each librarian should do, we specify the
+librarians. In this case, all we need is their name.
+#+begin_src kcats
+  ["Darlene" "Thomas" "Ethel"] ;; the names of the librarians
+  swap map ;; for each librarian do the above program
+
+  drop ;; the resulting list, we only care about launching envs
+  
+#+end_src
+
+Finally we can just collect all the results from the output channel,
+and drop the other items we don't need anymore, leaving just the results.
+
+#+begin_src kcats
+  [take] collect ;; the results
+  ;; drop generator, leaving only results
+  sink drop drop
+#+end_src
+
+Here's the whole program:
+
+#+begin_src kcats
+  handoff ;; a pipe for unprocessed books
+  "examples/books.kcats" file-out slurp read ;; read the library
+
+  ;; feed all the unprocessed books into a pipe, in a separate task
+  [[put] step] spawn animate
+  drop ;; this copy of the library as the task to feed it is already running
+  handoff ;; a pipe to collect completed work
+  timestamps ;; pipe for the librarians to stamp their books with
+
+  ;; the spawn prog should see: n ts po pi (librarian-name, timestamps, output-pipe, input-pipe)
+  ;; the book each prog should see: book n ts po pi
+  snapshot ; capture n, ts, po, pi
+  [[pair ; capture n, ts.
+    [[take dropdown ;; get a timestamp and then drop the ts pipe
+      pair [checked-in-by last-checkin] swap zip] dip join]
+    capture
+    [[take]] dip ;; make a generator out of pi
+    each ;; book, do the stamping
+    float siphon] ;; from the each generator to the output pipe 
+   spawn animate] ;; launch a separate environment
+  capture
+  ;; now that we've already captured the pipes to the workers we
+  ;; can drop pi and ts
+  dropdown dropdeep
+
+  ["Darlene" "Thomas" "Ethel"] ;; the names of the librarians
+  swap map ;; for each librarian do the above program
+
+  drop ;; the resulting list, we only care about launching envs
+  [take] collect ;; the results
+  ;; drop generator, leaving only results
+  sink drop drop
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[[checked-in-by "Darlene"]
+  [last-checkin 1694100715695]
+  [author-first "George"]
+  [author-last "Orwell"]
+  [title "1984"]
+  [year 1949]
+  [subjects [government dystopia surveillance totalitarianism freedom]]]
+ [[checked-in-by "Thomas"]
+  [last-checkin 1694100715700]
+  [author-first "Aldous"]
+  [author-last "Huxley"]
+  [title "Brave New World"]
+  [year 1932]
+  [subjects [society technology dystopia happiness drugs]]]
+ [[checked-in-by "Darlene"]
+  [last-checkin 1694100715704]
+  [author-first "F. Scott"]
+  [author-last "Fitzgerald"]
+  [title "The Great Gatsby"]
+  [year 1925]
+  [subjects [wealth love obsession american-dream tragedy]]]
+ [[checked-in-by "Darlene"]
+  [last-checkin 1694100715704]
+  [author-first "J.D."]
+  [author-last "Salinger"]
+  [title "The Catcher in the Rye"]
+  [year 1951]
+  [subjects [adolescence alienation innocence society adulthood]]]
+ [[checked-in-by "Ethel"]
+  [last-checkin 1694100715704]
+  [author-first "Jane"]
+  [author-last "Austen"]
+  [title "Pride and Prejudice"]
+  [year 1813]
+  [subjects [love marriage society class reputation]]]
+ [[checked-in-by "Darlene"]
+  [last-checkin 1694100715704]
+  [author-first "Mary"]
+  [author-last "Shelley"]
+  [title "Frankenstein"]
+  [year 1818]
+  [subjects [creation science responsibility monster humanity]]]
+ [[checked-in-by "Ethel"]
+  [last-checkin 1694100715704]
+  [author-first "John"]
+  [author-last "Steinbeck"]
+  [title "Of Mice and Men"]
+  [year 1937]
+  [subjects [friendship dream loneliness society tragedy]]]
+ [[checked-in-by "Ethel"]
+  [last-checkin 1694100715704]
+  [author-first "Ernest"]
+  [author-last "Hemingway"]
+  [title "The Old Man and the Sea"]
+  [year 1952]
+  [subjects [endurance nature old-age fisherman sea]]]
+ [[checked-in-by "Darlene"]
+  [last-checkin 1694100715704]
+  [author-first "Harper"]
+  [author-last "Lee"]
+  [title "To Kill a Mockingbird"]
+  [year 1960]
+  [subjects [racism innocence morality law childhood]]]
+ [[checked-in-by "Ethel"]
+  [last-checkin 1694100715704]
+  [author-first "J.R.R."]
+  [author-last "Tolkien"]
+  [title "The Lord of the Rings"]
+  [year 1954]
+  [subjects [adventure elf dwarf hobbit ring journey magic evil]]]
+ [[checked-in-by "Darlene"]
+  [last-checkin 1694100715704]
+  [author-first "Joseph"]
+  [author-last "Conrad"]
+  [title "Heart of Darkness"]
+  [year 1899]
+  [subjects [colonization africa journey morality darkness europeans]]]
+ [[checked-in-by "Ethel"]
+  [last-checkin 1694100715704]
+  [author-first "Leo"]
+  [author-last "Tolstoy"]
+  [title "War and Peace"]
+  [year 1869]
+  [subjects [war peace society history love aristocracy]]]
+ [[checked-in-by "Darlene"]
+  [last-checkin 1694100715704]
+  [author-first "Homer"]
+  [title "The Odyssey"]
+  [year -800]
+  [subjects [journey odyssey homecoming gods heroism adventure]]]
+ [[checked-in-by "Darlene"]
+  [last-checkin 1694100715704]
+  [author-first "Charlotte"]
+  [author-last "Bronte"]
+  [title "Jane Eyre"]
+  [year 1847]
+  [subjects [love morality society class womanhood independence]]]
+ [[checked-in-by "Ethel"]
+  [last-checkin 1694100715704]
+  [author-first "Mark"]
+  [author-last "Twain"]
+  [title "Adventures of Huckleberry Finn"]
+  [year 1884]
+  [subjects [adventure racism slavery morality friendship river]]]
+ [[checked-in-by "Darlene"]
+  [last-checkin 1694100715704]
+  [author-first "Ray"]
+  [author-last "Bradbury"]
+  [title "Fahrenheit 451"]
+  [year 1953]
+  [subjects [censorship knowledge books society dystopia future]]]
+ [[checked-in-by "Ethel"]
+  [last-checkin 1694100715704]
+  [author-first "Charles"]
+  [author-last "Dickens"]
+  [title "A Tale of Two Cities"]
+  [year 1859]
+  [subjects [revolution love sacrifice resurrection society history]]]
+ [[checked-in-by "Thomas"]
+  [last-checkin 1694100715704]
+  [author-first "William"]
+  [author-last "Golding"]
+  [title "Lord of the Flies"]
+  [year 1954]
+  [subjects [society civilization savagery childhood morality island]]]
+ [[checked-in-by "Ethel"]
+  [last-checkin 1694100715704]
+  [author-first "Miguel de"]
+  [author-last "Cervantes"]
+  [title "Don Quixote"]
+  [year 1605]
+  [subjects [adventure idealism reality knight insanity literature]]]
+ [[checked-in-by "Thomas"]
+  [last-checkin 1694100715704]
+  [author-first "H.G."]
+  [author-last "Wells"]
+  [title "The War of the Worlds"]
+  [year 1898]
+  [subjects [invasion aliens society technology war humanity]]]]
+#+end_src
 ** Debugging
+*** The debugger
 In kcats, we don't need an external debugger. We can debug our
 programs right in the kcats interpeter. We can specify the program to
 run and step through it.
 
-Let's say this is the program we want to step through. This is how we'd normally run it:
+Let's say this is the program we want to step through. This is how
+we'd normally run it:
 #+begin_src kcats :exports both :results code
 0 1 3 inc 1 range [+] step
 #+end_src
@@ -1729,7 +2187,7 @@ Let's say this is the program we want to step through. This is how we'd normally
 6
 #+end_src
 
-To debug, we put it into an environment object which we can then use
+To debug, we put it into an environment item which we can then use
 debugging words like =advance=:
 
 #+begin_src kcats :exports both :results code
@@ -1838,543 +2296,38 @@ We can even mess with the stack and the program:
               [+] step]]]
 #+end_src
 
-** Multithreading (Work in progress)
-We'll show how parallel programming (multithreading) works in kcats,
-with an example. Let's say we have a database of books, and we have 3
-librarians checking in returned books. Let's say for simplicity that
-*all* the books in the database were checked out and have now been
-returned and are ready for checkin. We want to update the database so
-that each book has a =last-checkin= property with the timestamp the
-librarian processed it. We want all the books to be processed exactly
-once, with 3 librarians working in parallel.
+*** Other tools
+The "good old fashioned" method of debugging a program is to put =print=
+statements throughout the program to get insight into what's
+happening.
 
-We'll create chunks of our program and put it all together
-later. Here's one chunk.  Let's read in our database and parse it into
-a list:
+You can do that in kcats too!
 
 #+begin_src kcats
-"examples/books.kcats" file-out slurp read
+3 [odd?] ["it was odd" print inc] ["it was even" print 2 *] if
 #+end_src
 
-So that's our stack of unprocessed books. Now let's set up our team of
-library workers.
+=print= takes a string and will print it to standard out.
+
+#+RESULTS:
+#+begin_src kcats
+it was odd
+4
+#+end_src
+
+There's also a way to print the current stack, it's called =dump=, and
+it has has no stack effect, so it's safe to put anywhere.
 
 #+begin_src kcats
-  handoff ;; a pipe for unprocessed books
-  "examples/books.kcats" file-out slurp read ;; read the library
-
-  ;; feed all the unprocessed books into a pipe, in a separate task
-  [[put] step] spawn animate
-  drop ;; this copy of the library as the task to feed it is already running
-  handoff ;; a pipe to collect completed work
-  timestamps ;; pipe for the librarians to stamp their books with
-
-  ;; the spawn prog should see: n ts po pi (librarian-name, timestamps, output-pipe, input-pipe)
-  ;; the book each prog should see: book n ts po pi
-  snapshot ; capture n, ts, po, pi
-  [[pair ; capture n, ts.
-    [[take dropdown ;; get a timestamp and then drop the ts pipe
-      pair [librarian time] swap zip] dip join]
-    capture
-    [[take]] dip ;; make a generator out of pi
-    each ;; book, do the stamping
-    float siphon] ;; from the each generator to the output pipe 
-   spawn animate] ;; launch a separate environment
-  capture
-  ;; now that we've already captured the pipes to the workers we
-  ;; can drop pi and ts
-  dropdown dropdeep
-
-  ["Darlene" "Thomas" "Ethel"] ;; the names of the librarians
-  swap map ;; for each librarian do the above program
-
-  drop ;; the resulting list, we only care about launching envs
-  [take] collect ;; the results
-  ;; drop generator, leaving only results
-  sink drop drop
+1 2 3 [odd?] [dump inc] [dump 2 *] if 
 #+end_src
 
 #+RESULTS:
 #+begin_src kcats
-[[unwound [["Darlene"] unwrap [receiver] dipdown [[[swap take dropdown pair [librarian
-                                                                             time]
-                                                    swap zip]
-                                                   dip join]
-                                                  capture [drop drop [take]] dip each float siphon]
-           future [["Darlene" [take] ["Thomas" "Ethel"]
-                    [[from systemtime]
-                     [type out]
-                     [values [[units milliseconds]
-                              [type integer]]]]
-                    [[handoff 1]
-                     [type out]]
-                    [[handoff 0]
-                     [type tunnel]]]] unwrap evert first dropdown [[generate [[[[[type out]
-                                                                                 [from systemtime]
-                                                                                 [values [[type integer]
-                                                                                          [units milliseconds]]]]
-                                                                                [[type tunnel]
-                                                                                 [handoff 1]]
-                                                                                [[type tunnel]
-                                                                                 [handoff 0]]]
-                                                                               swap [restore] dip [sender] dip [receiver] dipdown [[[swap take dropdown pair [librarian
-                                                                                                                                                              time]
-                                                                                                                                     swap zip]
-                                                                                                                                    dip join]
-                                                                                                                                   capture [drop drop [take]] dip each float siphon]
-                                                                               future]
-                                                                              bail]
-                                                                    shielddown]] unwrap swap [] swap clone [put [generate] dip swap clone] loop drop
-           [[[[[[values [[units milliseconds]
-                         [type integer]]]
-                [type out]
-                [from systemtime]]
-               [[handoff 1]
-                [type tunnel]]
-               [[handoff 0]
-                [type tunnel]]]
-              swap [restore] dip [sender] dip [receiver] dipdown [[[swap take dropdown pair [librarian
-                                                                                             time]
-                                                                    swap zip]
-                                                                   dip join]
-                                                                  capture [drop drop [take]] dip each float siphon]
-              future]
-             ["Darlene" "Thomas" "Ethel"] [[type out]
-                                           [values [[type integer]
-                                                    [units milliseconds]]]
-                                           [from systemtime]]
-             [[type out]
-              [handoff 1]]
-             [[handoff 0]
-              [type tunnel]]]] unwrap evert first [drop drop]
-           dip drop drop [take] collect]]
- [type error]
- [asked [handoff]]
- [reason "type mismatch"]
- [actual [[from systemtime]
-          [type out]
-          [values [[units milliseconds]
-                   [type integer]]]]]
- [handled true]]
-[[type tunnel]
- [handoff 1]]
-[[handoff 0]
- [type tunnel]]
+[3 2 1]
+4 2 1
 #+end_src
 
-let's work on just the siphoning
-#+begin_src kcats 
-  "examples/books.kcats" file-out slurp read ;; pi
-  [] ;; po
-  timestamps
-  "Alice"
-  [[swap take dropdown pair [librarian time] swap zip] dip join]
-  capture [drop drop [take]] dip each float
-  ;drop
-
-  ;each ;generate
-  ;swap 
-  siphon
-  ;; each
-#+end_src
-
-#+RESULTS:
-#+begin_src kcats
-[[[librarian "Alice"]
-  [time 1693407360725]
-  [author-first "George"]
-  [author-last "Orwell"]
-  [title "1984"]
-  [year 1949]
-  [subjects [government dystopia surveillance totalitarianism freedom]]]
- [[librarian "Alice"]
-  [time 1693407360725]
-  [author-first "Aldous"]
-  [author-last "Huxley"]
-  [title "Brave New World"]
-  [year 1932]
-  [subjects [society technology dystopia happiness drugs]]]
- [[librarian "Alice"]
-  [time 1693407360725]
-  [author-first "F. Scott"]
-  [author-last "Fitzgerald"]
-  [title "The Great Gatsby"]
-  [year 1925]
-  [subjects [wealth love obsession american-dream tragedy]]]
- [[librarian "Alice"]
-  [time 1693407360725]
-  [author-first "J.D."]
-  [author-last "Salinger"]
-  [title "The Catcher in the Rye"]
-  [year 1951]
-  [subjects [adolescence alienation innocence society adulthood]]]
- [[librarian "Alice"]
-  [time 1693407360725]
-  [author-first "Jane"]
-  [author-last "Austen"]
-  [title "Pride and Prejudice"]
-  [year 1813]
-  [subjects [love marriage society class reputation]]]
- [[librarian "Alice"]
-  [time 1693407360725]
-  [author-first "Mary"]
-  [author-last "Shelley"]
-  [title "Frankenstein"]
-  [year 1818]
-  [subjects [creation science responsibility monster humanity]]]
- [[librarian "Alice"]
-  [time 1693407360725]
-  [author-first "John"]
-  [author-last "Steinbeck"]
-  [title "Of Mice and Men"]
-  [year 1937]
-  [subjects [friendship dream loneliness society tragedy]]]
- [[librarian "Alice"]
-  [time 1693407360725]
-  [author-first "Ernest"]
-  [author-last "Hemingway"]
-  [title "The Old Man and the Sea"]
-  [year 1952]
-  [subjects [endurance nature old-age fisherman sea]]]
- [[librarian "Alice"]
-  [time 1693407360725]
-  [author-first "Harper"]
-  [author-last "Lee"]
-  [title "To Kill a Mockingbird"]
-  [year 1960]
-  [subjects [racism innocence morality law childhood]]]
- [[librarian "Alice"]
-  [time 1693407360725]
-  [author-first "J.R.R."]
-  [author-last "Tolkien"]
-  [title "The Lord of the Rings"]
-  [year 1954]
-  [subjects [adventure elf dwarf hobbit ring journey magic evil]]]
- [[librarian "Alice"]
-  [time 1693407360725]
-  [author-first "Joseph"]
-  [author-last "Conrad"]
-  [title "Heart of Darkness"]
-  [year 1899]
-  [subjects [colonization africa journey morality darkness europeans]]]
- [[librarian "Alice"]
-  [time 1693407360725]
-  [author-first "Leo"]
-  [author-last "Tolstoy"]
-  [title "War and Peace"]
-  [year 1869]
-  [subjects [war peace society history love aristocracy]]]
- [[librarian "Alice"]
-  [time 1693407360725]
-  [author-first "Homer"]
-  [title "The Odyssey"]
-  [year -800]
-  [subjects [journey odyssey homecoming gods heroism adventure]]]
- [[librarian "Alice"]
-  [time 1693407360725]
-  [author-first "Charlotte"]
-  [author-last "Bronte"]
-  [title "Jane Eyre"]
-  [year 1847]
-  [subjects [love morality society class womanhood independence]]]
- [[librarian "Alice"]
-  [time 1693407360725]
-  [author-first "Mark"]
-  [author-last "Twain"]
-  [title "Adventures of Huckleberry Finn"]
-  [year 1884]
-  [subjects [adventure racism slavery morality friendship river]]]
- [[librarian "Alice"]
-  [time 1693407360725]
-  [author-first "Ray"]
-  [author-last "Bradbury"]
-  [title "Fahrenheit 451"]
-  [year 1953]
-  [subjects [censorship knowledge books society dystopia future]]]
- [[librarian "Alice"]
-  [time 1693407360725]
-  [author-first "Charles"]
-  [author-last "Dickens"]
-  [title "A Tale of Two Cities"]
-  [year 1859]
-  [subjects [revolution love sacrifice resurrection society history]]]
- [[librarian "Alice"]
-  [time 1693407360726]
-  [author-first "William"]
-  [author-last "Golding"]
-  [title "Lord of the Flies"]
-  [year 1954]
-  [subjects [society civilization savagery childhood morality island]]]
- [[librarian "Alice"]
-  [time 1693407360726]
-  [author-first "Miguel de"]
-  [author-last "Cervantes"]
-  [title "Don Quixote"]
-  [year 1605]
-  [subjects [adventure idealism reality knight insanity literature]]]
- [[librarian "Alice"]
-  [time 1693407360726]
-  [author-first "H.G."]
-  [author-last "Wells"]
-  [title "The War of the Worlds"]
-  [year 1898]
-  [subjects [invasion aliens society technology war humanity]]]
- 
- []]
-[generate [[["Alice" [[type out]
-                      [values [[units milliseconds]
-                               [type integer]]]
-                      [from systemtime]]
-             [] [[[author-first "George"]
-                  [author-last "Orwell"]
-                  [title "1984"]
-                  [year 1949]
-                  [subjects [government dystopia surveillance totalitarianism freedom]]]
-                 [[author-first "Aldous"]
-                  [author-last "Huxley"]
-                  [title "Brave New World"]
-                  [year 1932]
-                  [subjects [society technology dystopia happiness drugs]]]
-                 [[author-first "F. Scott"]
-                  [author-last "Fitzgerald"]
-                  [title "The Great Gatsby"]
-                  [year 1925]
-                  [subjects [wealth love obsession american-dream tragedy]]]
-                 [[author-first "J.D."]
-                  [author-last "Salinger"]
-                  [title "The Catcher in the Rye"]
-                  [year 1951]
-                  [subjects [adolescence alienation innocence society adulthood]]]
-                 [[author-first "Jane"]
-                  [author-last "Austen"]
-                  [title "Pride and Prejudice"]
-                  [year 1813]
-                  [subjects [love marriage society class reputation]]]
-                 [[author-first "Mary"]
-                  [author-last "Shelley"]
-                  [title "Frankenstein"]
-                  [year 1818]
-                  [subjects [creation science responsibility monster humanity]]]
-                 [[author-first "John"]
-                  [author-last "Steinbeck"]
-                  [title "Of Mice and Men"]
-                  [year 1937]
-                  [subjects [friendship dream loneliness society tragedy]]]
-                 [[author-first "Ernest"]
-                  [author-last "Hemingway"]
-                  [title "The Old Man and the Sea"]
-                  [year 1952]
-                  [subjects [endurance nature old-age fisherman sea]]]
-                 [[author-first "Harper"]
-                  [author-last "Lee"]
-                  [title "To Kill a Mockingbird"]
-                  [year 1960]
-                  [subjects [racism innocence morality law childhood]]]
-                 [[author-first "J.R.R."]
-                  [author-last "Tolkien"]
-                  [title "The Lord of the Rings"]
-                  [year 1954]
-                  [subjects [adventure elf dwarf hobbit ring journey magic evil]]]
-                 [[author-first "Joseph"]
-                  [author-last "Conrad"]
-                  [title "Heart of Darkness"]
-                  [year 1899]
-                  [subjects [colonization africa journey morality darkness europeans]]]
-                 [[author-first "Leo"]
-                  [author-last "Tolstoy"]
-                  [title "War and Peace"]
-                  [year 1869]
-                  [subjects [war peace society history love aristocracy]]]
-                 [[author-first "Homer"]
-                  [title "The Odyssey"]
-                  [year -800]
-                  [subjects [journey odyssey homecoming gods heroism adventure]]]
-                 [[author-first "Charlotte"]
-                  [author-last "Bronte"]
-                  [title "Jane Eyre"]
-                  [year 1847]
-                  [subjects [love morality society class womanhood independence]]]
-                 [[author-first "Mark"]
-                  [author-last "Twain"]
-                  [title "Adventures of Huckleberry Finn"]
-                  [year 1884]
-                  [subjects [adventure racism slavery morality friendship river]]]
-                 [[author-first "Ray"]
-                  [author-last "Bradbury"]
-                  [title "Fahrenheit 451"]
-                  [year 1953]
-                  [subjects [censorship knowledge books society dystopia future]]]
-                 [[author-first "Charles"]
-                  [author-last "Dickens"]
-                  [title "A Tale of Two Cities"]
-                  [year 1859]
-                  [subjects [revolution love sacrifice resurrection society history]]]
-                 [[author-first "William"]
-                  [author-last "Golding"]
-                  [title "Lord of the Flies"]
-                  [year 1954]
-                  [subjects [society civilization savagery childhood morality island]]]
-                 [[author-first "Miguel de"]
-                  [author-last "Cervantes"]
-                  [title "Don Quixote"]
-                  [year 1605]
-                  [subjects [adventure idealism reality knight insanity literature]]]
-                 [[author-first "H.G."]
-                  [author-last "Wells"]
-                  [title "The War of the Worlds"]
-                  [year 1898]
-                  [subjects [invasion aliens society technology war humanity]]]]]
-            swap [restore] dip [swap take dropdown pair [librarian time]
-                                swap zip]
-            dip join]
-           bail]
- shielddown]
-[take] []
-#+end_src
-
-#+begin_src kcats
-  "examples/books.kcats" file-out slurp read [take] ;; pi
-  [] ;; po
-  timestamps
-  "Alice"
-  [[author-first "Miguel de"]
-   [author-last "Cervantes"]
-   [title "Don Quixote"]
-   [year 1605]
-   [subjects [adventure idealism reality knight insanity literature]]]
-  [swap take dropdown pair [librarian time] swap zip] dip join
-#+end_src
-
-#+RESULTS:
-#+begin_src kcats
-[[librarian "Alice"]
- [time 1693353332677]
- [author-first "Miguel de"]
- [author-last "Cervantes"]
- [title "Don Quixote"]
- [year 1605]
- [subjects [adventure idealism reality knight insanity literature]]]
-[] [take] [[[author-first "George"]
-            [author-last "Orwell"]
-            [title "1984"]
-            [year 1949]
-            [subjects [government dystopia surveillance totalitarianism freedom]]]
-           [[author-first "Aldous"]
-            [author-last "Huxley"]
-            [title "Brave New World"]
-            [year 1932]
-            [subjects [society technology dystopia happiness drugs]]]
-           [[author-first "F. Scott"]
-            [author-last "Fitzgerald"]
-            [title "The Great Gatsby"]
-            [year 1925]
-            [subjects [wealth love obsession american-dream tragedy]]]
-           [[author-first "J.D."]
-            [author-last "Salinger"]
-            [title "The Catcher in the Rye"]
-            [year 1951]
-            [subjects [adolescence alienation innocence society adulthood]]]
-           [[author-first "Jane"]
-            [author-last "Austen"]
-            [title "Pride and Prejudice"]
-            [year 1813]
-            [subjects [love marriage society class reputation]]]
-           [[author-first "Mary"]
-            [author-last "Shelley"]
-            [title "Frankenstein"]
-            [year 1818]
-            [subjects [creation science responsibility monster humanity]]]
-           [[author-first "John"]
-            [author-last "Steinbeck"]
-            [title "Of Mice and Men"]
-            [year 1937]
-            [subjects [friendship dream loneliness society tragedy]]]
-           [[author-first "Ernest"]
-            [author-last "Hemingway"]
-            [title "The Old Man and the Sea"]
-            [year 1952]
-            [subjects [endurance nature old-age fisherman sea]]]
-           [[author-first "Harper"]
-            [author-last "Lee"]
-            [title "To Kill a Mockingbird"]
-            [year 1960]
-            [subjects [racism innocence morality law childhood]]]
-           [[author-first "J.R.R."]
-            [author-last "Tolkien"]
-            [title "The Lord of the Rings"]
-            [year 1954]
-            [subjects [adventure elf dwarf hobbit ring journey magic evil]]]
-           [[author-first "Joseph"]
-            [author-last "Conrad"]
-            [title "Heart of Darkness"]
-            [year 1899]
-            [subjects [colonization africa journey morality darkness europeans]]]
-           [[author-first "Leo"]
-            [author-last "Tolstoy"]
-            [title "War and Peace"]
-            [year 1869]
-            [subjects [war peace society history love aristocracy]]]
-           [[author-first "Homer"]
-            [title "The Odyssey"]
-            [year -800]
-            [subjects [journey odyssey homecoming gods heroism adventure]]]
-           [[author-first "Charlotte"]
-            [author-last "Bronte"]
-            [title "Jane Eyre"]
-            [year 1847]
-            [subjects [love morality society class womanhood independence]]]
-           [[author-first "Mark"]
-            [author-last "Twain"]
-            [title "Adventures of Huckleberry Finn"]
-            [year 1884]
-            [subjects [adventure racism slavery morality friendship river]]]
-           [[author-first "Ray"]
-            [author-last "Bradbury"]
-            [title "Fahrenheit 451"]
-            [year 1953]
-            [subjects [censorship knowledge books society dystopia future]]]
-           [[author-first "Charles"]
-            [author-last "Dickens"]
-            [title "A Tale of Two Cities"]
-            [year 1859]
-            [subjects [revolution love sacrifice resurrection society history]]]
-           [[author-first "William"]
-            [author-last "Golding"]
-            [title "Lord of the Flies"]
-            [year 1954]
-            [subjects [society civilization savagery childhood morality island]]]
-           [[author-first "Miguel de"]
-            [author-last "Cervantes"]
-            [title "Don Quixote"]
-            [year 1605]
-            [subjects [adventure idealism reality knight insanity literature]]]
-           [[author-first "H.G."]
-            [author-last "Wells"]
-            [title "The War of the Worlds"]
-            [year 1898]
-            [subjects [invasion aliens society technology war humanity]]]]
-#+end_src
-
-#+begin_src kcats
-[1 2 3 4] [take] [inc] each
-#+end_src
-
-#+RESULTS:
-#+begin_src kcats
-[generate [[inc] bail]
- shielddown]
-[take] [1 2 3 4]
-#+end_src
-
-Then we want to create a pipe that we can hand off books from the
-"library" (the main environment), to librarians (new environments that
-run in parallel). Then, we'll create another pipe to get the 
-
-#+begin_src kcats
-handoff 
-#+end_src
-
- 
 * Example programs
 ** Query a sample database
 #+begin_src kcats
