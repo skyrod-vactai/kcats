@@ -4808,20 +4808,19 @@ How to interact with files on disk
   use crate::types::associative as assoc;
   use crate::types::error::Error;
   use crate::types::*;
-  use futures::Stream;
   use std::future;
   use std::pin::Pin;
   use std::ptr;
   use std::sync::Arc;
-  use std::task::{Context, Poll};
   use tokio::fs::File;
-  use tokio::io::{AsyncRead, ReadBuf};
   use tokio::io::{AsyncReadExt, AsyncWriteExt};
   use tokio::sync::RwLock;
 
+  use super::closed_error;
+
   #[derive(Debug)]
   pub struct StaticFile {
-      pub file: File,
+      pub file: Option<File>,
       pub path: String,
   }
 
@@ -4837,48 +4836,36 @@ How to interact with files on disk
           &'a mut self,
           i: Item,
       ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
-          let b = Bytes::try_from(i);
+          match self.file.as_mut() {
+              Some(f) => {
+                  let b = Bytes::try_from(i);
 
-          match b {
-              Ok(bs) => Box::pin(async move { self.file.write_all(&bs).await.map_err(|e| e.into()) }),
-              Err(e) => Box::pin(future::ready(Err(e))),
+                  match b {
+                      Ok(bs) => Box::pin(async move { f.write_all(&bs).await.map_err(|e| e.into()) }),
+                      Err(e) => Box::pin(future::ready(Err(e))),
+                  }
+              }
+              None => Box::pin(future::ready(Err(closed_error(false)))),
           }
       }
 
       pub fn take<'a>(
           &'a mut self,
       ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Item>, Error>> + Send + 'a>> {
-          let mut bs = [0u8; 1024];
-          Box::pin(async move {
-              let ct = self.file.read(&mut bs).await?;
-              if ct == 0 {
-                  // EOF, no more takes since it's static
-                  Ok(None)
-              } else {
-                  Ok(Some(bs[0..ct].to_vec().into()))
+          match self.file.as_mut() {
+              Some(f) => {
+                  let mut bs = [0u8; 1024];
+                  Box::pin(async move {
+                      let ct = f.read(&mut bs).await?;
+                      if ct == 0 {
+                          // EOF, no more takes since it's static
+                          Ok(None)
+                      } else {
+                          Ok(Some(bs[0..ct].to_vec().into()))
+                      }
+                  })
               }
-          })
-      }
-  }
-
-  impl Stream for StaticFile {
-      type Item = Result<Item, Error>;
-
-      fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-          let mut buf = vec![0u8; 1024];
-          let mut read_buf = ReadBuf::new(&mut buf);
-
-          match Pin::new(&mut self.file).poll_read(cx, &mut read_buf) {
-              Poll::Ready(Ok(())) => {
-                  let bytes_read = read_buf.filled().len();
-                  if bytes_read == 0 {
-                      Poll::Ready(None)
-                  } else {
-                      Poll::Ready(Some(Ok(read_buf.filled().to_owned().into())))
-                  }
-              }
-              Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e.into()))),
-              Poll::Pending => Poll::Pending,
+              None => Box::pin(future::ready(Err(closed_error(false)))),
           }
       }
   }
@@ -4908,7 +4895,7 @@ How to interact with files on disk
           .create_new(true)
           .open(path.clone())?;
       Ok(super::In::StaticFile(Arc::new(RwLock::new(StaticFile {
-          file: File::from_std(file),
+          file: Some(File::from_std(file)),
           path,
       })))
       .into())
@@ -4918,7 +4905,7 @@ How to interact with files on disk
       let path = String::try_from(i)?;
       let file = std::fs::File::open(path.clone())?;
       Ok(super::Out::StaticFile(Arc::new(RwLock::new(StaticFile {
-          file: File::from_std(file),
+          file: Some(File::from_std(file)),
           path,
       })))
       .into())
