@@ -228,7 +228,11 @@ internally, to keep track of things like the stack, program, lists etc.
       Char(Char),
       Dispenser(coll::Dispenser),
       Receptacle(coll::Receptacle),
+      Nothing,
   }
+
+  // a const Item value for Nothing
+  pub const NOTHING: Item = Item::Nothing;
 
   pub type Future<T> = Pin<Box<dyn std::future::Future<Output = T> + Send>>;
   pub type StepFn = dyn Fn(env::Environment) -> Future<env::Environment> + Sync + Send;
@@ -237,6 +241,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn eq(&self, other: &Self) -> bool {
           match (self, other) {
               // same types, just use their own eq
+              (Item::Nothing, Item::Nothing) => true,
               (Item::Int(a), Item::Int(b)) => a == b,
               (Item::Float(a), Item::Float(b)) => a == b,
               (Item::Word(a), Item::Word(b)) => a == b,
@@ -249,6 +254,10 @@ internally, to keep track of things like the stack, program, lists etc.
                   Item::Dispenser(coll::Dispenser::Sized(b)),
               ) => a == b,
               (Item::Dispenser(a), Item::Dispenser(b)) => a == b,
+              (Item::Nothing, Item::Dispenser(coll::Dispenser::Sized(b))) => b.is_empty(),
+              (Item::Dispenser(coll::Dispenser::Sized(b)), Item::Nothing) => b.is_empty(),
+              (Item::Nothing, Item::Receptacle(coll::Receptacle::Sized(b))) => b.is_empty(),
+              (Item::Receptacle(coll::Receptacle::Sized(b)), Item::Nothing) => b.is_empty(),
               (Item::Char(a), Item::Char(b)) => a == b,
               // (Item::Assoc(a), Item::Assoc(b)) => a == b,
               // (Item::List(a), Item::List(b)) => a == b,
@@ -286,7 +295,7 @@ internally, to keep track of things like the stack, program, lists etc.
   // The default Item is NOTHING.
   impl Default for Item {
       fn default() -> Self {
-          coll::NOTHING
+          NOTHING
       }
   }
 
@@ -371,7 +380,7 @@ internally, to keep track of things like the stack, program, lists etc.
           if b {
               "true".into()
           } else {
-              coll::NOTHING
+              NOTHING
           }
       }
   }
@@ -510,7 +519,6 @@ internally, to keep track of things like the stack, program, lists etc.
       Set(Set),
       String(String),
       Bytes(Bytes),
-      Nothing,
   }
 
   impl PartialEq for Sized {
@@ -524,15 +532,10 @@ internally, to keep track of things like the stack, program, lists etc.
               (Sized::String(a), Sized::String(b)) => a == b,
               (Sized::Bytes(a), Sized::Bytes(b)) => a == b,
               (Sized::Set(a), Sized::Set(b)) => a == b,
-              (Sized::Nothing, Sized::Nothing) => true,
-              (Sized::Nothing, l) => l.is_empty(),
-              (l, Sized::Nothing) => l.is_empty(),
               _ => false,
           }
       }
   }
-  // a const Item value for Nothing
-  pub const NOTHING: Item = Item::Dispenser(Dispenser::Sized(Sized::Nothing));
 
   impl Dispenser {
       pub fn take(self) -> Future<(Dispenser, Option<Item>)> {
@@ -580,7 +583,6 @@ internally, to keep track of things like the stack, program, lists etc.
               Sized::String(s) => s.len(),
               Sized::Bytes(b) => b.len(),
               Sized::Set(s) => s.len(),
-              Sized::Nothing => 0,
           }
       }
 
@@ -592,7 +594,6 @@ internally, to keep track of things like the stack, program, lists etc.
                   let i = lm.pop_front();
                   (Dispenser::Sized(Sized::List(l)), i)
               }
-              Sized::Nothing => (Dispenser::Sized(Sized::Nothing), None),
               Sized::String(mut s) => {
                   // TODO: this may perform badly
                   let first_char = s.chars().next();
@@ -635,7 +636,6 @@ internally, to keep track of things like the stack, program, lists etc.
                   b.push(i as u8);
                   Ok(Sized::Bytes(b))
               }
-              (Sized::Nothing, i) => Ok(Sized::List(List::from_iter([i]))),
               (Sized::String(_), _) => unimplemented!(),
               (i, _) => Err(Error::expected("packable", i.into())),
           }
@@ -700,8 +700,6 @@ internally, to keep track of things like the stack, program, lists etc.
                   a.extend(b);
                   Sized::Bytes(a)
               }
-              (Sized::Nothing, x) => x,
-              (x, Sized::Nothing) => x,
               //TODO: not every combination makes sense, return error here, don't panic
               (s, other) => todo!("Cannot join {:?} and {:?}", s, other),
           })
@@ -742,7 +740,6 @@ internally, to keep track of things like the stack, program, lists etc.
           match self {
               Sized::Associative(map) => Box::new(map.into_iter().map(|kv| kv.into())),
               Sized::List(mut list) => Box::new(list.inner().into_iter()),
-              Sized::Nothing => Box::new(std::iter::empty()),
               Sized::String(s) => {
                   let chars: Vec<char> = s.chars().collect();
                   Box::new(chars.into_iter().map(|c| c.into()))
@@ -785,7 +782,6 @@ internally, to keep track of things like the stack, program, lists etc.
       fn try_from(s: Sized) -> Result<Self, Self::Error> {
           match s {
               Sized::List(l) => Ok(l),
-              Sized::Nothing => Ok(List::new()),
               Sized::Associative(a) => Ok(List::from_iter(a.into_iter().map(Item::from))),
               i => Err(Error::expected("list", i.into())),
           }
@@ -798,6 +794,7 @@ internally, to keep track of things like the stack, program, lists etc.
           match i {
               Item::Dispenser(l) => Sized::try_from(l).and_then(List::try_from),
               Item::Receptacle(l) => Sized::try_from(l).and_then(List::try_from),
+              Item::Nothing => Ok(List::new()),
               i => Err(Error::expected("list", i.into())),
           }
       }
@@ -810,6 +807,7 @@ internally, to keep track of things like the stack, program, lists etc.
           match item {
               Item::Dispenser(c) => c.try_into(),
               Item::Receptacle(p) => Dispenser::try_from(p)?.try_into(),
+              Item::Nothing => Ok(Sized::List(List::new())),
               i => {
                   // let bt = backtrace::Backtrace::new();
                   // println!("try from item {:?},\n {:?}", i, bt);
@@ -826,6 +824,7 @@ internally, to keep track of things like the stack, program, lists etc.
           match item {
               Item::Receptacle(p) => Ok(p),
               Item::Dispenser(c) => c.try_into(),
+              Item::Nothing => Ok(Receptacle::Sized(Sized::List(List::new()))),
               i => Err(Error::expected("packable", i)),
           }
       }
@@ -904,6 +903,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
       fn try_from(item: Item) -> Result<Self, Self::Error> {
           match item {
+              Item::Nothing => Ok(Dispenser::Sized(Sized::List(List::new()))),
               Item::Dispenser(c) => Ok(c),
               Item::Receptacle(p) => Ok(Dispenser::try_from(p)?),
               i => Err(Error::expected("iterable", i)),
@@ -971,7 +971,7 @@ internally, to keep track of things like the stack, program, lists etc.
               }
               KeyItem::Word(w) => Item::Word(w),
               KeyItem::Bytes(bs) => bs.into(),
-              KeyItem::Nothing => coll::NOTHING,
+              KeyItem::Nothing => NOTHING,
           }
       }
   }
@@ -1007,8 +1007,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   KeyList::try_from_iter(l.inner().into_iter())?,
               )),
 
-              Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Nothing)) => Ok(KeyItem::Nothing),
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Nothing)) => Ok(KeyItem::Nothing),
+              Item::Nothing => Ok(KeyItem::Nothing),
 
               Item::Word(w) => Ok(KeyItem::Word(w)),
 
@@ -1211,7 +1210,7 @@ internally, to keep track of things like the stack, program, lists etc.
                           coll::List::from_iter(
                               vec![
                                   Item::Word(key),
-                                  maybe_value.map(Item::from).unwrap_or(coll::NOTHING),
+                                  maybe_value.map(Item::from).unwrap_or(NOTHING),
                               ]
                               .into_iter(),
                           )
@@ -1856,9 +1855,7 @@ internally, to keep track of things like the stack, program, lists etc.
       }
 
       pub fn pop_expr(&mut self) -> Item {
-          coll::Arc::make_mut(&mut self.program)
-              .pop_front()
-              .unwrap()
+          coll::Arc::make_mut(&mut self.program).pop_front().unwrap()
       }
 
       pub fn append_program(mut self, mut items: coll::List) -> Environment {
@@ -2177,6 +2174,7 @@ example, in order to read/write to/from disk).
 #+begin_src rust :tangle src/serialize.rs :mkdirp yes
   extern crate edn_format;
   use crate::types::environment::Environment;
+  use crate::types::NOTHING;
   use crate::types::{associative as assoc, collection as coll, error::Error, *};
   use base64;
   use std::collections::VecDeque;
@@ -2194,7 +2192,7 @@ example, in order to read/write to/from disk).
           edn_format::Value::Integer(i) => Ok(Item::Int(*i)),
           edn_format::Value::Vector(v) => Ok({
               if v.is_empty() {
-                  coll::NOTHING
+                  NOTHING
               } else {
                   coll::List::from_iter(
                       v.iter()
@@ -2234,6 +2232,7 @@ example, in order to read/write to/from disk).
           Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
               assoc::Associative::Env(e),
           ))) => from_item(&e.representation()),
+          Item::Nothing => edn_format::Value::Vector(vec![]),
           Item::Int(i) => edn_format::Value::Integer(*i),
           Item::Float(f) => edn_format::Value::from(*f),
           Item::Char(c) => edn_format::Value::Character(*c),
@@ -2696,7 +2695,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           let (k, def): (assoc::KeyItem, Item) = r.try_into().unwrap();
           let word: Word = k.try_into().unwrap();
           let iter: Box<dyn Iterator<Item = Item>> = def.try_into().unwrap();
-
           let new_entry: dict::Entry = iter.try_into().unwrap();
           let new_entry2 = new_entry.clone();
           let dict = coll::Arc::make_mut(&mut env.dictionary);
@@ -2970,10 +2968,13 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn is_list(i: Item) -> ItemResult {
-      Ok(Item::from(matches!(
-          i,
-          Item::Dispenser(coll::Dispenser::Sized(_)) | Item::Receptacle(coll::Receptacle::Sized(_))
-      )))
+      match i {
+          Item::Nothing => Ok(true.into()),
+          i => Ok(coll::Sized::try_from(i)
+              .map(|s| matches!(s, coll::Sized::List(_)))
+              .unwrap_or(false)
+              .into()),
+      }
   }
 
   pub fn first(i: Item) -> ItemResult {
@@ -3260,7 +3261,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       // extend the size of the vector to be big enough to set
                       // the given index, pad with 'nothing' values.
                       if lm.len() <= idx {
-                          lm.resize(idx + 1, coll::NOTHING);
+                          lm.resize(idx + 1, NOTHING);
                       }
                       lm[*k as usize] = v;
                       Ok(l.into())
@@ -3275,7 +3276,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       // extend the size of the vector to be big enough to set
                       // the given index, pad with 'nothing' values.
                       if lm.len() <= idx {
-                          lm.resize(idx + 1, coll::NOTHING);
+                          lm.resize(idx + 1, NOTHING);
                       }
                       lm[*k as usize] = v;
                       Ok(l.into())
@@ -3297,7 +3298,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       // extend the size of the vector to be big enough to set
                       // the given index, pad with 'nothing' values.
                       if lm.len() <= idx {
-                          lm.resize(idx + 1, coll::NOTHING);
+                          lm.resize(idx + 1, NOTHING);
                       }
                       let inner = &lm[idx];
 
@@ -3367,7 +3368,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   ) => {
                       let lm = l.make_mut();
                       let old_value = if let Some(item) = lm.get_mut(*k as usize) {
-                          mem::replace(item, coll::NOTHING)
+                          mem::replace(item, NOTHING)
                       } else {
                           return Err(Error::short_list(k.clone())); // replace with your error
                       };
@@ -3449,7 +3450,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           if is_truthy(j.clone()) {
               j
           } else {
-              coll::NOTHING
+              NOTHING
           }
       })
       //Ok(Item::from(is_truthy(i) || is_truthy(j)))
@@ -3459,7 +3460,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       Ok(if is_truthy(i) && is_truthy(j.clone()) {
           j
       } else {
-          coll::NOTHING
+          NOTHING
       })
   }
 
@@ -3468,17 +3469,23 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn is_association(i: Item) -> ItemResult {
-      Ok(coll::Sized::try_from(i)
-          .map(|s| matches!(s, coll::Sized::Associative(_) | coll::Sized::Nothing))
-          .unwrap_or(false)
-          .into())
+      match i {
+          Item::Nothing => Ok(true.into()),
+          i => Ok(coll::Sized::try_from(i)
+              .map(|s| matches!(s, coll::Sized::Associative(_)))
+              .unwrap_or(false)
+              .into()),
+      }
   }
 
   pub fn is_set(i: Item) -> ItemResult {
-      Ok(coll::Sized::try_from(i)
-          .map(|s| matches!(s, coll::Sized::Set(_) | coll::Sized::Nothing))
-          .unwrap_or(false)
-          .into())
+      match i {
+          Item::Nothing => Ok(true.into()),
+          i => Ok(coll::Sized::try_from(i)
+              .map(|s| matches!(s, coll::Sized::Set(_)))
+              .unwrap_or(false)
+              .into()),
+      }
   }
 
   pub fn is_odd(i: Item) -> ItemResult {
@@ -3536,7 +3543,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           }
       } else {
           // clauses empty, return nothing
-          env.push(coll::NOTHING).into()
+          env.push(NOTHING).into()
       }
   }
 
@@ -3558,6 +3565,16 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   fn check_type(i: &Item, w: Word) -> Result<(), Error> {
       match (w, i) {
+          (w, Item::Nothing)
+              if w == *S_DISPENSER
+                  || w == *S_RECEPTACLE
+                  || w == *S_LIST
+                  || w == *S_ASSOC
+                  || w == *S_SIZED
+                  || w == *S_ORDERED =>
+          {
+              Ok(())
+          }
           (w, _) if w == *S_ITEM => Ok(()),
           (w, Item::Dispenser(_) | Item::Receptacle(_)) if w == *S_DISPENSER => Ok(()),
           (w, Item::Receptacle(_) | Item::Dispenser(_)) if w == *S_RECEPTACLE => Ok(()),
@@ -3589,8 +3606,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               w,
               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(_)))
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::List(_)))
-              | Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Nothing))
-              | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Nothing)),
+              | Item::Nothing,
           ) if w == *S_LIST || w == *S_PROGRAM => Ok(()),
 
           (
@@ -3865,7 +3881,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       match inner_env {
           Ok(inner) => {
               if inner.program.is_empty() {
-                  Box::pin(async move { env.push(coll::NOTHING).into() })
+                  Box::pin(async move { env.push(NOTHING).into() })
               } else {
                   Box::pin(eval_step(inner).map(|inner_next| env.push(inner_next.into())))
               }
@@ -4792,20 +4808,19 @@ How to interact with files on disk
   use crate::types::associative as assoc;
   use crate::types::error::Error;
   use crate::types::*;
-  use futures::Stream;
   use std::future;
   use std::pin::Pin;
   use std::ptr;
   use std::sync::Arc;
-  use std::task::{Context, Poll};
   use tokio::fs::File;
-  use tokio::io::{AsyncRead, ReadBuf};
   use tokio::io::{AsyncReadExt, AsyncWriteExt};
   use tokio::sync::RwLock;
 
+  use super::closed_error;
+
   #[derive(Debug)]
   pub struct StaticFile {
-      pub file: File,
+      pub file: Option<File>,
       pub path: String,
   }
 
@@ -4821,48 +4836,36 @@ How to interact with files on disk
           &'a mut self,
           i: Item,
       ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
-          let b = Bytes::try_from(i);
+          match self.file.as_mut() {
+              Some(f) => {
+                  let b = Bytes::try_from(i);
 
-          match b {
-              Ok(bs) => Box::pin(async move { self.file.write_all(&bs).await.map_err(|e| e.into()) }),
-              Err(e) => Box::pin(future::ready(Err(e))),
+                  match b {
+                      Ok(bs) => Box::pin(async move { f.write_all(&bs).await.map_err(|e| e.into()) }),
+                      Err(e) => Box::pin(future::ready(Err(e))),
+                  }
+              }
+              None => Box::pin(future::ready(Err(closed_error(false)))),
           }
       }
 
       pub fn take<'a>(
           &'a mut self,
       ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Item>, Error>> + Send + 'a>> {
-          let mut bs = [0u8; 1024];
-          Box::pin(async move {
-              let ct = self.file.read(&mut bs).await?;
-              if ct == 0 {
-                  // EOF, no more takes since it's static
-                  Ok(None)
-              } else {
-                  Ok(Some(bs[0..ct].to_vec().into()))
+          match self.file.as_mut() {
+              Some(f) => {
+                  let mut bs = [0u8; 1024];
+                  Box::pin(async move {
+                      let ct = f.read(&mut bs).await?;
+                      if ct == 0 {
+                          // EOF, no more takes since it's static
+                          Ok(None)
+                      } else {
+                          Ok(Some(bs[0..ct].to_vec().into()))
+                      }
+                  })
               }
-          })
-      }
-  }
-
-  impl Stream for StaticFile {
-      type Item = Result<Item, Error>;
-
-      fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-          let mut buf = vec![0u8; 1024];
-          let mut read_buf = ReadBuf::new(&mut buf);
-
-          match Pin::new(&mut self.file).poll_read(cx, &mut read_buf) {
-              Poll::Ready(Ok(())) => {
-                  let bytes_read = read_buf.filled().len();
-                  if bytes_read == 0 {
-                      Poll::Ready(None)
-                  } else {
-                      Poll::Ready(Some(Ok(read_buf.filled().to_owned().into())))
-                  }
-              }
-              Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e.into()))),
-              Poll::Pending => Poll::Pending,
+              None => Box::pin(future::ready(Err(closed_error(false)))),
           }
       }
   }
@@ -4892,7 +4895,7 @@ How to interact with files on disk
           .create_new(true)
           .open(path.clone())?;
       Ok(super::In::StaticFile(Arc::new(RwLock::new(StaticFile {
-          file: File::from_std(file),
+          file: Some(File::from_std(file)),
           path,
       })))
       .into())
@@ -4902,7 +4905,7 @@ How to interact with files on disk
       let path = String::try_from(i)?;
       let file = std::fs::File::open(path.clone())?;
       Ok(super::Out::StaticFile(Arc::new(RwLock::new(StaticFile {
-          file: File::from_std(file),
+          file: Some(File::from_std(file)),
           path,
       })))
       .into())
@@ -5463,7 +5466,7 @@ Implement the =handoff= type
               self.handle = Some(tokio::spawn(async move {
                   sleep(duration).await;
                   //TODO handle error condition on send
-                  let _ = sender.send(coll::NOTHING);
+                  let _ = sender.send(types::NOTHING);
               }));
           }
       }
@@ -5734,7 +5737,7 @@ set, we can use them here too.
 I don't think there will ever be user-created pipe types as it would
 have to be done in rust and not in kcats.
 
-**** TODO Composable transforms
+**** DONE Composable transforms
 There should be some way to compose transforms in a pipe. For example,
 we can have a pipe that when you put bytes in it, it gets written to a
 certain file on disk. But what we really want is that we put bytes
@@ -5747,7 +5750,7 @@ aren't going to be i/o, it's pure computation. Actually I guess any
 pipe could take an optional transform. Clojure.core.async channels do this.
 
 Maybe the first thing to do is implement transducers?
-***** TODO Siphon from one pipe to another
+***** DONE Siphon from one pipe to another
 A nice primitive would be a word that takes a program (the program
 should expect an item on ToS and it should leave a transformed item)
 and two pipes, and takes from one pipe, runs the program, and puts the
@@ -5822,8 +5825,18 @@ This could be done using a network pipe, and an assemble function that
 pulls byte chunks and builds objects when there are enough bytes for
 one object, and puts them into a handoff pipe.
 
-This should be possible to do entirely in kcats.
+This should be possible to do entirely in kcats, similar to how the
+interactive mode works. Send a length, then send that number of
+bytes. Then the receiving transform can track how many bytes it has
+left to receive and the partial encoded item it's got so far. It takes
+the next chunk, knocks off that many bytes (if it's more than needed
+for that item), and calls =read=. If it's still not enough for the full
+item, append to the partial encoded item and decrease the 'bytes
+needed' number.
 
+This mechanism of using kcats serialization means we can't send
+associations and sets over the wire as-is. We'd have to send them as a
+list and convert them at the other end.
 **** DONE Time pipe
 Each take from the pipe return the current unix time in ms.  Should be
 a "singleton" - probably using Box::leak, so that we can insert a copy
