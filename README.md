@@ -1,6 +1,8 @@
 # The kcats Programming language
 
-* [Book of kcats](https://skyrod-vactai.github.io/kcats/book-of-kcats.html)
+[Get started!](https://skyrod-vactai.github.io/kcats/book-of-kcats.html) 
+
+# Other Documentation
 * [Lexicon](https://skyrod-vactai.github.io/kcats/lexicon.html)
 * [The Implementation](https://skyrod-vactai.github.io/kcats/production.html)
 
