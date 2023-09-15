@@ -8,11 +8,17 @@
 
 ## Issue reporting
 
-Instead of opening a github issue, add a TODO subheading to the Issues heading in the respective `.org` file. Commit the change and submit it as a pull request. In the branch where that issue is being fixed, it will be changed to INPROGRESS. When the issue is fixed, the heading will be removed. (If you disagree that it's been fixed, submit a PR that reverts the commit to remove it).
+Use github issues https://github.com/skyrod-vactai/kcats/issues if that's easiest.
 
-You can edit this file right on github, in your own fork of the project, if you prefer.
+Recommended: Instead of opening a github issue, create a fork and add a TODO subheading to the Issues heading in the respective `.org` file. You can edit org files right on github, in your own fork.
 
-Why do things this weird way? I don't want to rely on github, nice as it is.
+
+* For bugs add issues here under Issues heading in production.org
+* For documentation problems add issues here under Issues heading in book-of-kcats.org
+
+Then submit it as a pull request. 
+
+To see the status, check your PR. It will have more commits by the developers added to it.
 
 ## Other feedback
 
