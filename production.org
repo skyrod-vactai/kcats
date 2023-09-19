@@ -540,7 +540,11 @@ internally, to keep track of things like the stack, program, lists etc.
   impl Dispenser {
       pub fn take(self) -> Future<(Dispenser, Option<Item>)> {
           match self {
-              Dispenser::Sized(s) => Box::pin(future::ready(s.take())),
+              Dispenser::Sized(s) => {
+                  let (s, item) = s.take();
+
+                  Box::pin(future::ready((Dispenser::Sized(s), item)))
+              }
               Dispenser::Out(mut o) => Box::pin({
                   let i = o.take();
                   i.map(|r| {
@@ -586,28 +590,31 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
-      pub fn take(self) -> (Dispenser, Option<Item>) {
+      pub fn take(self) -> (Self, Option<Item>) {
           match self {
-              Sized::Associative(a) => a.take(),
+              Sized::Associative(a) => {
+                  let (a, i) = a.take();
+                  (Sized::Associative(a), i)
+              }
               Sized::List(mut l) => {
                   let lm = l.make_mut();
                   let i = lm.pop_front();
-                  (Dispenser::Sized(Sized::List(l)), i)
+                  (Sized::List(l), i)
               }
               Sized::String(mut s) => {
                   // TODO: this may perform badly
                   let first_char = s.chars().next();
                   s.drain(..first_char.map(|s| s.len_utf8()).unwrap_or(0));
                   let i = first_char.map(Item::Char);
-                  (Dispenser::Sized(Sized::String(s)), i)
+                  (Sized::String(s), i)
               }
               Sized::Bytes(mut b) => {
                   if b.is_empty() {
-                      (Dispenser::Sized(Sized::Bytes(b)), None)
+                      (Sized::Bytes(b), None)
                   } else {
                       let i = Some(Item::Int(b[0] as Int));
                       b.drain(..1);
-                      (Dispenser::Sized(Sized::Bytes(b)), i)
+                      (Sized::Bytes(b), i)
                   }
               }
               Sized::Set(mut s) => {
@@ -616,7 +623,37 @@ internally, to keep track of things like the stack, program, lists etc.
                   if let Some(i) = i.clone() {
                       sm.take(&i);
                   }
-                  (Dispenser::Sized(Sized::Set(s)), i.map(Item::from))
+                  (Sized::Set(s), i.map(Item::from))
+              }
+          }
+      }
+
+      pub fn pop(self) -> (Self, Option<Item>) {
+          match self {
+              Sized::Associative(a) => {
+                  let (a, i) = a.take();
+                  (Sized::Associative(a), i)
+              }
+              Sized::List(mut l) => {
+                  let lm = l.make_mut();
+                  let i = lm.pop_back();
+                  (Sized::List(l), i)
+              }
+              Sized::String(mut s) => s
+                  .pop()
+                  .map(|c| (Sized::String(s), Some(c.into())))
+                  .unwrap_or((Sized::String(String::new()), None)),
+              Sized::Bytes(mut b) => b
+                  .pop()
+                  .map(|c| (Sized::Bytes(b), Some((c as Int).into())))
+                  .unwrap_or((Sized::Bytes(vec![]), None)),
+              Sized::Set(mut s) => {
+                  let i = s.iter().next().cloned();
+                  let sm = s.make_mut();
+                  if let Some(i) = i.clone() {
+                      sm.take(&i);
+                  }
+                  (Sized::Set(s), i.map(Item::from))
               }
           }
       }
@@ -1189,14 +1226,14 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
-      pub fn take(self) -> (coll::Dispenser, Option<Item>) {
+      pub fn take(self) -> (Self, Option<Item>) {
           match self {
               Associative::Assoc(mut a) => {
                   let maybe_key = a.inner().keys().next().cloned();
                   let am = a.make_mut();
                   let maybe_value = maybe_key.as_ref().and_then(|key| am.remove(&key));
                   (
-                      coll::Dispenser::Sized(coll::Sized::Associative(Associative::Assoc(a))),
+                      Associative::Assoc(a),
                       maybe_key.map(|key| {
                           coll::List::from_iter(
                               vec![Item::from(key), Item::from(maybe_value.unwrap_or_default())]
@@ -1211,7 +1248,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   let dm = d.make_mut();
                   let maybe_value = maybe_key.and_then(|key| dm.remove(&key));
                   (
-                      coll::Dispenser::Sized(coll::Sized::Associative(Associative::Dictionary(d))),
+                      Associative::Dictionary(d),
                       maybe_key.map(|key| {
                           coll::List::from_iter(
                               vec![
@@ -3008,8 +3045,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn last(i: Item) -> ItemResult {
-      let l = coll::List::try_from(i)?;
-      Ok(l.back().map(|i| i.clone()).unwrap_or_default())
+      let s = coll::Sized::try_from(i)?;
+      Ok(s.into_iter().last().unwrap_or_default())
   }
 
   pub fn loop_(mut env: Environment) -> Future<Environment> {
@@ -3136,13 +3173,13 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       match coll {
           Some(i) => {
               let i2 = i.clone();
-              let r = coll::List::try_from(i);
-              match r {
-                  Ok(mut it) => {
-                      let itm = it.make_mut();
-                      let i = itm.pop_back();
+              let s = coll::Sized::try_from(i);
+
+              match s {
+                  Ok(it) => {
+                      let (c, i) = it.pop();
                       let stack = env.stack.make_mut();
-                      stack.push_front(it.into());
+                      stack.push_front(c.into());
                       stack.push_front(i.unwrap_or_default());
                       env.into()
                   }
