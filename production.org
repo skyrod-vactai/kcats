@@ -6,7 +6,7 @@
 #+STARTUP: showeverything
 #+PROPERTY: header-args:clojure :noweb yes :results value silent
 #+PROPERTY: header-args:kcats :noweb yes :results code :exports both
-#+TODO: TODO(t) INPROGRESS(i) | DONE(d) CANCELED(c)
+#+TODO: TODO(t) INPROGRESS(i!) | DONE(d!) CANCELED(c@)
 #+HTML_HEAD: <link rel="stylesheet" type="text/css" href="https://www.pirilampo.org/styles/readtheorg/css/htmlize.css"/>
 #+HTML_HEAD: <link rel="stylesheet" type="text/css" href="https://www.pirilampo.org/styles/readtheorg/css/readtheorg.css"/>
 #+HTML_HEAD: <style> pre.src { background: black; color: white; } #content { max-width: 1000px } </style>
@@ -2329,7 +2329,7 @@ example, in order to read/write to/from disk).
   }
 
   pub fn emit(item: &Item) -> String {
-      auto_format(edn_format::emit_str(&from_item(item)).as_str(), 20, 80)
+      edn_format::emit_str(&from_item(item))
   }
 
   pub fn emit_all(items: &VecDeque<Item>) -> String {
@@ -2339,7 +2339,7 @@ example, in order to read/write to/from disk).
           s.push_str(" ".into());
       }
       s.pop();
-      auto_format(&s, 20, 80)
+      s.to_string()
   }
 
   // print out envs in error messages
@@ -2491,7 +2491,7 @@ example, in order to read/write to/from disk).
       result
   }
 
-  fn auto_format(input: &str, max_items: usize, max_chars: usize) -> String {
+  pub fn auto_format(input: &str, max_items: usize, max_chars: usize) -> String {
       let with_breaks = insert_line_breaks(input, max_items, max_chars);
       format_indentation(&with_breaks)
   }
@@ -2638,6 +2638,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   "attend",
                   Box::leak(Box::new(f_stack1(crate::pipes::channel::select))),
               ),
+              ("autoformat", Box::leak(Box::new(f_stack1(autoformat)))),
               ("branch", Box::leak(Box::new(branch))),
               ("bytes", Box::leak(Box::new(f_stack1(bytes)))),
               ("bytes?", Box::leak(Box::new(f_stack1(is_bytes)))),
@@ -3621,6 +3622,13 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       )))
   }
 
+  pub fn autoformat(i: Item) -> ItemResult {
+      let s = String::try_from(i)?;
+      Ok(Item::Dispenser(coll::Dispenser::Sized(
+          coll::Sized::String(serialize::auto_format(&s.as_str(), 20, 80)),
+      )))
+  }
+
   fn check_type(i: &Item, w: Word) -> Result<(), Error> {
       match (w, i) {
           (w, Item::Nothing)
@@ -3822,8 +3830,13 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   fn reverse(i: Item) -> ItemResult {
-      let mut l = coll::List::try_from(i).unwrap();
-      Ok(coll::List::from_iter(l.inner().into_iter().rev()).into())
+      let s = coll::Sized::try_from(i)?;
+      match s {
+          coll::Sized::List(mut l) => Ok(coll::List::from_iter(l.inner().into_iter().rev()).into()),
+          coll::Sized::String(s) => Ok(s.chars().rev().collect::<String>().into()),
+          coll::Sized::Bytes(b) => Ok(b.into_iter().rev().collect::<Vec<u8>>().into()),
+          s => Err(Error::expected("ordered", s.into())),
+      }
   }
 
   fn bytes(i: Item) -> ItemResult {
@@ -4175,19 +4188,22 @@ We'll also define how to run unit tests.
   mod serialize;
   mod types;
 
-  use crate::types::{environment::Environment, error, *};
+  use crate::types::{environment::Environment, error};
   use std::io::{self, BufRead, Read, Write};
   use std::sync::Arc;
   use tokio;
 
   fn print_result(env: Environment) {
       if env.program.is_empty() {
-          println!("{}", serialize::emit_all(&env.stack));
+          println!(
+              "{}",
+              serialize::auto_format(serialize::emit_all(&env.stack).as_str(), 20, 80)
+          );
       } else {
           println!(
               "stack: {}\nprogram: {}",
-              serialize::emit(&Item::from(env.stack)),
-              serialize::emit(&Item::from(env.program))
+              serialize::auto_format(serialize::emit_all(&env.stack).as_str(), 20, 80),
+              serialize::auto_format(serialize::emit_all(&env.program).as_str(), 20, 80)
           )
       }
   }
@@ -4232,13 +4248,14 @@ We'll also define how to run unit tests.
   }
 
   async fn print_with_length(env: &Environment) {
-      let result = serialize::emit_all(&env.stack);
+      let result = serialize::auto_format(serialize::emit_all(&env.stack).as_str(), 20, 80);
+
       // first print the length of the result
       println!("{}\n{}", result.len(), result);
   }
 
   async fn print(env: &Environment) {
-      let result = serialize::emit_all(&env.stack);
+      let result = serialize::auto_format(serialize::emit_all(&env.stack).as_str(), 20, 80);
       println!("{}", result);
   }
 
@@ -4468,6 +4485,7 @@ We'll also define how to run unit tests.
       #[test_case("dropper")]
       #[test_case("each")]
       #[test_case("emit")]
+      #[test_case("ends?" ; "is_ends")]
       #[test_case("environment")]
       #[test_case("evaluate")]
       #[test_case("eval_step")]
@@ -4527,6 +4545,7 @@ We'll also define how to run unit tests.
       #[test_case("snapshot")]
       #[test_case("something?" ; "is_something")]
       #[test_case("sqrt")]
+      #[test_case("starts?" ; "is_starts")]
       #[test_case("step")]
       #[test_case("string")]
       #[test_case("string?" ; "is_string")]
@@ -5972,7 +5991,24 @@ standard "foo" bytes put
 Stdin is not tested, since currently the interpreter reads the program
 from stdin. May need to change that (read the program from filesystem
 and let the program itself access stdin).
-**** TODO Pipe take outcome
+**** CANCELED Pipe take outcome
+- State "CANCELED"   from "TODO"       [2023-09-22 Fri 09:14] \\
+  I don't think there's any glaring inconsistency here - indefinite (or
+  i guess I might call them 'unsized') dispensers will dispense =nothing=
+  when there's nothing left. That means that when you are using one of
+  these, =nothing= is not a valid value you can use in the sequence.
+  
+  That means, for example, that if you wanted to print whether integers
+  are odd or not, you can't quite do that. You'd need to use pairs (the
+  original value and true/[] for whether it's odd).
+  
+  Perhaps later we can think about signaling end-of-stream out of
+  band. One way to do that is to use an unhandled error value that
+  unwinds the stack, and you have to recover to catch it. But that
+  introduces a lot of complexity and I think it may be easier to just
+  work around the fact that you can't use =nothing= in the data. It's
+  possible that maybe the complexity in the out-of-band impl could be
+  abstracted away, so it's worth revisiting later.
 There is some inconsistency with what happens when there's nothing
 left - empty lists just return nothing on take, but closed pipes
 return an error. May need to resolve this inconsistency.
@@ -7308,7 +7344,7 @@ emit will take an object and return its serialization.
 
 There should be some way of round tripping here, maybe a word =read1= or
 something that just reads one object. 
-*** TODO Inconsistent stack handling when encountering error :consistency:
+*** TODO [#A] Inconsistent stack handling when encountering error :consistency:
 Some words pop the arguments off the stack, then if an error is
 encountered, throws the error without the args on the stack. Others
 leave the args intact. This needs to be consistent.
@@ -8452,7 +8488,8 @@ item yet), or Item (got a new item), or some signal for end of stream,
 or Error. So it would have some program with a while loop to
 iterate. All such transforms would probably have the same program.
 
-*** INPROGRESS [#A] Auto code formatter
+*** DONE [#A] Auto code formatter
+- State "DONE"       from "INPROGRESS" [2023-09-22 Fri 09:25]
 This is desperately needed, as a big blob of output line-wrapped is
 very hard to read.
 
@@ -8727,4 +8764,54 @@ Like =while= but calls init before starting and each time through the loop. Call
   timestamps
   [take] [odd?] [dump drop] [clone [execute] dip] dipdown float  join while  
 #+end_src
+*** DONE startswith/endswith
+Note this impl is not efficient because it zips the entire input
+before starting comparison. An efficient one would keep an index
+counter and compare via lookup.
 
+starts
+#+begin_src kcats
+"abcd" "" zip [unwrap =] every? 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+true
+#+end_src
+
+ends
+#+begin_src kcats
+"abcd" "abcd" [reverse] both zip [[=] inject first] map [] every? 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+true
+#+end_src
+*** DONE map doesn't handle nothing values
+#+begin_src kcats
+[1 2 3 4 5] [odd?] map
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[true [] true [] true]
+#+end_src
+
+ughhh should probably revert the change that left map in terms of
+generators, because map isn't indefinite and has different handling of =nothing=.
+*** INPROGRESS Separate formatting from emitting
+- State "INPROGRESS" from "TODO"       [2023-09-23 Sat 10:29]
+*** TODO Fix line breaks with byte literals
+#+begin_src kcats
+"foo" bytes key
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[public #b64 "NNJledu0Vmk+VAZyz5IvUt3g1lMuNb8GvgE6fFMvIOA="] [secret #b64 "LCa0a2j/xo/5m0U8HTBBNBNCLXBkg7+g+YpeiGJm564="]
+ [type elliptic-curve-key]]
+#+end_src
+
+Line break doesn't get added because it thinks =#b64= is an item when
+it's really a parsing hint.
