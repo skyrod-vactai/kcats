@@ -2201,15 +2201,13 @@ words for them (hashing, encryption, signing)
   }
 
   pub fn verify(k: Item, m: Item, s: Item) -> ItemResult {
+      let mret = m.clone();
       let pk: signing::PublicKey = k.try_into()?;
       let mbs: Bytes = m.try_into()?;
       let sbs: Bytes = s.try_into()?;
       let sig = signing::Signature::from_bytes(&sbs)
           .map_err(|_e| Error::expected("signature", Default::default()))?;
-      Ok(pk
-          .verify(&mbs, &sig)
-          .map(|_| Item::from(true))
-          .unwrap_or_default())
+      Ok(pk.verify(&mbs, &sig).map(|_| mret).unwrap_or_default())
   }
 #+end_src
 *** Serialization
@@ -4367,6 +4365,7 @@ We'll also define how to run unit tests.
       use super::error::Error;
       use super::*;
       use crate::types::collection as coll;
+      use crate::types::{Item, Word};
       use internment::Intern;
       use std::borrow::Borrow;
       use test_case::test_case;
@@ -7003,15 +7002,176 @@ true
 #+begin_src kcats :results code
   "foo" bytes key "we attack at dawn" bytes [sign] shield
   ;; now change the message
-  [drop "we attack at sunset" bytes] dip
+  [drop "we attack at dawn" bytes] dip
   verify
 #+end_src
 
 #+RESULTS:
 #+begin_src kcats
-[]
+#b64 "d2UgYXR0YWNrIGF0IGRhd24="
 #+end_src
 
+We need to be able to construct scripts and their hash. What is the
+public key format? We can sort the assoc so that the serialization is
+always the same.
+
+#+begin_src kcats
+  "foo" bytes key ;; new key
+  [secret] unassign ;; discard the secret portion
+  [first] sort ;; make sure the assoc is always serialized the same way
+  wrap [sink verify] join 
+  emit; bytes hash 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+"[[[public #b64 \"NNJledu0Vmk+VAZyz5IvUt3g1lMuNb8GvgE6fFMvIOA=\"] [type elliptic-curve-key]] sink verify]"
+#+end_src
+
+So this is the script data. Then the high level script (that's always
+the same) is: we've got inputs, a script, and a script hash. If the
+hash of the script is equal the given hash, execute the program on the
+given input.
+
+#+begin_src kcats
+"[[[public #b64 \"NNJledu0Vmk+VAZyz5IvUt3g1lMuNb8GvgE6fFMvIOA=\"] [type elliptic-curve-key]] sink verify]" bytes [hash] shield
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+#b64 "SsjPm5GDruW/Ixa/pY97y+Y2JI1+siSETU6yJwlSUvM=" #b64 "W1tbcHVibGljICNiNjQgIk5OSmxlZHUwVm1rK1ZBWnl6NUl2VXQzZzFsTXVOYjhHdmdFNmZGTXZJT0E9Il0gW3R5cGUgZWxsaXB0aWMtY3VydmUta2V5XV0gc2luayB2ZXJpZnld"
+#+end_src
+
+Now let's make a signature with that same key
+#+begin_src kcats
+"foo" bytes key "we attack at dawn" bytes [sign] shield
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+#b64 "sAVOx61lJzZAcVMPNFBeDGjzaSej++hqjLctgr1stVcAMk+L1mSZC7nxbtj5+8rYj99zXKLZX6gQzO8bBvvlAA=="
+#b64 "d2UgYXR0YWNrIGF0IGRhd24=" [[type elliptic-curve-key]
+                                 [secret #b64 "LCa0a2j/xo/5m0U8HTBBNBNCLXBkg7+g+YpeiGJm564="] [public #b64 "NNJledu0Vmk+VAZyz5IvUt3g1lMuNb8GvgE6fFMvIOA="]]
+#+end_src
+
+Now use that data and execute the script on it
+#+begin_src kcats 
+  [#b64 "sAVOx61lJzZAcVMPNFBeDGjzaSej++hqjLctgr1stVcAMk+L1mSZC7nxbtj5+8rYj99zXKLZX6gQzO8bBvvlAA=="
+   #b64 "d2UgYXR0YWNrIGF0IGRhd24="] emit
+  read first 
+  "[[[public #b64 \"NNJledu0Vmk+VAZyz5IvUt3g1lMuNb8GvgE6fFMvIOA=\"] [type elliptic-curve-key]] sink verify]" read first inject first
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+true
+#+end_src
+
+Now let's make a word 'authenticate', that takes a script hash, a
+script, and its args, and returns true if it's the right script and it
+validates. Important: check the hash before attempting to execute or
+even read the script. That ensures that it's what the sender intended
+(doesn't protect against malicious real sender, just malicious impostors).
+
+#+begin_src kcats
+  #b64 "SsjPm5GDruW/Ixa/pY97y+Y2JI1+siSETU6yJwlSUvM=" ;; script hash
+  #b64 "W1tbcHVibGljICNiNjQgIk5OSmxlZHUwVm1rK1ZBWnl6NUl2VXQzZzFsTXVOYjhHdmdFNmZGTXZJT0E9Il0gW3R5cGUgZWxsaXB0aWMtY3VydmUta2V5XV0gc2luayB2ZXJpZnld" ;; script
+  ;"foo"
+  [#b64 "sAVOx61lJzZAcVMPNFBeDGjzaSej++hqjLctgr1stVcAMk+L1mSZC7nxbtj5+8rYj99zXKLZX6gQzO8bBvvlAA=="
+   #b64 "d2UgYXR0YWNrIGF0IGRhd24="
+   ] emit bytes ;; the proof (key) as serialized bytes list - the sig and message
+  ;; first check hash
+  [[[hash =] dive]
+   [swap [string read first] both functional [inject] lingo first]
+   [drop drop []] if] [[]] recover
+
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+true #b64 "SsjPm5GDruW/Ixa/pY97y+Y2JI1+siSETU6yJwlSUvM="
+#+end_src
+
+Try where the actual script is not what the hash requires, should return =nothing=
+#+begin_src kcats 
+  #b64 "SsjPm5GDruW/Ixa/pY97y+Y2JI1+siSETU6yJwlSUvM=" ;; script hash
+  "[true]" emit bytes
+  [#b64 "sAVOx61lJzZAcVMPNFBeDGjzaSej++hqjLctgr1stVcAMk+L1mSZC7nxbtj5+8rYj99zXKLZX6gQzO8bBvvlAA=="
+   #b64 "d2UgYXR0YWNrIGF0IGRhd24="
+   ] ;; data as list
+  ;; first check hash
+  [[[hash =] dive]
+   [swap string read first functional [inject] lingo first]
+   [drop drop []] if] [[]] recover
+  
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[] #b64 "SsjPm5GDruW/Ixa/pY97y+Y2JI1+siSETU6yJwlSUvM="
+#+end_src
+
+Try where the signature is invalid by substituting a sig from a different message - same key.
+#+begin_src kcats
+"foo" bytes key "we attack at dusk" bytes sign
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+#b64 "XtOnDCT9+iiHV0BElSAckjo76e2yY3swEOOWo0FfstHgukymw9XXHm7+jLtEBsBjJzo5kyo6058WJ/XPpAe1Aw=="
+#+end_src
+
+#+begin_src kcats 
+  #b64 "SsjPm5GDruW/Ixa/pY97y+Y2JI1+siSETU6yJwlSUvM=" ;; script hash
+  #b64 "W1tbcHVibGljICNiNjQgIk5OSmxlZHUwVm1rK1ZBWnl6NUl2VXQzZzFsTXVOYjhHdmdFNmZGTXZJT0E9Il0gW3R5cGUgZWxsaXB0aWMtY3VydmUta2V5XV0gc2luayB2ZXJpZnld" ;; lock
+  [#b64 "XtOnDCT9+iiHV0BElSAckjo76e2yY3swEOOWo0FfstHgukymw9XXHm7+jLtEBsBjJzo5kyo6058WJ/XPpAe1Aw=="
+   #b64 "d2UgYXR0YWNrIGF0IGRhd24="
+   ] ;; data as list
+  ;; first check hash
+  [[[hash =] dive]
+   [swap string read first functional [inject] lingo first]
+   [drop drop []] if] [[]] recover
+
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[] #b64 "SsjPm5GDruW/Ixa/pY97y+Y2JI1+siSETU6yJwlSUvM="
+#+end_src
+
+try a dummy script that really does always validate
+#+begin_src kcats
+  [true] emit bytes hash
+  "[true]" bytes []
+  [[dump [hash =] dive]
+   [swap string read first functional [inject] lingo first]
+   [drop drop []] if] [[]] recover
+
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[] #b64 "W3RydWVd" #b64 "HCjy6wlYw9FdsfDw5/K4mYyiuPZ6tCah+7PVYf52+tk="]
+true #b64 "HCjy6wlYw9FdsfDw5/K4mYyiuPZ6tCah+7PVYf52+tk="
+#+end_src
+
+***** INPROGRESS Make verify return the message
+one thing I hadn't considered before. We receive this package of
+"proof" - proof of what? That this message is from the party
+represented by the given script hash. What message?  It's contained in
+the proof. The important thing is that if the proof is good *we return
+the message*. I think a good contract is that we return the message (as
+bytes) if it's valid proof, otherwise =nothing=.  If we only return =true=
+on valid proof then we have to embark on digging out the message from
+potentially nested proofs. If we just return the message from each
+layer (on success) then we don't have to have this separate logic.
+
+I think it's best to just have the contract of the word =verify= do this
+for us - there's no reason to just return the truthy value =true= when
+the message is a perfectly good truthy value. I suppose signing an
+empty byte array could cause confusion (if that were considered
+"nothing" which I suppose it should, but currently isn't). But I can't
+think of any valid reason to sign 'nothing'.
 ***** TODO AES Encryption
 ***** TODO Random
 **** DONE Pure functional env
