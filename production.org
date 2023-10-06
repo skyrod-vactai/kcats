@@ -431,6 +431,18 @@ internally, to keep track of things like the stack, program, lists etc.
           Item::Int(c)
       }
   }
+
+  impl<T> From<Option<T>> for Item
+  where
+      Item: From<T>,
+  {
+      fn from(opt: Option<T>) -> Item {
+          match opt {
+              Some(t) => Item::from(t),
+              None => Item::default(),
+          }
+      }
+  }
 #+end_src
 **** Collection types
 #+begin_src rust :tangle src/types/collection.rs :mkdirp yes
@@ -674,11 +686,12 @@ internally, to keep track of things like the stack, program, lists etc.
                   b.push(i as u8);
                   Ok(Sized::Bytes(b))
               }
+              (Sized::Bytes(_), i) => Err(Error::expected("integer", i)),
               (Sized::String(mut s), Item::Char(c)) => Ok(Sized::String({
                   s.push(c);
                   s
               })),
-              (i, _) => Err(Error::expected("packable", i.into())),
+              (Sized::String(_), i) => Err(Error::expected("char", i)),
           }
       }
 
@@ -758,6 +771,18 @@ internally, to keep track of things like the stack, program, lists etc.
               _ => todo!("contains not implemented for {:?}", self),
           }
       }
+
+      pub fn empty(&self) -> Sized {
+          match self {
+              Sized::Associative(_) => {
+                  Sized::Associative(assoc::Associative::Assoc(assoc::Association::new()))
+              }
+              Sized::List(_) => Sized::List(List::new()),
+              Sized::Set(_) => Sized::Set(Set::new()),
+              Sized::String(_) => Sized::String(String::new()),
+              Sized::Bytes(_) => Sized::Bytes(vec![]),
+          }
+      }
   }
 
   impl Receptacle {
@@ -826,6 +851,12 @@ internally, to keep track of things like the stack, program, lists etc.
               Sized::Associative(a) => Ok(List::from_iter(a.into_iter().map(Item::from))),
               i => Err(Error::expected("list", i.into())),
           }
+      }
+  }
+
+  impl From<VecDeque<Item>> for List {
+      fn from(v: VecDeque<Item>) -> Self {
+          List::from_iter(v.into_iter())
       }
   }
 
@@ -2542,10 +2573,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   use crate::types::environment::Environment;
   use crate::types::error::Error;
   use crate::types::*;
-
   use futures::future::FutureExt;
   use num_integer::Roots;
   use std::collections::HashMap;
+  use std::collections::VecDeque;
   //use std::future::Future;
   use std::mem;
   use std::ops::Range;
@@ -2652,6 +2683,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               ("dipdown", Box::leak(Box::new(dipdown))),
               ("drop", Box::leak(Box::new(drop))),
               ("emit", Box::leak(Box::new(f_stack1(emit)))),
+              ("empty", Box::leak(Box::new(f_stack1(empty)))),
               ("environment", Box::leak(Box::new(f_stack1(environment)))),
               ("error?", Box::leak(Box::new(f_stack1(is_error)))),
               ("eval-step", Box::leak(Box::new(eval_step_outer))),
@@ -2714,6 +2746,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               ("set?", Box::leak(Box::new(f_stack1(is_set)))),
               ("sign", Box::leak(Box::new(f_stack2(crate::crypto::sign)))),
               ("sink", Box::leak(Box::new(sink))),
+              ("slice", Box::leak(Box::new(f_stack3(slice)))),
               (
                   "socket",
                   Box::leak(Box::new(f_stack2_async(crate::pipes::net::socket))),
@@ -4173,6 +4206,45 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       it.sort_unstable_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Less));
       Ok(coll::List::from_iter(it.into_iter().map(|(k, _)| k)).into())
   }
+
+  fn slice(arr: Item, start: Item, end: Item) -> ItemResult {
+      let arr = coll::Sized::try_from(arr)?;
+      match arr {
+          coll::Sized::Bytes(arr) => {
+              let start = Int::try_from(start)?;
+              let end = Int::try_from(end)?;
+              Ok(arr
+                  .get(start as usize..end as usize)
+                  .map(|a| a.to_vec())
+                  .into())
+          }
+          coll::Sized::String(arr) => {
+              let start = Int::try_from(start)?;
+              let end = Int::try_from(end)?;
+              Ok(arr
+                  .get(start as usize..end as usize)
+                  .map(|a| a.to_string())
+                  .into())
+          }
+          coll::Sized::List(arr) => {
+              let start = Int::try_from(start)?;
+              let end = Int::try_from(end)?;
+              let owned_subset: VecDeque<Item> = arr
+                  .iter()
+                  .skip(start as usize)
+                  .take(end as usize - start as usize)
+                  .cloned()
+                  .collect();
+              Ok(coll::List::from(owned_subset).into())
+          }
+          i => Err(Error::expected("ordered", i.into())),
+      }
+  }
+
+  fn empty(s: Item) -> ItemResult {
+      let s = coll::Sized::try_from(s)?;
+      Ok(s.empty().into())
+  }
 #+end_src
 *** Top level execution
 We'll define the main module which reads input for the kcats
@@ -4484,6 +4556,7 @@ We'll also define how to run unit tests.
       #[test_case("dropper")]
       #[test_case("each")]
       #[test_case("emit")]
+      #[test_case("empty")]
       #[test_case("ends?" ; "is_ends")]
       #[test_case("environment")]
       #[test_case("evaluate")]
@@ -4505,6 +4578,7 @@ We'll also define how to run unit tests.
       #[test_case("indexed")]
       #[test_case("inject")]
       #[test_case("inscribe")]
+      #[test_case("into")]
       #[test_case("join")]
       #[test_case("joiner")]
       #[test_case("keep")]
@@ -4541,6 +4615,7 @@ We'll also define how to run unit tests.
       #[test_case("shielddowndown")]
       #[test_case("sink")]
       #[test_case("siphon")]
+      #[test_case("slice")]
       #[test_case("snapshot")]
       #[test_case("something?" ; "is_something")]
       #[test_case("sqrt")]
@@ -4549,6 +4624,7 @@ We'll also define how to run unit tests.
       #[test_case("string")]
       #[test_case("string?" ; "is_string")]
       #[test_case("spawn")]
+      #[test_case("split")]
       #[test_case("swap")]
       #[test_case("swapdown")]
       #[test_case("take")]
@@ -5956,12 +6032,105 @@ know how many bytes we're going to get in a chunk.
 First we might need a generator that divides into lines.
 A generic splitter generator would do most of the work.
 
-First let's write a function that takes a byte and if it matches. Need
-to know whole separator, what we've got so far (if anything).
-#+begin_src kcats
-"foo" [] []
 
+#+begin_src kcats
+  "foo\nbar\nbaz\n\n" [take]
+  "\n"  ;; \f
+  [empty] shield
+  [[[generate] divedown [clone [put] dip] bail]
+   [[[] [drop swap ends? not]] [execute] every?]
+   [drop] prime
+   drop
+   [swap ends?]
+   [[[count] shield] dive 
+    [[count] shield] dive swap - [0] dip slice]
+   when
+   [empty] shield swap]
+  collect
 #+end_src
+
+#+RESULTS:
+#+begin_src kcats
+["foo" "bar" "baz"] [[[generate] divedown [clone [put] dip] bail] [[[] [drop swap
+                                                                        ends? not]]
+                                                                   [execute] every?]
+                     [drop] prime drop [swap ends?]
+                     [[[count] shield]
+                      dive [[count] shield]
+                      dive swap - [0] dip slice]
+                     when [empty] shield swap]
+"" "\n" [take] ""
+#+end_src
+
+#+begin_src kcats
+"foo\nbar\nbaz\n\n" [take]
+  "\n"  ;; \f
+ split collect
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+["foo" "bar" "baz"] [[[generate] divedown [clone [put] dip] bail] [[[] [drop swap
+                                                                        ends? not]]
+                                                                   [execute] every?]
+                     [drop] prime drop [swap ends?]
+                     [[[count] shield]
+                      dive [[count] shield]
+                      dive swap - [0] dip slice]
+                     when [empty] shield swap]
+"" "\n" [take] ""
+#+end_src
+
+Ok this works but ultimately what we need is =resplit= which takes a
+list of sized (all the same type presumably) and joins and splits
+piece by piece.
+
+We could just create something like =atomize= that takes a generator of
+lists, and emits single items.
+#+begin_src kcats
+  ["foo\n" "bar\nba" "z\n\n"]
+  [take] []
+  [[] [take] [drop generate take] if] 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+"foo\nbar\nbaz\n\n" [[] [take] [drop generate take] if] [] [take] []
+#+end_src
+
+Ok the =atomize= is still handy but what I'm going to do is implement
+splitter, that takes a string and emits fields. Then i can use that
+generator *within* a re-split chunks generator, that keeps partial
+content as state.
+
+So here's that split gen:
+#+begin_src kcats
+  ;"foo\nbar\nbaz\n\n" [take] "\n"
+  [1 2 3 2 5] [take] [2] 
+  [empty] [divedown shield] decorated
+  [[[generate] divedown [clone [put] dip] bail]
+     [[[] [drop swap ends? not]] [execute] every?]
+     [drop] prime
+     drop
+     [swap ends?]
+     [[[count] shield] dive 
+      [[count] shield] dive swap - [0] dip slice]
+     when
+     [empty] shield swap] generate
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[1] [[[generate] divedown [clone [put] dip] bail] [[[] [drop swap ends? not]]
+                                                   [execute] every?]
+     [drop] prime drop [swap ends?]
+     [[[count] shield]
+      dive [[count] shield]
+      dive swap - [0] dip slice]
+     when [empty] shield swap]
+[] [2] [take] [3 2 5]
+#+end_src
+
 **** DONE Time pipe
 Each take from the pipe return the current unix time in ms.  Should be
 a "singleton" - probably using Box::leak, so that we can insert a copy
@@ -8617,7 +8786,8 @@ Show HN: Kcats: A Powerful, Beginner-Friendly, Stack-Based Programming Language
 - [ ] r/learnprogramming
 - [ ] r/coding
 - [X] programming.dev
-**** TODO Solve some programmer.dev challenges
+**** DONE Solve some programmer.dev challenges
+- State "DONE"       from "TODO"       [2023-10-05 Thu 11:11]
 Remove matching parens
 #+begin_src kcats
   "[(({})({)(()}]"
@@ -8975,3 +9145,27 @@ generators, because map isn't indefinite and has different handling of =nothing=
 
 Line break doesn't get added because it thinks =#b64= is an item when
 it's really a parsing hint.
+*** INPROGRESS slice ordered items
+- State "INPROGRESS" from "TODO"       [2023-10-04 Wed 19:00]
+We have indexing to a single subitem but we need to be able to get
+ranges too. I think all the underlying types support it so we just
+need to expose it.
+#+begin_src kcats
+"foobarbaz" 3 60 slice
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+#+end_src
+
+#+begin_src kcats
+[a b c d e f] 2 4 slice
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[c d]
+#+end_src
+
+This works but currently panics if you go beyond the valid
+indices. Should probably throw a proper error.
