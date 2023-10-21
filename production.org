@@ -121,6 +121,7 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::types::dictionary as dict;
   use crate::types::environment as env;
   use crate::types::error::Error;
+  use core::default::Default;
   use internment::Intern;
   use lazy_static::lazy_static;
   use std::collections::{HashMap, VecDeque};
@@ -214,13 +215,6 @@ internally, to keep track of things like the stack, program, lists etc.
       pub static ref S_WORD: Intern<String> = Intern::new("word".to_string());
   }
 
-  // #[derive(Debug, Clone)]
-  // pub enum Sequence {
-  //     Assoc(Associative),
-  //     List(ListContent),
-  //     Nothing,
-  // }
-
   #[derive(Debug, Clone)]
   pub enum Item {
       Int(Int),
@@ -229,11 +223,7 @@ internally, to keep track of things like the stack, program, lists etc.
       Char(Char),
       Dispenser(coll::Dispenser),
       Receptacle(coll::Receptacle),
-      Nothing,
   }
-
-  // a const Item value for Nothing
-  pub const NOTHING: Item = Item::Nothing;
 
   pub type Future<T> = Pin<Box<dyn std::future::Future<Output = T> + Send>>;
   pub type StepFn = dyn Fn(env::Environment) -> Future<env::Environment> + Sync + Send;
@@ -242,7 +232,6 @@ internally, to keep track of things like the stack, program, lists etc.
       fn eq(&self, other: &Self) -> bool {
           match (self, other) {
               // same types, just use their own eq
-              (Item::Nothing, Item::Nothing) => true,
               (Item::Int(a), Item::Int(b)) => a == b,
               (Item::Float(a), Item::Float(b)) => a == b,
               (Item::Word(a), Item::Word(b)) => a == b,
@@ -255,10 +244,6 @@ internally, to keep track of things like the stack, program, lists etc.
                   Item::Dispenser(coll::Dispenser::Sized(b)),
               ) => a == b,
               (Item::Dispenser(a), Item::Dispenser(b)) => a == b,
-              (Item::Nothing, Item::Dispenser(coll::Dispenser::Sized(b))) => b.is_empty(),
-              (Item::Dispenser(coll::Dispenser::Sized(b)), Item::Nothing) => b.is_empty(),
-              (Item::Nothing, Item::Receptacle(coll::Receptacle::Sized(b))) => b.is_empty(),
-              (Item::Receptacle(coll::Receptacle::Sized(b)), Item::Nothing) => b.is_empty(),
               (Item::Char(a), Item::Char(b)) => a == b,
               // (Item::Assoc(a), Item::Assoc(b)) => a == b,
               // (Item::List(a), Item::List(b)) => a == b,
@@ -293,10 +278,10 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  // The default Item is NOTHING.
+  // The default Item is empty list.
   impl Default for Item {
       fn default() -> Self {
-          NOTHING
+          coll::Dispenser::default().into()
       }
   }
 
@@ -373,7 +358,7 @@ internally, to keep track of things like the stack, program, lists etc.
   // }
 
   // As there are no real booleans, we use the word 'yes' but literally
-  // any value except the empty list is truthy. If we read a value
+  // any value except empty containers is truthy. If we read a value
   // 'false' in edn, that's not actually a boolean, it's just the
   // symbol/word false.
   impl From<bool> for Item {
@@ -381,7 +366,7 @@ internally, to keep track of things like the stack, program, lists etc.
           if b {
               "yes".into()
           } else {
-              NOTHING
+              Item::default()
           }
       }
   }
@@ -480,19 +465,9 @@ internally, to keep track of things like the stack, program, lists etc.
   pub type List = Arc<ListContent>;
   pub type Set = Arc<Setty<assoc::KeyItem>>;
 
-  impl List {
-      pub fn new() -> List {
-          Newtype(sync::Arc::new(Newtype(VecDeque::new())))
-      }
-  }
-
   impl Set {
       pub fn from(h: HashSet<assoc::KeyItem>) -> Set {
           Newtype(sync::Arc::new(Newtype(h)))
-      }
-
-      pub fn new() -> Set {
-          Set::from(HashSet::new())
       }
   }
 
@@ -797,8 +772,8 @@ internally, to keep track of things like the stack, program, lists etc.
               Sized::Associative(_) => {
                   Sized::Associative(assoc::Associative::Assoc(assoc::Association::new()))
               }
-              Sized::List(_) => Sized::List(List::new()),
-              Sized::Set(_) => Sized::Set(Set::new()),
+              Sized::List(_) => Sized::List(List::default()),
+              Sized::Set(_) => Sized::Set(Set::default()),
               Sized::String(_) => Sized::String(String::new()),
               Sized::Bytes(_) => Sized::Bytes(vec![]),
           }
@@ -892,7 +867,6 @@ internally, to keep track of things like the stack, program, lists etc.
           match i {
               Item::Dispenser(l) => Sized::try_from(l).and_then(List::try_from),
               Item::Receptacle(l) => Sized::try_from(l).and_then(List::try_from),
-              Item::Nothing => Ok(List::new()),
               i => Err(Error::expected("list", i)),
           }
       }
@@ -905,7 +879,6 @@ internally, to keep track of things like the stack, program, lists etc.
           match item {
               Item::Dispenser(c) => c.try_into(),
               Item::Receptacle(p) => Dispenser::try_from(p)?.try_into(),
-              Item::Nothing => Ok(Sized::List(List::new())),
               i => {
                   // let bt = backtrace::Backtrace::new();
                   // println!("try from item {:?},\n {:?}", i, bt);
@@ -922,7 +895,6 @@ internally, to keep track of things like the stack, program, lists etc.
           match item {
               Item::Receptacle(p) => Ok(p),
               Item::Dispenser(c) => c.try_into(),
-              Item::Nothing => Ok(Receptacle::Sized(Sized::List(List::new()))),
               i => Err(Error::expected("packable", i)),
           }
       }
@@ -1001,7 +973,6 @@ internally, to keep track of things like the stack, program, lists etc.
 
       fn try_from(item: Item) -> Result<Self, Self::Error> {
           match item {
-              Item::Nothing => Ok(Dispenser::Sized(Sized::List(List::new()))),
               Item::Dispenser(c) => Ok(c),
               Item::Receptacle(p) => Ok(Dispenser::try_from(p)?),
               i => Err(Error::expected("iterable", i)),
@@ -1021,6 +992,36 @@ internally, to keep track of things like the stack, program, lists etc.
           Ok(Set::from(hs))
       }
   }
+
+  impl Default for List {
+      fn default() -> Self {
+          Newtype(sync::Arc::new(Newtype(VecDeque::new())))
+      }
+  }
+
+  impl Default for Set {
+      fn default() -> Self {
+          Set::from(HashSet::new())
+      }
+  }
+
+  impl Default for Sized {
+      fn default() -> Self {
+          Sized::List(List::default())
+      }
+  }
+
+  impl Default for Dispenser {
+      fn default() -> Self {
+          Dispenser::Sized(Sized::default())
+      }
+  }
+
+  impl Default for Receptacle {
+      fn default() -> Self {
+          Receptacle::Sized(Sized::default())
+      }
+  }
 #+end_src
 **** Associative types
 #+begin_src rust :tangle src/types/associative.rs :mkdirp yes
@@ -1038,7 +1039,6 @@ internally, to keep track of things like the stack, program, lists etc.
   pub enum KeyItem {
       // Order matters here, for comparison purposes - changing the
       // order will change the result of how eg int compares to word.
-      Nothing,
       Int(Int),
       Char(Char),
       Word(Word),
@@ -1071,7 +1071,6 @@ internally, to keep track of things like the stack, program, lists etc.
               KeyItem::Word(w) => Item::Word(w),
               KeyItem::Bytes(bs) => bs.into(),
               KeyItem::Char(c) => Item::Char(c),
-              KeyItem::Nothing => NOTHING,
           }
       }
   }
@@ -1106,9 +1105,6 @@ internally, to keep track of things like the stack, program, lists etc.
               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(mut l))) => Ok(KeyItem::List(
                   KeyList::try_from_iter(l.inner().into_iter())?,
               )),
-
-              Item::Nothing => Ok(KeyItem::Nothing),
-
               Item::Word(w) => Ok(KeyItem::Word(w)),
               Item::Char(c) => Ok(KeyItem::Char(c)),
 
@@ -1310,7 +1306,7 @@ internally, to keep track of things like the stack, program, lists etc.
                           coll::List::from_iter(
                               vec![
                                   Item::Word(key),
-                                  maybe_value.map(Item::from).unwrap_or(NOTHING),
+                                  maybe_value.map(Item::from).unwrap_or(Item::default()),
                               ]
                               .into_iter(),
                           )
@@ -1754,7 +1750,7 @@ internally, to keep track of things like the stack, program, lists etc.
           }
           Ok(Entry {
               examples,
-              definition: definition.unwrap_or(Definition::Derived(coll::List::new())),
+              definition: definition.unwrap_or(Definition::Derived(coll::List::default())),
               spec,
           })
       }
@@ -2264,7 +2260,6 @@ example, in order to read/write to/from disk).
 #+begin_src rust :tangle src/serialize.rs :mkdirp yes
   extern crate edn_format;
   use crate::types::environment::Environment;
-  use crate::types::NOTHING;
   use crate::types::{associative as assoc, collection as coll, error::Error, *};
   use std::collections::VecDeque;
   use std::fmt;
@@ -2280,16 +2275,12 @@ example, in order to read/write to/from disk).
       match item {
           edn_format::Value::Integer(i) => Ok(Item::Int(*i)),
           edn_format::Value::Vector(v) => Ok({
-              if v.is_empty() {
-                  NOTHING
-              } else {
-                  coll::List::from_iter(
-                      v.iter()
-                          .map(to_item)
-                          .collect::<Result<Vec<Item>, Error>>()?,
-                  )
-                  .into()
-              }
+              coll::List::from_iter(
+                  v.iter()
+                      .map(to_item)
+                      .collect::<Result<VecDeque<Item>, Error>>()?,
+              )
+              .into()
           }),
           edn_format::Value::Symbol(s) => Ok(Item::Word(s.to_string().into())),
           // we don't have booleans in kcats, so if we see 'false' that
@@ -2321,7 +2312,6 @@ example, in order to read/write to/from disk).
           Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
               assoc::Associative::Env(e),
           ))) => from_item(&e.representation()),
-          Item::Nothing => edn_format::Value::Vector(vec![]),
           Item::Int(i) => edn_format::Value::Integer(*i),
           Item::Float(f) => edn_format::Value::from(*f),
           Item::Char(c) => edn_format::Value::Character(*c),
@@ -2933,7 +2923,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn is_empty(i: Item) -> ItemResult {
       Ok(Item::from(match i {
-          Item::Nothing => true,
           Item::Dispenser(coll::Dispenser::Sized(s)) => s.is_empty(),
           Item::Receptacle(coll::Receptacle::Sized(s)) => s.is_empty(),
           _ => false,
@@ -3110,13 +3099,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn is_list(i: Item) -> ItemResult {
-      match i {
-          Item::Nothing => Ok(true.into()),
-          i => Ok(coll::Sized::try_from(i)
-              .map(|s| matches!(s, coll::Sized::List(_)))
-              .unwrap_or(false)
-              .into()),
-      }
+      Ok(coll::Sized::try_from(i)
+          .map(|s| matches!(s, coll::Sized::List(_)))
+          .unwrap_or(false)
+          .into())
   }
 
   pub fn first(i: Item) -> ItemResult {
@@ -3303,7 +3289,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   //     if b {
   //         "true".into()
   //     } else {
-  //         coll::NOTHING
+  //         coll::Item::default()
   //     }
   // }
 
@@ -3417,7 +3403,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       // extend the size of the vector to be big enough to set
                       // the given index, pad with 'nothing' values.
                       if lm.len() <= idx {
-                          lm.resize(idx + 1, NOTHING);
+                          lm.resize(idx + 1, Item::default());
                       }
                       lm[*k as usize] = v;
                       Ok(l.into())
@@ -3432,7 +3418,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       // extend the size of the vector to be big enough to set
                       // the given index, pad with 'nothing' values.
                       if lm.len() <= idx {
-                          lm.resize(idx + 1, NOTHING);
+                          lm.resize(idx + 1, Item::default());
                       }
                       lm[*k as usize] = v;
                       Ok(l.into())
@@ -3454,7 +3440,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       // extend the size of the vector to be big enough to set
                       // the given index, pad with 'nothing' values.
                       if lm.len() <= idx {
-                          lm.resize(idx + 1, NOTHING);
+                          lm.resize(idx + 1, Item::default());
                       }
                       let inner = &lm[idx];
 
@@ -3464,7 +3450,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                                   Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(l))),
                                   assoc::KeyItem::Int(_),
                               ) => l.clone().into(),
-                              (_, assoc::KeyItem::Int(_)) => coll::List::new().into(),
+                              (_, assoc::KeyItem::Int(_)) => coll::List::default().into(),
                               _ => assoc::Association::new().into(),
                           };
                           assoc_in(i, ks, v)?
@@ -3524,7 +3510,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   ) => {
                       let lm = l.make_mut();
                       let old_value = if let Some(item) = lm.get_mut(*k as usize) {
-                          mem::replace(item, NOTHING)
+                          mem::replace(item, Item::default())
                       } else {
                           return Err(Error::short_list(*k)); // replace with your error
                       };
@@ -3604,7 +3590,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       } else if is_truthy(j.clone()) {
           j
       } else {
-          NOTHING
+          Item::default()
       })
       //Ok(Item::from(is_truthy(i) || is_truthy(j)))
   }
@@ -3613,7 +3599,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       Ok(if is_truthy(i) && is_truthy(j.clone()) {
           j
       } else {
-          NOTHING
+          Item::default()
       })
   }
 
@@ -3622,23 +3608,17 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn is_association(i: Item) -> ItemResult {
-      match i {
-          Item::Nothing => Ok(true.into()),
-          i => Ok(coll::Sized::try_from(i)
-              .map(|s| matches!(s, coll::Sized::Associative(_)))
-              .unwrap_or(false)
-              .into()),
-      }
+      Ok(coll::Sized::try_from(i)
+          .map(|s| matches!(s, coll::Sized::Associative(_)))
+          .unwrap_or(false)
+          .into())
   }
 
   pub fn is_set(i: Item) -> ItemResult {
-      match i {
-          Item::Nothing => Ok(true.into()),
-          i => Ok(coll::Sized::try_from(i)
-              .map(|s| matches!(s, coll::Sized::Set(_)))
-              .unwrap_or(false)
-              .into()),
-      }
+      Ok(coll::Sized::try_from(i)
+          .map(|s| matches!(s, coll::Sized::Set(_)))
+          .unwrap_or(false)
+          .into())
   }
 
   pub fn is_odd(i: Item) -> ItemResult {
@@ -3698,7 +3678,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       } else {
           // clauses empty, return nothing
           env.pop_expr();
-          env.push(NOTHING).into()
+          env.push(Item::default()).into()
       }
   }
 
@@ -3730,16 +3710,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   fn check_type(i: &Item, w: Word) -> Result<(), Error> {
       match (w, i) {
-          (w, Item::Nothing)
-              if w == *S_DISPENSER
-                  || w == *S_RECEPTACLE
-                  || w == *S_LIST
-                  || w == *S_ASSOC
-                  || w == *S_SIZED
-                  || w == *S_ORDERED =>
-          {
-              Ok(())
-          }
           (w, _) if w == *S_ITEM => Ok(()),
           (w, Item::Dispenser(_) | Item::Receptacle(_)) if w == *S_DISPENSER => Ok(()),
           (w, Item::Receptacle(_) | Item::Dispenser(_)) if w == *S_RECEPTACLE => Ok(()),
@@ -3770,8 +3740,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           (
               w,
               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(_)))
-              | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::List(_)))
-              | Item::Nothing,
+              | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::List(_))),
           ) if w == *S_LIST || w == *S_PROGRAM => Ok(()),
 
           (
@@ -4025,11 +3994,11 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   pub fn standard_env(program: Option<coll::List>, stack: Option<coll::List>) -> Environment {
       let prog_expr = match program {
           Some(p) => Stack::from(p),
-          _ => Stack::new(),
+          _ => Stack::default(),
       };
 
       let env = Environment {
-          stack: stack.unwrap_or(Stack::new()),
+          stack: stack.unwrap_or(Stack::default()),
           program: prog_expr,
           dictionary: coll::Arc::wrap(HashMap::<Word, dict::Entry>::new()),
       };
@@ -4048,7 +4017,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           Ok(inner) => {
               env.pop_expr();
               if inner.program.is_empty() {
-                  Box::pin(async move { env.push(NOTHING) })
+                  Box::pin(async move { env.push(Item::default()) })
               } else {
                   Box::pin(eval_step(inner).map(|inner_next| env.push(inner_next.into())))
               }
@@ -5707,7 +5676,7 @@ Implement the =handoff= type
               self.handle = Some(tokio::spawn(async move {
                   sleep(duration).await;
                   //TODO handle error condition on send
-                  let _ = sender.send(types::NOTHING);
+                  let _ = sender.send(Item::default());
               }));
           }
       }
@@ -9561,7 +9530,9 @@ yes -12
 #+begin_src kcats
 [] 11
 #+end_src
-*** TODO Remove notion of Nothing from the implementation
+*** DONE Remove notion of Nothing from the implementation
+- State "DONE"       from "INPROGRESS" [2023-10-21 Sat 11:29]
+- State "INPROGRESS" from "TODO"       [2023-10-21 Sat 11:29]
 I don't think the performance boost (if any) is worth it. Everywhere
 we use NOTHING now, we can just set it to an empty List. And probably
 rename it to Empty or something like that. There's no need for the enum variant.
