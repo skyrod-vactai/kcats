@@ -2382,6 +2382,7 @@ example, in order to read/write to/from disk).
       open_list_stack.push((0, 0));
       let mut last_char: char = '\n';
       let mut in_string: bool = false;
+      let mut in_tag = false;
       let mut chars = input.chars().peekable(); // Convert to a Peekable iterator
 
       while let Some(c) = chars.next() {
@@ -2419,13 +2420,25 @@ example, in order to read/write to/from disk).
               ' ' => {
                   if !in_string {
                       let (last_count, break_count) = open_list_stack.last_mut().unwrap();
-                      ,*last_count += 1;
-                      if (*last_count % max_items) == 0 || current_line_length > max_chars {
+                      if in_tag {
+                          in_tag = false;
+                      } else {
+                          ,*last_count += 1;
+                      }
+                      if (*last_count > 0 && (*last_count % max_items) == 0)
+                          || current_line_length > max_chars
+                      {
                           result.push('\n');
                           ,*break_count += 1;
                           current_line_length = 0;
                           //*last_count = 0;
                       }
+                  }
+                  result.push(c);
+              }
+              '#' => {
+                  if !in_string {
+                      in_tag = true;
                   }
                   result.push(c);
               }
@@ -3891,12 +3904,15 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   fn bytes(i: Item) -> ItemResult {
       match i {
+          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(b))) => Ok(b.into()),
+          Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(b))) => Ok(b.into()),
           Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(s))) => {
               Ok(s.as_bytes().to_vec().into())
           }
           Item::Receptacle(coll::Receptacle::Sized(coll::Sized::String(s))) => {
               Ok(s.as_bytes().to_vec().into())
           }
+
           i => Ok(Bytes::from(serialize::emit(&i)).into()),
       }
   }
@@ -4238,27 +4254,39 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   fn slice(arr: Item, start: Item, end: Item) -> ItemResult {
+      //println!("Start: {:?}, End: {:?}", start, end);
       let arr = coll::Sized::try_from(arr)?;
+      let mut start = Int::try_from(start)?;
+      let mut end = Int::try_from(end)?;
+      if start < 0 {
+          start = arr.len() as i64 + start;
+      }
+      if end <= 0 {
+          end = arr.len() as i64 + end;
+      }
+      if start < 0 {
+          return Err(Error::negative(start));
+      }
+      if end < 0 {
+          return Err(Error::negative(end));
+      }
+      if start > end {
+          return Err(Error::create(
+              crate::types::wrap("<=".into()),
+              "invalid index range",
+              Some(pair(start.into(), end.into())),
+          ));
+      }
       match arr {
-          coll::Sized::Bytes(arr) => {
-              let start = Int::try_from(start)?;
-              let end = Int::try_from(end)?;
-              Ok(arr
-                  .get(start as usize..end as usize)
-                  .map(|a| a.to_vec())
-                  .into())
-          }
-          coll::Sized::String(arr) => {
-              let start = Int::try_from(start)?;
-              let end = Int::try_from(end)?;
-              Ok(arr
-                  .get(start as usize..end as usize)
-                  .map(|a| a.to_string())
-                  .into())
-          }
+          coll::Sized::Bytes(arr) => Ok(arr
+              .get(start as usize..end as usize)
+              .map(|a| a.to_vec())
+              .into()),
+          coll::Sized::String(arr) => Ok(arr
+              .get(start as usize..end as usize)
+              .map(|a| a.to_string())
+              .into()),
           coll::Sized::List(arr) => {
-              let start = Int::try_from(start)?;
-              let end = Int::try_from(end)?;
               let owned_subset: VecDeque<Item> = arr
                   .iter()
                   .skip(start as usize)
@@ -8594,6 +8622,83 @@ let's make an equivalent to =map= (that doesn't require a generator) for ease of
 #+end_src
 
 ...wait a minute, isn't that just =step=?
+
+**** TODO Generator combinators?
+When writing =partition=, it would be nice if we could use generators
+*within* a generator. For example, we need to partition a list into
+pairs. It would be nice if we could use =2 taker= repeatedly. Let's see if we can make that work:
+
+#+begin_src kcats
+  [1 2 3 4 5 6 7] [take]
+  [2 taker collect dropdown dropdown] collect
+
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[1 2]
+ [3 4]
+ [5 6]
+ [7]]
+[2 taker collect dropdown dropdown] [take] []
+#+end_src
+
+Ok wow did not expect that to be so easy.
+
+Maybe we can even implement the window shifting version?
+
+#+begin_src kcats 
+  [1 2 3 4 5 6 7] [take]
+  3 1  ; params: window-size, shift-size, state
+  []
+  [[[dotake [[taker collect
+              dropdown dropdown] ; drop the used-up taker generator
+             join divedeep]]
+    [doshift [[[count <=]
+               [swap 0 slice]
+               [[]] if] shield swap]]]
+   [
+    []
+    [over wrap dotake [join doshift] bail]
+    [[over] dive wrap dotake swap drop doshift]
+    if]
+   let]
+  collect
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[1 2 3] [2 3 4] [3 4 5] [4 5 6] [5 6 7]] [[[dotake [[taker collect dropdown dropdown]
+                                                     join divedeep]]
+                                            [doshift [[[count <=]
+                                                       [swap 0 slice] [[]] if]
+                                                      shield swap]]]
+                                           [[] [over wrap dotake [join doshift]
+                                                bail]
+                                            [[over] dive wrap dotake swap drop doshift]
+                                            if]
+                                           let]
+[6 7]
+1 3 [take] []
+#+end_src
+
+**** INPROGRESS Applying generator to an existing container
+- State "INPROGRESS" from "TODO"       [2023-11-10 Fri 16:36]
+we commonly have this construct: =[[1 2 3] ... collect] shield=, where
+we're transducing a list and we want to just get the result.
+
+#+begin_src kcats
+  [1 2 3 4 5] [[odd?] keep] 
+  [xform dispenser] label
+  [[[poke dispenser] [take] [splice xform] collect] shield]
+  template execute
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[1 3 5]
+#+end_src
+
 *** DONE Investigate simpler map/filter impls
 #+begin_src kcats :results code
 7 8 [+] [] [] sink [shielddown dip] decorate [swap] unwrap prepend [swap put] join step
@@ -9292,15 +9397,18 @@ generators, because map isn't indefinite and has different handling of =nothing=
 *** DONE Separate formatting from emitting
 - State "DONE"       from "INPROGRESS" [2023-10-19 Thu 21:04]
 - State "INPROGRESS" from "TODO"       [2023-09-23 Sat 10:29]
-*** TODO Fix line breaks with byte literals
+*** DONE Fix line breaks with byte literals
+- State "DONE"       from "INPROGRESS" [2023-11-19 Sun 19:17]
+- State "INPROGRESS" from "TODO"       [2023-11-19 Sun 18:48]
 #+begin_src kcats
 "foo" bytes key
 #+end_src
 
 #+RESULTS:
 #+begin_src kcats
-[[public #b64 "NNJledu0Vmk+VAZyz5IvUt3g1lMuNb8GvgE6fFMvIOA="] [secret #b64 "LCa0a2j/xo/5m0U8HTBBNBNCLXBkg7+g+YpeiGJm564="]
- [type elliptic-curve-key]]
+[[type elliptic-curve-key]
+ [public #b64 "NNJledu0Vmk+VAZyz5IvUt3g1lMuNb8GvgE6fFMvIOA="]
+ [secret #b64 "LCa0a2j/xo/5m0U8HTBBNBNCLXBkg7+g+YpeiGJm564="]]
 #+end_src
 
 Line break doesn't get added because it thinks =#b64= is an item when
@@ -9656,3 +9764,24 @@ Ok let's see if we can go back and use this in existing code.
 + dupd (clonedown)
 + dupdd (clonedeep)
 + tuck (opposite of over: under) 
+*** DONE implement 'label'
+- State "DONE"       from "TODO"       [2023-11-10 Fri 14:05]
+We're "labeling" items on the stack and get a map. eg
+="Alice" 23 "123 Main St" [address age name] label=
+
+The question is do we label from stack's top to bottom or the other
+direction? Let's try "top first" - if we have a literal we can just
+write a map literal to start, so i think this is ok.
+
+#+begin_src kcats 
+  "Alice" 23 "123 Main St" [address age name]
+  [] swap ;; labels acc
+  [wrap float assign] step
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[address "123 Main St"]
+ [age 23]
+ [name "Alice"]]
+#+end_src
