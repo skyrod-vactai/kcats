@@ -1288,7 +1288,7 @@ internally, to keep track of things like the stack, program, lists etc.
                       }),
                   )
               }
-              _ => todo!("taking from assoc Requires insert/remove impl")k
+              _ => todo!("taking from assoc Requires insert/remove impl")
           }
       }
   }
@@ -1481,6 +1481,10 @@ internally, to keep track of things like the stack, program, lists etc.
           )
       }
 
+      pub fn overflow() -> Error {
+          Error::create(types::wrap("arithmetic".into()), "number overflow", None)
+      }
+
       pub fn undefined(w: Word) -> Error {
           Error::create(types::wrap(Item::Word(w)), "word is not defined", None)
       }
@@ -1510,6 +1514,26 @@ internally, to keep track of things like the stack, program, lists etc.
               coll::List::from_iter(["count".into(), Item::Int(expected), "=".into()]),
               "list had wrong number of items",
               None,
+          )
+      }
+
+      pub fn negative(actual: Int) -> Error {
+          Error::too_small(actual, 0)
+      }
+
+      pub fn too_small(actual: Int, expected: Int) -> Error {
+          Error::create(
+              coll::List::from_iter([Item::Int(expected), Item::from(">=")]),
+              "number too small",
+              Some(Item::Int(actual)),
+          )
+      }
+
+      pub fn too_large(actual: Int, expected: Int) -> Error {
+          Error::create(
+              coll::List::from_iter([Item::Int(expected), Item::from("<=")]),
+              "number too large",
+              Some(Item::Int(actual)),
           )
       }
 
@@ -2683,7 +2707,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               ("bytes?", Box::leak(Box::new(f_stack1(is_bytes)))),
               ("clone", Box::leak(Box::new(clone))),
               ("contains?", Box::leak(Box::new(f_stack2(contains)))),
-              ("ceil", Box::leak(Box::new(f_stack1(ceil)))),
+              ("ceiling", Box::leak(Box::new(f_stack1(ceiling)))),
               ("compare", Box::leak(Box::new(f_stack2(compare)))),
               ("count", Box::leak(Box::new(f_stack1(count)))),
               ("dec", Box::leak(Box::new(f_stack1(dec)))),
@@ -2702,6 +2726,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               ("even?", Box::leak(Box::new(f_stack1(is_even)))),
               ("evert", Box::leak(Box::new(evert))),
               ("execute", Box::leak(Box::new(execute))),
+              ("exp", Box::leak(Box::new(f_stack2(exp)))),
               ("fail", Box::leak(Box::new(f_stack1(fail)))),
               (
                   "file-in",
@@ -2713,6 +2738,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               ),
               ("first", Box::leak(Box::new(f_stack1(first)))),
               ("float", Box::leak(Box::new(float))),
+              ("floor", Box::leak(Box::new(f_stack1(floor)))),
               ("handle", Box::leak(Box::new(f_stack1(handle)))),
               (
                   "handoff",
@@ -2725,6 +2751,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               ("key", Box::leak(Box::new(f_stack1(crate::crypto::key)))),
               ("last", Box::leak(Box::new(f_stack1(last)))),
               ("list?", Box::leak(Box::new(f_stack1(is_list)))),
+              ("log", Box::leak(Box::new(f_stack2(log)))),
               ("loop", Box::leak(Box::new(loop_))),
               ("mod", Box::leak(Box::new(f_stack2(mod_)))),
               ("not", Box::leak(Box::new(f_stack1(not)))),
@@ -2744,6 +2771,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               ("redefine", Box::leak(Box::new(redefine))),
               ("resume", Box::leak(Box::new(identity))),
               ("reverse", Box::leak(Box::new(f_stack1(reverse)))),
+              ("round", Box::leak(Box::new(f_stack1(round)))),
               ("second", Box::leak(Box::new(f_stack1(second)))),
               (
                   "sender",
@@ -2890,6 +2918,57 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let i = Int::try_from(i)?;
       let j = Int::try_from(j)?;
       Ok(Item::Int(i % j))
+  }
+
+  pub fn floor(i: Item) -> ItemResult {
+      match i {
+          Item::Int(i) => Ok(Item::Int(i)),
+          Item::Float(i) => Ok(Item::Int(i.floor() as Int)),
+          i => number_type_error(i),
+      }
+  }
+
+  pub fn ceiling(i: Item) -> ItemResult {
+      match i {
+          Item::Int(i) => Ok(Item::Int(i)),
+          Item::Float(i) => Ok(Item::Int(i.ceil() as Int)),
+          i => number_type_error(i),
+      }
+  }
+
+  pub fn round(i: Item) -> ItemResult {
+      match i {
+          Item::Int(i) => Ok(Item::Int(i)),
+          Item::Float(i) => Ok(Item::Int(i.round() as Int)),
+          i => number_type_error(i),
+      }
+  }
+
+  pub fn exp(base: Item, exponent: Item) -> ItemResult {
+      match (base, exponent) {
+          (Item::Int(base), Item::Int(exponent)) => base
+              .checked_pow(exponent as u32)
+              .ok_or(Error::overflow())
+              .map(Item::Int),
+          (base, exponent) => number_type_error(pair(base, exponent)),
+      }
+  }
+
+  pub fn log(value: Item, base: Item) -> ItemResult {
+      match (base, value) {
+          (Item::Int(base), Item::Int(value)) => {
+              if base <= 1 {
+                  Err(Error::too_small(base, 1))
+              } else if value <= 0 {
+                  Err(Error::too_small(value, 0))
+              } else {
+                  let base = base as Float;
+                  let value = value as Float;
+                  Ok(Item::Float(value.log(base)))
+              }
+          }
+          (base, value) => number_type_error(pair(base, value)),
+      }
   }
 
   pub fn inc(i: Item) -> ItemResult {
@@ -4051,11 +4130,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       env.push(d.into()).into()
   }
 
-  fn ceil(i: Item) -> ItemResult {
-      let f = Float::try_from(i)?;
-      Ok(Item::Float(f.ceil()))
-  }
-
   fn sqrt(i: Item) -> ItemResult {
       match i {
           Item::Int(i) => Ok(Item::Int(i.sqrt())),
@@ -4579,6 +4653,7 @@ We'll also define how to run unit tests.
       #[test_case("abs")]
       #[test_case("and")]
       #[test_case("any?" ; "is_any")]
+      #[test_case("assemble")]
       #[test_case("assign")]
       #[test_case("association")]
       #[test_case("association?" ; "is_association")]
@@ -4593,7 +4668,7 @@ We'll also define how to run unit tests.
       #[test_case("bytes")]
       #[test_case("bytes?" ; "is_bytes")]
       #[test_case("capture")]
-      #[test_case("ceil")]
+      #[test_case("ceiling")]
       #[test_case("clone")]
       #[test_case("clonedown")]
       #[test_case("clonedeep")]
@@ -4627,9 +4702,11 @@ We'll also define how to run unit tests.
       #[test_case("evert")]
       #[test_case("every?" ; "is_every")]
       #[test_case("execute")]
+      #[test_case("exp")]
       #[test_case("filter")]
       #[test_case("first")]
       #[test_case("float")]
+      #[test_case("floor")]
       #[test_case("fold")]
       #[test_case("functional")]
       #[test_case("future")]
@@ -4645,11 +4722,13 @@ We'll also define how to run unit tests.
       #[test_case("join")]
       #[test_case("joiner")]
       #[test_case("keep")]
+      #[test_case("label")]
       #[test_case("let")]
       #[test_case("lingo")]
       #[test_case("list?" ; "is_list")]
       #[test_case("lookup")]
       #[test_case("loop")]
+      #[test_case("log")]
       #[test_case("map")]
       #[test_case("max")]
       #[test_case("min")]
@@ -4660,8 +4739,8 @@ We'll also define how to run unit tests.
       #[test_case("odd?" ; "is_odd")]
       #[test_case("or")]
       #[test_case("over")]
+      #[test_case("partition")]
       #[test_case("pipe?" ; "is_pipe")]
-      #[test_case("pop")]
       #[test_case("put")]
       #[test_case("prepend")]
       #[test_case("primrec")]
@@ -4674,6 +4753,7 @@ We'll also define how to run unit tests.
       #[test_case("restore")]
       #[test_case("retry")]
       #[test_case("reverse")]
+      #[test_case("round")]
       #[test_case("set")]
       #[test_case("set?" ; "is_set")]
       #[test_case("shield")]
