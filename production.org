@@ -2611,10 +2611,11 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   fn f_stack1(f: fn(Item) -> ItemResult) -> impl Fn(Environment) -> Future<Environment> {
       move |mut env: Environment| {
-          let x = env.pop();
-          let res = f(x);
+          let x = env.tos().unwrap();
+          let res = f(x.clone());
           if res.is_ok() {
               env.pop_expr();
+              env.pop();
           }
           env.push(Item::from(res)).into()
       }
@@ -2622,11 +2623,13 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   fn f_stack2(f: fn(Item, Item) -> ItemResult) -> impl Fn(Environment) -> Future<Environment> {
       move |mut env: Environment| {
-          let x = env.pop();
-          let y = env.pop();
-          let res = f(y, x);
+          let x = env.tos().unwrap();
+          let y = env.stack.get(1).unwrap();
+          let res = f(y.clone(), x.clone());
           if res.is_ok() {
               env.pop_expr();
+              env.pop();
+              env.pop();
           }
           env.push(Item::from(res)).into()
       }
@@ -2634,12 +2637,15 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   fn f_stack3(f: fn(Item, Item, Item) -> ItemResult) -> impl Fn(Environment) -> Future<Environment> {
       move |mut env: Environment| {
-          let x = env.pop();
-          let y = env.pop();
-          let z = env.pop();
-          let res = f(z, y, x);
+          let x = env.tos().unwrap();
+          let y = env.stack.get(1).unwrap();
+          let z = env.stack.get(2).unwrap();
+          let res = f(z.clone(), y.clone(), x.clone());
           if res.is_ok() {
               env.pop_expr();
+              env.pop();
+              env.pop();
+              env.pop();
           }
           env.push(Item::from(res)).into()
       }
@@ -3650,6 +3656,16 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           (coll::Sized::List(l), assoc::KeyItem::Int(k)) => {
               Ok(l.get(k as usize).cloned().unwrap_or_default())
           }
+          (coll::Sized::String(s), assoc::KeyItem::Int(k)) => {
+              //let s = s.inner();
+              s.chars()
+                  .nth(k as usize)
+                  .map_or(Ok(Item::default()), |c| Ok(c.into()))
+          }
+          (coll::Sized::Bytes(b), assoc::KeyItem::Int(k)) => b
+              .get(k as usize)
+              .cloned()
+              .map_or(Ok(Item::default()), |c| Ok(Item::Int(c as i64))),
           (i, k) => {
               let m = assoc::Associative::try_from(i)?;
               Ok(m.get(&k).unwrap_or_default())
@@ -4652,6 +4668,7 @@ We'll also define how to run unit tests.
       #[test_case("bind")]
       #[test_case("binddown")]
       #[test_case("binddeep")]
+      #[test_case("bits")]
       #[test_case("both?" ; "is_both")]
       #[test_case("branch")]
       #[test_case("breaker")]
@@ -4730,6 +4747,7 @@ We'll also define how to run unit tests.
       #[test_case("odd?" ; "is_odd")]
       #[test_case("or")]
       #[test_case("over")]
+      #[test_case("pad")]
       #[test_case("partition")]
       #[test_case("pipe?" ; "is_pipe")]
       #[test_case("put")]
@@ -7517,8 +7535,8 @@ the message is a perfectly good truthy value. I suppose signing an
 empty byte array could cause confusion (if that were considered
 "nothing" which I suppose it should, but currently isn't). But I can't
 think of any valid reason to sign 'nothing'.
-***** TODO AES Encryption
-***** TODO Random
+***** TODO [#A] AES Encryption
+***** TODO [#B] Random
 **** DONE Pure functional env
 #+begin_src kcats
   [[pipe-in pipe-out channel timeout handoff file-in file-out timestamps standard serversocket animate future spit tunnel ] [wrap unassign] step] [1 2 swap] lingo
@@ -7752,28 +7770,29 @@ database. Disable exploitable words. Catch errors and return to the user.
 
   ;; book db
   "examples/books.kcats" file-out slurp read
-  
-  functional ;; dictionary modifications, removes any io access 
+
+  ;functional ;; dictionary modifications, removes any io access 
 
   ;; API Server code begins here
 
-  dictionary swap execute ;; -> new-dict db sock
+  ;dictionary swap execute ;; -> new-dict db sock
 
   ;; start building the environment
   [[program [take ;; the request as bytes
-                swap ;; we want the pipe on top so we can dip the user's program under it -> pipe req db
-                [string ;; translate to a string -> req-str db
-                 read ;; the request program into a data structure -> prog db
-                 [execute] [] recover ;; the program -> items*
-                 snapshot] dip ;; under the pipe so the user's code has no access
-                swap ;; -> response pipe
-                emit ;; -> response-str pipe
-                bytes ;; -> response-bytes pipe
-                put ;; the response into the pipe
-                drop ;; close the connection
-               ]]] environment ;; -> env new-dict db sock 
-  [dictionary] float ;; -> new-dict [dictionary] env db sock
-  assign  ;; -> env db sock
+             swap ;; we want the pipe on top so we can dip the user's program under it -> pipe req db
+             [string ;; translate to a string -> req-str db
+              read first ;; the request program into a data structure -> prog db
+              clone emit print ;; log the request
+              functional [[execute] [] recover] lingo ;; the program -> items*
+              snapshot] dip ;; under the pipe so the user's code has no access
+             swap ;; -> response pipe
+             emit ;; -> response-str pipe
+             bytes ;; -> response-bytes pipe
+             put ;; the response into the pipe
+             drop ;; close the connection
+            ]]] environment ;; -> env new-dict db sock 
+  ;[dictionary] float ;; -> new-dict [dictionary] env db sock
+  ;assign  ;; -> env db sock
 
   ;; now just need to assign the stack, which is [pipe db] 
   float ;; -> sock env db
@@ -7791,6 +7810,28 @@ database. Disable exploitable words. Catch errors and return to the user.
 
   step ;; accepts incoming connections until killed
 #+end_src
+**** INPROGRESS Simple API client
+#+begin_src kcats
+  "localhost" 12121 socket
+  [[[title] lookup count 10 <] filter]
+  bytes put
+  [[take] joiner generate string read] shielddown
+  #+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[[[[author-first "George"]
+    [author-last "Orwell"]
+    [title "1984"]
+    [year 1949]
+    [subjects [government dystopia surveillance totalitarianism freedom]]]
+   [[author-first "Charlotte"]
+    [author-last "Bronte"]
+    [title "Jane Eyre"]
+    [year 1847]
+    [subjects [love morality society class womanhood independence]]]]]]
+#+end_src
+
 **** TODO Kademlia functions
 ***** TODO COMMENT Distance
 takes two hashes, returns the xor distance between them
