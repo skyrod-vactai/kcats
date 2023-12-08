@@ -77,7 +77,7 @@ the location where you installed the kcats binary.
 #+BEGIN_SRC toml :tangle Cargo.toml
   [package]
   name = "kcats"
-  version = "0.5.3"
+  version = "0.6.0"
   edition = "2021"
 
   # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -5853,6 +5853,70 @@ Implement the =handoff= type
       let ms = Int::try_from(i)?;
       //TODO: check for negative values
       Ok(Timer::new(Duration::from_millis(ms as u64)).into())
+  }
+#+end_src
+***** Database
+#+begin_src rust :tangle src/pipes/db.rs :mkdirp yes
+  use crate::types::associative as assoc;
+  use crate::types::collection as coll;
+  use crate::types::Item;
+  use rusqlite::types::ValueRef;
+  use rusqlite::{Connection, Result};
+
+  #[derive(Debug)]
+  pub struct Db {
+      conn: Connection,
+  }
+
+  impl Db {
+      pub fn new() -> Result<Self> {
+          let conn = Connection::open("/tmp/kcats-database.db")?;
+          Ok(Db { conn })
+      }
+
+      pub fn query(&self, query: &str) -> Result<Vec<Vec<String>>> {
+          let mut stmt = self.conn.prepare(query)?;
+          let rows = stmt.query_map([], |row| {
+              let mut result_row = Vec::new();
+              for i in 0..row.as_ref().column_count() {
+                  result_row.push(row.get::<usize, String>(i)?);
+              }
+              Ok(result_row)
+          })?;
+
+          rows.collect() // Collects and returns the results
+      }
+
+      pub fn query2(&self, query: &str) -> Result<Item> {
+          let mut stmt = self.conn.prepare(query)?;
+
+          let rows = stmt.query_map([], |row| {
+              Ok(Item::from(assoc::Association::from(
+                  (0..row.as_ref().column_count()).map(|column_index| {
+                      let column_name = row.as_ref().column_name(column_index).unwrap().to_string();
+                      let column_value: ValueRef = row.get_ref_unwrap(column_index);
+                      (assoc::KeyItem::from(column_name), Item::from(column_value))
+                  }),
+              )))
+          })?;
+          Ok(rows.collect::<coll::List>().into())
+      }
+  }
+
+  impl From<ValueRef<'_>> for Item {
+      fn from(value: ValueRef) -> Self {
+          match value {
+              ValueRef::Integer(i) => Item::Int(i),
+              ValueRef::Real(f) => Item::Float(f),
+              ValueRef::Text(t) => Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(
+                  String::from_utf8_lossy(t).into_owned(),
+              ))),
+              ValueRef::Blob(b) => {
+                  Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(b.to_vec())))
+              }
+              ValueRef::Null => Item::default(),
+          }
+      }
   }
 #+end_src
 ** Issues
