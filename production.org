@@ -2607,6 +2607,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 #+begin_src rust :tangle src/axiom.rs :mkdirp yes
   use super::serialize;
   use crate::pipes;
+  use crate::pipes::db;
   use crate::types::associative as assoc;
   use crate::types::collection as coll;
   use crate::types::dictionary as dict;
@@ -2738,6 +2739,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               ("ceiling", Box::leak(Box::new(f_stack1(ceiling)))),
               ("compare", Box::leak(Box::new(f_stack2(compare)))),
               ("count", Box::leak(Box::new(f_stack1(count)))),
+              ("database", Box::leak(Box::new(f_stack1(db::db)))),
               ("dec", Box::leak(Box::new(f_stack1(dec)))),
               ("decide", Box::leak(Box::new(decide))),
               ("dip", Box::leak(Box::new(dip))),
@@ -5857,9 +5859,11 @@ Implement the =handoff= type
 #+end_src
 ***** Database
 #+begin_src rust :tangle src/pipes/db.rs :mkdirp yes
+  use crate::axiom;
   use crate::types::associative as assoc;
   use crate::types::collection as coll;
-  use crate::types::Item;
+  use crate::types::error::Error;
+  use crate::types::{self, Item};
   use rusqlite::types::ValueRef;
   use rusqlite::{Connection, Result};
 
@@ -5874,33 +5878,29 @@ Implement the =handoff= type
           Ok(Db { conn })
       }
 
-      pub fn query(&self, query: &str) -> Result<Vec<Vec<String>>> {
-          let mut stmt = self.conn.prepare(query)?;
-          let rows = stmt.query_map([], |row| {
-              let mut result_row = Vec::new();
-              for i in 0..row.as_ref().column_count() {
-                  result_row.push(row.get::<usize, String>(i)?);
-              }
-              Ok(result_row)
-          })?;
-
-          rows.collect() // Collects and returns the results
-      }
-
-      pub fn query2(&self, query: &str) -> Result<Item> {
+      pub fn query(&self, query: &str) -> axiom::ItemResult {
           let mut stmt = self.conn.prepare(query)?;
 
           let rows = stmt.query_map([], |row| {
-              Ok(Item::from(assoc::Association::from(
-                  (0..row.as_ref().column_count()).map(|column_index| {
-                      let column_name = row.as_ref().column_name(column_index).unwrap().to_string();
-                      let column_value: ValueRef = row.get_ref_unwrap(column_index);
-                      (assoc::KeyItem::from(column_name), Item::from(column_value))
-                  }),
-              )))
+              Ok(Item::from(
+                  (0..row.as_ref().column_count())
+                      .map(|column_index| {
+                          let column_name =
+                              row.as_ref().column_name(column_index).unwrap().to_string();
+                          let column_value: ValueRef = row.get_ref_unwrap(column_index);
+                          (assoc::KeyItem::from(column_name), Item::from(column_value))
+                      })
+                      .collect::<assoc::Association>(),
+              ))
           })?;
-          Ok(rows.collect::<coll::List>().into())
+          Ok(rows.collect::<Result<coll::List, _>>()?.into())
       }
+  }
+
+  pub fn db(i: Item) -> axiom::ItemResult {
+      let query: String = i.try_into()?;
+      let db = Db::new()?;
+      db.query(&query)
   }
 
   impl From<ValueRef<'_>> for Item {
@@ -5916,6 +5916,12 @@ Implement the =handoff= type
               }
               ValueRef::Null => Item::default(),
           }
+      }
+  }
+
+  impl From<rusqlite::Error> for Error {
+      fn from(error: rusqlite::Error) -> Self {
+          Error::create(types::wrap("io".into()), error.to_string().as_str(), None)
       }
   }
 #+end_src
@@ -10090,4 +10096,50 @@ Make this a multimethod
 **** DONE ismulti?
 - State "DONE"       from "TODO"       [2023-12-04 Mon 16:25]
 **** 
+*** TODO Database
+**** Simple Test
+#+begin_src kcats
+"create table Person (firstName text not null, lastName text not null, email text)" database 
+#+end_src
 
+#+RESULTS:
+#+begin_src kcats
+[]
+#+end_src
+
+#+begin_src kcats
+"insert into Person (firstName, lastName, email) values ('Skywife', 'Vactai', 'skywife@skyrod.me')" database 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[]
+#+end_src
+
+#+begin_src kcats
+  "select (firstName) from Person where lastName='Vactai'" database 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[[firstName "Skyrod"]] [[firstName "Skykid"]] [[firstName "Skywife"]]]
+#+end_src
+
+
+#+begin_src kcats
+dictionary [swap] lookup
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[definition builtin-function]
+ [examples [[[1 2 3 swap] [1 3 2]]]]
+ [spec [[[item a]
+         [item b]]
+        [[item b]
+         [item a]]]]]
+#+end_src
+**** Books db
+#+begin_src kcats
+
+#+end_src
