@@ -112,14 +112,15 @@ the location where you installed the kcats binary.
   backtrace = "0.3.61"
 
   # database
-  rusqlite = { version = "0.30", optional = true }  # Specify the version you need
+  #indradb-lib = { version = "*", features = ["rocksdb-datastore"] }
+  #rocksdb = "0.21.0"
+  cozo = { version = "0.7", features = ["storage-sqlite"] }
+  chrono = "0.4.31"
 
   [dev-dependencies]
   test-case = "2.0.0"
 
   [features]
-  db = ["rusqlite"]
-  default = ["db"]
 #+END_SRC
 *** Internal data types
 **** Basic internal types
@@ -461,6 +462,17 @@ internally, to keep track of things like the stack, program, lists etc.
       {
           Newtype(sync::Arc::new(Newtype(
               iter.into_iter().collect::<VecDeque<Item>>(),
+          )))
+      }
+  }
+
+  impl FromIterator<assoc::KeyItem> for Set {
+      fn from_iter<I>(iter: I) -> Self
+      where
+          I: IntoIterator<Item = assoc::KeyItem>,
+      {
+          Newtype(sync::Arc::new(Newtype(
+              iter.into_iter().collect::<HashSet<assoc::KeyItem>>(),
           )))
       }
   }
@@ -936,6 +948,12 @@ internally, to keep track of things like the stack, program, lists etc.
   impl From<List> for Item {
       fn from(l: List) -> Self {
           Item::Dispenser(Dispenser::Sized(Sized::List(l)))
+      }
+  }
+
+  impl From<Set> for Item {
+      fn from(l: Set) -> Self {
+          Item::Dispenser(Dispenser::Sized(Sized::Set(l)))
       }
   }
 
@@ -2739,7 +2757,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               ("ceiling", Box::leak(Box::new(f_stack1(ceiling)))),
               ("compare", Box::leak(Box::new(f_stack2(compare)))),
               ("count", Box::leak(Box::new(f_stack1(count)))),
-              ("database", Box::leak(Box::new(f_stack1(db::db)))),
+              ("database", Box::leak(Box::new(f_stack1(db::query)))),
               ("dec", Box::leak(Box::new(f_stack1(dec)))),
               ("decide", Box::leak(Box::new(decide))),
               ("dip", Box::leak(Box::new(dip))),
@@ -4865,6 +4883,7 @@ The basic pipe contracts.
 
   use futures::executor;
   pub mod channel;
+  pub mod db;
   pub mod fs;
   pub mod net;
   pub mod standard;
@@ -5864,63 +5883,121 @@ Implement the =handoff= type
   use crate::types::collection as coll;
   use crate::types::error::Error;
   use crate::types::{self, Item};
-  use rusqlite::types::ValueRef;
-  use rusqlite::{Connection, Result};
 
-  #[derive(Debug)]
-  pub struct Db {
-      conn: Connection,
+  use std::collections::VecDeque;
+  use std::sync::OnceLock;
+
+  fn db() -> &'static cozo::DbInstance {
+      static DB: OnceLock<cozo::DbInstance> = OnceLock::new();
+      DB.get_or_init(|| {
+          cozo::DbInstance::new("sqlite", "/tmp/kcats-database.db", Default::default()).unwrap()
+      })
   }
 
-  impl Db {
-      pub fn new() -> Result<Self> {
-          let conn = Connection::open("/tmp/kcats-database.db")?;
-          Ok(Db { conn })
+  pub fn query(script: Item) -> axiom::ItemResult {
+      Ok(db()
+          .run_script(
+              String::try_from(script)?.as_str(),
+              Default::default(),
+              cozo::ScriptMutability::Immutable,
+          )?
+          .into())
+  }
+
+  impl From<cozo::NamedRows> for Item {
+      fn from(results: cozo::NamedRows) -> Self {
+          let headers = results
+              .headers
+              .iter()
+              .map(|i| Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(i.clone()))))
+              .collect::<coll::List>();
+          let mut rows = results
+              .rows
+              .into_iter()
+              .map(|row| Item::from(row.into_iter().map(Item::from).collect::<coll::List>()))
+              .collect::<VecDeque<Item>>();
+          rows.push_front(Item::from(headers));
+          Item::from(coll::List::from(rows))
       }
-
-      pub fn query(&self, query: &str) -> axiom::ItemResult {
-          let mut stmt = self.conn.prepare(query)?;
-
-          let rows = stmt.query_map([], |row| {
-              Ok(Item::from(
-                  (0..row.as_ref().column_count())
-                      .map(|column_index| {
-                          let column_name =
-                              row.as_ref().column_name(column_index).unwrap().to_string();
-                          let column_value: ValueRef = row.get_ref_unwrap(column_index);
-                          (assoc::KeyItem::from(column_name), Item::from(column_value))
-                      })
-                      .collect::<assoc::Association>(),
-              ))
-          })?;
-          Ok(rows.collect::<Result<coll::List, _>>()?.into())
-      }
   }
 
-  pub fn db(i: Item) -> axiom::ItemResult {
-      let query: String = i.try_into()?;
-      let db = Db::new()?;
-      db.query(&query)
-  }
-
-  impl From<ValueRef<'_>> for Item {
-      fn from(value: ValueRef) -> Self {
-          match value {
-              ValueRef::Integer(i) => Item::Int(i),
-              ValueRef::Real(f) => Item::Float(f),
-              ValueRef::Text(t) => Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(
-                  String::from_utf8_lossy(t).into_owned(),
-              ))),
-              ValueRef::Blob(b) => {
-                  Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(b.to_vec())))
+  impl From<cozo::DataValue> for Item {
+      fn from(dv: cozo::DataValue) -> Self {
+          match dv {
+              cozo::DataValue::Null => Item::default(),
+              cozo::DataValue::Num(cozo::Num::Int(i)) => Item::Int(i),
+              cozo::DataValue::Num(cozo::Num::Float(f)) => Item::Float(f),
+              cozo::DataValue::Str(s) => {
+                  Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(s.to_string())))
               }
-              ValueRef::Null => Item::default(),
+              cozo::DataValue::Bool(b) => Item::from(b),
+              cozo::DataValue::Bytes(b) => Item::from(b),
+              cozo::DataValue::Vec(_) => todo!("Support cozodb vector values"),
+              cozo::DataValue::Bot => panic!("Bot values are supposed to be internal only"),
+              cozo::DataValue::Validity(v) => Item::from(v),
+              cozo::DataValue::Uuid(u) => Item::from(u.0.to_string()),
+              cozo::DataValue::Regex(_) => todo!("Support cozodb regex values"),
+              cozo::DataValue::List(l) => coll::List::from_iter(l.into_iter().map(Item::from)).into(),
+              cozo::DataValue::Set(s) => coll::Set::from_iter(
+                  s.into_iter()
+                      .map(|i| assoc::KeyItem::try_from(Item::from(i)).unwrap()),
+              )
+              .into(),
+              cozo::DataValue::Json(_) => todo!("Support cozodb JSON values"),
           }
       }
   }
 
-  impl From<rusqlite::Error> for Error {
-      fn from(error: rusqlite::Error) -> Self {
+  impl From<cozo::Validity> for Item {
+      fn from(v: cozo::Validity) -> Self {
+          coll::List::from_iter([Item::from(v.timestamp.0 .0), Item::from(v.is_assert.0)]).into()
+      }
+  }
+
+  // impl Db {
+  //     pub fn query(&self, query: &str) -> axiom::ItemResult {
+  //         let mut stmt = self.conn.prepare(query)?;
+
+  //         let rows = stmt.query_map([], |row| {
+  //             Ok(Item::from(
+  //                 (0..row.as_ref().column_count())
+  //                     .map(|column_index| {
+  //                         let column_name =
+  //                             row.as_ref().column_name(column_index).unwrap().to_string();
+  //                         let column_value: ValueRef = row.get_ref_unwrap(column_index);
+  //                         (assoc::KeyItem::from(column_name), Item::from(column_value))
+  //                     })
+  //                     .collect::<assoc::Association>(),
+  //             ))
+  //         })?;
+  //         Ok(rows.collect::<Result<coll::List, _>>()?.into())
+  //     }
+  // }
+
+  // pub fn db(i: Item) -> axiom::ItemResult {
+  //     let query: String = i.try_into()?;
+  //     let db = Db::new()?;
+  //     db.query(&query)
+  // }
+
+  // impl From<ValueRef<'_>> for Item {
+  //     fn from(value: ValueRef) -> Self {
+  //         match value {
+  //             ValueRef::Integer(i) => Item::Int(i),
+  //             ValueRef::Real(f) => Item::Float(f),
+  //             ValueRef::Text(t) => Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(
+  //                 String::from_utf8_lossy(t).into_owned(),
+  //             ))),
+  //             ValueRef::Blob(b) => {
+  //                 Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(b.to_vec())))
+  //             }
+  //             ValueRef::Null => Item::default(),
+  //         }
+  //     }
+  // }
+
+  impl From<cozo::Error> for Error {
+      fn from(error: cozo::Error) -> Self {
           Error::create(types::wrap("io".into()), error.to_string().as_str(), None)
       }
   }
@@ -10294,3 +10371,766 @@ CREATE INDEX idx_valuestring ON EAV (ValueString);
   [Attribute "Year"]
   [ValueInteger 1949]]]
 #+end_src
+**** Attribute database using CozoDB
+The idea here is to ignore identity in the database and make that the
+responsibility of the client. The database only links attributes, and
+has nothing to say about whether a given entity is the "same" entity
+as another. It only says "something has both the color brown and the
+height 1.5m". What attributes are sufficient to establish identity is
+not part of the database. It's just a graph connecting attribute/value
+pairs.
+*****  First experiments
+#+begin_src fundamental
+  ?[a_attr, a_val, b_attr, b_val] <-
+  [
+    ["author", "George Orwell", "title", "1984"],
+    ["author", "George Orwell", "title", "Animal Farm"],
+    ["author", "George Orwell", "genre", "dystopia"],
+    ["genre", "dystopia", "title", "1984"],
+    ["created", "1949", "title", "1984"],
+    ["format", "book", "title", "1984"],
+    ["language", "english", "title", "1984"],
+    ["name", "George Orwell", "created", "1905"],
+    ["name", "George Orwell", "sex", "male"]
+  ]
+
+  :replace also {a_attr, a_val, b_attr, b_val}
+#+end_src
+
+#+begin_src restclient
+  POST http://127.0.0.1:3000/text-query
+  Content-Type: application/json
+
+  {"script": ":create attributes { a_attr: String, a_val: Any, b_attr: String, b_val: Any}",
+   "params": {}}
+#+end_src
+
+#+RESULTS:
+#+BEGIN_SRC js
+{
+  "headers": [
+    "status"
+  ],
+  "next": null,
+  "ok": true,
+  "rows": [
+    [
+      "OK"
+    ]
+  ],
+  "took": 0.016436112
+}
+// POST http://127.0.0.1:3000/text-query
+// HTTP/1.1 200 OK
+// content-type: application/json
+// content-length: 79
+// access-control-allow-origin: *
+// vary: origin
+// vary: access-control-request-method
+// vary: access-control-request-headers
+// date: Tue, 19 Dec 2023 23:25:15 GMT
+// Request duration: 0.018199s
+#+END_SRC
+
+#+begin_src restclient
+  POST http://127.0.0.1:3000/text-query
+  Content-Type: application/json
+
+  {"script": "?[a_attr, a_val, b_attr, b_val] <- [['author', 'George Orwell', 'title', '1984'], ['author', 'George Orwell', 'title', 'Animal Farm'], ['author', 'George Orwell', 'genre', 'dystopia'], ['genre', 'dystopia', 'title', '1984'], ['created', '1949', 'title', '1984'], ['format', 'book', 'title', '1984'], ['language', 'english', 'title', '1984'], ['name', 'George Orwell', 'created', '1905'], ['name', 'George Orwell', 'sex', 'male']] :put attributes",
+     "params": {}}
+#+end_src
+
+#+RESULTS:
+#+BEGIN_SRC js
+{
+  "headers": [
+    "status"
+  ],
+  "next": null,
+  "ok": true,
+  "rows": [
+    [
+      "OK"
+    ]
+  ],
+  "took": 0.011967695
+}
+// POST http://127.0.0.1:3000/text-query
+// HTTP/1.1 200 OK
+// content-type: application/json
+// vary: origin
+// vary: access-control-request-method
+// vary: access-control-request-headers
+// access-control-allow-origin: *
+// transfer-encoding: chunked
+// date: Tue, 19 Dec 2023 23:39:51 GMT
+// Request duration: 0.064371s
+#+END_SRC
+
+"When was the author of 1984 born?"
+#+begin_src restclient
+  POST http://127.0.0.1:3000/text-query
+  Content-Type: application/json
+
+  {"script": "linked[a, v, oa, ov] := *attributes[a, v, oa, ov] or *attributes[oa, ov, a, v]\n?[born] := linked['title', '1984', 'author', author], linked['created', born, 'name', author]", 
+   "params": {}}
+#+end_src
+
+#+RESULTS:
+#+BEGIN_SRC js
+{
+  "headers": [
+    "born"
+  ],
+  "next": null,
+  "ok": true,
+  "rows": [
+    [
+      "1905"
+    ]
+  ],
+  "took": 0.001707655
+}
+// POST http://127.0.0.1:3000/text-query
+// HTTP/1.1 200 OK
+// content-type: application/json
+// content-length: 79
+// access-control-allow-origin: *
+// vary: origin
+// vary: access-control-request-method
+// vary: access-control-request-headers
+// date: Tue, 19 Dec 2023 23:56:27 GMT
+// Request duration: 0.002975s
+#+END_SRC
+
+"What books did the author of 1984 write?"
+#+begin_src restclient
+  POST http://127.0.0.1:3000/text-query
+  Content-Type: application/json
+
+  {"script": "linked[a, v, oa, ov] := *attributes[a, v, oa, ov] or *attributes[oa, ov, a, v]\n?[title] := linked['title', '1984', 'author', author], linked['title', title, 'author', author]", 
+   "params": {}}
+#+end_src
+
+#+RESULTS:
+#+BEGIN_SRC js
+{
+  "headers": [
+    "title"
+  ],
+  "next": null,
+  "ok": true,
+  "rows": [
+    [
+      "1984"
+    ],
+    [
+      "Animal Farm"
+    ]
+  ],
+  "took": 0.001771184
+}
+// POST http://127.0.0.1:3000/text-query
+// HTTP/1.1 200 OK
+// content-type: application/json
+// content-length: 96
+// access-control-allow-origin: *
+// vary: origin
+// vary: access-control-request-method
+// vary: access-control-request-headers
+// date: Wed, 20 Dec 2023 00:05:26 GMT
+// Request duration: 0.002879s
+#+END_SRC
+
+
+
+How to write that query in kcats format?
+#+begin_src kcats
+  [[title "1984" author a?]
+   [created c? name a?]
+   [c?]]
+#+end_src
+
+Everything about Orwell
+#+begin_src restclient
+  POST http://127.0.0.1:3000/text-query
+  Content-Type: application/json
+
+  {"script": "linked[a, v, oa, ov] := *attributes[a, v, oa, ov] or *attributes[oa, ov, a, v]\n?[a1, v, a2] := linked[a1, v, a2, 'George Orwell'] ", 
+   "params": {}}
+#+end_src
+
+#+RESULTS:
+#+BEGIN_SRC js
+{
+  "headers": [
+    "a1",
+    "v",
+    "a2"
+  ],
+  "next": null,
+  "ok": true,
+  "rows": [
+    [
+      "created",
+      "1905",
+      "name"
+    ],
+    [
+      "genre",
+      "dystopia",
+      "author"
+    ],
+    [
+      "sex",
+      "male",
+      "name"
+    ],
+    [
+      "title",
+      "1984",
+      "author"
+    ],
+    [
+      "title",
+      "Animal Farm",
+      "author"
+    ]
+  ],
+  "took": 0.00130435
+}
+// POST http://127.0.0.1:3000/text-query
+// HTTP/1.1 200 OK
+// content-type: application/json
+// content-length: 213
+// access-control-allow-origin: *
+// vary: origin
+// vary: access-control-request-method
+// vary: access-control-request-headers
+// date: Wed, 20 Dec 2023 00:14:07 GMT
+// Request duration: 0.002445s
+#+END_SRC
+
+***** Using org-mode eval
+Now we have an org-mode evaluator!
+#+begin_src cozodb :results value table
+{:create attributes {a_attr: String, b_attr: String, a_val: Any, b_val: Any}}
+#+end_src
+
+#+RESULTS:
+| OK |
+
+#+begin_src cozodb :results value table
+  %import /home/v/workspace/kcats/countries-cozo.json
+#+end_src
+
+#+RESULTS:
+| [31mparser::pest[0m |
+
+
+#+begin_src cozodb
+::index create attributes:rev {b_attr, a_attr, b_val, a_val}
+#+end_src
+
+#+begin_src cozodb :results value table
+  linked[a, v, oa, ov] := *attributes[a, v, oa, ov] or *attributes[oa, ov, a, v]
+  ?[title] := linked['title', '1984', 'author', author], linked['title', title, 'author', author]
+#+end_src
+
+#+RESULTS:
+
+What movies has robert de niro been in?
+#+begin_src cozodb
+linked[a, v, oa, ov] := *attributes[a, v, oa, ov] or *attributes[oa, ov, a, v]
+?[title] := linked['title', title, 'cast', cast], actor in cast, actor == 'Robert De Niro'
+#+end_src
+
+#+RESULTS:
+| GoodFellas                    |
+| Jackie Brown                  |
+| Mean Streets                  |
+| Midnight Run                  |
+| Once Upon a Time in America   |
+| Raging Bull                   |
+| Righteous Kill                |
+| Silver Linings Playbook       |
+| Stardust                      |
+| The Irishman                  |
+| The Irishman: In Conversation |
+| The Score                     |
+
+
+
+What directors has robert de niro worked with?
+#+begin_src cozodb
+  linked[a, oa, v, ov] := *attributes[a, oa, v, ov] or *attributes[oa, a, ov, v]
+  ?[director] := linked['title', 'cast', title, cast],
+                 linked['title', 'director', title, director], 
+                 actor in cast, actor = 'Robert De Niro' 
+#+end_src
+
+#+RESULTS:
+|                   |
+| David O. Russell  |
+| Frank Oz          |
+| Jon Avnet         |
+| Martin Brest      |
+| Martin Scorsese   |
+| Matthew Vaughn    |
+| Quentin Tarantino |
+| Sergio Leone      |
+
+
+What movies had both Adam Sandler and David Spade?
+#+begin_src cozodb
+  linked[a, v, oa, ov] := *attributes[a, oa, v,  ov] or *attributes:rev[a, oa, v, ov]
+  ?[title] := linked['title', title, 'cast', cast],
+              actor1 in cast,
+              actor2 in cast,
+              actor1 == 'Adam Sandler', actor2 = 'David Spade'
+#+end_src
+
+#+RESULTS:
+| Grown Ups                             |
+| Hotel Transylvania 3: Summer Vacation |
+| The Do-Over                           |
+| The Ridiculous 6                      |
+
+Adam Sandler's 5 most recent movies
+#+begin_src cozodb
+  linked[a, v, oa, ov] := *attributes[a, oa, v,  ov] or *attributes:rev[a, oa, v, ov]
+   ?[title, year] := linked['title', title, 'cast', cast],
+                     linked['release_year', year, 'title', title],
+                     actor in cast, actor == 'Adam Sandler',
+   :limit 5
+   :order -year
+#+end_src
+
+#+RESULTS:
+| Hubie Halloween                       | 2020 |
+| Murder Mystery                        | 2019 |
+| Uncut Gems                            | 2019 |
+| ADAM SANDLER 100% FRESH               | 2018 |
+| Hotel Transylvania 3: Summer Vacation | 2018 |
+
+What actors have been in the most movies with Sandler
+#+begin_src cozodb
+  ?[count(title), actor2] := linked['title', title, 'cast', cast],
+                    target = 'Adam Sandler',
+                    actor1 in cast, actor1 == target,
+                    actor2 in cast, actor2 != target
+  :limit 10
+  :order -count(title)
+#+end_src
+
+#+RESULTS:
+| 7 | Rob Schneider     |
+| 6 | Allen Covert      |
+| 5 | Nick Swardson     |
+| 5 | Steve Buscemi     |
+| 4 | David Spade       |
+| 4 | Kevin James       |
+| 3 | Blake Clark       |
+| 3 | Colin Quinn       |
+| 3 | John Turturro     |
+| 3 | Jonathan Loughran |
+
+
+#+begin_src cozodb
+  linked[a, v, oa, ov] := *attributes[a, oa, v,  ov] or *attributes:rev[a, oa, v, ov]
+  ?[attr, val] := linked['title', 'Murder Mystery', attr, val]
+#+end_src
+
+#+RESULTS:
+| cast         | [Adam Sandler Jennifer Aniston Luke Evans Gemma Arterton Adeel Akhtar Luis Gerardo Méndez Dany Boon Terence Stamp]                               |
+| country      | United States                                                                                                                                    |
+| description  | On a long-awaited trip to Europe, a New York City cop and his hairdresser wife scramble to solve a baffling murder aboard a billionaire's yacht. |
+| director     | Kyle Newacheck                                                                                                                                   |
+| duration     | 98                                                                                                                                               |
+| rating       | PG-13                                                                                                                                            |
+| release_year | 2019                                                                                                                                             |
+| type         | Movie                                                                                                                                            |
+
+10 longest movie titles
+#+begin_src cozodb
+  linked[a, v, oa, ov] := *attributes[a, oa, v,  ov] or *attributes:rev[a, oa, v, ov]
+  ?[title, ct] := linked['title', title, _, _], ct = length(title)
+  :limit 10
+  :order -ct
+#+end_src 
+
+#+RESULTS:
+| Jim & Andy: The Great Beyond - Featuring a Very Special, Contractually Obligated Mention of Tony Clifton | 104 |
+| Ken Burns Presents: College Behind Bars: A Film by Lynn Novick and Produced by Sarah Botstein  |  93 |
+| Mike Birbiglia: What I Should Have Said Was Nothing: Tales from My Secret Public Journal       |  88 |
+| The Power of Grayskull: The Definitive History of He-Man and the Masters of the Universe       |  88 |
+| Steve Martin and Martin Short: An Evening You Will Forget for the Rest of Your Life            |  83 |
+| Cultivating the Seas: History and Future of the Full-Cycle Cultured Kindai Tuna                |  79 |
+| Power Rangers Samurai: Christmas Together, Friends Forever (Christmas Special)                 |  78 |
+| Willy and the Guardians of the Lake: Tales from the Lakeside Winter Adventure                  |  77 |
+| Ya no estoy aquí: Una conversación entre Guillermo del Toro y Alfonso Cuarón                   |  76 |
+| The Road to El Camino: Behind the Scenes of El Camino: A Breaking Bad Movie                    |  75 |
+
+#+begin_src cozodb
+  linked[a, oa, v,  ov] := *attributes[a, oa, v, ov] or *attributes[oa, a, v, ov]
+  ?[count(title)] := linked['title', title, _, _], 
+#+end_src 
+
+#+RESULTS:
+| 70456 |
+
+#+begin_src cozodb
+  linked[a, v, oa, ov] := *attributes[a, oa, v,  ov] or *attributes:rev[a, oa, v, ov]
+  ?[title] := linked['director', 'Steven Spielberg', 'title', title ], 
+#+end_src 
+
+#+RESULTS:
+| Catch Me If You Can                                |
+| Indiana Jones and the Kingdom of the Crystal Skull |
+| Indiana Jones and the Last Crusade                 |
+| Indiana Jones and the Raiders of the Lost Ark      |
+| Indiana Jones and the Temple of Doom               |
+| Jaws                                               |
+| Lincoln                                            |
+| Schindler's List                                   |
+| The Adventures of Tintin                           |
+| The BFG                                            |
+| War Horse                                          |
+
+#+begin_src cozodb
+  ::explain {
+            linked[a, v, oa, ov] := *attributes[a, v, oa, ov]
+  ?[title] := linked['title', title, 'director', 'Steven Spielberg'] }
+#+end_src 
+
+#+RESULTS:
+| 0 | 0 | ?      | 3         |     load_mem | ?                  | S.0.0                              | :null                             | []                 | [*1 *2 *3]          |            |
+| 0 | 0 | ?      | 2         |     load_mem | linked             | Mbfbb                              | :null                             | []                 | [**0 title **1 **2] |            |
+| 0 | 0 | ?      | 1         | mem_mat_join | :null              | ((*1 . **0) (*2 . **1) (*3 . **2)) | :null                             | [title]            |                     |            |
+| 0 | 0 | ?      | 0         |          out | :null              | :null                              | :null                             | [title]            |                     |            |
+| 0 | 1 | linked | Mbfbb     |            4 | load_mem           | linked                             | S.0.0bfbb                         | :null              | []                  | [a oa ov]  |
+| 0 | 1 | linked | Mbfbb     |            3 | load_stored        | :attributes                        | :null                             | []                 | [**0 v **1 **2]     |            |
+| 0 | 1 | linked | Mbfbb     |            2 | stored_mat_join    | :null                              | ((a . **0) (oa . **1) (ov . **2)) | :null              | [a oa ov v]         |            |
+| 0 | 1 | linked | Mbfbb     |            1 | reorder            | :null                              | :null                             | :null              | [a v oa ov]         |            |
+| 0 | 1 | linked | Mbfbb     |            0 | out                | :null                              | :null                             | :null              | [a v oa ov]         |            |
+| 0 | 2 | linked | Mbfbb     |            4 | load_mem           | linked                             | S.1.0bfbb                         | :null              | []                  | [a oa ov]  |
+| 0 | 2 | linked | Mbfbb     |            3 | load_stored        | :attributes                        | :null                             | []                 | [**0 **1 **2 v]     |            |
+| 0 | 2 | linked | Mbfbb     |            2 | stored_prefix_join | :null                              | ((a . **2) (oa . **0) (ov . **1)) | :null              | [a oa ov v]         |            |
+| 0 | 2 | linked | Mbfbb     |            1 | reorder            | :null                              | :null                             | :null              | [a v oa ov]         |            |
+| 0 | 2 | linked | Mbfbb     |            0 | out                | :null                              | :null                             | :null              | [a v oa ov]         |            |
+| 0 | 3 | linked | Ibfbb     |            1 | load_mem           | ?                                  | S.0.0                             | :null              | []                  | [*1 *2 *3] |
+| 0 | 3 | linked | Ibfbb     |            0 | out                | :null                              | :null                             | :null              | [*1 *2 *3]          |            |
+| 0 | 4 | ?      | S.0.0     |            3 | unify              | *1                                 | :null                             | "title"            | [*1]                |            |
+| 0 | 4 | ?      | S.0.0     |            2 | unify              | *2                                 | :null                             | "director"         | [*1 *2]             |            |
+| 0 | 4 | ?      | S.0.0     |            1 | unify              | *3                                 | :null                             | "Steven Spielberg" | [*1 *2 *3]          |            |
+| 0 | 4 | ?      | S.0.0     |            0 | out                | :null                              | :null                             | :null              | [*1 *2 *3]          |            |
+| 0 | 5 | linked | S.0.0bfbb |            1 | load_mem           | linked                             | Ibfbb                             | :null              | []                  | [a oa ov]  |
+| 0 | 5 | linked | S.0.0bfbb |            0 | out                | :null                              | :null                             | :null              | [a oa ov]           |            |
+| 0 | 6 | linked | S.1.0bfbb |            1 | load_mem           | linked                             | Ibfbb                             | :null              | []                  | [a oa ov]  |
+| 0 | 6 | linked | S.1.0bfbb |            0 | out                | :null                              | :null                             | :null              | [a oa ov]           |            |
+
+#+begin_src cozodb
+  linked[a, v, oa, ov] := *attributes[a, oa, v,  ov] or *attributes:rev[a, oa, v, ov]
+  ?[c] := linked['timezone', 'America/New_York', 'country', c]
+#+end_src
+
+#+RESULTS:
+| United States |
+
+
+#+begin_src cozodb
+  linked[a, v, oa, ov] := *attributes[a, oa, v,  ov] or *attributes:rev[a, oa, v, ov]
+  ?[a, v, distance] := linked['coordinates', c, a, v], distance = l2_dist(vec([35.99403, -78.89862], 'F32'), c)
+  :limit 10
+  :order distance
+#+end_src
+
+#+RESULTS:
+#+begin_example
+[31meval::throw[0m
+
+  [31m×[0m Evaluation of expression failed
+   ╭─[1:1]
+ [2m1[0m │ linked[a, v, oa, ov] := *attributes[a, oa, v,  ov] or *attributes:rev[a, oa, v, ov]
+ [2m2[0m │ ?[a, v, distance] := linked['coordinates', c, a, v], distance = l2_dist(vec([35.99403, -78.89862], 'F32'), c)
+   · [35;1m                                                                ─────────────────────────────────────────────[0m
+ [2m3[0m │ :limit 10
+   ╰────
+[36m  help: [0m'l2_dist' requires two vectors of the same type
+#+end_example
+
+Furthest cities (the distance formula isn't quite right but
+demonstrates the concept). Disambiguate the city of Durham from other
+durhams, using the state.
+#+begin_src cozodb
+  linked[a, v, oa, ov] := *attributes[a, oa, v,  ov] or *attributes:rev[a, oa, v, ov]
+  ?[v, s, country, distance] := linked['coordinates', c, 'state', 'North Carolina'], 
+        linked['coordinates', c, 'name', 'Durham'],
+        linked['coordinates', c2, 'name', v], distance = l2_dist(vec(c), vec(c2)),
+        linked['coordinates', c2, 'state', s],
+        linked['name', s, 'country', country]
+        :limit 10
+        :order -distance
+#+end_src
+
+#+RESULTS:
+| Gisborne    | Gisborne District    | New Zealand | 71571.2578125 |
+| Wairoa      | Hawke's Bay Region   | New Zealand |       71301.0 |
+| Napier      | Hawke's Bay Region   | New Zealand |   71137.46875 |
+| Hastings    | Hawke's Bay Region   | New Zealand |   71127.15625 |
+| Taradale    | Hawke's Bay Region   | New Zealand | 71111.7421875 |
+| Opotiki     | Bay of Plenty Region | New Zealand |    71107.5625 |
+| Castlepoint | Wellington Region    | New Zealand |       70996.5 |
+| Whakatane   | Bay of Plenty Region | New Zealand | 70945.6328125 |
+| Murupara    | Bay of Plenty Region | New Zealand |  70875.046875 |
+| Edgecumbe   | Bay of Plenty Region | New Zealand | 70871.4765625 |
+
+#+begin_src cozodb
+  linked[a, v, oa, ov] := *attributes[a, oa, v,  ov] or *attributes:rev[a, oa, v, ov]
+  ?[a, v] := linked['coordinates', c, 'country', 'United States'], linked['coordinates', c, a, v]
+#+end_src
+
+#+RESULTS:
+| country    | Liberia                              |
+| country    | United States                        |
+| name       | Alabama                              |
+| name       | Alaska                               |
+| name       | American Samoa                       |
+| name       | Arizona                              |
+| name       | Arkansas                             |
+| name       | Baker Island                         |
+| name       | California                           |
+| name       | Colorado                             |
+| name       | Connecticut                          |
+| name       | Delaware                             |
+| name       | District of Columbia                 |
+| name       | Florida                              |
+| name       | Georgia                              |
+| name       | Guam                                 |
+| name       | Hawaii                               |
+| name       | Howland Island                       |
+| name       | Idaho                                |
+| name       | Illinois                             |
+| name       | Indiana                              |
+| name       | Iowa                                 |
+| name       | Jarvis Island                        |
+| name       | Johnston Atoll                       |
+| name       | Kansas                               |
+| name       | Kentucky                             |
+| name       | Kingman Reef                         |
+| name       | Louisiana                            |
+| name       | Maine                                |
+| name       | Maryland                             |
+| name       | Maryland County                      |
+| name       | Massachusetts                        |
+| name       | Michigan                             |
+| name       | Midway Atoll                         |
+| name       | Minnesota                            |
+| name       | Mississippi                          |
+| name       | Missouri                             |
+| name       | Montana                              |
+| name       | Navassa Island                       |
+| name       | Nebraska                             |
+| name       | Nevada                               |
+| name       | New Hampshire                        |
+| name       | New Jersey                           |
+| name       | New Mexico                           |
+| name       | New York                             |
+| name       | North Carolina                       |
+| name       | North Dakota                         |
+| name       | Northern Mariana Islands             |
+| name       | Ohio                                 |
+| name       | Oklahoma                             |
+| name       | Oregon                               |
+| name       | Palmyra Atoll                        |
+| name       | Pennsylvania                         |
+| name       | Puerto Rico                          |
+| name       | Rhode Island                         |
+| name       | South Carolina                       |
+| name       | South Dakota                         |
+| name       | Tennessee                            |
+| name       | Texas                                |
+| name       | United States Minor Outlying Islands |
+| name       | United States Virgin Islands         |
+| name       | Utah                                 |
+| name       | Vermont                              |
+| name       | Virginia                             |
+| name       | Wake Island                          |
+| name       | Washington                           |
+| name       | West Virginia                        |
+| name       | Wisconsin                            |
+| name       | Wyoming                              |
+| state_code | AK                                   |
+| state_code | AL                                   |
+| state_code | AR                                   |
+| state_code | AS                                   |
+| state_code | AZ                                   |
+| state_code | CA                                   |
+| state_code | CO                                   |
+| state_code | CT                                   |
+| state_code | DC                                   |
+| state_code | DE                                   |
+| state_code | FL                                   |
+| state_code | GA                                   |
+| state_code | GU                                   |
+| state_code | HI                                   |
+| state_code | IA                                   |
+| state_code | ID                                   |
+| state_code | IL                                   |
+| state_code | IN                                   |
+| state_code | KS                                   |
+| state_code | KY                                   |
+| state_code | LA                                   |
+| state_code | MA                                   |
+| state_code | MD                                   |
+| state_code | ME                                   |
+| state_code | MI                                   |
+| state_code | MN                                   |
+| state_code | MO                                   |
+| state_code | MP                                   |
+| state_code | MS                                   |
+| state_code | MT                                   |
+| state_code | MY                                   |
+| state_code | NC                                   |
+| state_code | ND                                   |
+| state_code | NE                                   |
+| state_code | NH                                   |
+| state_code | NJ                                   |
+| state_code | NM                                   |
+| state_code | NV                                   |
+| state_code | NY                                   |
+| state_code | OH                                   |
+| state_code | OK                                   |
+| state_code | OR                                   |
+| state_code | PA                                   |
+| state_code | PR                                   |
+| state_code | RI                                   |
+| state_code | SC                                   |
+| state_code | SD                                   |
+| state_code | TN                                   |
+| state_code | TX                                   |
+| state_code | UM                                   |
+| state_code | UM-67                                |
+| state_code | UM-71                                |
+| state_code | UM-76                                |
+| state_code | UM-79                                |
+| state_code | UM-81                                |
+| state_code | UM-84                                |
+| state_code | UM-86                                |
+| state_code | UM-89                                |
+| state_code | UM-95                                |
+| state_code | UT                                   |
+| state_code | VA                                   |
+| state_code | VI                                   |
+| state_code | VT                                   |
+| state_code | WA                                   |
+| state_code | WI                                   |
+| state_code | WV                                   |
+| state_code | WY                                   |
+
+***** Using an artificial entity column
+#+begin_src cozodb :results value table
+{:create eav {entity: Uuid, attribute: String, value: Any}}
+#+end_src
+
+What type should =entity= be? Some keys are uuids that link to pk attrs,
+others are just the entity id. Maybe everything should use uuid? 
+***** Add source and time columns
+#+begin_src cozodb :results value table
+  {:create trust {source: Bytes,
+                  target: Bytes,
+                  with: Any,
+                  ts: Validity default 'ASSERT'
+                  =>
+                  score: Int,
+                  }}
+#+end_src
+
+#+RESULTS:
+| [31mparser::pest[0m |
+
+
+#+begin_src cozodb
+::remove trust
+#+end_src
+
+#+RESULTS:
+: [31mquery::relation_not_found[0m
+: 
+:   [31m×[0m Cannot find requested stored relation 'trusted_attributes'
+
+#+begin_src cozodb 
+  ?[source, target, with, ts, score] <-
+  [
+   ["bWU=", "QWxpY2U=", 'introduce', 'ASSERT', 11]       
+  ]
+  :put trust {source, target, with, ts, score}
+#+end_src
+
+#+RESULTS:
+: [31meval::invalid_validity[0m
+: 
+:   [31m×[0m when executing against relation 'trust'
+: [31m  ├─▶ [0mwhen processing tuple ["bWU=", "QWxpY2U=", "introduce", [1703279106.2922018, true], 10]
+: [31m  ╰─▶ [0m[1703279106.2922018, true] cannot be coerced into validity
+
+#+begin_src cozodb
+::relations
+#+end_src
+
+#+RESULTS:
+| attributes     | 4 | normal | 4 | 0 | 0 | 0 | 0 |   |
+| attributes:rev | 4 | index  | 4 | 0 | 0 | 0 | 0 |   |
+| trust          | 5 | normal | 4 | 1 | 0 | 0 | 0 |   |
+
+#+begin_src cozodb
+?[source, target, with, score] := *trust[source, target, with, ts, score @ 'NOW']
+#+end_src
+
+#+RESULTS:
+| bWU= | QWxpY2U= | introduce | 11 |
+
+***** Questions
+What about when we insert "name=Alice, height=1.2", and then later
+"name=Alice, height=1.3"?
+
+I think part of the problem is we can't just arbitrarily pair
+attributes, one of them has to be the "key".
+
+For example, let's say we don't do that and we have:
+[name Alice, height 1.6]
+[height 1.6, weight 50]
+
+In this case the "link" is height. But we don't want to link to
+anything that's 1.6m high.
+
+The first attribute has to be something that identifies the
+entity. But as we know, not every entity has a single attribute that
+uniquely identifies it. eg Person. The name isn't unique, but let's
+say name+birthday is unique.
+
+[name Alice, height 1.6]
+[name Alice, bday 1/1]
+[name Alice, bday 6/4]
+[name Alice, height 1.3]
+
+What we need is a unique id to attach to her attributes:
+
+[id 1, name Alice]
+[id 1, bday 1/1]
+;; now we can hang other attrs off the id
+[id 1, height 1.6]
+
+One question is, does every entity have some unique attribute? It may,
+but either we may not know it or it's really a combination of more
+than one.
+
+So there's several solutions,
++ Make the first attr a compound of multiple actual attrs, and make
+  the individual ones linked from there.
++ Hash the multiple attrs
+
+ If the attrs are a tuple, in theory we can fetch the record directly
+  ,if the user knows how the key is built. THat's better than a
+  generated id which the user is guaranteed not to know. So given
+  this, let's remodel.
