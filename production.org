@@ -425,8 +425,11 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   mod serde {
-      use super::{Item, Word};
+      use super::Item;
+      use crate::types::associative as assoc;
+      use crate::types::collection as coll;
       use serde::de::{self, Deserialize, Deserializer, Visitor};
+      use std::collections::HashMap;
       use std::fmt;
 
       struct ItemVisitor;
@@ -450,6 +453,48 @@ internally, to keep track of things like the stack, program, lists etc.
               E: de::Error,
           {
               Ok(Item::Float(value))
+          }
+
+          fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+          where
+              E: de::Error,
+          {
+              Ok(Item::Dispenser(coll::Dispenser::Sized(
+                  coll::Sized::String(v),
+              )))
+          }
+
+          fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E>
+          where
+              E: de::Error,
+          {
+              Ok(Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(
+                  v,
+              ))))
+          }
+
+          fn visit_map<A>(self, mut ma: A) -> Result<Self::Value, A::Error>
+          where
+              A: de::MapAccess<'de>,
+          {
+              let mut map = HashMap::new();
+              while let Some((key, value)) = ma.next_entry::<assoc::KeyItem, Item>()? {
+                  map.insert(key, value);
+              }
+              Ok(Item::Dispenser(coll::Dispenser::Sized(
+                  coll::Sized::Associative(assoc::Associative::Assoc(map.into())),
+              )))
+          }
+
+          fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+          where
+              A: de::SeqAccess<'de>,
+          {
+              let mut items = Vec::new();
+              while let Some(item) = seq.next_element::<Item>()? {
+                  items.push(item);
+              }
+              Ok(coll::List::from(items).into())
           }
       }
 
@@ -1075,8 +1120,7 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   mod serde {
-      use super::{List, Sized};
-      use crate::types::associative::serde::AssociativeVisitor;
+      use super::Sized;
       use serde::de::{self, Deserialize, Deserializer, Visitor};
       use std::fmt;
 
@@ -1095,33 +1139,6 @@ internally, to keep track of things like the stack, program, lists etc.
           {
               // Construct Sized based on a string
               Ok(Sized::String(value))
-          }
-
-          fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E>
-          where
-              E: de::Error,
-          {
-              Ok(Sized::Bytes(v))
-          }
-
-          fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
-          where
-              A: de::MapAccess<'de>,
-          {
-              // Directly use AssociativeVisitor to handle the map
-              let associative = AssociativeVisitor.visit_map(map)?;
-              Ok(Sized::Associative(associative))
-          }
-
-          fn visit_seq<A>(self, seq: A) -> Result<Self::Value, A::Error>
-          where
-              A: de::SeqAccess<'de>,
-          {
-              let mut items = Vec::new();
-              while let Some(item) = seq.next_element()? {
-                  items.push(item);
-              }
-              Ok(List::from(items))
           }
       }
 
@@ -1426,7 +1443,7 @@ internally, to keep track of things like the stack, program, lists etc.
                       }),
                   )
               }
-              _ => todo!("taking from assoc Requires insert/remove impl")
+              _ => todo!("taking from assoc Requires insert/remove impl"),
           }
       }
   }
@@ -1492,6 +1509,12 @@ internally, to keep track of things like the stack, program, lists etc.
                   .map(|i| Entry::try_from(i.clone()))
                   .collect::<Result<HashMap<KeyItem, Item>, Error>>()?,
           )))
+      }
+  }
+
+  impl From<HashMap<KeyItem, Item>> for Association {
+      fn from(h: HashMap<KeyItem, Item>) -> Self {
+          coll::Arc::wrap(Newtype(h))
       }
   }
 
@@ -1576,6 +1599,63 @@ internally, to keep track of things like the stack, program, lists etc.
   impl From<Associative> for Item {
       fn from(a: Associative) -> Item {
           coll::Sized::Associative(a).into()
+      }
+  }
+
+  mod serde {
+      use super::{KeyItem, KeyList};
+      use serde::de::{self, Deserialize, Deserializer, Visitor};
+      use std::fmt;
+
+      struct KeyItemVisitor;
+
+      impl<'de> Visitor<'de> for KeyItemVisitor {
+          type Value = KeyItem;
+
+          fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+              formatter.write_str("expected a specific representation for Item")
+          }
+
+          fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+          where
+              E: de::Error,
+          {
+              Ok(KeyItem::Int(value))
+          }
+
+          fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+          where
+              E: de::Error,
+          {
+              Ok(KeyItem::String(v))
+          }
+
+          fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E>
+          where
+              E: de::Error,
+          {
+              Ok(KeyItem::Bytes(v))
+          }
+
+          fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+          where
+              A: de::SeqAccess<'de>,
+          {
+              let mut items: Vec<KeyItem> = Vec::new();
+              while let Some(item) = seq.next_element::<KeyItem>()? {
+                  items.push(item);
+              }
+              Ok(KeyItem::List(KeyList::from_iter(items.into_iter())))
+          }
+      }
+
+      impl<'de> Deserialize<'de> for KeyItem {
+          fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+          where
+              D: Deserializer<'de>,
+          {
+              deserializer.deserialize_any(KeyItemVisitor)
+          }
       }
   }
 #+end_src
@@ -2743,10 +2823,12 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   use crate::types::environment::Environment;
   use crate::types::error::Error;
   use crate::types::*;
+  use dynfmt::Format;
   use futures::future::FutureExt;
   use num_integer::Roots;
   use std::collections::HashMap;
   use std::collections::VecDeque;
+  use std::ops::Deref;
   //use std::future::Future;
   use std::mem;
   use std::ops::Range;
