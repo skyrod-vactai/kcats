@@ -86,6 +86,7 @@ the location where you installed the kcats binary.
   # serialization
   edn-format = "3.3.0"
   serde = "1"
+  serde_json = "1"
 
   #edn-format = { path = "../edn-format" }
   base64 = "0.13.0"
@@ -428,7 +429,10 @@ internally, to keep track of things like the stack, program, lists etc.
       use super::Item;
       use crate::types::associative as assoc;
       use crate::types::collection as coll;
+      use crate::types::{wrap, Error};
       use serde::de::{self, Deserialize, Deserializer, Visitor};
+      use serde::ser::{Serialize, Serializer};
+      use serde_json;
       use std::collections::HashMap;
       use std::fmt;
 
@@ -448,6 +452,13 @@ internally, to keep track of things like the stack, program, lists etc.
               Ok(Item::Int(value))
           }
 
+          fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+          where
+              E: de::Error,
+          {
+              Ok(Item::Int(value as i64))
+          }
+
           fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
           where
               E: de::Error,
@@ -455,12 +466,26 @@ internally, to keep track of things like the stack, program, lists etc.
               Ok(Item::Float(value))
           }
 
-          fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+          fn visit_none<E>(self) -> Result<Self::Value, E>
+          where
+              E: de::Error,
+          {
+              Ok(Item::default())
+          }
+
+          fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E>
+          where
+              E: de::Error,
+          {
+              Ok(Item::from(v))
+          }
+
+          fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
           where
               E: de::Error,
           {
               Ok(Item::Dispenser(coll::Dispenser::Sized(
-                  coll::Sized::String(v),
+                  coll::Sized::String(v.to_string()),
               )))
           }
 
@@ -506,6 +531,30 @@ internally, to keep track of things like the stack, program, lists etc.
               deserializer.deserialize_any(ItemVisitor)
           }
       }
+
+      impl From<serde_json::Error> for Error {
+          fn from(err: serde_json::Error) -> Error {
+              Error::create(wrap("serialize".into()), &err.to_string(), None)
+          }
+      }
+
+      impl Serialize for Item {
+          fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+          where
+              S: Serializer,
+          {
+              match *self {
+                  Item::Int(i) => serializer.serialize_i64(i),
+                  Item::Float(f) => serializer.serialize_f64(f),
+                  Item::Char(c) => serializer.serialize_char(c),
+                  Item::Word(w) => serializer.serialize_str(w.as_str()),
+
+                  // Handle other variants
+                  Item::Dispenser(ref dispenser) => dispenser.serialize(serializer),
+                  Item::Receptacle(ref receptacle) => receptacle.serialize(serializer),
+              }
+          }
+      }
   }
 #+end_src
 **** Collection types
@@ -531,7 +580,7 @@ internally, to keep track of things like the stack, program, lists etc.
           sync::Arc::make_mut(&mut self.0)
       }
 
-      pub fn inner(&mut self) -> T {
+      pub fn inner(&self) -> T {
           sync::Arc::try_unwrap(self.0.clone()).unwrap_or_else(|rc| (*rc).clone())
       }
 
@@ -764,30 +813,30 @@ internally, to keep track of things like the stack, program, lists etc.
           Ok(match (self, other) {
               (Sized::Associative(a), Sized::List(l)) => Sized::Associative({
                   let mut a: assoc::Association = a.into();
-                  let mut more = assoc::Association::try_from_iter(l.clone().inner().into_iter())?;
+                  let more = assoc::Association::try_from_iter(l.clone().inner().into_iter())?;
                   let am = a.make_mut();
                   am.extend(more.inner().into_iter());
                   assoc::Associative::Assoc(a)
               }),
               (Sized::List(l), Sized::Associative(a)) => {
-                  let mut a: assoc::Association = a.into();
+                  let a: assoc::Association = a.into();
                   let mut la = assoc::Association::try_from_iter(l.clone().inner().into_iter())?;
                   let lam = la.make_mut();
                   lam.extend(a.inner().into_iter());
                   Sized::Associative(assoc::Associative::Assoc(la))
               }
               (Sized::Associative(a), Sized::Associative(b)) => Sized::Associative(a.join(b)),
-              (Sized::List(mut a), Sized::List(mut b)) => {
+              (Sized::List(mut a), Sized::List(b)) => {
                   let am = a.make_mut();
                   am.extend(b.inner());
                   Sized::List(a)
               }
-              (Sized::Set(mut a), Sized::Set(mut b)) => {
+              (Sized::Set(mut a), Sized::Set(b)) => {
                   let am = a.make_mut();
                   am.extend(b.inner());
                   Sized::Set(a)
               }
-              (Sized::List(mut a), Sized::Set(mut b)) => {
+              (Sized::List(a), Sized::Set(mut b)) => {
                   let bm = b.make_mut();
 
                   bm.extend(
@@ -799,7 +848,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   );
                   Sized::Set(b)
               }
-              (Sized::Set(mut a), Sized::List(mut b)) => {
+              (Sized::Set(mut a), Sized::List(b)) => {
                   let am = a.make_mut();
 
                   am.extend(
@@ -890,7 +939,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn into_iter(self) -> Self::IntoIter {
           match self {
               Sized::Associative(map) => Box::new(map.into_iter().map(|kv| kv.into())),
-              Sized::List(mut list) => Box::new(list.inner().into_iter()),
+              Sized::List(list) => Box::new(list.inner().into_iter()),
               Sized::String(s) => {
                   let chars: Vec<char> = s.chars().collect();
                   Box::new(chars.into_iter().map(|c| c.into()))
@@ -899,7 +948,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   let vec: Vec<Item> = b.into_iter().map(|byte| Item::from(byte as Int)).collect();
                   Box::new(vec.into_iter())
               }
-              Sized::Set(mut s) => Box::new(s.inner().into_iter().map(|i| i.into())),
+              Sized::Set(s) => Box::new(s.inner().into_iter().map(|i| i.into())),
           }
       }
   }
@@ -1120,34 +1169,74 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   mod serde {
-      use super::Sized;
-      use serde::de::{self, Deserialize, Deserializer, Visitor};
-      use std::fmt;
+      use super::{Dispenser, Receptacle, Sized};
+      use crate::serialize::Display;
+      use crate::types::associative as assoc;
+      use serde::ser::{Serialize, SerializeMap, SerializeSeq};
 
-      struct SizedVisitor;
-
-      impl<'de> Visitor<'de> for SizedVisitor {
-          type Value = Sized;
-
-          fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-              formatter.write_str("expected a specific representation for Sized")
-          }
-
-          fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+      impl Serialize for Dispenser {
+          fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
           where
-              E: de::Error,
+              S: serde::Serializer,
           {
-              // Construct Sized based on a string
-              Ok(Sized::String(value))
+              match self {
+                  Dispenser::Out(o) => o.representation().serialize(serializer),
+                  Dispenser::Tunnel(t) => t.representation().serialize(serializer),
+                  Dispenser::Sized(s) => s.serialize(serializer),
+              }
           }
       }
 
-      impl<'de> Deserialize<'de> for Sized {
-          fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+      impl Serialize for Receptacle {
+          fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
           where
-              D: Deserializer<'de>,
+              S: serde::Serializer,
           {
-              deserializer.deserialize_any(SizedVisitor)
+              match self {
+                  Receptacle::In(i) => i.representation().serialize(serializer),
+                  Receptacle::Tunnel(t) => t.representation().serialize(serializer),
+                  Receptacle::Sized(s) => s.serialize(serializer),
+              }
+          }
+      }
+
+      impl Serialize for Sized {
+          fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+          where
+              S: serde::Serializer,
+          {
+              match self {
+                  Sized::Associative(a) => {
+                      // Start serializing a map
+                      let assoc = assoc::Association::from(a.clone());
+                      let mut map = serializer.serialize_map(Some(assoc.len()))?;
+                      for (key, value) in assoc.inner() {
+                          // Serialize each entry in the map
+                          map.serialize_entry(&key, &value)?;
+                      }
+                      // Finish serializing the map
+                      map.end()
+                  }
+
+                  Sized::List(ref l) => {
+                      // Serialize a list (sequence)
+                      let mut seq = serializer.serialize_seq(Some(l.len()))?;
+                      for element in l.inner() {
+                          seq.serialize_element(&element)?;
+                      }
+                      seq.end()
+                  }
+                  Sized::Bytes(b) => serializer.serialize_bytes(b.as_slice()),
+                  Sized::Set(s) => {
+                      // Serialize a list (sequence)
+                      let mut seq = serializer.serialize_seq(Some(s.len()))?;
+                      for element in s.inner() {
+                          seq.serialize_element(&element)?;
+                      }
+                      seq.end()
+                  }
+                  Sized::String(s) => serializer.serialize_str(s.as_str()),
+              }
           }
       }
   }
@@ -1194,9 +1283,7 @@ internally, to keep track of things like the stack, program, lists etc.
           match i {
               KeyItem::Int(i) => Item::Int(i),
               KeyItem::String(i) => i.into(),
-              KeyItem::List(mut l) => {
-                  coll::List::from_iter(l.inner().into_iter().map(Item::from)).into()
-              }
+              KeyItem::List(l) => coll::List::from_iter(l.inner().into_iter().map(Item::from)).into(),
               KeyItem::Word(w) => Item::Word(w),
               KeyItem::Bytes(bs) => bs.into(),
               KeyItem::Char(c) => Item::Char(c),
@@ -1231,7 +1318,7 @@ internally, to keep track of things like the stack, program, lists etc.
               Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(i))) => {
                   Ok(KeyItem::Bytes(i))
               }
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(mut l))) => Ok(KeyItem::List(
+              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(l))) => Ok(KeyItem::List(
                   KeyList::try_from_iter(l.inner().into_iter())?,
               )),
               Item::Word(w) => Ok(KeyItem::Word(w)),
@@ -1338,7 +1425,7 @@ internally, to keep track of things like the stack, program, lists etc.
               (Associative::DictEntry(_), Associative::DictEntry(other)) => {
                   Associative::DictEntry(other)
               }
-              (Associative::Dictionary(mut this), Associative::Dictionary(mut other)) => {
+              (Associative::Dictionary(mut this), Associative::Dictionary(other)) => {
                   let thism = coll::Arc::make_mut(&mut this);
                   thism.extend(other.inner().into_iter());
                   Associative::Dictionary(this)
@@ -1454,9 +1541,9 @@ internally, to keep track of things like the stack, program, lists etc.
 
       fn into_iter<'a>(self) -> Self::IntoIter {
           match self {
-              Associative::Assoc(mut a) => Box::new(a.inner().into_iter()),
+              Associative::Assoc(a) => Box::new(a.inner().into_iter()),
               Associative::DictEntry(e) => Box::new(e.into_iter()),
-              Associative::Dictionary(mut d) => {
+              Associative::Dictionary(d) => {
                   Box::new(d.inner().into_iter().map(|(k, v)| (k.into(), v.into())))
               }
               Associative::Error(e) => e.into_iter(),
@@ -1605,6 +1692,7 @@ internally, to keep track of things like the stack, program, lists etc.
   mod serde {
       use super::{KeyItem, KeyList};
       use serde::de::{self, Deserialize, Deserializer, Visitor};
+      use serde::ser::{Serialize, SerializeSeq};
       use std::fmt;
 
       struct KeyItemVisitor;
@@ -1623,11 +1711,18 @@ internally, to keep track of things like the stack, program, lists etc.
               Ok(KeyItem::Int(value))
           }
 
-          fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+          fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
           where
               E: de::Error,
           {
-              Ok(KeyItem::String(v))
+              Ok(KeyItem::Int(value as i64))
+          }
+
+          fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+          where
+              E: de::Error,
+          {
+              Ok(KeyItem::String(v.to_string()))
           }
 
           fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E>
@@ -1655,6 +1750,29 @@ internally, to keep track of things like the stack, program, lists etc.
               D: Deserializer<'de>,
           {
               deserializer.deserialize_any(KeyItemVisitor)
+          }
+      }
+
+      impl Serialize for KeyItem {
+          fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+          where
+              S: serde::Serializer,
+          {
+              match self {
+                  KeyItem::Int(i) => serializer.serialize_i64(i.clone()),
+                  KeyItem::Word(w) => serializer.serialize_str(w.as_str()),
+                  KeyItem::Char(c) => serializer.serialize_char(c.clone()),
+                  KeyItem::Bytes(b) => serializer.serialize_bytes(b.as_slice()),
+                  KeyItem::List(ref l) => {
+                      // Serialize a list (sequence)
+                      let mut seq = serializer.serialize_seq(Some(l.len()))?;
+                      for element in l.inner() {
+                          seq.serialize_element(&element)?;
+                      }
+                      seq.end()
+                  }
+                  KeyItem::String(s) => serializer.serialize_str(s.as_str()),
+              }
           }
       }
   }
@@ -1839,7 +1957,7 @@ internally, to keep track of things like the stack, program, lists etc.
       type Item = assoc::Entry;
       type IntoIter = Box<dyn Iterator<Item = assoc::Entry>>;
 
-      fn into_iter(mut self) -> Self::IntoIter {
+      fn into_iter(self) -> Self::IntoIter {
           Box::new(
               self.data
                   .inner()
@@ -2209,7 +2327,7 @@ internally, to keep track of things like the stack, program, lists etc.
                               (assoc::Associative::Env(self), Some(old.into()))
                           }
                           Err(_) => {
-                              let mut a = assoc::Association::from_iter(self);
+                              let a = assoc::Association::from_iter(self);
                               let old = a.inner().insert(k, v);
                               (assoc::Associative::Assoc(a), old)
                           }
@@ -2224,7 +2342,7 @@ internally, to keep track of things like the stack, program, lists etc.
                               (assoc::Associative::Env(self), Some(old.into()))
                           }
                           Err(_) => {
-                              let mut a = assoc::Association::from_iter(self);
+                              let a = assoc::Association::from_iter(self);
                               let old = a.inner().insert(k, v);
                               (assoc::Associative::Assoc(a), old)
                           }
@@ -2239,20 +2357,20 @@ internally, to keep track of things like the stack, program, lists etc.
                               (assoc::Associative::Env(self), Some(old.into()))
                           }
                           Err(_) => {
-                              let mut a = assoc::Association::from_iter(self);
+                              let a = assoc::Association::from_iter(self);
                               let old = a.inner().insert(k, v);
                               (assoc::Associative::Assoc(a), old)
                           }
                       }
                   }
                   k => {
-                      let mut a = assoc::Association::from_iter(self);
+                      let a = assoc::Association::from_iter(self);
                       let old = a.inner().insert(k.into(), v);
                       (assoc::Associative::Assoc(a), old)
                   }
               },
               _ => {
-                  let mut a = assoc::Association::from_iter(self);
+                  let a = assoc::Association::from_iter(self);
                   let old = a.inner().insert(k, v);
                   (assoc::Associative::Assoc(a), old)
               }
@@ -2279,7 +2397,7 @@ internally, to keep track of things like the stack, program, lists etc.
               }
           }
           let mut env = axiom::standard_env(program, stack);
-          if let Some(mut d) = dictionary {
+          if let Some(d) = dictionary {
               let edmut = env.dictionary.make_mut();
               edmut.extend(d.inner().into_iter());
           }
@@ -2953,6 +3071,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               ("database", Box::leak(Box::new(f_stack1(db::query)))),
               ("dec", Box::leak(Box::new(f_stack1(dec)))),
               ("decide", Box::leak(Box::new(decide))),
+              ("decodejson", Box::leak(Box::new(f_stack1(decode_json)))),
               ("dip", Box::leak(Box::new(dip))),
               ("dictionary", Box::leak(Box::new(dictionary))),
               ("dipdown", Box::leak(Box::new(dipdown))),
@@ -2961,6 +3080,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               ("empty", Box::leak(Box::new(f_stack1(empty)))),
               ("empty?", Box::leak(Box::new(f_stack1(is_empty)))),
               ("encodestring", Box::leak(Box::new(f_stack1(encode_string)))),
+              ("encodejson", Box::leak(Box::new(f_stack1(encode_json)))),
               ("environment", Box::leak(Box::new(f_stack1(environment)))),
               ("error?", Box::leak(Box::new(f_stack1(is_error)))),
               ("eval-step", Box::leak(Box::new(eval_step_outer))),
@@ -3069,7 +3189,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn read_lexicon(lexicon: String, mut env: Environment) -> Environment {
-      let mut items = serialize::parse(lexicon).unwrap();
+      let items = serialize::parse(lexicon).unwrap();
       for r in Box::new(items.inner().into_iter()) {
           let (k, def): (assoc::KeyItem, Item) = r.try_into().unwrap();
           let word: Word = k.try_into().unwrap();
@@ -3870,7 +3990,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn assign(m: Item, ks: Item, v: Item) -> ItemResult {
-      let mut kit = coll::List::try_from(ks)?;
+      let kit = coll::List::try_from(ks)?;
       let mut ksvec: assoc::KeyList = assoc::KeyList::try_from_iter(kit.inner().into_iter())?;
       ksvec.make_mut().make_contiguous();
       let (ks, _) = ksvec.as_slices();
@@ -3878,7 +3998,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn unassign(m: Item, ks: Item) -> ItemResult {
-      let mut kit = coll::List::try_from(ks)?;
+      let kit = coll::List::try_from(ks)?;
       let mut ksvec: assoc::KeyList = assoc::KeyList::try_from_iter(kit.inner().into_iter())?;
       ksvec.make_mut().make_contiguous();
       let (ks, _) = ksvec.as_slices();
@@ -4225,7 +4345,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   fn reverse(i: Item) -> ItemResult {
       let s = coll::Sized::try_from(i)?;
       match s {
-          coll::Sized::List(mut l) => Ok(coll::List::from_iter(l.inner().into_iter().rev()).into()),
+          coll::Sized::List(l) => Ok(coll::List::from_iter(l.inner().into_iter().rev()).into()),
           coll::Sized::String(s) => Ok(s.chars().rev().collect::<String>().into()),
           coll::Sized::Bytes(b) => Ok(b.into_iter().rev().collect::<Vec<u8>>().into()),
           s => Err(Error::expected("ordered", s.into())),
@@ -4560,7 +4680,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn sort_by_key(i: Item) -> ItemResult {
-      let mut l = coll::List::try_from(i)?;
+      let l = coll::List::try_from(i)?;
       let it = l.inner().into_iter().map(as_pair);
       let mut it = it.collect::<Result<Vec<(Item, assoc::KeyItem)>, Error>>()?;
       it.sort_unstable_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Less));
@@ -4620,7 +4740,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   fn format(fstr: Item, items: Item) -> ItemResult {
       let fstr = String::try_from(fstr)?;
-      let mut items = coll::List::try_from(items)?;
+      let items = coll::List::try_from(items)?;
       let strings = items
           .inner()
           .into_iter()
@@ -4631,6 +4751,15 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           .deref()
           .to_string()
           .into())
+  }
+
+  fn decode_json(s: Item) -> ItemResult {
+      let s = String::try_from(s)?;
+      Ok(serde_json::from_str::<Item>(s.as_str())?)
+  }
+
+  fn encode_json(i: Item) -> ItemResult {
+      Ok(Item::from(serde_json::to_string(&i)?))
   }
 #+end_src
 *** Top level execution
@@ -4937,6 +5066,7 @@ We'll also define how to run unit tests.
       #[test_case("cut")]
       #[test_case("dec")]
       #[test_case("decide")]
+      #[test_case("decodejson")]
       #[test_case("decorate")]
       #[test_case("decorated")]
       #[test_case("dip")]
@@ -4953,6 +5083,7 @@ We'll also define how to run unit tests.
       #[test_case("emit")]
       #[test_case("ends?" ; "is_ends")]
       #[test_case("encode")]
+      #[test_case("encodejson")]
       #[test_case("encodestring")]
       #[test_case("environment")]
       #[test_case("evaluate")]
@@ -5901,7 +6032,7 @@ Implement the =handoff= type
   // selector to choose the next ready pipe.  A pipe means it's a
   // receive, a pipe/item pair means it's a send.
   pub fn select(i: Item) -> axiom::ItemResult {
-      let mut l = coll::List::try_from(i)?;
+      let l = coll::List::try_from(i)?;
       let original = l.clone();
 
       //Create references out of any [pipe item] pairs
@@ -6119,7 +6250,7 @@ Implement the =handoff= type
           let headers = results
               .headers
               .iter()
-              .map(|i| Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(i.clone()))))
+              .map(|s| Item::from(s.clone()))
               .collect::<coll::List>();
           let mut rows = results
               .rows
