@@ -77,7 +77,7 @@ the location where you installed the kcats binary.
 #+BEGIN_SRC toml :tangle Cargo.toml
   [package]
   name = "kcats"
-  version = "0.5.1"
+  version = "0.6.0"
   edition = "2021"
 
   # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -85,19 +85,26 @@ the location where you installed the kcats binary.
   [dependencies]
   # serialization
   edn-format = "3.3.0"
+  serde = "1"
+  serde_json = "1"
+
   #edn-format = { path = "../edn-format" }
   base64 = "0.13.0"
 
   # String literals
-  internment = "0.6.0" 
+  internment = {version = "0.6.0", features = ["serde"]}
   lazy_static = "1.4.0"
 
   num-integer = "0.1.44"
+
+  # String format
+  dynfmt = { version = "0.1.5", features = ["curly"] }
 
   # crypto stuff
   ed25519-dalek = {version="1", features=["batch_deterministic", "std", "rand"]}
   sha2 = "0.10.6"
   rand_core = "0.5.1" # careful here, having 2 versions present will make weird compile errors
+  rand = "0.8"
 
   # multithreading
   futures = "0.3"
@@ -109,8 +116,17 @@ the location where you installed the kcats binary.
 
   # debugging
   backtrace = "0.3.61"
+
+  # database
+  #indradb-lib = { version = "*", features = ["rocksdb-datastore"] }
+  #rocksdb = "0.21.0"
+  cozo = { version = "0.7", features = ["storage-sqlite"] }
+  chrono = "0.4.31"
+
   [dev-dependencies]
   test-case = "2.0.0"
+
+  [features]
 #+END_SRC
 *** Internal data types
 **** Basic internal types
@@ -361,6 +377,12 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  impl From<dynfmt::Error<'_>> for Error {
+      fn from(err: dynfmt::Error) -> Error {
+          Error::create(wrap("format".into()), &err.to_string(), None)
+      }
+  }
+
   impl From<&str> for Item {
       fn from(i: &str) -> Self {
           Item::Word(Word::from(i))
@@ -402,6 +424,138 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
   }
+
+  mod serde {
+      use super::Item;
+      use crate::types::associative as assoc;
+      use crate::types::collection as coll;
+      use crate::types::{wrap, Error};
+      use serde::de::{self, Deserialize, Deserializer, Visitor};
+      use serde::ser::{Serialize, Serializer};
+      use serde_json;
+      use std::collections::HashMap;
+      use std::fmt;
+
+      struct ItemVisitor;
+
+      impl<'de> Visitor<'de> for ItemVisitor {
+          type Value = Item;
+
+          fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+              formatter.write_str("expected a specific representation for Item")
+          }
+
+          fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+          where
+              E: de::Error,
+          {
+              Ok(Item::Int(value))
+          }
+
+          fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+          where
+              E: de::Error,
+          {
+              Ok(Item::Int(value as i64))
+          }
+
+          fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+          where
+              E: de::Error,
+          {
+              Ok(Item::Float(value))
+          }
+
+          fn visit_none<E>(self) -> Result<Self::Value, E>
+          where
+              E: de::Error,
+          {
+              Ok(Item::default())
+          }
+
+          fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E>
+          where
+              E: de::Error,
+          {
+              Ok(Item::from(v))
+          }
+
+          fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+          where
+              E: de::Error,
+          {
+              Ok(Item::Dispenser(coll::Dispenser::Sized(
+                  coll::Sized::String(v.to_string()),
+              )))
+          }
+
+          fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E>
+          where
+              E: de::Error,
+          {
+              Ok(Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(
+                  v,
+              ))))
+          }
+
+          fn visit_map<A>(self, mut ma: A) -> Result<Self::Value, A::Error>
+          where
+              A: de::MapAccess<'de>,
+          {
+              let mut map = HashMap::new();
+              while let Some((key, value)) = ma.next_entry::<assoc::KeyItem, Item>()? {
+                  map.insert(key, value);
+              }
+              Ok(Item::Dispenser(coll::Dispenser::Sized(
+                  coll::Sized::Associative(assoc::Associative::Assoc(map.into())),
+              )))
+          }
+
+          fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+          where
+              A: de::SeqAccess<'de>,
+          {
+              let mut items = Vec::new();
+              while let Some(item) = seq.next_element::<Item>()? {
+                  items.push(item);
+              }
+              Ok(coll::List::from(items).into())
+          }
+      }
+
+      impl<'de> Deserialize<'de> for Item {
+          fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+          where
+              D: Deserializer<'de>,
+          {
+              deserializer.deserialize_any(ItemVisitor)
+          }
+      }
+
+      impl From<serde_json::Error> for Error {
+          fn from(err: serde_json::Error) -> Error {
+              Error::create(wrap("serialize".into()), &err.to_string(), None)
+          }
+      }
+
+      impl Serialize for Item {
+          fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+          where
+              S: Serializer,
+          {
+              match *self {
+                  Item::Int(i) => serializer.serialize_i64(i),
+                  Item::Float(f) => serializer.serialize_f64(f),
+                  Item::Char(c) => serializer.serialize_char(c),
+                  Item::Word(w) => serializer.serialize_str(w.as_str()),
+
+                  // Handle other variants
+                  Item::Dispenser(ref dispenser) => dispenser.serialize(serializer),
+                  Item::Receptacle(ref receptacle) => receptacle.serialize(serializer),
+              }
+          }
+      }
+  }
 #+end_src
 **** Collection types
 #+begin_src rust :tangle src/types/collection.rs :mkdirp yes
@@ -426,7 +580,7 @@ internally, to keep track of things like the stack, program, lists etc.
           sync::Arc::make_mut(&mut self.0)
       }
 
-      pub fn inner(&mut self) -> T {
+      pub fn inner(&self) -> T {
           sync::Arc::try_unwrap(self.0.clone()).unwrap_or_else(|rc| (*rc).clone())
       }
 
@@ -452,6 +606,17 @@ internally, to keep track of things like the stack, program, lists etc.
       {
           Newtype(sync::Arc::new(Newtype(
               iter.into_iter().collect::<VecDeque<Item>>(),
+          )))
+      }
+  }
+
+  impl FromIterator<assoc::KeyItem> for Set {
+      fn from_iter<I>(iter: I) -> Self
+      where
+          I: IntoIterator<Item = assoc::KeyItem>,
+      {
+          Newtype(sync::Arc::new(Newtype(
+              iter.into_iter().collect::<HashSet<assoc::KeyItem>>(),
           )))
       }
   }
@@ -648,30 +813,30 @@ internally, to keep track of things like the stack, program, lists etc.
           Ok(match (self, other) {
               (Sized::Associative(a), Sized::List(l)) => Sized::Associative({
                   let mut a: assoc::Association = a.into();
-                  let mut more = assoc::Association::try_from_iter(l.clone().inner().into_iter())?;
+                  let more = assoc::Association::try_from_iter(l.clone().inner().into_iter())?;
                   let am = a.make_mut();
                   am.extend(more.inner().into_iter());
                   assoc::Associative::Assoc(a)
               }),
               (Sized::List(l), Sized::Associative(a)) => {
-                  let mut a: assoc::Association = a.into();
+                  let a: assoc::Association = a.into();
                   let mut la = assoc::Association::try_from_iter(l.clone().inner().into_iter())?;
                   let lam = la.make_mut();
                   lam.extend(a.inner().into_iter());
                   Sized::Associative(assoc::Associative::Assoc(la))
               }
               (Sized::Associative(a), Sized::Associative(b)) => Sized::Associative(a.join(b)),
-              (Sized::List(mut a), Sized::List(mut b)) => {
+              (Sized::List(mut a), Sized::List(b)) => {
                   let am = a.make_mut();
                   am.extend(b.inner());
                   Sized::List(a)
               }
-              (Sized::Set(mut a), Sized::Set(mut b)) => {
+              (Sized::Set(mut a), Sized::Set(b)) => {
                   let am = a.make_mut();
                   am.extend(b.inner());
                   Sized::Set(a)
               }
-              (Sized::List(mut a), Sized::Set(mut b)) => {
+              (Sized::List(a), Sized::Set(mut b)) => {
                   let bm = b.make_mut();
 
                   bm.extend(
@@ -683,7 +848,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   );
                   Sized::Set(b)
               }
-              (Sized::Set(mut a), Sized::List(mut b)) => {
+              (Sized::Set(mut a), Sized::List(b)) => {
                   let am = a.make_mut();
 
                   am.extend(
@@ -774,7 +939,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn into_iter(self) -> Self::IntoIter {
           match self {
               Sized::Associative(map) => Box::new(map.into_iter().map(|kv| kv.into())),
-              Sized::List(mut list) => Box::new(list.inner().into_iter()),
+              Sized::List(list) => Box::new(list.inner().into_iter()),
               Sized::String(s) => {
                   let chars: Vec<char> = s.chars().collect();
                   Box::new(chars.into_iter().map(|c| c.into()))
@@ -783,7 +948,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   let vec: Vec<Item> = b.into_iter().map(|byte| Item::from(byte as Int)).collect();
                   Box::new(vec.into_iter())
               }
-              Sized::Set(mut s) => Box::new(s.inner().into_iter().map(|i| i.into())),
+              Sized::Set(s) => Box::new(s.inner().into_iter().map(|i| i.into())),
           }
       }
   }
@@ -930,6 +1095,12 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  impl From<Set> for Item {
+      fn from(l: Set) -> Self {
+          Item::Dispenser(Dispenser::Sized(Sized::Set(l)))
+      }
+  }
+
   impl From<Dispenser> for Item {
       fn from(c: Dispenser) -> Self {
           Item::Dispenser(c)
@@ -996,6 +1167,79 @@ internally, to keep track of things like the stack, program, lists etc.
           Receptacle::Sized(Sized::default())
       }
   }
+
+  mod serde {
+      use super::{Dispenser, Receptacle, Sized};
+      use crate::serialize::Display;
+      use crate::types::associative as assoc;
+      use serde::ser::{Serialize, SerializeMap, SerializeSeq};
+
+      impl Serialize for Dispenser {
+          fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+          where
+              S: serde::Serializer,
+          {
+              match self {
+                  Dispenser::Out(o) => o.representation().serialize(serializer),
+                  Dispenser::Tunnel(t) => t.representation().serialize(serializer),
+                  Dispenser::Sized(s) => s.serialize(serializer),
+              }
+          }
+      }
+
+      impl Serialize for Receptacle {
+          fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+          where
+              S: serde::Serializer,
+          {
+              match self {
+                  Receptacle::In(i) => i.representation().serialize(serializer),
+                  Receptacle::Tunnel(t) => t.representation().serialize(serializer),
+                  Receptacle::Sized(s) => s.serialize(serializer),
+              }
+          }
+      }
+
+      impl Serialize for Sized {
+          fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+          where
+              S: serde::Serializer,
+          {
+              match self {
+                  Sized::Associative(a) => {
+                      // Start serializing a map
+                      let assoc = assoc::Association::from(a.clone());
+                      let mut map = serializer.serialize_map(Some(assoc.len()))?;
+                      for (key, value) in assoc.inner() {
+                          // Serialize each entry in the map
+                          map.serialize_entry(&key, &value)?;
+                      }
+                      // Finish serializing the map
+                      map.end()
+                  }
+
+                  Sized::List(ref l) => {
+                      // Serialize a list (sequence)
+                      let mut seq = serializer.serialize_seq(Some(l.len()))?;
+                      for element in l.inner() {
+                          seq.serialize_element(&element)?;
+                      }
+                      seq.end()
+                  }
+                  Sized::Bytes(b) => serializer.serialize_bytes(b.as_slice()),
+                  Sized::Set(s) => {
+                      // Serialize a list (sequence)
+                      let mut seq = serializer.serialize_seq(Some(s.len()))?;
+                      for element in s.inner() {
+                          seq.serialize_element(&element)?;
+                      }
+                      seq.end()
+                  }
+                  Sized::String(s) => serializer.serialize_str(s.as_str()),
+              }
+          }
+      }
+  }
 #+end_src
 **** Associative types
 #+begin_src rust :tangle src/types/associative.rs :mkdirp yes
@@ -1039,9 +1283,7 @@ internally, to keep track of things like the stack, program, lists etc.
           match i {
               KeyItem::Int(i) => Item::Int(i),
               KeyItem::String(i) => i.into(),
-              KeyItem::List(mut l) => {
-                  coll::List::from_iter(l.inner().into_iter().map(Item::from)).into()
-              }
+              KeyItem::List(l) => coll::List::from_iter(l.inner().into_iter().map(Item::from)).into(),
               KeyItem::Word(w) => Item::Word(w),
               KeyItem::Bytes(bs) => bs.into(),
               KeyItem::Char(c) => Item::Char(c),
@@ -1076,7 +1318,7 @@ internally, to keep track of things like the stack, program, lists etc.
               Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(i))) => {
                   Ok(KeyItem::Bytes(i))
               }
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(mut l))) => Ok(KeyItem::List(
+              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(l))) => Ok(KeyItem::List(
                   KeyList::try_from_iter(l.inner().into_iter())?,
               )),
               Item::Word(w) => Ok(KeyItem::Word(w)),
@@ -1183,7 +1425,7 @@ internally, to keep track of things like the stack, program, lists etc.
               (Associative::DictEntry(_), Associative::DictEntry(other)) => {
                   Associative::DictEntry(other)
               }
-              (Associative::Dictionary(mut this), Associative::Dictionary(mut other)) => {
+              (Associative::Dictionary(mut this), Associative::Dictionary(other)) => {
                   let thism = coll::Arc::make_mut(&mut this);
                   thism.extend(other.inner().into_iter());
                   Associative::Dictionary(this)
@@ -1288,7 +1530,7 @@ internally, to keep track of things like the stack, program, lists etc.
                       }),
                   )
               }
-              _ => todo!("taking from assoc Requires insert/remove impl")
+              _ => todo!("taking from assoc Requires insert/remove impl"),
           }
       }
   }
@@ -1299,9 +1541,9 @@ internally, to keep track of things like the stack, program, lists etc.
 
       fn into_iter<'a>(self) -> Self::IntoIter {
           match self {
-              Associative::Assoc(mut a) => Box::new(a.inner().into_iter()),
+              Associative::Assoc(a) => Box::new(a.inner().into_iter()),
               Associative::DictEntry(e) => Box::new(e.into_iter()),
-              Associative::Dictionary(mut d) => {
+              Associative::Dictionary(d) => {
                   Box::new(d.inner().into_iter().map(|(k, v)| (k.into(), v.into())))
               }
               Associative::Error(e) => e.into_iter(),
@@ -1354,6 +1596,12 @@ internally, to keep track of things like the stack, program, lists etc.
                   .map(|i| Entry::try_from(i.clone()))
                   .collect::<Result<HashMap<KeyItem, Item>, Error>>()?,
           )))
+      }
+  }
+
+  impl From<HashMap<KeyItem, Item>> for Association {
+      fn from(h: HashMap<KeyItem, Item>) -> Self {
+          coll::Arc::wrap(Newtype(h))
       }
   }
 
@@ -1438,6 +1686,94 @@ internally, to keep track of things like the stack, program, lists etc.
   impl From<Associative> for Item {
       fn from(a: Associative) -> Item {
           coll::Sized::Associative(a).into()
+      }
+  }
+
+  mod serde {
+      use super::{KeyItem, KeyList};
+      use serde::de::{self, Deserialize, Deserializer, Visitor};
+      use serde::ser::{Serialize, SerializeSeq};
+      use std::fmt;
+
+      struct KeyItemVisitor;
+
+      impl<'de> Visitor<'de> for KeyItemVisitor {
+          type Value = KeyItem;
+
+          fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+              formatter.write_str("expected a specific representation for Item")
+          }
+
+          fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+          where
+              E: de::Error,
+          {
+              Ok(KeyItem::Int(value))
+          }
+
+          fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+          where
+              E: de::Error,
+          {
+              Ok(KeyItem::Int(value as i64))
+          }
+
+          fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+          where
+              E: de::Error,
+          {
+              Ok(KeyItem::String(v.to_string()))
+          }
+
+          fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E>
+          where
+              E: de::Error,
+          {
+              Ok(KeyItem::Bytes(v))
+          }
+
+          fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+          where
+              A: de::SeqAccess<'de>,
+          {
+              let mut items: Vec<KeyItem> = Vec::new();
+              while let Some(item) = seq.next_element::<KeyItem>()? {
+                  items.push(item);
+              }
+              Ok(KeyItem::List(KeyList::from_iter(items.into_iter())))
+          }
+      }
+
+      impl<'de> Deserialize<'de> for KeyItem {
+          fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+          where
+              D: Deserializer<'de>,
+          {
+              deserializer.deserialize_any(KeyItemVisitor)
+          }
+      }
+
+      impl Serialize for KeyItem {
+          fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+          where
+              S: serde::Serializer,
+          {
+              match self {
+                  KeyItem::Int(i) => serializer.serialize_i64(i.clone()),
+                  KeyItem::Word(w) => serializer.serialize_str(w.as_str()),
+                  KeyItem::Char(c) => serializer.serialize_char(c.clone()),
+                  KeyItem::Bytes(b) => serializer.serialize_bytes(b.as_slice()),
+                  KeyItem::List(ref l) => {
+                      // Serialize a list (sequence)
+                      let mut seq = serializer.serialize_seq(Some(l.len()))?;
+                      for element in l.inner() {
+                          seq.serialize_element(&element)?;
+                      }
+                      seq.end()
+                  }
+                  KeyItem::String(s) => serializer.serialize_str(s.as_str()),
+              }
+          }
       }
   }
 #+end_src
@@ -1621,7 +1957,7 @@ internally, to keep track of things like the stack, program, lists etc.
       type Item = assoc::Entry;
       type IntoIter = Box<dyn Iterator<Item = assoc::Entry>>;
 
-      fn into_iter(mut self) -> Self::IntoIter {
+      fn into_iter(self) -> Self::IntoIter {
           Box::new(
               self.data
                   .inner()
@@ -1991,7 +2327,7 @@ internally, to keep track of things like the stack, program, lists etc.
                               (assoc::Associative::Env(self), Some(old.into()))
                           }
                           Err(_) => {
-                              let mut a = assoc::Association::from_iter(self);
+                              let a = assoc::Association::from_iter(self);
                               let old = a.inner().insert(k, v);
                               (assoc::Associative::Assoc(a), old)
                           }
@@ -2006,7 +2342,7 @@ internally, to keep track of things like the stack, program, lists etc.
                               (assoc::Associative::Env(self), Some(old.into()))
                           }
                           Err(_) => {
-                              let mut a = assoc::Association::from_iter(self);
+                              let a = assoc::Association::from_iter(self);
                               let old = a.inner().insert(k, v);
                               (assoc::Associative::Assoc(a), old)
                           }
@@ -2021,20 +2357,20 @@ internally, to keep track of things like the stack, program, lists etc.
                               (assoc::Associative::Env(self), Some(old.into()))
                           }
                           Err(_) => {
-                              let mut a = assoc::Association::from_iter(self);
+                              let a = assoc::Association::from_iter(self);
                               let old = a.inner().insert(k, v);
                               (assoc::Associative::Assoc(a), old)
                           }
                       }
                   }
                   k => {
-                      let mut a = assoc::Association::from_iter(self);
+                      let a = assoc::Association::from_iter(self);
                       let old = a.inner().insert(k.into(), v);
                       (assoc::Associative::Assoc(a), old)
                   }
               },
               _ => {
-                  let mut a = assoc::Association::from_iter(self);
+                  let a = assoc::Association::from_iter(self);
                   let old = a.inner().insert(k, v);
                   (assoc::Associative::Assoc(a), old)
               }
@@ -2061,7 +2397,7 @@ internally, to keep track of things like the stack, program, lists etc.
               }
           }
           let mut env = axiom::standard_env(program, stack);
-          if let Some(mut d) = dictionary {
+          if let Some(d) = dictionary {
               let edmut = env.dictionary.make_mut();
               edmut.extend(d.inner().into_iter());
           }
@@ -2120,12 +2456,15 @@ We'll implement certain cryptography functions in rust and make kcats
 words for them (hashing, encryption, signing)
 #+begin_src rust :tangle src/crypto.rs :mkdirp yes
   use crate::axiom::ItemResult;
+  use crate::types::Int;
   use crate::types::{associative as assoc, error::Error, Bytes, Item};
   use core::ops::Deref;
   use ed25519_dalek as signing;
   use ed25519_dalek::{Signer, Verifier};
+  use rand::rngs::OsRng; // Import OsRng
+  use rand::RngCore as RandRngCore;
   use rand_core::{CryptoRng, RngCore};
-  use sha2::{self, Digest};
+  use sha2::{self, Digest}; // Import RngCore for the fill_bytes method
 
   pub fn hash(i: Item) -> ItemResult {
       let b = Bytes::try_from(i).unwrap();
@@ -2250,6 +2589,17 @@ words for them (hashing, encryption, signing)
       let sig = signing::Signature::from_bytes(&sbs)
           .map_err(|_e| Error::expected("signature", Default::default()))?;
       Ok(pk.verify(&mbs, &sig).map(|_| mret).unwrap_or_default())
+  }
+
+  fn random_bytes(n: usize) -> Vec<u8> {
+      let mut bytes = vec![0u8; n]; // Create a vector of n zeros
+      OsRng.fill_bytes(&mut bytes); // Fill the vector with random bytes
+      bytes
+  }
+
+  pub fn random(n: Item) -> ItemResult {
+      let n: Int = n.try_into()?;
+      Ok(random_bytes(n as usize).into())
   }
 #+end_src
 *** Serialization
@@ -2584,16 +2934,19 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 #+begin_src rust :tangle src/axiom.rs :mkdirp yes
   use super::serialize;
   use crate::pipes;
+  use crate::pipes::db;
   use crate::types::associative as assoc;
   use crate::types::collection as coll;
   use crate::types::dictionary as dict;
   use crate::types::environment::Environment;
   use crate::types::error::Error;
   use crate::types::*;
+  use dynfmt::Format;
   use futures::future::FutureExt;
   use num_integer::Roots;
   use std::collections::HashMap;
   use std::collections::VecDeque;
+  use std::ops::Deref;
   //use std::future::Future;
   use std::mem;
   use std::ops::Range;
@@ -2611,43 +2964,56 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   fn f_stack1(f: fn(Item) -> ItemResult) -> impl Fn(Environment) -> Future<Environment> {
       move |mut env: Environment| {
-          let x = env.tos().unwrap();
-          let res = f(x.clone());
-          if res.is_ok() {
-              env.pop_expr();
-              env.pop();
+          if let Some(x) = env.tos() {
+              let res = f(x.clone());
+              if res.is_ok() {
+                  env.pop_expr();
+                  env.pop();
+              }
+              env.push(Item::from(res)).into()
+          } else {
+              env.push(Item::from(Error::stack_underflow())).into()
           }
-          env.push(Item::from(res)).into()
       }
   }
 
   fn f_stack2(f: fn(Item, Item) -> ItemResult) -> impl Fn(Environment) -> Future<Environment> {
       move |mut env: Environment| {
-          let x = env.tos().unwrap();
-          let y = env.stack.get(1).unwrap();
-          let res = f(y.clone(), x.clone());
-          if res.is_ok() {
-              env.pop_expr();
-              env.pop();
-              env.pop();
+          let x = env.tos();
+          let y = env.stack.get(1);
+          match (x, y) {
+              (Some(x), Some(y)) => {
+                  let res = f(y.clone(), x.clone());
+                  if res.is_ok() {
+                      env.pop_expr();
+                      env.pop();
+                      env.pop();
+                  }
+                  env.push(Item::from(res)).into()
+              }
+              _ => env.push(Item::from(Error::stack_underflow())).into(),
           }
-          env.push(Item::from(res)).into()
       }
   }
 
   fn f_stack3(f: fn(Item, Item, Item) -> ItemResult) -> impl Fn(Environment) -> Future<Environment> {
       move |mut env: Environment| {
-          let x = env.tos().unwrap();
-          let y = env.stack.get(1).unwrap();
-          let z = env.stack.get(2).unwrap();
-          let res = f(z.clone(), y.clone(), x.clone());
-          if res.is_ok() {
-              env.pop_expr();
-              env.pop();
-              env.pop();
-              env.pop();
+          let x = env.tos();
+          let y = env.stack.get(1);
+          let z = env.stack.get(2);
+          match (x, y, z) {
+              (Some(x), Some(y), Some(z)) => {
+                  let res = f(z.clone(), y.clone(), x.clone());
+                  if res.is_ok() {
+                      env.pop_expr();
+                      env.pop();
+                      env.pop();
+                      env.pop();
+                  }
+                  env.push(Item::from(res)).into()
+              }
+              _ => env.push(Item::from(Error::stack_underflow())).into(),
           }
-          env.push(Item::from(res)).into()
       }
   }
 
@@ -2709,15 +3075,16 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               ),
               ("autoformat", Box::leak(Box::new(f_stack1(autoformat)))),
               ("branch", Box::leak(Box::new(branch))),
-              ("bytes", Box::leak(Box::new(f_stack1(bytes)))),
               ("bytes?", Box::leak(Box::new(f_stack1(is_bytes)))),
               ("clone", Box::leak(Box::new(clone))),
               ("contains?", Box::leak(Box::new(f_stack2(contains)))),
               ("ceiling", Box::leak(Box::new(f_stack1(ceiling)))),
               ("compare", Box::leak(Box::new(f_stack2(compare)))),
               ("count", Box::leak(Box::new(f_stack1(count)))),
+              ("database", Box::leak(Box::new(f_stack1(db::query)))),
               ("dec", Box::leak(Box::new(f_stack1(dec)))),
               ("decide", Box::leak(Box::new(decide))),
+              ("decodejson", Box::leak(Box::new(f_stack1(decode_json)))),
               ("dip", Box::leak(Box::new(dip))),
               ("dictionary", Box::leak(Box::new(dictionary))),
               ("dipdown", Box::leak(Box::new(dipdown))),
@@ -2725,6 +3092,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               ("emit", Box::leak(Box::new(f_stack1(emit)))),
               ("empty", Box::leak(Box::new(f_stack1(empty)))),
               ("empty?", Box::leak(Box::new(f_stack1(is_empty)))),
+              ("encodestring", Box::leak(Box::new(f_stack1(encode_string)))),
+              ("encodejson", Box::leak(Box::new(f_stack1(encode_json)))),
               ("environment", Box::leak(Box::new(f_stack1(environment)))),
               ("error?", Box::leak(Box::new(f_stack1(is_error)))),
               ("eval-step", Box::leak(Box::new(eval_step_outer))),
@@ -2745,12 +3114,16 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               ("first", Box::leak(Box::new(f_stack1(first)))),
               ("float", Box::leak(Box::new(float))),
               ("floor", Box::leak(Box::new(f_stack1(floor)))),
+              ("format", Box::leak(Box::new(f_stack2(format)))),
               ("handle", Box::leak(Box::new(f_stack1(handle)))),
               (
                   "handoff",
                   Box::leak(Box::new(crate::pipes::channel::handoff)),
               ),
-              ("hash", Box::leak(Box::new(f_stack1(crate::crypto::hash)))),
+              (
+                  "hashbytes",
+                  Box::leak(Box::new(f_stack1(crate::crypto::hash))),
+              ),
               ("inc", Box::leak(Box::new(f_stack1(inc)))),
               ("inspect", Box::leak(Box::new(f_stack1(inspect)))),
               ("join", Box::leak(Box::new(f_stack2(join)))),
@@ -2767,6 +3140,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               ("pop", Box::leak(Box::new(pop))),
               ("put", Box::leak(Box::new(put))),
               ("pipe?", Box::leak(Box::new(f_stack1(is_pipe)))),
+              (
+                  "random",
+                  Box::leak(Box::new(f_stack1(crate::crypto::random))),
+              ),
               ("range", Box::leak(Box::new(range))),
               ("read", Box::leak(Box::new(read))),
               (
@@ -2825,7 +3202,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn read_lexicon(lexicon: String, mut env: Environment) -> Environment {
-      let mut items = serialize::parse(lexicon).unwrap();
+      let items = serialize::parse(lexicon).unwrap();
       for r in Box::new(items.inner().into_iter()) {
           let (k, def): (assoc::KeyItem, Item) = r.try_into().unwrap();
           let word: Word = k.try_into().unwrap();
@@ -3626,7 +4003,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn assign(m: Item, ks: Item, v: Item) -> ItemResult {
-      let mut kit = coll::List::try_from(ks)?;
+      let kit = coll::List::try_from(ks)?;
       let mut ksvec: assoc::KeyList = assoc::KeyList::try_from_iter(kit.inner().into_iter())?;
       ksvec.make_mut().make_contiguous();
       let (ks, _) = ksvec.as_slices();
@@ -3634,7 +4011,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn unassign(m: Item, ks: Item) -> ItemResult {
-      let mut kit = coll::List::try_from(ks)?;
+      let kit = coll::List::try_from(ks)?;
       let mut ksvec: assoc::KeyList = assoc::KeyList::try_from_iter(kit.inner().into_iter())?;
       ksvec.make_mut().make_contiguous();
       let (ks, _) = ksvec.as_slices();
@@ -3981,26 +4358,15 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   fn reverse(i: Item) -> ItemResult {
       let s = coll::Sized::try_from(i)?;
       match s {
-          coll::Sized::List(mut l) => Ok(coll::List::from_iter(l.inner().into_iter().rev()).into()),
+          coll::Sized::List(l) => Ok(coll::List::from_iter(l.inner().into_iter().rev()).into()),
           coll::Sized::String(s) => Ok(s.chars().rev().collect::<String>().into()),
           coll::Sized::Bytes(b) => Ok(b.into_iter().rev().collect::<Vec<u8>>().into()),
           s => Err(Error::expected("ordered", s.into())),
       }
   }
 
-  fn bytes(i: Item) -> ItemResult {
-      match i {
-          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(b))) => Ok(b.into()),
-          Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(b))) => Ok(b.into()),
-          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(s))) => {
-              Ok(s.as_bytes().to_vec().into())
-          }
-          Item::Receptacle(coll::Receptacle::Sized(coll::Sized::String(s))) => {
-              Ok(s.as_bytes().to_vec().into())
-          }
-
-          i => Ok(Bytes::from(serialize::emit(&i)).into()),
-      }
+  fn encode_string(i: Item) -> ItemResult {
+      Ok(String::try_from(i)?.as_bytes().to_vec().into())
   }
 
   fn string(i: Item) -> ItemResult {
@@ -4327,7 +4693,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn sort_by_key(i: Item) -> ItemResult {
-      let mut l = coll::List::try_from(i)?;
+      let l = coll::List::try_from(i)?;
       let it = l.inner().into_iter().map(as_pair);
       let mut it = it.collect::<Result<Vec<(Item, assoc::KeyItem)>, Error>>()?;
       it.sort_unstable_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Less));
@@ -4383,6 +4749,30 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   fn empty(s: Item) -> ItemResult {
       let s = coll::Sized::try_from(s)?;
       Ok(s.empty().into())
+  }
+
+  fn format(fstr: Item, items: Item) -> ItemResult {
+      let fstr = String::try_from(fstr)?;
+      let items = coll::List::try_from(items)?;
+      let strings = items
+          .inner()
+          .into_iter()
+          .map(String::try_from)
+          .collect::<Result<Vec<String>, Error>>()?;
+      Ok(dynfmt::SimpleCurlyFormat
+          .format(fstr.as_str(), strings)?
+          .deref()
+          .to_string()
+          .into())
+  }
+
+  fn decode_json(s: Item) -> ItemResult {
+      let s = String::try_from(s)?;
+      Ok(serde_json::from_str::<Item>(s.as_str())?)
+  }
+
+  fn encode_json(i: Item) -> ItemResult {
+      Ok(Item::from(serde_json::to_string(&i)?))
   }
 #+end_src
 *** Top level execution
@@ -4658,6 +5048,7 @@ We'll also define how to run unit tests.
       #[test_case("*" ; "mult")]
       #[test_case("/" ; "divide")]
       #[test_case("abs")]
+      #[test_case("addmethod")]
       #[test_case("and")]
       #[test_case("any?" ; "is_any")]
       #[test_case("assemble")]
@@ -4673,7 +5064,6 @@ We'll also define how to run unit tests.
       #[test_case("branch")]
       #[test_case("breaker")]
       #[test_case("butlast")]
-      #[test_case("bytes")]
       #[test_case("bytes?" ; "is_bytes")]
       #[test_case("capture")]
       #[test_case("catcher")]
@@ -4689,6 +5079,7 @@ We'll also define how to run unit tests.
       #[test_case("cut")]
       #[test_case("dec")]
       #[test_case("decide")]
+      #[test_case("decodejson")]
       #[test_case("decorate")]
       #[test_case("decorated")]
       #[test_case("dip")]
@@ -4704,6 +5095,9 @@ We'll also define how to run unit tests.
       #[test_case("each")]
       #[test_case("emit")]
       #[test_case("ends?" ; "is_ends")]
+      #[test_case("encode")]
+      #[test_case("encodejson")]
+      #[test_case("encodestring")]
       #[test_case("environment")]
       #[test_case("evaluate")]
       #[test_case("eval-step")]
@@ -4717,11 +5111,13 @@ We'll also define how to run unit tests.
       #[test_case("float")]
       #[test_case("floor")]
       #[test_case("fold")]
+      #[test_case("format")]
       #[test_case("functional")]
       #[test_case("future")]
       #[test_case("get")]
       #[test_case("generate")]
       #[test_case("group")]
+      #[test_case("hashbytes")]
       #[test_case("if")]
       #[test_case("inc")]
       #[test_case("indexed")]
@@ -4749,6 +5145,7 @@ We'll also define how to run unit tests.
       #[test_case("or")]
       #[test_case("over")]
       #[test_case("pad")]
+      #[test_case("pair?" ; "is_pair")]
       #[test_case("partition")]
       #[test_case("pipe?" ; "is_pipe")]
       #[test_case("put")]
@@ -4840,6 +5237,7 @@ The basic pipe contracts.
 
   use futures::executor;
   pub mod channel;
+  pub mod db;
   pub mod fs;
   pub mod net;
   pub mod standard;
@@ -5647,7 +6045,7 @@ Implement the =handoff= type
   // selector to choose the next ready pipe.  A pipe means it's a
   // receive, a pipe/item pair means it's a send.
   pub fn select(i: Item) -> axiom::ItemResult {
-      let mut l = coll::List::try_from(i)?;
+      let l = coll::List::try_from(i)?;
       let original = l.clone();
 
       //Create references out of any [pipe item] pairs
@@ -5830,6 +6228,132 @@ Implement the =handoff= type
       let ms = Int::try_from(i)?;
       //TODO: check for negative values
       Ok(Timer::new(Duration::from_millis(ms as u64)).into())
+  }
+#+end_src
+***** Database
+#+begin_src rust :tangle src/pipes/db.rs :mkdirp yes
+  use crate::axiom;
+  use crate::types::associative as assoc;
+  use crate::types::collection as coll;
+  use crate::types::error::Error;
+  use crate::types::{self, Item};
+
+  use std::collections::VecDeque;
+  use std::sync::OnceLock;
+
+  fn db() -> &'static cozo::DbInstance {
+      static DB: OnceLock<cozo::DbInstance> = OnceLock::new();
+      DB.get_or_init(|| {
+          cozo::DbInstance::new("sqlite", "/tmp/kcats-database.db", Default::default()).unwrap()
+      })
+  }
+
+  pub fn query(script: Item) -> axiom::ItemResult {
+      Ok(db()
+          .run_script(
+              String::try_from(script)?.as_str(),
+              Default::default(),
+              cozo::ScriptMutability::Immutable,
+          )?
+          .into())
+  }
+
+  impl From<cozo::NamedRows> for Item {
+      fn from(results: cozo::NamedRows) -> Self {
+          let headers = results
+              .headers
+              .iter()
+              .map(|s| Item::from(s.clone()))
+              .collect::<coll::List>();
+          let mut rows = results
+              .rows
+              .into_iter()
+              .map(|row| Item::from(row.into_iter().map(Item::from).collect::<coll::List>()))
+              .collect::<VecDeque<Item>>();
+          rows.push_front(Item::from(headers));
+          Item::from(coll::List::from(rows))
+      }
+  }
+
+  impl From<cozo::DataValue> for Item {
+      fn from(dv: cozo::DataValue) -> Self {
+          match dv {
+              cozo::DataValue::Null => Item::default(),
+              cozo::DataValue::Num(cozo::Num::Int(i)) => Item::Int(i),
+              cozo::DataValue::Num(cozo::Num::Float(f)) => Item::Float(f),
+              cozo::DataValue::Str(s) => {
+                  Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(s.to_string())))
+              }
+              cozo::DataValue::Bool(b) => Item::from(b),
+              cozo::DataValue::Bytes(b) => Item::from(b),
+              cozo::DataValue::Vec(_) => todo!("Support cozodb vector values"),
+              cozo::DataValue::Bot => panic!("Bot values are supposed to be internal only"),
+              cozo::DataValue::Validity(v) => Item::from(v),
+              cozo::DataValue::Uuid(u) => Item::from(u.0.to_string()),
+              cozo::DataValue::Regex(_) => todo!("Support cozodb regex values"),
+              cozo::DataValue::List(l) => coll::List::from_iter(l.into_iter().map(Item::from)).into(),
+              cozo::DataValue::Set(s) => coll::Set::from_iter(
+                  s.into_iter()
+                      .map(|i| assoc::KeyItem::try_from(Item::from(i)).unwrap()),
+              )
+              .into(),
+              cozo::DataValue::Json(_) => todo!("Support cozodb JSON values"),
+          }
+      }
+  }
+
+  impl From<cozo::Validity> for Item {
+      fn from(v: cozo::Validity) -> Self {
+          coll::List::from_iter([Item::from(v.timestamp.0 .0), Item::from(v.is_assert.0)]).into()
+      }
+  }
+
+  // impl Db {
+  //     pub fn query(&self, query: &str) -> axiom::ItemResult {
+  //         let mut stmt = self.conn.prepare(query)?;
+
+  //         let rows = stmt.query_map([], |row| {
+  //             Ok(Item::from(
+  //                 (0..row.as_ref().column_count())
+  //                     .map(|column_index| {
+  //                         let column_name =
+  //                             row.as_ref().column_name(column_index).unwrap().to_string();
+  //                         let column_value: ValueRef = row.get_ref_unwrap(column_index);
+  //                         (assoc::KeyItem::from(column_name), Item::from(column_value))
+  //                     })
+  //                     .collect::<assoc::Association>(),
+  //             ))
+  //         })?;
+  //         Ok(rows.collect::<Result<coll::List, _>>()?.into())
+  //     }
+  // }
+
+  // pub fn db(i: Item) -> axiom::ItemResult {
+  //     let query: String = i.try_into()?;
+  //     let db = Db::new()?;
+  //     db.query(&query)
+  // }
+
+  // impl From<ValueRef<'_>> for Item {
+  //     fn from(value: ValueRef) -> Self {
+  //         match value {
+  //             ValueRef::Integer(i) => Item::Int(i),
+  //             ValueRef::Real(f) => Item::Float(f),
+  //             ValueRef::Text(t) => Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(
+  //                 String::from_utf8_lossy(t).into_owned(),
+  //             ))),
+  //             ValueRef::Blob(b) => {
+  //                 Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(b.to_vec())))
+  //             }
+  //             ValueRef::Null => Item::default(),
+  //         }
+  //     }
+  // }
+
+  impl From<cozo::Error> for Error {
+      fn from(error: cozo::Error) -> Self {
+          Error::create(types::wrap("io".into()), error.to_string().as_str(), None)
+      }
   }
 #+end_src
 ** Issues
@@ -7506,8 +8030,8 @@ Try where the signature is invalid by substituting a sig from a different messag
 
 try a dummy script that really does always validate
 #+begin_src kcats
-  [true] emit bytes hash
-  "[true]" bytes []
+  [true] encode hash
+  "[true]" encode []
   [[dump [hash =] dive]
    [swap string read first functional [inject] lingo first]
    [drop drop []] if] [[]] recover
@@ -7515,8 +8039,8 @@ try a dummy script that really does always validate
 
 #+RESULTS:
 #+begin_src kcats
-[[] #b64 "W3RydWVd" #b64 "HCjy6wlYw9FdsfDw5/K4mYyiuPZ6tCah+7PVYf52+tk="]
-true #b64 "HCjy6wlYw9FdsfDw5/K4mYyiuPZ6tCah+7PVYf52+tk="
+[[] #b64 "W3RydWVd" #b64 "M+LwVX3X2/aNUvQNUQxkH9+m5dpgq8cN+sB9K2tsvM8="]
+[] #b64 "M+LwVX3X2/aNUvQNUQxkH9+m5dpgq8cN+sB9K2tsvM8="
 #+end_src
 
 ***** DONE Make verify return the message
@@ -7539,6 +8063,7 @@ empty byte array could cause confusion (if that were considered
 think of any valid reason to sign 'nothing'.
 ***** TODO [#A] AES Encryption
 ***** TODO [#B] Random
+
 **** DONE Pure functional env
 #+begin_src kcats
   [[pipe-in pipe-out channel timeout handoff file-in file-out timestamps standard serversocket animate future spit tunnel ] [wrap unassign] step] [1 2 swap] lingo
@@ -7892,7 +8417,8 @@ emit will take an object and return its serialization.
 
 There should be some way of round tripping here, maybe a word =read1= or
 something that just reads one object. 
-*** TODO [#A] Inconsistent stack handling when encountering error :consistency:
+*** INPROGRESS [#A] Inconsistent stack handling when encountering error :consistency:
+- State "INPROGRESS" from "TODO"       [2023-12-30 Sat 14:17]
 Some words pop the arguments off the stack, then if an error is
 encountered, throws the error without the args on the stack. Others
 leave the args intact. This needs to be consistent.
@@ -8500,7 +9026,24 @@ duplicates. Should be a similar impl to =keep=.
 #+RESULTS:
 : [1 1 3] [[generate] dive [contains?] [put [generate] dive] while] [] [take] []
 
-**** TODO partition
+**** DONE partition
+- State "DONE"       from "TODO"       [2023-12-07 Thu 17:39]
+#+begin_src kcats
+  [1 2 3 4 5 6] [take]
+  2 []
+  [[generate] dive]
+  [[[] [drop count inc ]] [execute] every?]
+  []
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[] [[[] [drop count inc]]
+    [execute] every?]
+[[generate] dive]
+[] 2 [take] [1 2 3 4 5 6]
+#+end_src
+
 **** DONE joiner (aka catenate)
 #+begin_src kcats
   [[1 2 3] [4 5 6] [7 8 9]]
@@ -8842,7 +9385,8 @@ Maybe we can even implement the window shifting version?
 1 3 [take] []
 #+end_src
 
-**** INPROGRESS Applying generator to an existing container
+**** DONE Applying generator to an existing container
+- State "DONE"       from "INPROGRESS" [2023-12-07 Thu 17:40]
 - State "INPROGRESS" from "TODO"       [2023-11-10 Fri 16:36]
 we commonly have this construct: =[[1 2 3] ... collect] shield=, where
 we're transducing a list and we want to just get the result.
@@ -9815,7 +10359,8 @@ rename it to Empty or something like that. There's no need for the enum variant.
 Data streams that we intend to produce later are going to need
 compression - the streams should be as small as possible (they'll be
 encrypted later so it's too late to compress them after that). lz4 maybe?
-*** INPROGRESS improve 'capture' semantics
+*** DONE improve 'capture' semantics with 'bind'
+- State "DONE"       from "INPROGRESS" [2023-12-30 Sat 14:34]
 - State "INPROGRESS" from "TODO"       [2023-10-30 Mon 17:02]
 The problem is that =capture= as written, doesn't make it obvious that
 it's combining the captured items with the stack at the time of
@@ -9945,3 +10490,1195 @@ write a map literal to start, so i think this is ok.
  [age 23]
  [name "Alice"]]
 #+end_src
+*** DONE Refactor bytes as 'encode'
+- State "DONE"       from "INPROGRESS" [2023-12-02 Sat 15:12]
+- State "INPROGRESS" from "TODO"       [2023-12-02 Sat 14:44]
+Make this a multimethod
+*** TODO Multimethod improvements
+**** TODO Convert to multi
+**** DONE Refactor addmethod
+- State "DONE"       from "INPROGRESS" [2023-12-04 Mon 16:24]
+- State "INPROGRESS" from "TODO"       [2023-12-04 Mon 16:13]
+#+begin_src kcats
+  [[[[count 3 >] ["foo" put]]
+    [[not] ["bar" put]]] decide]
+  [count 1 =] [rest]
+  pair ;; [c b] [[[...]] decide]
+  wrap [prepend] join [[0]] dip update
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[[[count 1 =] [rest]]
+  [[count 3 >] ["foo" put]]
+  [[not] ["bar" put]]]
+ decide]
+#+end_src
+
+#+begin_src kcats
+  [[hash definition]
+   [[number?] ["foo" hash] addmethod] update]
+  [1 hash]
+  lingo
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+#+end_src
+
+**** DONE ismulti?
+- State "DONE"       from "TODO"       [2023-12-04 Mon 16:25]
+**** 
+*** TODO Database
+**** Simple Test
+#+begin_src kcats
+"create table Person (firstName text not null, lastName text not null, email text)" database 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[]
+#+end_src
+
+#+begin_src kcats
+"insert into Person (firstName, lastName, email) values ('Skywife', 'Vactai', 'skywife@skyrod.me')" database 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[]
+#+end_src
+
+#+begin_src kcats
+  "select (firstName) from Person where lastName='Vactai'" database 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[[firstName "Skyrod"]] [[firstName "Skykid"]] [[firstName "Skywife"]]]
+#+end_src
+
+
+#+begin_src kcats
+dictionary [swap] lookup
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[definition builtin-function]
+ [examples [[[1 2 3 swap] [1 3 2]]]]
+ [spec [[[item a]
+         [item b]]
+        [[item b]
+         [item a]]]]]
+#+end_src
+**** Books db
+#+begin_src kcats
+  [[author-first "George"] [author-last "Orwell"] [title "1984"] [year 1949] [subjects [government dystopia surveillance totalitarianism freedom]]]
+  [[author-first "Aldous"] [author-last "Huxley"] [title "Brave New World"] [year 1932] [subjects [society technology dystopia happiness drugs]]]
+  [[author-first "F. Scott"] [author-last "Fitzgerald"] [title "The Great Gatsby"] [year 1925] [subjects [wealth love obsession american-dream tragedy]]]
+  [[author-first "J.D."] [author-last "Salinger"] [title "The Catcher in the Rye"] [year 1951] [subjects [adolescence alienation innocence society adulthood]]]
+  [[author-first "Jane"] [author-last "Austen"] [title "Pride and Prejudice"] [year 1813] [subjects [love marriage society class reputation]]]
+  [[author-first "Mary"] [author-last "Shelley"] [title "Frankenstein"] [year 1818] [subjects [creation science responsibility monster humanity]]]
+  [[author-first "John"] [author-last "Steinbeck"] [title "Of Mice and Men"] [year 1937] [subjects [friendship dream loneliness society tragedy]]]
+  [[author-first "Ernest"] [author-last "Hemingway"] [title "The Old Man and the Sea"] [year 1952] [subjects [endurance nature old-age fisherman sea]]]
+  [[author-first "Harper"] [author-last "Lee"] [title "To Kill a Mockingbird"] [year 1960] [subjects [racism innocence morality law childhood]]]
+  [[author-first "J.R.R."] [author-last "Tolkien"] [title "The Lord of the Rings"] [year 1954] [subjects [adventure elf dwarf hobbit ring journey magic evil]]]
+  [[author-first "Joseph"] [author-last "Conrad"] [title "Heart of Darkness"] [year 1899] [subjects [colonization africa journey morality darkness europeans]]]
+  [[author-first "Leo"] [author-last "Tolstoy"] [title "War and Peace"] [year 1869] [subjects [war peace society history love aristocracy]]]
+  [[author-first "Homer"] [title "The Odyssey"] [year -800] [subjects [journey odyssey homecoming gods heroism adventure]]]
+  [[author-first "Charlotte"] [author-last "Bronte"] [title "Jane Eyre"] [year 1847] [subjects [love morality society class womanhood independence]]]
+  [[author-first "Mark"] [author-last "Twain"] [title "Adventures of Huckleberry Finn"] [year 1884] [subjects [adventure racism slavery morality friendship river]]]
+  [[author-first "Ray"] [author-last "Bradbury"] [title "Fahrenheit 451"] [year 1953] [subjects [censorship knowledge books society dystopia future]]]
+  [[author-first "Charles"] [author-last "Dickens"] [title "A Tale of Two Cities"] [year 1859] [subjects [revolution love sacrifice resurrection society history]]]
+  [[author-first "William"] [author-last "Golding"] [title "Lord of the Flies"] [year 1954] [subjects [society civilization savagery childhood morality island]]]
+  [[author-first "Miguel de"] [author-last "Cervantes"] [title "Don Quixote"] [year 1605] [subjects [adventure idealism reality knight insanity literature]]]
+  [[author-first "H.G."] [author-last "Wells"] [title "The War of the Worlds"] [year 1898] [subjects [invasion aliens society technology war humanity]]]
+
+#+end_src
+
+#+begin_src kcats
+  db [take]
+  [[[type [book] unwrap =]
+    [[publishYear] lookup 1940 >=]]
+   [execute] every?]
+  keep
+#+end_src
+**** EAVTO (entity, attribute, value, time, observer)
+Here's a database of the most basic and abstract observations
+(ignoring time and observer for now - those are all "now" and "me").
+
+Down to a certain level, all attributes are also entities of their
+own, but at some point they have to be either axiomatic or
+circular. In the table below =type= and =format= are axiomatic.
+
+| Entity    | Attribute    | Value           |
+|-----------+--------------+-----------------|
+| Alice     | street       | 123 Fake St     |
+| Alice     | email        | alice@alice.com |
+| Alice     | birthdate    | 1/1/1980        |
+| street    | type         | attribute       |
+| street    | format       | string          |
+| email     | type         | attribute       |
+| email     | format       | string          |
+| birthdate | type         | attribute       |
+| birthdate | format       | integer         |
+| Alice     | relationship | Bob             |
+| Alice-Bob | type         | relationship    |
+| Alice-Bob | nature       | friends         |
+| Alice-Bob | trust        | 5/10            |
+
+Let's create an EAV table
+#+begin_src kcats
+  "CREATE TABLE EAV
+  ( Entity STRING,
+    Attribute STRING,
+    ValueString TEXT,
+    ValueInteger INTEGER,
+    ValueReal REAL,
+    ValueBlob BLOB,
+    ValueNumeric NUMERIC );" database 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[]
+#+end_src
+
+Create indices (should really do this for all the columns)
+
+#+begin_src kcats
+"CREATE INDEX idx_entity ON EAV (Entity);
+CREATE INDEX idx_attribute ON EAV (Attribute);
+CREATE INDEX idx_valuestring ON EAV (ValueString);
+" database
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[]
+#+end_src
+
+#+begin_src kcats
+  "INSERT INTO EAV (Entity, Attribute, ValueString, ValueInteger, ValueReal, ValueBlob, ValueNumeric) VALUES
+  ('Book1', 'Title', '1984', NULL, NULL, NULL, NULL),
+  ('Book1', 'Author', 'George Orwell', NULL, NULL, NULL, NULL),
+  ('Book1', 'Year', NULL, 1949, NULL, NULL, NULL),
+  ('Book2', 'Title', 'To Kill a Mockingbird', NULL, NULL, NULL, NULL),
+  ('Book2', 'Author', 'Harper Lee', NULL, NULL, NULL, NULL),
+  ('Book2', 'Year', NULL, 1960, NULL, NULL, NULL),
+  ('Author1', 'Name', 'George Orwell', NULL, NULL, NULL, NULL),
+  ('Author1', 'BirthYear', NULL, 1903, NULL, NULL, NULL),
+  ('Author2', 'Name', 'Harper Lee', NULL, NULL, NULL, NULL),
+  ('Author2', 'BirthYear', NULL, 1926, NULL, NULL, NULL); " database
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[]
+#+end_src
+
+#+begin_src kcats
+  "SELECT e1.ValueString AS Title
+  FROM EAV e1
+  JOIN EAV e2 ON e1.Entity = e2.Entity
+  WHERE e1.Attribute = 'Title'
+    AND e2.Attribute = 'Author'
+    AND e2.ValueString = 'George Orwell';
+  " database
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[[Title "1984"]]]
+#+end_src
+
+#+begin_src kcats
+  "SELECT e1.Entity as id, e1.Attribute, e1.ValueString, e1.ValueInteger, e1.ValueReal, e1.ValueBlob, e1.ValueNumeric
+  FROM EAV e1
+  INNER JOIN (
+      SELECT Entity 
+      FROM EAV 
+      WHERE Attribute = 'Author' AND ValueString = 'George Orwell'
+  ) AS e2 ON e1.Entity = e2.Entity;" database
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[[ValueReal []]
+  [ValueNumeric []]
+  [ValueInteger []]
+  [id "Book1"]
+  [ValueString "George Orwell"]
+  [Attribute "Author"]
+  [ValueBlob []]]
+ [[ValueBlob []]
+  [ValueReal []]
+  [ValueString "1984"]
+  [id "Book1"]
+  [ValueInteger []]
+  [Attribute "Title"]
+  [ValueNumeric []]]
+ [[ValueBlob []]
+  [ValueReal []]
+  [ValueNumeric []]
+  [ValueString []]
+  [id "Book1"]
+  [Attribute "Year"]
+  [ValueInteger 1949]]]
+#+end_src
+**** Attribute database using CozoDB
+The idea here is to ignore identity in the database and make that the
+responsibility of the client. The database only links attributes, and
+has nothing to say about whether a given entity is the "same" entity
+as another. It only says "something has both the color brown and the
+height 1.5m". What attributes are sufficient to establish identity is
+not part of the database. It's just a graph connecting attribute/value
+pairs.
+*****  First experiments
+#+begin_src fundamental
+  ?[a_attr, a_val, b_attr, b_val] <-
+  [
+    ["author", "George Orwell", "title", "1984"],
+    ["author", "George Orwell", "title", "Animal Farm"],
+    ["author", "George Orwell", "genre", "dystopia"],
+    ["genre", "dystopia", "title", "1984"],
+    ["created", "1949", "title", "1984"],
+    ["format", "book", "title", "1984"],
+    ["language", "english", "title", "1984"],
+    ["name", "George Orwell", "created", "1905"],
+    ["name", "George Orwell", "sex", "male"]
+  ]
+
+  :replace also {a_attr, a_val, b_attr, b_val}
+#+end_src
+
+#+begin_src restclient
+  POST http://127.0.0.1:3000/text-query
+  Content-Type: application/json
+
+  {"script": ":create attributes { a_attr: String, a_val: Any, b_attr: String, b_val: Any}",
+   "params": {}}
+#+end_src
+
+#+RESULTS:
+#+BEGIN_SRC js
+{
+  "headers": [
+    "status"
+  ],
+  "next": null,
+  "ok": true,
+  "rows": [
+    [
+      "OK"
+    ]
+  ],
+  "took": 0.016436112
+}
+// POST http://127.0.0.1:3000/text-query
+// HTTP/1.1 200 OK
+// content-type: application/json
+// content-length: 79
+// access-control-allow-origin: *
+// vary: origin
+// vary: access-control-request-method
+// vary: access-control-request-headers
+// date: Tue, 19 Dec 2023 23:25:15 GMT
+// Request duration: 0.018199s
+#+END_SRC
+
+#+begin_src restclient
+  POST http://127.0.0.1:3000/text-query
+  Content-Type: application/json
+
+  {"script": "?[a_attr, a_val, b_attr, b_val] <- [['author', 'George Orwell', 'title', '1984'], ['author', 'George Orwell', 'title', 'Animal Farm'], ['author', 'George Orwell', 'genre', 'dystopia'], ['genre', 'dystopia', 'title', '1984'], ['created', '1949', 'title', '1984'], ['format', 'book', 'title', '1984'], ['language', 'english', 'title', '1984'], ['name', 'George Orwell', 'created', '1905'], ['name', 'George Orwell', 'sex', 'male']] :put attributes",
+     "params": {}}
+#+end_src
+
+#+RESULTS:
+#+BEGIN_SRC js
+{
+  "headers": [
+    "status"
+  ],
+  "next": null,
+  "ok": true,
+  "rows": [
+    [
+      "OK"
+    ]
+  ],
+  "took": 0.011967695
+}
+// POST http://127.0.0.1:3000/text-query
+// HTTP/1.1 200 OK
+// content-type: application/json
+// vary: origin
+// vary: access-control-request-method
+// vary: access-control-request-headers
+// access-control-allow-origin: *
+// transfer-encoding: chunked
+// date: Tue, 19 Dec 2023 23:39:51 GMT
+// Request duration: 0.064371s
+#+END_SRC
+
+"When was the author of 1984 born?"
+#+begin_src restclient
+  POST http://127.0.0.1:3000/text-query
+  Content-Type: application/json
+
+  {"script": "linked[a, v, oa, ov] := *attributes[a, v, oa, ov] or *attributes[oa, ov, a, v]\n?[born] := linked['title', '1984', 'author', author], linked['created', born, 'name', author]", 
+   "params": {}}
+#+end_src
+
+#+RESULTS:
+#+BEGIN_SRC js
+{
+  "headers": [
+    "born"
+  ],
+  "next": null,
+  "ok": true,
+  "rows": [
+    [
+      "1905"
+    ]
+  ],
+  "took": 0.001707655
+}
+// POST http://127.0.0.1:3000/text-query
+// HTTP/1.1 200 OK
+// content-type: application/json
+// content-length: 79
+// access-control-allow-origin: *
+// vary: origin
+// vary: access-control-request-method
+// vary: access-control-request-headers
+// date: Tue, 19 Dec 2023 23:56:27 GMT
+// Request duration: 0.002975s
+#+END_SRC
+
+"What books did the author of 1984 write?"
+#+begin_src restclient
+  POST http://127.0.0.1:3000/text-query
+  Content-Type: application/json
+
+  {"script": "linked[a, v, oa, ov] := *attributes[a, v, oa, ov] or *attributes[oa, ov, a, v]\n?[title] := linked['title', '1984', 'author', author], linked['title', title, 'author', author]", 
+   "params": {}}
+#+end_src
+
+#+RESULTS:
+#+BEGIN_SRC js
+{
+  "headers": [
+    "title"
+  ],
+  "next": null,
+  "ok": true,
+  "rows": [
+    [
+      "1984"
+    ],
+    [
+      "Animal Farm"
+    ]
+  ],
+  "took": 0.001771184
+}
+// POST http://127.0.0.1:3000/text-query
+// HTTP/1.1 200 OK
+// content-type: application/json
+// content-length: 96
+// access-control-allow-origin: *
+// vary: origin
+// vary: access-control-request-method
+// vary: access-control-request-headers
+// date: Wed, 20 Dec 2023 00:05:26 GMT
+// Request duration: 0.002879s
+#+END_SRC
+
+
+
+How to write that query in kcats format?
+#+begin_src kcats
+  [[title "1984" author a?]
+   [created c? name a?]
+   [c?]]
+#+end_src
+
+Everything about Orwell
+#+begin_src restclient
+  POST http://127.0.0.1:3000/text-query
+  Content-Type: application/json
+
+  {"script": "linked[a, v, oa, ov] := *attributes[a, v, oa, ov] or *attributes[oa, ov, a, v]\n?[a1, v, a2] := linked[a1, v, a2, 'George Orwell'] ", 
+   "params": {}}
+#+end_src
+
+#+RESULTS:
+#+BEGIN_SRC js
+{
+  "headers": [
+    "a1",
+    "v",
+    "a2"
+  ],
+  "next": null,
+  "ok": true,
+  "rows": [
+    [
+      "created",
+      "1905",
+      "name"
+    ],
+    [
+      "genre",
+      "dystopia",
+      "author"
+    ],
+    [
+      "sex",
+      "male",
+      "name"
+    ],
+    [
+      "title",
+      "1984",
+      "author"
+    ],
+    [
+      "title",
+      "Animal Farm",
+      "author"
+    ]
+  ],
+  "took": 0.00130435
+}
+// POST http://127.0.0.1:3000/text-query
+// HTTP/1.1 200 OK
+// content-type: application/json
+// content-length: 213
+// access-control-allow-origin: *
+// vary: origin
+// vary: access-control-request-method
+// vary: access-control-request-headers
+// date: Wed, 20 Dec 2023 00:14:07 GMT
+// Request duration: 0.002445s
+#+END_SRC
+
+***** Using org-mode eval
+Now we have an org-mode evaluator!
+#+begin_src cozodb :results value table
+{:create attributes {a_attr: String, b_attr: String, a_val: Any, b_val: Any}}
+#+end_src
+
+#+RESULTS:
+| OK |
+
+#+begin_src cozodb :results value table
+  %import /home/v/workspace/kcats/countries-cozo.json
+#+end_src
+
+#+RESULTS:
+| [31mparser::pest[0m |
+
+
+#+begin_src cozodb
+::index create attributes:rev {b_attr, a_attr, b_val, a_val}
+#+end_src
+
+#+begin_src cozodb :results value table
+  linked[a, v, oa, ov] := *attributes[a, v, oa, ov] or *attributes[oa, ov, a, v]
+  ?[title] := linked['title', '1984', 'author', author], linked['title', title, 'author', author]
+#+end_src
+
+#+RESULTS:
+
+What movies has robert de niro been in?
+#+begin_src cozodb
+linked[a, v, oa, ov] := *attributes[a, v, oa, ov] or *attributes[oa, ov, a, v]
+?[title] := linked['title', title, 'cast', cast], actor in cast, actor == 'Robert De Niro'
+#+end_src
+
+#+RESULTS:
+| GoodFellas                    |
+| Jackie Brown                  |
+| Mean Streets                  |
+| Midnight Run                  |
+| Once Upon a Time in America   |
+| Raging Bull                   |
+| Righteous Kill                |
+| Silver Linings Playbook       |
+| Stardust                      |
+| The Irishman                  |
+| The Irishman: In Conversation |
+| The Score                     |
+
+
+
+What directors has robert de niro worked with?
+#+begin_src cozodb
+  linked[a, oa, v, ov] := *attributes[a, oa, v, ov] or *attributes[oa, a, ov, v]
+  ?[director] := linked['title', 'cast', title, cast],
+                 linked['title', 'director', title, director], 
+                 actor in cast, actor = 'Robert De Niro' 
+#+end_src
+
+#+RESULTS:
+|                   |
+| David O. Russell  |
+| Frank Oz          |
+| Jon Avnet         |
+| Martin Brest      |
+| Martin Scorsese   |
+| Matthew Vaughn    |
+| Quentin Tarantino |
+| Sergio Leone      |
+
+
+What movies had both Adam Sandler and David Spade?
+#+begin_src cozodb
+  linked[a, v, oa, ov] := *attributes[a, oa, v,  ov] or *attributes:rev[a, oa, v, ov]
+  ?[title] := linked['title', title, 'cast', cast],
+              actor1 in cast,
+              actor2 in cast,
+              actor1 == 'Adam Sandler', actor2 == 'David Spade'
+#+end_src
+
+#+RESULTS:
+| Grown Ups                             |
+| Hotel Transylvania 3: Summer Vacation |
+| The Do-Over                           |
+| The Ridiculous 6                      |
+
+Adam Sandler's 5 most recent movies
+#+begin_src cozodb
+  linked[a, v, oa, ov] := *attributes[a, oa, v,  ov] or *attributes:rev[a, oa, v, ov]
+   ?[title, year] := linked['title', title, 'cast', cast],
+                     linked['release_year', year, 'title', title],
+                     actor in cast, actor == 'Adam Sandler',
+   :limit 5
+   :order -year
+#+end_src
+
+#+RESULTS:
+| Hubie Halloween                       | 2020 |
+| Murder Mystery                        | 2019 |
+| Uncut Gems                            | 2019 |
+| ADAM SANDLER 100% FRESH               | 2018 |
+| Hotel Transylvania 3: Summer Vacation | 2018 |
+
+What actors have been in the most movies with Sandler
+#+begin_src cozodb
+  ?[count(title), actor2] := linked['title', title, 'cast', cast],
+                    target = 'Adam Sandler',
+                    actor1 in cast, actor1 == target,
+                    actor2 in cast, actor2 != target
+  :limit 10
+  :order -count(title)
+#+end_src
+
+#+RESULTS:
+| 7 | Rob Schneider     |
+| 6 | Allen Covert      |
+| 5 | Nick Swardson     |
+| 5 | Steve Buscemi     |
+| 4 | David Spade       |
+| 4 | Kevin James       |
+| 3 | Blake Clark       |
+| 3 | Colin Quinn       |
+| 3 | John Turturro     |
+| 3 | Jonathan Loughran |
+
+
+#+begin_src cozodb
+  linked[a, v, oa, ov] := *attributes[a, oa, v,  ov] or *attributes:rev[a, oa, v, ov]
+  ?[attr, val] := linked['title', 'Murder Mystery', attr, val]
+#+end_src
+
+#+RESULTS:
+| cast         | [Adam Sandler Jennifer Aniston Luke Evans Gemma Arterton Adeel Akhtar Luis Gerardo Méndez Dany Boon Terence Stamp]                               |
+| country      | United States                                                                                                                                    |
+| description  | On a long-awaited trip to Europe, a New York City cop and his hairdresser wife scramble to solve a baffling murder aboard a billionaire's yacht. |
+| director     | Kyle Newacheck                                                                                                                                   |
+| duration     | 98                                                                                                                                               |
+| rating       | PG-13                                                                                                                                            |
+| release_year | 2019                                                                                                                                             |
+| type         | Movie                                                                                                                                            |
+
+10 longest movie titles
+#+begin_src cozodb
+  linked[a, v, oa, ov] := *attributes[a, oa, v,  ov] or *attributes:rev[a, oa, v, ov]
+  ?[title, ct] := linked['title', title, _, _], ct = length(title)
+  :limit 10
+  :order -ct
+#+end_src 
+
+#+RESULTS:
+| Jim & Andy: The Great Beyond - Featuring a Very Special, Contractually Obligated Mention of Tony Clifton | 104 |
+| Ken Burns Presents: College Behind Bars: A Film by Lynn Novick and Produced by Sarah Botstein  |  93 |
+| Mike Birbiglia: What I Should Have Said Was Nothing: Tales from My Secret Public Journal       |  88 |
+| The Power of Grayskull: The Definitive History of He-Man and the Masters of the Universe       |  88 |
+| Steve Martin and Martin Short: An Evening You Will Forget for the Rest of Your Life            |  83 |
+| Cultivating the Seas: History and Future of the Full-Cycle Cultured Kindai Tuna                |  79 |
+| Power Rangers Samurai: Christmas Together, Friends Forever (Christmas Special)                 |  78 |
+| Willy and the Guardians of the Lake: Tales from the Lakeside Winter Adventure                  |  77 |
+| Ya no estoy aquí: Una conversación entre Guillermo del Toro y Alfonso Cuarón                   |  76 |
+| The Road to El Camino: Behind the Scenes of El Camino: A Breaking Bad Movie                    |  75 |
+
+#+begin_src cozodb
+  linked[a, oa, v,  ov] := *attributes[a, oa, v, ov] or *attributes[oa, a, v, ov]
+  ?[count(title)] := linked['title', title, _, _], 
+#+end_src 
+
+#+RESULTS:
+| 70456 |
+
+#+begin_src cozodb
+  linked[a, v, oa, ov] := *attributes[a, oa, v,  ov] or *attributes:rev[a, oa, v, ov]
+  ?[title] := linked['director', 'Steven Spielberg', 'title', title ], 
+#+end_src 
+
+#+RESULTS:
+| Catch Me If You Can                                |
+| Indiana Jones and the Kingdom of the Crystal Skull |
+| Indiana Jones and the Last Crusade                 |
+| Indiana Jones and the Raiders of the Lost Ark      |
+| Indiana Jones and the Temple of Doom               |
+| Jaws                                               |
+| Lincoln                                            |
+| Schindler's List                                   |
+| The Adventures of Tintin                           |
+| The BFG                                            |
+| War Horse                                          |
+
+#+begin_src cozodb
+  ::explain {
+            linked[a, v, oa, ov] := *attributes[a, v, oa, ov]
+  ?[title] := linked['title', title, 'director', 'Steven Spielberg'] }
+#+end_src 
+
+#+RESULTS:
+| 0 | 0 | ?      | 3         |     load_mem | ?                  | S.0.0                              | :null                             | []                 | [*1 *2 *3]          |            |
+| 0 | 0 | ?      | 2         |     load_mem | linked             | Mbfbb                              | :null                             | []                 | [**0 title **1 **2] |            |
+| 0 | 0 | ?      | 1         | mem_mat_join | :null              | ((*1 . **0) (*2 . **1) (*3 . **2)) | :null                             | [title]            |                     |            |
+| 0 | 0 | ?      | 0         |          out | :null              | :null                              | :null                             | [title]            |                     |            |
+| 0 | 1 | linked | Mbfbb     |            4 | load_mem           | linked                             | S.0.0bfbb                         | :null              | []                  | [a oa ov]  |
+| 0 | 1 | linked | Mbfbb     |            3 | load_stored        | :attributes                        | :null                             | []                 | [**0 v **1 **2]     |            |
+| 0 | 1 | linked | Mbfbb     |            2 | stored_mat_join    | :null                              | ((a . **0) (oa . **1) (ov . **2)) | :null              | [a oa ov v]         |            |
+| 0 | 1 | linked | Mbfbb     |            1 | reorder            | :null                              | :null                             | :null              | [a v oa ov]         |            |
+| 0 | 1 | linked | Mbfbb     |            0 | out                | :null                              | :null                             | :null              | [a v oa ov]         |            |
+| 0 | 2 | linked | Mbfbb     |            4 | load_mem           | linked                             | S.1.0bfbb                         | :null              | []                  | [a oa ov]  |
+| 0 | 2 | linked | Mbfbb     |            3 | load_stored        | :attributes                        | :null                             | []                 | [**0 **1 **2 v]     |            |
+| 0 | 2 | linked | Mbfbb     |            2 | stored_prefix_join | :null                              | ((a . **2) (oa . **0) (ov . **1)) | :null              | [a oa ov v]         |            |
+| 0 | 2 | linked | Mbfbb     |            1 | reorder            | :null                              | :null                             | :null              | [a v oa ov]         |            |
+| 0 | 2 | linked | Mbfbb     |            0 | out                | :null                              | :null                             | :null              | [a v oa ov]         |            |
+| 0 | 3 | linked | Ibfbb     |            1 | load_mem           | ?                                  | S.0.0                             | :null              | []                  | [*1 *2 *3] |
+| 0 | 3 | linked | Ibfbb     |            0 | out                | :null                              | :null                             | :null              | [*1 *2 *3]          |            |
+| 0 | 4 | ?      | S.0.0     |            3 | unify              | *1                                 | :null                             | "title"            | [*1]                |            |
+| 0 | 4 | ?      | S.0.0     |            2 | unify              | *2                                 | :null                             | "director"         | [*1 *2]             |            |
+| 0 | 4 | ?      | S.0.0     |            1 | unify              | *3                                 | :null                             | "Steven Spielberg" | [*1 *2 *3]          |            |
+| 0 | 4 | ?      | S.0.0     |            0 | out                | :null                              | :null                             | :null              | [*1 *2 *3]          |            |
+| 0 | 5 | linked | S.0.0bfbb |            1 | load_mem           | linked                             | Ibfbb                             | :null              | []                  | [a oa ov]  |
+| 0 | 5 | linked | S.0.0bfbb |            0 | out                | :null                              | :null                             | :null              | [a oa ov]           |            |
+| 0 | 6 | linked | S.1.0bfbb |            1 | load_mem           | linked                             | Ibfbb                             | :null              | []                  | [a oa ov]  |
+| 0 | 6 | linked | S.1.0bfbb |            0 | out                | :null                              | :null                             | :null              | [a oa ov]           |            |
+
+#+begin_src cozodb
+  linked[a, v, oa, ov] := *attributes[a, oa, v,  ov] or *attributes:rev[a, oa, v, ov]
+  ?[c] := linked['timezone', 'America/New_York', 'country', c]
+#+end_src
+
+#+RESULTS:
+| United States |
+
+
+#+begin_src cozodb
+  linked[a, v, oa, ov] := *attributes[a, oa, v,  ov] or *attributes:rev[a, oa, v, ov]
+  ?[a, v, distance] := linked['coordinates', c, a, v], distance = l2_dist(vec([35.99403, -78.89862], 'F32'), c)
+  :limit 10
+  :order distance
+#+end_src
+
+#+RESULTS:
+#+begin_example
+[31meval::throw[0m
+
+  [31m×[0m Evaluation of expression failed
+   ╭─[1:1]
+ [2m1[0m │ linked[a, v, oa, ov] := *attributes[a, oa, v,  ov] or *attributes:rev[a, oa, v, ov]
+ [2m2[0m │ ?[a, v, distance] := linked['coordinates', c, a, v], distance = l2_dist(vec([35.99403, -78.89862], 'F32'), c)
+   · [35;1m                                                                ─────────────────────────────────────────────[0m
+ [2m3[0m │ :limit 10
+   ╰────
+[36m  help: [0m'l2_dist' requires two vectors of the same type
+#+end_example
+
+Furthest cities (the distance formula isn't quite right but
+demonstrates the concept). Disambiguate the city of Durham from other
+durhams, using the state.
+#+begin_src cozodb
+  linked[a, v, oa, ov] := *attributes[a, oa, v,  ov] or *attributes:rev[a, oa, v, ov]
+  ?[v, s, country, distance] := linked['coordinates', c, 'state', 'North Carolina'], 
+        linked['coordinates', c, 'name', 'Durham'],
+        linked['coordinates', c2, 'name', v], distance = l2_dist(vec(c), vec(c2)),
+        linked['coordinates', c2, 'state', s],
+        linked['name', s, 'country', country]
+        :limit 10
+        :order -distance
+#+end_src
+
+#+RESULTS:
+| Gisborne    | Gisborne District    | New Zealand | 71571.2578125 |
+| Wairoa      | Hawke's Bay Region   | New Zealand |       71301.0 |
+| Napier      | Hawke's Bay Region   | New Zealand |   71137.46875 |
+| Hastings    | Hawke's Bay Region   | New Zealand |   71127.15625 |
+| Taradale    | Hawke's Bay Region   | New Zealand | 71111.7421875 |
+| Opotiki     | Bay of Plenty Region | New Zealand |    71107.5625 |
+| Castlepoint | Wellington Region    | New Zealand |       70996.5 |
+| Whakatane   | Bay of Plenty Region | New Zealand | 70945.6328125 |
+| Murupara    | Bay of Plenty Region | New Zealand |  70875.046875 |
+| Edgecumbe   | Bay of Plenty Region | New Zealand | 70871.4765625 |
+
+#+begin_src cozodb
+  linked[a, v, oa, ov] := *attributes[a, oa, v,  ov] or *attributes:rev[a, oa, v, ov]
+  ?[a, v] := linked['coordinates', c, 'country', 'United States'], linked['coordinates', c, a, v]
+#+end_src
+
+#+RESULTS:
+| country    | Liberia                              |
+| country    | United States                        |
+| name       | Alabama                              |
+| name       | Alaska                               |
+| name       | American Samoa                       |
+| name       | Arizona                              |
+| name       | Arkansas                             |
+| name       | Baker Island                         |
+| name       | California                           |
+| name       | Colorado                             |
+| name       | Connecticut                          |
+| name       | Delaware                             |
+| name       | District of Columbia                 |
+| name       | Florida                              |
+| name       | Georgia                              |
+| name       | Guam                                 |
+| name       | Hawaii                               |
+| name       | Howland Island                       |
+| name       | Idaho                                |
+| name       | Illinois                             |
+| name       | Indiana                              |
+| name       | Iowa                                 |
+| name       | Jarvis Island                        |
+| name       | Johnston Atoll                       |
+| name       | Kansas                               |
+| name       | Kentucky                             |
+| name       | Kingman Reef                         |
+| name       | Louisiana                            |
+| name       | Maine                                |
+| name       | Maryland                             |
+| name       | Maryland County                      |
+| name       | Massachusetts                        |
+| name       | Michigan                             |
+| name       | Midway Atoll                         |
+| name       | Minnesota                            |
+| name       | Mississippi                          |
+| name       | Missouri                             |
+| name       | Montana                              |
+| name       | Navassa Island                       |
+| name       | Nebraska                             |
+| name       | Nevada                               |
+| name       | New Hampshire                        |
+| name       | New Jersey                           |
+| name       | New Mexico                           |
+| name       | New York                             |
+| name       | North Carolina                       |
+| name       | North Dakota                         |
+| name       | Northern Mariana Islands             |
+| name       | Ohio                                 |
+| name       | Oklahoma                             |
+| name       | Oregon                               |
+| name       | Palmyra Atoll                        |
+| name       | Pennsylvania                         |
+| name       | Puerto Rico                          |
+| name       | Rhode Island                         |
+| name       | South Carolina                       |
+| name       | South Dakota                         |
+| name       | Tennessee                            |
+| name       | Texas                                |
+| name       | United States Minor Outlying Islands |
+| name       | United States Virgin Islands         |
+| name       | Utah                                 |
+| name       | Vermont                              |
+| name       | Virginia                             |
+| name       | Wake Island                          |
+| name       | Washington                           |
+| name       | West Virginia                        |
+| name       | Wisconsin                            |
+| name       | Wyoming                              |
+| state_code | AK                                   |
+| state_code | AL                                   |
+| state_code | AR                                   |
+| state_code | AS                                   |
+| state_code | AZ                                   |
+| state_code | CA                                   |
+| state_code | CO                                   |
+| state_code | CT                                   |
+| state_code | DC                                   |
+| state_code | DE                                   |
+| state_code | FL                                   |
+| state_code | GA                                   |
+| state_code | GU                                   |
+| state_code | HI                                   |
+| state_code | IA                                   |
+| state_code | ID                                   |
+| state_code | IL                                   |
+| state_code | IN                                   |
+| state_code | KS                                   |
+| state_code | KY                                   |
+| state_code | LA                                   |
+| state_code | MA                                   |
+| state_code | MD                                   |
+| state_code | ME                                   |
+| state_code | MI                                   |
+| state_code | MN                                   |
+| state_code | MO                                   |
+| state_code | MP                                   |
+| state_code | MS                                   |
+| state_code | MT                                   |
+| state_code | MY                                   |
+| state_code | NC                                   |
+| state_code | ND                                   |
+| state_code | NE                                   |
+| state_code | NH                                   |
+| state_code | NJ                                   |
+| state_code | NM                                   |
+| state_code | NV                                   |
+| state_code | NY                                   |
+| state_code | OH                                   |
+| state_code | OK                                   |
+| state_code | OR                                   |
+| state_code | PA                                   |
+| state_code | PR                                   |
+| state_code | RI                                   |
+| state_code | SC                                   |
+| state_code | SD                                   |
+| state_code | TN                                   |
+| state_code | TX                                   |
+| state_code | UM                                   |
+| state_code | UM-67                                |
+| state_code | UM-71                                |
+| state_code | UM-76                                |
+| state_code | UM-79                                |
+| state_code | UM-81                                |
+| state_code | UM-84                                |
+| state_code | UM-86                                |
+| state_code | UM-89                                |
+| state_code | UM-95                                |
+| state_code | UT                                   |
+| state_code | VA                                   |
+| state_code | VI                                   |
+| state_code | VT                                   |
+| state_code | WA                                   |
+| state_code | WI                                   |
+| state_code | WV                                   |
+| state_code | WY                                   |
+
+***** Using an artificial entity column
+#+begin_src cozodb :results value table
+{:create eav {entity: Uuid, attribute: String, value: Any}}
+#+end_src
+
+What type should =entity= be? Some keys are uuids that link to pk attrs,
+others are just the entity id. Maybe everything should use uuid? 
+***** Add source and time columns
+#+begin_src cozodb :results value table
+  {:create trust {source: Bytes,
+                  target: Bytes,
+                  with: Any,
+                  ts: Validity default 'ASSERT'
+                  =>
+                  score: Int,
+                  }}
+#+end_src
+
+#+RESULTS:
+| [31mparser::pest[0m |
+
+
+#+begin_src cozodb
+::remove trust
+#+end_src
+
+#+RESULTS:
+: [31mquery::relation_not_found[0m
+: 
+:   [31m×[0m Cannot find requested stored relation 'trusted_attributes'
+
+#+begin_src cozodb 
+  ?[source, target, with, ts, score] <-
+  [
+   ["bWU=", "QWxpY2U=", 'introduce', 'ASSERT', 11]       
+  ]
+  :put trust {source, target, with, ts, score}
+#+end_src
+
+#+RESULTS:
+: [31meval::invalid_validity[0m
+: 
+:   [31m×[0m when executing against relation 'trust'
+: [31m  ├─▶ [0mwhen processing tuple ["bWU=", "QWxpY2U=", "introduce", [1703279106.2922018, true], 10]
+: [31m  ╰─▶ [0m[1703279106.2922018, true] cannot be coerced into validity
+
+#+begin_src cozodb
+::relations
+#+end_src
+
+#+RESULTS:
+| attributes     | 4 | normal | 4 | 0 | 0 | 0 | 0 |   |
+| attributes:rev | 4 | index  | 4 | 0 | 0 | 0 | 0 |   |
+| trust          | 5 | normal | 4 | 1 | 0 | 0 | 0 |   |
+
+#+begin_src cozodb
+?[source, target, with, score] := *trust[source, target, with, ts, score @ 'NOW']
+#+end_src
+
+#+RESULTS:
+| bWU= | QWxpY2U= | introduce | 11 |
+
+***** Questions
+What about when we insert "name=Alice, height=1.2", and then later
+"name=Alice, height=1.3"?
+
+I think part of the problem is we can't just arbitrarily pair
+attributes, one of them has to be the "key".
+
+For example, let's say we don't do that and we have:
+[name Alice, height 1.6]
+[height 1.6, weight 50]
+
+In this case the "link" is height. But we don't want to link to
+anything that's 1.6m high.
+
+The first attribute has to be something that identifies the
+entity. But as we know, not every entity has a single attribute that
+uniquely identifies it. eg Person. The name isn't unique, but let's
+say name+birthday is unique.
+
+[name Alice, height 1.6]
+[name Alice, bday 1/1]
+[name Alice, bday 6/4]
+[name Alice, height 1.3]
+
+What we need is a unique id to attach to her attributes:
+
+[id 1, name Alice]
+[id 1, bday 1/1]
+;; now we can hang other attrs off the id
+[id 1, height 1.6]
+
+One question is, does every entity have some unique attribute? It may,
+but either we may not know it or it's really a combination of more
+than one.
+
+So there's several solutions,
++ Make the first attr a compound of multiple actual attrs, and make
+  the individual ones linked from there.
++ Hash the multiple attrs
+
+ If the attrs are a tuple, in theory we can fetch the record directly
+  ,if the user knows how the key is built. THat's better than a
+  generated id which the user is guaranteed not to know. So given
+  this, let's remodel.
+
+***** kcats query format
+#+begin_src cozodb
+  linked[a, v, oa, ov] := *attributes[a, oa, v,  ov] or *attributes:rev[a, oa, v, ov]
+  ?[a, v] := linked['coordinates', c, 'country', 'United States'], linked['coordinates', c, a, v]
+#+end_src
+
+Let's say we wanted to write this query as kcats data instead of a string. How?
+We've got 2 rules, one with an =or= and the other an =and=.
+
+We could create some words to build some more explicit objects.
+#+begin_src kcats
+  [a v oa ov] [linked]  
+  [a oa v ov] [attributes] rel ;; *attributes[a, oa, v,  ov]
+  [a oa v ov] [attributes rev] index ;; *attributes:rev[a, oa, v, ov]
+  or
+  rule
+  [a v] [?]
+  ["coordinates" c "country" "United States"] [linked] rel
+  ["coordinates" c a v] [linked] rel
+  and
+  rule
+
+#+end_src
+
+Of course, the most straightforward is to probably just build the
+query string, it's just a bit error prone and inefficient.
+
+Let's do that query and dump the parsed object, so we can imitate it a bit:
+
+#+begin_src rust :crates '(cozo)
+  extern crate cozo;
+  use cozo;
+
+  fn main() {
+      let db = DbInstance::new("mem", "", Default::default());
+      db.par
+  }
+#+end_src
+Ok nevermind those functions that deal with parsed scripts are
+private. I guess we'll have to just build the query string!
+
+#+begin_src kcats
+  [[comma-separate [[string] map ", " interpose "" swap [join] step]]]
+  [[a b c d] comma-separate]
+  let
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+"a, b, c, d"
+#+end_src
+
+***** Import into cozo by reading json
+#+begin_src kcats
+  "Ama Qamata, Khosi Ngema, Gail Mabalane, Thabang Molaba, Dillon Windvogel, Natasha Thahane, Arno Greeff, Xolile Tshabalala, Getmore Sithole, Cindy Mahlangu, Ryle De Morny, Greteli Fincham, Sello Maake Ka-Ncube, Odwa Gwanya, Mekaila Mathys, Sandi Schultz, Duane Williams, Shamilla Miller, Patrick Mofokeng"
+  [", " split] assemble
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+["Ama Qamata" "Khosi Ngema" "Gail Mabalane" "Thabang Molaba" "Dillon Windvogel" "Natasha Thahane"
+ "Arno Greeff" "Xolile Tshabalala" "Getmore Sithole" "Cindy Mahlangu" "Ryle De Morny"
+ "Greteli Fincham" "Sello Maake Ka-Ncube" "Odwa Gwanya" "Mekaila Mathys" "Sandi Schultz"
+ "Duane Williams" "Shamilla Miller" "Patrick Mofokeng"]
+#+end_src
+
+#+begin_src kcats
+  "/home/jweiss/Downloads/netflix_titles.json" file-out slurp decodejson 
+
+  [[300 taker
+    [["cast"] [[", " split] assemble] update
+     [take] [] into 
+     ;encodejson "u[uuid] <- [[rand_uuid_v1()]] av[attribute, value] <- {} ?[entity, attribute, value] :=  av[attribute, value], u[entity] :put eav {entity, attribute, value}"
+     ;swap wrap format
+    ]
+    each
+    [["description"] lookup \" contains?] keep
+   ]
+   assemble first emit "u[uuid] <- [[rand_uuid_v1()]] av[attribute, value] <- {} ?[entity, attribute, value] :=  av[attribute, value], u[entity] :put eav {entity, attribute, value}"
+     swap wrap format print] [] recover 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+u[uuid] <- [[rand_uuid_v1()]] av[attribute, value] <- [["duration" "1 Season"] ["description" "Sicily boasts a bold \"Anti-Mafia\" coalition. But what happens when those trying to bring down organized crime are accused of being criminals themselves?"] ["type" "TV Show"] ["title" "Vendetta: Truth, Lies and The Mafia"] ["listed_in" "Crime TV Shows, Docuseries, International TV Shows"] ["show_id" "s11"] ["director" ""] ["release_year" 2021] ["country" ""] ["cast" []] ["date_added" "September 24, 2021"] ["rating" "TV-MA"]] ?[entity, attribute, value] :=  av[attribute, value], u[entity] :put eav {entity, attribute, value}
+#+end_src
+
+
+ #+begin_src cozodb
+           u[uuid] <- [[rand_uuid_v1()]] av[attribute, value] <- [["listed_in","Crime TV Shows, Docuseries, International TV Shows"],["duration","1 Season"],["release_year",2021],["show_id","s11"],["title","Vendetta: Truth, Lies and The Mafia"],["type","TV Show"],["description","Sicily boasts a bold \"Anti-Mafia\" coalition. But what happens when those trying to bring down organized crime are accused of being criminals themselves?"],["director",""],["date_added","September 24, 2021"],["country",""],["cast",[]],["rating","TV-MA"]] ?[entity, attribute, value] :=  av[attribute, value], u[entity] :put eav {entity, attribute, value}
+          #+end_src
+
+          #+RESULTS:
+          : [31mparser::pest[0m
+          : 
+          :   [31m×[0m The query parser has encountered unexpected input / end of input at 292..292
+          :    ╭────
+          :  [2m1[0m │ u[uuid] <- [[rand_uuid_v1()]] av[attribute, value] <- [["listed_in","Crime TV Shows, Docuseries, International TV Shows"],["duration","1 Season"],["release_year",2021],["show_id","s11"],["title","Vendetta: Truth, Lies and The Mafia"],["type","TV Show"],["description","Sicily boasts a bold \"Anti-Mafia\" coalition. But what happens when those trying to bring down organized crime are accused of being criminals themselves?"],["director",""],["date_added","September 24, 2021"],["country",""],["cast",[]],["rating","TV-MA"]] ?[entity, attribute, value] :=  av[attribute, value], u[entity] :put eav {entity, attribute, value} 
+          :    · [35;1m                                                                                                                                                                                                                                                                                                    ▲[0m
+          :    ╰────
+
+#+begin_src kcats
+"" [", " split] assemble
+;[1 2 3 4 5] [[odd?] keep] assemble
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[type error]
+ [unwound [source [take] ", " split collect [[]] unwrap evert first]]
+ [asked [source]]
+ [reason "word is not defined"]
+ [handled yes]]
+#+end_src
+
+#+begin_src kcats
+[foo] [take] [] into
+#+end_src
+#+begin_src kcats
+":create eav {entity: Uuid, attribute: String, value: Any}" database
+#+end_src
+#+RESULTS:
+#+begin_src kcats
+[["status"] ["OK"]]
+#+end_src
+
+#+begin_src cozodb
+    ?[entity, attribute, value] <~
+    Constant(data: [[uuid, "release_year", 2021],
+     [uuid, "cast", ["Sami Bouajila", "Tracy Gotoas", "Samuel Jouy", "Nabiha Akkari", "Sofia Lesaffre", "Salim Kechiouche", "Noureddine Farihi", "Geert Van Rampelberg", "Bakary Diombera"]],
+     [uuid, "show_id", "s3"],
+     [uuid, "country", ""],
+     [uuid, "director", "Julien Leclercq"],
+     [uuid, "listed_in", "Crime TV Shows, International TV Shows, TV Action & Adventure"],
+     [uuid, "rating", "TV-MA"], [uuid, "type", "TV Show"], [uuid, "title", "Ganglands"],
+     [uuid, "date_added", "September 24, 2021"],
+     [uuid, "duration", "1 Season"],
+     [uuid, "description", "To protect his family from a powerful drug lord, skilled thief Mehdi and his expert team of robbers are pulled into a violent and deadly turf war."]]),
+      uuid = rand_uuid_v4()
+    :put eav {entity, attribute, value}
+
+#+end_src
+
+#+RESULTS:
+: [31mparser::pest[0m
+: 
+:   [31m×[0m The query parser has encountered unexpected input / end of input at 777..777
+:     ╭─[10:1]
+:  [2m10[0m │  [uuid, "duration", "1 Season"],
+:  [2m11[0m │  [uuid, "description", "To protect his family from a powerful drug lord, skilled thief Mehdi and his expert team of robbers are pulled into a violent and deadly turf war."]]),
+:     · [35;1m                                                                                                                                                                              ▲[0m
+:  [2m12[0m │   uuid = rand_uuid_v4()
+:     ╰────
+
+#+begin_src cozodb
+  u[uuid] <- [[rand_uuid_v1()]]
+  av[attribute, value] <- [["release_year",2021],["director","Julien Leclercq"],["description","To protect his family from a powerful drug lord, skilled thief Mehdi and his expert team of robbers are pulled into a violent and deadly turf war."],["duration","1 Season"],["rating","TV-MA"],["title","Ganglands"],["cast",["Sami Bouajila","Tracy Gotoas","Samuel Jouy","Nabiha Akkari","Sofia Lesaffre","Salim Kechiouche","Noureddine Farihi","Geert Van Rampelberg","Bakary Diombera"]],["type","TV Show"],["date_added","September 24, 2021"],["country",""],["listed_in","Crime TV Shows, International TV Shows, TV Action & Adventure"],["show_id","s3"]]
+  ?[entity, attribute, value] :=  av[attribute, value], u[entity]
+
+  :put eav {entity, attribute, value} :returning
+
+#+end_src
+
+#+RESULTS:
+| inserted | 36fc42bd-a775-11ee-a783-d0c86867d02e | cast         | [Sami Bouajila Tracy Gotoas Samuel Jouy Nabiha Akkari Sofia Lesaffre Salim Kechiouche Noureddine Farihi Geert Van Rampelberg Bakary Diombera]      |
+| inserted | 36fc42bd-a775-11ee-a783-d0c86867d02e | country      |                                                                                                                                                    |
+| inserted | 36fc42bd-a775-11ee-a783-d0c86867d02e | date_added   | September 24, 2021                                                                                                                                 |
+| inserted | 36fc42bd-a775-11ee-a783-d0c86867d02e | description  | To protect his family from a powerful drug lord, skilled thief Mehdi and his expert team of robbers are pulled into a violent and deadly turf war. |
+| inserted | 36fc42bd-a775-11ee-a783-d0c86867d02e | director     | Julien Leclercq                                                                                                                                    |
+| inserted | 36fc42bd-a775-11ee-a783-d0c86867d02e | duration     | 1 Season                                                                                                                                           |
+| inserted | 36fc42bd-a775-11ee-a783-d0c86867d02e | listed_in    | Crime TV Shows, International TV Shows, TV Action & Adventure                                                                                      |
+| inserted | 36fc42bd-a775-11ee-a783-d0c86867d02e | rating       | TV-MA                                                                                                                                              |
+| inserted | 36fc42bd-a775-11ee-a783-d0c86867d02e | release_year | 2021                                                                                                                                               |
+| inserted | 36fc42bd-a775-11ee-a783-d0c86867d02e | show_id      | s3                                                                                                                                                 |
+| inserted | 36fc42bd-a775-11ee-a783-d0c86867d02e | title        | Ganglands                                                                                                                                          |
+| inserted | 36fc42bd-a775-11ee-a783-d0c86867d02e | type         | TV Show                                                                                                                                            |
+
+#+begin_src cozodb
+  linked[a1, v1, a2, v2] := *eav[id, a1, v1], *eav[id, a2, v2]
+  ?[t] := linked['title', t, 'release_year', 2021]          
+#+end_src
+
+#+RESULTS:
+| Blood & Water                    |
+| Ganglands                        |
+| Jailbirds New Orleans            |
+| Kota Factory                     |
+| Midnight Mass                    |
+| My Little Pony: A New Generation |
+| The Great British Baking Show    |
+| The Starling                     |
