@@ -142,6 +142,7 @@ internally, to keep track of things like the stack, program, lists etc.
   use lazy_static::lazy_static;
   use std::collections::{HashMap, VecDeque};
   use std::fmt;
+  use std::fmt::Display;
   use std::hash::Hash;
   use std::marker::Sync;
   use std::ops::{Deref, DerefMut};
@@ -197,7 +198,40 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  pub type Word = Intern<String>;
+  #[derive(Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord, Default)]
+  pub struct Word {
+      data: Intern<String>,
+      dictversion: Option<usize>,
+  }
+
+  impl Word {}
+
+  impl Display for Word {
+      fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+          write!(f, "{}", self.data.as_str())
+      }
+  }
+
+  impl From<&str> for Word {
+      fn from(s: &str) -> Self {
+          Word {
+              data: Intern::<String>::from(s),
+              dictversion: None,
+          }
+      }
+  }
+
+  impl From<String> for Word {
+      fn from(s: String) -> Self {
+          Word::from(s.as_str())
+      }
+  }
+
+  impl<'a> From<&'a Word> for &'a str {
+      fn from(s: &'a Word) -> Self {
+          s.data.as_str()
+      }
+  }
 
   pub type Stack = collection::List;
 
@@ -210,25 +244,25 @@ internally, to keep track of things like the stack, program, lists etc.
   pub type Char = char;
 
   lazy_static! {
-      pub static ref S_ASSOC: Intern<String> = Intern::new("association".to_string());
-      pub static ref S_BOOLEAN: Intern<String> = Intern::new("boolean".to_string());
-      pub static ref S_BYTES: Intern<String> = Intern::new("bytes".to_string());
-      pub static ref S_CHAR: Intern<String> = Intern::new("character".to_string());
-      pub static ref S_DISPENSER: Intern<String> = Intern::new("dispenser".to_string());
-      pub static ref S_ENVIRONMENT: Intern<String> = Intern::new("environment".to_string());
-      pub static ref S_ERROR: Intern<String> = Intern::new("error".to_string());
-      pub static ref S_FLOAT: Intern<String> = Intern::new("float".to_string());
-      pub static ref S_INTEGER: Intern<String> = Intern::new("integer".to_string());
-      pub static ref S_ITEM: Intern<String> = Intern::new("item".to_string());
-      pub static ref S_LIST: Intern<String> = Intern::new("list".to_string());
-      pub static ref S_NUMBER: Intern<String> = Intern::new("number".to_string());
-      pub static ref S_ORDERED: Intern<String> = Intern::new("ordered".to_string());
-      pub static ref S_PIPE: Intern<String> = Intern::new("pipe".to_string());
-      pub static ref S_PROGRAM: Intern<String> = Intern::new("program".to_string());
-      pub static ref S_RECEPTACLE: Intern<String> = Intern::new("receptacle".to_string());
-      pub static ref S_SIZED: Intern<String> = Intern::new("sized".to_string());
-      pub static ref S_STRING: Intern<String> = Intern::new("string".to_string());
-      pub static ref S_WORD: Intern<String> = Intern::new("word".to_string());
+      pub static ref S_ASSOC: Word = Word::from("association");
+      pub static ref S_BOOLEAN: Word = Word::from("boolean");
+      pub static ref S_BYTES: Word = Word::from("bytes");
+      pub static ref S_CHAR: Word = Word::from("character");
+      pub static ref S_DISPENSER: Word = Word::from("dispenser");
+      pub static ref S_ENVIRONMENT: Word = Word::from("environment");
+      pub static ref S_ERROR: Word = Word::from("error");
+      pub static ref S_FLOAT: Word = Word::from("float");
+      pub static ref S_INTEGER: Word = Word::from("integer");
+      pub static ref S_ITEM: Word = Word::from("item");
+      pub static ref S_LIST: Word = Word::from("list");
+      pub static ref S_NUMBER: Word = Word::from("number");
+      pub static ref S_ORDERED: Word = Word::from("ordered");
+      pub static ref S_PIPE: Word = Word::from("pipe");
+      pub static ref S_PROGRAM: Word = Word::from("program");
+      pub static ref S_RECEPTACLE: Word = Word::from("receptacle");
+      pub static ref S_SIZED: Word = Word::from("sized");
+      pub static ref S_STRING: Word = Word::from("string");
+      pub static ref S_WORD: Word = Word::from("word");
   }
 
   #[derive(Debug, Clone)]
@@ -542,11 +576,11 @@ internally, to keep track of things like the stack, program, lists etc.
           where
               S: Serializer,
           {
-              match *self {
-                  Item::Int(i) => serializer.serialize_i64(i),
-                  Item::Float(f) => serializer.serialize_f64(f),
-                  Item::Char(c) => serializer.serialize_char(c),
-                  Item::Word(w) => serializer.serialize_str(w.as_str()),
+              match self {
+                  Item::Int(i) => serializer.serialize_i64(*i),
+                  Item::Float(f) => serializer.serialize_f64(*f),
+                  Item::Char(c) => serializer.serialize_char(*c),
+                  Item::Word(w) => serializer.serialize_str(w.into()),
 
                   // Handle other variants
                   Item::Dispenser(ref dispenser) => dispenser.serialize(serializer),
@@ -1412,6 +1446,42 @@ internally, to keep track of things like the stack, program, lists etc.
                   _ => (Associative::Dictionary(d), None),
               },
               Associative::Env(e) => e.insert(k, v),
+              Associative::DictEntry(mut de) => match k {
+                  KeyItem::Word(ref w) => {
+                      let w: &str = w.into();
+                      if w == "definition" {
+                          let l = coll::List::try_from(v);
+                          match l {
+                              Ok(l) => {
+                                  de.definition = dict::Definition::Derived(l);
+                                  (Associative::DictEntry(de), None) // TODO: return the old def
+                              }
+                              Err(_) => (Associative::DictEntry(de), None),
+                          }
+                      } else if w == "examples" {
+                          let l = coll::List::try_from(v);
+                          match l {
+                              Ok(l) => {
+                                  de.examples = Some(l);
+                                  (Associative::DictEntry(de), None) // TODO: return the old examples
+                              }
+                              Err(_) => (Associative::DictEntry(de), None),
+                          }
+                      } else if w == "spec" {
+                          let l = coll::List::try_from(v);
+                          match l {
+                              Ok(l) => {
+                                  de.spec = Some(l);
+                                  (Associative::DictEntry(de), None) // TODO: return the old spec
+                              }
+                              Err(_) => (Associative::DictEntry(de), None),
+                          }
+                      } else {
+                          (Associative::DictEntry(de), None)
+                      }
+                  }
+                  _ => (Associative::DictEntry(de), None),
+              },
               _ => todo!("insert Implementations for error, env etc"),
           }
       }
@@ -1453,11 +1523,11 @@ internally, to keep track of things like the stack, program, lists etc.
               Associative::Assoc(a) => a.get(k).cloned(),
               Associative::Error(e) => e.data.get(k).cloned(),
               Associative::Env(e) => match k {
-                  KeyItem::Word(s) => e.get(s.as_str()),
+                  KeyItem::Word(s) => e.get(s.into()),
                   _ => None,
               },
               Associative::DictEntry(d) => match k {
-                  KeyItem::Word(s) => d.get(s.as_str()),
+                  KeyItem::Word(s) => d.get(s.into()),
                   _ => None,
               },
               Associative::Dictionary(d) => match k {
@@ -1524,7 +1594,7 @@ internally, to keep track of things like the stack, program, lists etc.
               Associative::Dictionary(mut d) => {
                   let maybe_key = d.inner().keys().next().cloned();
                   let dm = d.make_mut();
-                  let maybe_value = maybe_key.and_then(|key| dm.remove(&key));
+                  let maybe_value = maybe_key.clone().and_then(|key| dm.remove(&key));
                   (
                       Associative::Dictionary(d),
                       maybe_key.map(|key| {
@@ -1766,7 +1836,7 @@ internally, to keep track of things like the stack, program, lists etc.
           {
               match self {
                   KeyItem::Int(i) => serializer.serialize_i64(*i),
-                  KeyItem::Word(w) => serializer.serialize_str(w.as_str()),
+                  KeyItem::Word(w) => serializer.serialize_str(w.into()),
                   KeyItem::Char(c) => serializer.serialize_char(*c),
                   KeyItem::Bytes(b) => serializer.serialize_bytes(b.as_slice()),
                   KeyItem::List(ref l) => {
@@ -2004,8 +2074,8 @@ internally, to keep track of things like the stack, program, lists etc.
       }
 
       pub fn contains_key(&self, key: &assoc::KeyItem) -> bool {
-          Word::try_from(key.clone()).map_or(false, |w| {
-              matches!(w.as_str(), "examples" | "spec" | "definition")
+          Word::try_from(key.clone()).map_or(false, |ref w| {
+              matches!(w.into(), "examples" | "spec" | "definition")
           })
       }
   }
@@ -2316,65 +2386,68 @@ internally, to keep track of things like the stack, program, lists etc.
       }
 
       pub fn contains_key(&self, key: &assoc::KeyItem) -> bool {
-          Word::try_from(key.clone()).map_or(false, |w| {
-              matches!(w.as_str(), "stack" | "program" | "dictionary")
+          Word::try_from(key.clone()).map_or(false, |ref w| {
+              matches!(w.into(), "stack" | "program" | "dictionary")
           })
       }
 
       pub fn insert(mut self, k: assoc::KeyItem, v: Item) -> (assoc::Associative, Option<Item>) {
           match k {
-              assoc::KeyItem::Word(w) => match w.as_str() {
-                  "stack" => {
-                      let l = coll::List::try_from(v.clone());
-                      match l {
-                          Ok(l) => {
-                              let old = self.stack.clone();
-                              self.stack = l;
-                              (assoc::Associative::Env(self), Some(old.into()))
-                          }
-                          Err(_) => {
-                              let a = assoc::Association::from_iter(self);
-                              let old = a.inner().insert(k, v);
-                              (assoc::Associative::Assoc(a), old)
-                          }
-                      }
-                  }
-                  "program" => {
-                      let l = coll::List::try_from(v.clone());
-                      match l {
-                          Ok(l) => {
-                              let old = self.program.clone();
-                              self.program = l;
-                              (assoc::Associative::Env(self), Some(old.into()))
-                          }
-                          Err(_) => {
-                              let a = assoc::Association::from_iter(self);
-                              let old = a.inner().insert(k, v);
-                              (assoc::Associative::Assoc(a), old)
+              assoc::KeyItem::Word(ref w) => {
+                  let w: &str = w.into();
+                  match w {
+                      "stack" => {
+                          let l = coll::List::try_from(v.clone());
+                          match l {
+                              Ok(l) => {
+                                  let old = self.stack.clone();
+                                  self.stack = l;
+                                  (assoc::Associative::Env(self), Some(old.into()))
+                              }
+                              Err(_) => {
+                                  let a = assoc::Association::from_iter(self);
+                                  let old = a.inner().insert(k, v);
+                                  (assoc::Associative::Assoc(a), old)
+                              }
                           }
                       }
-                  }
-                  "dictionary" => {
-                      let d = dict::Dictionary::try_from(v.clone());
-                      match d {
-                          Ok(d) => {
-                              let old = self.dictionary.clone();
-                              self.dictionary = d;
-                              (assoc::Associative::Env(self), Some(old.into()))
-                          }
-                          Err(_) => {
-                              let a = assoc::Association::from_iter(self);
-                              let old = a.inner().insert(k, v);
-                              (assoc::Associative::Assoc(a), old)
+                      "program" => {
+                          let l = coll::List::try_from(v.clone());
+                          match l {
+                              Ok(l) => {
+                                  let old = self.program.clone();
+                                  self.program = l;
+                                  (assoc::Associative::Env(self), Some(old.into()))
+                              }
+                              Err(_) => {
+                                  let a = assoc::Association::from_iter(self);
+                                  let old = a.inner().insert(k, v);
+                                  (assoc::Associative::Assoc(a), old)
+                              }
                           }
                       }
+                      "dictionary" => {
+                          let d = dict::Dictionary::try_from(v.clone());
+                          match d {
+                              Ok(d) => {
+                                  let old = self.dictionary.clone();
+                                  self.dictionary = d;
+                                  (assoc::Associative::Env(self), Some(old.into()))
+                              }
+                              Err(_) => {
+                                  let a = assoc::Association::from_iter(self);
+                                  let old = a.inner().insert(k, v);
+                                  (assoc::Associative::Assoc(a), old)
+                              }
+                          }
+                      }
+                      k => {
+                          let a = assoc::Association::from_iter(self);
+                          let old = a.inner().insert(k.into(), v);
+                          (assoc::Associative::Assoc(a), old)
+                      }
                   }
-                  k => {
-                      let a = assoc::Association::from_iter(self);
-                      let old = a.inner().insert(k.into(), v);
-                      (assoc::Associative::Assoc(a), old)
-                  }
-              },
+              }
               _ => {
                   let a = assoc::Association::from_iter(self);
                   let old = a.inner().insert(k, v);
@@ -2696,7 +2769,7 @@ example, in order to read/write to/from disk).
           Item::Receptacle(coll::Receptacle::Sized(v)) => {
               from_item(&Item::Dispenser(coll::Dispenser::Sized(v.clone())))
           }
-          Item::Word(w) => edn_format::Value::Symbol(edn_format::Symbol::from_name(w)),
+          Item::Word(w) => edn_format::Value::Symbol(edn_format::Symbol::from_name(w.into())),
           //Item::Entry(w) => edn_format::Value::Symbol(edn_format::Symbol::from_name(&w.word)),
           Item::Dispenser(coll::Dispenser::Out(o)) => from_item(&o.representation()),
           Item::Dispenser(coll::Dispenser::Tunnel(t)) => from_item(&t.representation()),
@@ -3244,7 +3317,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   fn number_type_error(i: Item) -> ItemResult {
-      invalid_type_error(crate::types::wrap(Item::Word(*S_NUMBER)), i)
+      invalid_type_error(crate::types::wrap(Item::Word(Word::from("number"))), i)
   }
 
   fn pair(i: Item, j: Item) -> Item {
@@ -4186,26 +4259,26 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       )))
   }
 
-  fn check_type(i: &Item, w: Word) -> Result<(), Error> {
+  fn check_type(i: &Item, w: &Word) -> Result<(), Error> {
       match (w, i) {
-          (w, _) if w == *S_ITEM => Ok(()),
-          (w, Item::Dispenser(_) | Item::Receptacle(_)) if w == *S_DISPENSER => Ok(()),
-          (w, Item::Receptacle(_) | Item::Dispenser(_)) if w == *S_RECEPTACLE => Ok(()),
-          (w, Item::Int(_)) if w == *S_INTEGER || w == *S_NUMBER => Ok(()),
-          (w, Item::Float(_)) if w == *S_FLOAT || w == *S_NUMBER => Ok(()),
+          (w, _) if *w == *S_ITEM => Ok(()),
+          (w, Item::Dispenser(_) | Item::Receptacle(_)) if *w == *S_DISPENSER => Ok(()),
+          (w, Item::Receptacle(_) | Item::Dispenser(_)) if *w == *S_RECEPTACLE => Ok(()),
+          (w, Item::Int(_)) if *w == *S_INTEGER || *w == *S_NUMBER => Ok(()),
+          (w, Item::Float(_)) if *w == *S_FLOAT || *w == *S_NUMBER => Ok(()),
           // TODO: also handle cases where bytes/string is a list
           (
               w,
               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(_)))
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(_))),
-          ) if w == *S_BYTES || w == *S_ORDERED => Ok(()),
+          ) if *w == *S_BYTES || *w == *S_ORDERED => Ok(()),
 
           (
               w,
               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(_)))
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::String(_))),
-          ) if w == *S_STRING => Ok(()),
-          (w, Item::Word(_)) if w == *S_WORD => Ok(()),
+          ) if *w == *S_STRING => Ok(()),
+          (w, Item::Word(_)) if *w == *S_WORD => Ok(()),
 
           (
               w,
@@ -4213,19 +4286,19 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               | Item::Dispenser(coll::Dispenser::Tunnel(_))
               | Item::Receptacle(coll::Receptacle::Tunnel(_))
               | Item::Receptacle(coll::Receptacle::In(_)),
-          ) if w == *S_PIPE => Ok(()),
+          ) if *w == *S_PIPE => Ok(()),
 
           (
               w,
               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(_)))
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::List(_))),
-          ) if w == *S_LIST || w == *S_PROGRAM => Ok(()),
+          ) if *w == *S_LIST || *w == *S_PROGRAM => Ok(()),
 
           (
               w,
               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(_)))
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(_))),
-          ) if w == *S_ASSOC => Ok(()),
+          ) if *w == *S_ASSOC => Ok(()),
 
           (
               w,
@@ -4235,13 +4308,13 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(
                   assoc::Associative::Error(_),
               ))),
-          ) if w == *S_ERROR => Ok(()),
+          ) if *w == *S_ERROR => Ok(()),
 
           (
               w,
               Item::Dispenser(coll::Dispenser::Sized(_))
               | Item::Receptacle(coll::Receptacle::Sized(_)),
-          ) if w == *S_SIZED || w == *S_ORDERED => Ok(()),
+          ) if *w == *S_SIZED || *w == *S_ORDERED => Ok(()),
 
           (
               w,
@@ -4251,10 +4324,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(
                   assoc::Associative::Env(_),
               ))),
-          ) if w == *S_ENVIRONMENT => Ok(()),
+          ) if *w == *S_ENVIRONMENT => Ok(()),
           (w, i) => {
               //println!("Type check failed! wanted {} got {:?}", w, i);
-              Err(Error::expected(&w, i.clone()))
+              Err(Error::expected(w.into(), i.clone()))
           }
       }
   }
@@ -4287,11 +4360,11 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           match spec {
               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(named))) => {
                   match named.get(0).unwrap() {
-                      Item::Word(w) => check_type(item, *w),
+                      Item::Word(w) => check_type(item, w),
                       i => Err(Error::expected("list", i.clone())),
                   }
               }
-              Item::Word(w) => check_type(item, *w),
+              Item::Word(w) => check_type(item, w),
               // the type might happen to also be a defined
               // word, like 'association'
               i => Err(Error::expected("list", i.clone())),
@@ -4326,7 +4399,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                           }
                       }
                   } else {
-                      let w = *word;
+                      let w = word.clone();
                       env.push(Error::undefined(w).into()).into()
                   }
               }
@@ -4380,7 +4453,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       match i {
           Item::Int(i) => Ok(i.to_be_bytes().to_vec().into()),
           Item::Float(f) => Ok(f.to_be_bytes().to_vec().into()),
-          _ => Err(Error::expected("number", i.into())),
+          _ => Err(Error::expected("number", i)),
       }
   }
 
@@ -4981,7 +5054,6 @@ We'll also define how to run unit tests.
       use super::*;
       use crate::types::collection as coll;
       use crate::types::{Item, Word};
-      use internment::Intern;
       use std::borrow::Borrow;
       use test_case::test_case;
 
@@ -5221,7 +5293,7 @@ We'll also define how to run unit tests.
       fn test_lexicon(word: &str) {
           let e = axiom::standard_env(None, None);
 
-          let r = test_word(e.clone(), Intern::new(word.to_string()));
+          let r = test_word(e.clone(), word.into());
           assert!(r.is_empty(), "{:?}", r);
       }
   }
@@ -5602,7 +5674,7 @@ How to interact with files on disk
       ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Item>, Error>> + Send + 'a>> {
           match self.file.as_mut() {
               Some(f) => {
-                  let mut bs = [0u8; 1024];
+                  let mut bs = [0u8; 102400];
                   Box::pin(async move {
                       let ct = f.read(&mut bs).await?;
                       if ct == 0 {
