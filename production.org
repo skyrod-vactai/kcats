@@ -2083,6 +2083,12 @@ internally, to keep track of things like the stack, program, lists etc.
 
   pub type Dictionary = coll::Arc<HashMap<Word, Entry>>;
 
+  impl Default for Dictionary {
+      fn default() -> Self {
+          coll::Arc::wrap(HashMap::new())
+      }
+  }
+
   #[derive(Clone)]
   pub enum Definition {
       Axiom(&'static StepFn),
@@ -2340,9 +2346,55 @@ internally, to keep track of things like the stack, program, lists etc.
       pub stack: Stack,
       pub program: Stack,
       pub dictionary: dict::Dictionary,
+      dictversion: usize, // used to track newly defined words
   }
 
   impl Environment {
+      pub fn standard(program: Option<coll::List>, stack: Option<coll::List>) -> Environment {
+          let prog_expr = program.unwrap_or_default();
+
+          let mut env = Environment {
+              stack: stack.unwrap_or_default(),
+              program: prog_expr,
+              dictionary: dict::Dictionary::default(),
+              dictversion: 0,
+          };
+          env.add_standard_dictionary();
+          //print!("Env: {:?}", env.dictionary);
+          env
+      }
+
+      pub fn read_lexicon(&mut self, lexicon: String) {
+          let items = serialize::parse(lexicon).unwrap();
+          for r in Box::new(items.inner().into_iter()) {
+              let (k, def): (assoc::KeyItem, Item) = r.try_into().unwrap();
+              let word: Word = k.try_into().unwrap();
+              let iter: Box<dyn Iterator<Item = Item>> = def.try_into().unwrap();
+              let new_entry: dict::Entry = iter.try_into().unwrap();
+              let new_entry2 = new_entry.clone();
+              let dict = coll::Arc::make_mut(&mut self.dictionary);
+              dict.entry(word)
+                  .and_modify(|e| {
+                      e.examples = new_entry.examples;
+                      e.spec = new_entry.spec;
+                      e.definition = new_entry.definition;
+                  })
+                  .or_insert(new_entry2);
+          }
+      }
+
+      pub fn add_standard_dictionary(&mut self) {
+          // read builtins
+          let builtins =
+              String::from_utf8(include_bytes!("../kcats/builtins.kcats").to_vec()).unwrap();
+          self.read_lexicon(builtins);
+          //println!("with builtins {:?}", env.dictionary);
+          axiom::add_builtins(&mut self.dictionary);
+          //env = add_derivations(env);
+          let lexicon = String::from_utf8(include_bytes!("../kcats/lexicon.kcats").to_vec()).unwrap();
+          self.read_lexicon(lexicon);
+      }
+
       pub fn push(mut self, i: Item) -> Environment {
           coll::Arc::make_mut(&mut self.stack).push_front(i);
           self
@@ -2375,6 +2427,14 @@ internally, to keep track of things like the stack, program, lists etc.
 
       pub fn len(&self) -> usize {
           3 // 3 fields
+      }
+
+      pub fn new_dictversion(mut self) {
+          self.dictversion += 1;
+      }
+
+      pub fn prev_dictversion(mut self) {
+          self.dictversion -= 1;
       }
 
       pub fn get(&self, key: &str) -> Option<Item> {
@@ -2476,7 +2536,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   continue;
               }
           }
-          let mut env = axiom::standard_env(program, stack);
+          let mut env = Environment::standard(program, stack);
           if let Some(d) = dictionary {
               let edmut = env.dictionary.make_mut();
               edmut.extend(d.inner());
@@ -3024,7 +3084,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   use dynfmt::Format;
   use futures::future::FutureExt;
   use num_integer::Roots;
-  use std::collections::HashMap;
   use std::collections::VecDeque;
   use std::ops::Deref;
   //use std::future::Future;
@@ -3112,20 +3171,16 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }
   }
 
-  fn update_axiom_entries(
-      mut d: dict::Dictionary,
-      updates: Vec<(&str, &'static StepFn)>,
-  ) -> dict::Dictionary {
-      let dm = coll::Arc::make_mut(&mut d);
+  fn update_axiom_entries(d: &mut dict::Dictionary, updates: Vec<(&str, &'static StepFn)>) {
+      let dm = d.make_mut();
       for (w, f) in updates {
           dm.entry(Word::from(w)).and_modify(|e| {
               e.definition = dict::Definition::Axiom(f);
           });
       }
-      d
   }
 
-  pub fn add_builtins(d: dict::Dictionary) -> dict::Dictionary {
+  pub fn add_builtins(d: &mut dict::Dictionary) {
       update_axiom_entries(
           d,
           vec![
@@ -3280,38 +3335,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               ("yes", Box::leak(Box::new(yes))),
               ("zero?", Box::leak(Box::new(f_stack1(is_zero)))),
           ],
-      )
-  }
-
-  pub fn read_lexicon(lexicon: String, mut env: Environment) -> Environment {
-      let items = serialize::parse(lexicon).unwrap();
-      for r in Box::new(items.inner().into_iter()) {
-          let (k, def): (assoc::KeyItem, Item) = r.try_into().unwrap();
-          let word: Word = k.try_into().unwrap();
-          let iter: Box<dyn Iterator<Item = Item>> = def.try_into().unwrap();
-          let new_entry: dict::Entry = iter.try_into().unwrap();
-          let new_entry2 = new_entry.clone();
-          let dict = coll::Arc::make_mut(&mut env.dictionary);
-          dict.entry(word)
-              .and_modify(|e| {
-                  e.examples = new_entry.examples;
-                  e.spec = new_entry.spec;
-                  e.definition = new_entry.definition;
-              })
-              .or_insert(new_entry2);
-      }
-      env
-  }
-
-  pub fn add_standard_dictionary(env: Environment) -> Environment {
-      // read builtins
-      let builtins = String::from_utf8(include_bytes!("kcats/builtins.kcats").to_vec()).unwrap();
-      let mut env = read_lexicon(builtins, env);
-      //println!("with builtins {:?}", env.dictionary);
-      env.dictionary = add_builtins(env.dictionary);
-      //env = add_derivations(env);
-      let lexicon = String::from_utf8(include_bytes!("kcats/lexicon.kcats").to_vec()).unwrap();
-      read_lexicon(lexicon, env)
+      );
   }
 
   pub fn invalid_type_error(asked: coll::List, actual: Item) -> ItemResult {
@@ -4535,20 +4559,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       env
   }
 
-  pub fn standard_env(program: Option<coll::List>, stack: Option<coll::List>) -> Environment {
-      let prog_expr = match program {
-          Some(p) => Stack::from(p),
-          _ => Stack::default(),
-      };
-
-      let env = Environment {
-          stack: stack.unwrap_or_default(),
-          program: prog_expr,
-          dictionary: coll::Arc::wrap(HashMap::<Word, dict::Entry>::new()),
-      };
-      add_standard_dictionary(env)
-  }
-
   fn environment(p: Item) -> ItemResult {
       Environment::try_from(p).map(|e| e.into())
   }
@@ -4954,7 +4964,7 @@ We'll also define how to run unit tests.
   // string, and then evaluates that string as a kcats program. It then
   // prints the length of the result, and then the result itself.
   async fn interactive_mode() {
-      let mut env = axiom::standard_env(None, None);
+      let mut env = Environment::standard(None, None);
 
       loop {
           if let Some(program) = read_input().await {
@@ -4976,7 +4986,7 @@ We'll also define how to run unit tests.
   }
 
   async fn repl() {
-      let mut env = axiom::standard_env(None, None);
+      let mut env = Environment::standard(None, None);
 
       loop {
           // Print the prompt and flush it to stdout immediately
@@ -5008,7 +5018,7 @@ We'll also define how to run unit tests.
 
   async fn read_eval_print(program: String) {
       // otherwise, read from stdin
-      match parse_input(axiom::standard_env(None, None), program) {
+      match parse_input(Environment::standard(None, None), program) {
           Ok(env) => {
               print_result(axiom::eval(env).await);
           }
@@ -5286,7 +5296,7 @@ We'll also define how to run unit tests.
       #[test_case("zero?" ; "is_zero")]
       #[test_case("zip")]
       fn test_lexicon(word: &str) {
-          let e = axiom::standard_env(None, None);
+          let e = Environment::standard(None, None);
 
           let r = test_word(e.clone(), word.into());
           assert!(r.is_empty(), "{:?}", r);
