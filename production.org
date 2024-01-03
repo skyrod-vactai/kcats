@@ -207,7 +207,7 @@ internally, to keep track of things like the stack, program, lists etc.
   impl Word {
       pub fn versioned(&self, v: usize) -> Self {
           Word {
-              data: self.data.clone(),
+              data: self.data,
               dictversion: Some(v),
           }
       }
@@ -2092,9 +2092,9 @@ internally, to keep track of things like the stack, program, lists etc.
               Definition::Axiom(_) => 0,
               Definition::Derived(l) => l
                   .front()
-                  .and_then(|i| match i {
-                      Item::Int(i) => Some(*i as usize),
-                      _ => Some(0),
+                  .map(|i| match i {
+                      Item::Int(i) => *i as usize,
+                      _ => 0,
                   })
                   .unwrap_or_default(),
           }
@@ -2114,21 +2114,21 @@ internally, to keep track of things like the stack, program, lists etc.
   impl Dictionary {
       pub fn next_version(&mut self) -> usize {
           let k = Word::from("+version+");
-          let v = self.get(&k).map_or(0 as usize, Entry::get_version_info) + 1;
+          let v = self.get(&k).map_or(0_usize, Entry::get_version_info) + 1;
           let e = Entry::version(v);
           self.make_mut().insert(k, e);
-          return v;
+          v
       }
 
       pub fn make_version(&mut self, word: Word) {
           // copy the existing non-versioned entry
           let mut unversioned = word.clone();
           unversioned.dictversion = None;
-          let existing = self.get(&unversioned);
-          existing.map(|v| {
-              let wordv = word.clone();
-              self.insert(wordv, v.clone());
-          });
+          let d = self.make_mut();
+
+          if let Some(existing) = d.get(&unversioned) {
+              d.insert(word.clone(), existing.clone());
+          }
       }
   }
 
@@ -2453,6 +2453,8 @@ internally, to keep track of things like the stack, program, lists etc.
           coll::Arc::make_mut(&mut self.stack).pop_front().unwrap()
       }
 
+      /// Pushes one item onto the front of the expression (so that it
+      /// executes first)
       pub fn push_expr(mut self, i: Item) -> Environment {
           coll::Arc::make_mut(&mut self.program).push_front(i);
           self
@@ -2462,6 +2464,10 @@ internally, to keep track of things like the stack, program, lists etc.
           coll::Arc::make_mut(&mut self.program).pop_front().unwrap()
       }
 
+      /// Pushes a new program into the expression (at the front of the
+      /// expression so that it executes first). The different between
+      /// this and push_expr is that this function splices the program
+      /// into the expression, joining them.
       pub fn append_program(mut self, mut items: coll::List) -> Environment {
           let expr = self.program.make_mut();
           let ct = expr.len();
@@ -3316,6 +3322,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               ("inspect", Box::leak(Box::new(f_stack1(inspect)))),
               ("join", Box::leak(Box::new(f_stack2(join)))),
               ("key", Box::leak(Box::new(f_stack1(crate::crypto::key)))),
+              ("let*", Box::leak(Box::new(let_))),
               ("last", Box::leak(Box::new(f_stack1(last)))),
               ("list?", Box::leak(Box::new(f_stack1(is_list)))),
               ("log", Box::leak(Box::new(f_stack2(log)))),
@@ -4753,7 +4760,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       .into()
   }
 
-  fn label(p: &mut coll::List, words: HashMap<Intern<String>, Word>) {
+  fn label(p: &mut coll::List, words: &HashMap<Intern<String>, Word>) {
       let p = p.make_mut();
 
       for item in p.iter_mut() {
@@ -4773,18 +4780,17 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn version(p: &mut coll::List, words: Vec<Word>) {
-      let words_map: HashMap<Intern<String>, Word> = words
-          .into_iter()
-          .map(|word| (word.data.clone(), word))
-          .collect();
+      let words_map: HashMap<Intern<String>, Word> =
+          words.into_iter().map(|word| (word.data, word)).collect();
 
-      label(p, words_map);
+      label(p, &words_map);
   }
 
   pub fn let_(mut env: Environment) -> Future<Environment> {
       // Extract the bindings and program
-      let bindings = assoc::Associative::try_from(env.pop());
       let program = coll::List::try_from(env.pop());
+      let bindings = assoc::Associative::try_from(env.pop());
+
       match (bindings, program) {
           (Ok(bindings), Ok(ref mut program)) => {
               let ver = env.dictionary.next_version();
@@ -4808,17 +4814,43 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       let backup_dict = env.dictionary.clone();
                       let words = bindings
                           .keys()
-                          .into_iter()
                           .cloned()
                           .map(|k| Word::try_from(k).unwrap())
                           .collect::<Vec<Word>>();
                       for word in words.clone() {
                           env.dictionary.make_version(word);
                       }
-                      let versioned_program = version(program, words);
+                      version(program, words);
 
-                      // start pushing into the expression
+                      // get ready to update the dictionary with the user's changes
+                      // first put dict and updates on stack
+                      let dict = env.dictionary.clone();
+                      let p = coll::List::from_iter([
+                          Item::from("unwrap"),
+                          coll::List::from_iter([
+                              Item::from("wrap"),
+                              coll::List::from_iter([Item::from("definition")]).into(),
+                              "join".into(),
+                          ])
+                          .into(),
+                          "dip".into(),
+                          "update".into(),
+                      ]);
+                      env = env
+                          .push(dict.into())
+                          .push(assoc::Association::from(bindings).into())
+                          .push(p.into());
+                      // now push a program to step through the updates
 
+                      env.pop_expr(); //pop off the let word
+
+                      env = env
+                          .push_expr("define".into())
+                          .push_expr(backup_dict.into())
+                          .append_program(program.clone())
+                          .push_expr("define".into())
+                          .push_expr("step".into());
+                      //println!("{:?}", env);
                       // finally return the env
                       env.into()
                   }
@@ -12097,9 +12129,9 @@ Do the following:
 + [X] For each word, if the non-versioned word exists in the dictionary, copy it to the versioned word
 + [X] Recursively run through the program, updating words with the new version
 + [X] Change all the keys in the updates to the new version
-+ [ ] place into expression: get dictionary, step through updates, calling update, redefine
-+ [ ] place into expression: program (unwrapped)
-+ [ ] place into expression: the old dictionary, redefine
++ [X] place into expression: get dictionary, step through updates, calling update, redefine
++ [X] place into expression: program (unwrapped)
++ [X] place into expression: the old dictionary, redefine
 
 This should give us
 + The ability to do =let*= type stuff - refer to one function in the
@@ -12109,4 +12141,82 @@ This should give us
 + The implementation details don't leak into the language, this
   function could just be called =let=. The existing one we could rename
   to something more indicative of unsafe operations.
+
+  test it
+    Can call new words
+  #+begin_src kcats
+  [[foo [["foo"]]]] [foo] let*
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  No spec for foo!
+  "foo"
+  #+end_src
+
+    Can still access base words like swap
+  #+begin_src kcats
+  [[foo [["foo"]]]] [1 2 swap foo] let*
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  No spec for foo!
+  "foo" 1 2
+  #+end_src
+
+    Words no longer accessible after let ends
+  #+begin_src kcats
+  [[foo [["foo"]]]] [1 2 swap foo] let* foo
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  No spec for foo!
+  [[unwound [foo]]
+   [reason "word is not defined"]
+   [asked [foo]]
+   [type error]
+   [handled yes]]
+  "foo" 1 2
+  #+end_src
+
+   Previously defined words can be used inline
+  #+begin_src kcats
+    [[square [[clone *]]]
+     [fourth [[square square]]]] [3 fourth] let* 
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  No spec for fourth!
+  [[asked [square]]
+   [reason "word is not defined"]
+   [type error]
+   [unwound [square square dictionary_redacted define]]
+   [handled yes]]
+  3
+  #+end_src
+
 ***** TODO kcats impl
+#+begin_src kcats 
+  ;[foo] 1 version [foo] 2 version =
+  ;dictionary [*version*] [[definition [1]]] assign
+  [[foo [["foo"]]]
+   [bar [["bar"]]]
+   [lookup [["swappie"]]]] 
+  [foo bar swap]
+  dictionary
+  [+version+ definition] [[] [[inc] inject] [[0]] if] update ;; d p u
+
+  [[+version+ definition] lookup first] shield ;; v d p u
+  [sink] dip ;; v p u d
+  clone ;; v v p u d 
+  [version swap] dip version   ;; u p d
+
+   swapdown   ;; u d p
+  [ unwrap [wrap [definition] join] dip  update] step 
+  define
+  execute
+#+end_src
+
