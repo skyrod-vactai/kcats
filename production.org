@@ -200,11 +200,18 @@ internally, to keep track of things like the stack, program, lists etc.
 
   #[derive(Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord, Default)]
   pub struct Word {
-      data: Intern<String>,
-      dictversion: Option<usize>,
+      pub data: Intern<String>,
+      pub dictversion: Option<usize>,
   }
 
-  impl Word {}
+  impl Word {
+      pub fn versioned(&self, v: usize) -> Self {
+          Word {
+              data: self.data.clone(),
+              dictversion: Some(v),
+          }
+      }
+  }
 
   impl Display for Word {
       fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -2079,9 +2086,51 @@ internally, to keep track of things like the stack, program, lists etc.
               matches!(w.into(), "examples" | "spec" | "definition")
           })
       }
+
+      pub fn get_version_info(&self) -> usize {
+          match &self.definition {
+              Definition::Axiom(_) => 0,
+              Definition::Derived(l) => l
+                  .front()
+                  .and_then(|i| match i {
+                      Item::Int(i) => Some(*i as usize),
+                      _ => Some(0),
+                  })
+                  .unwrap_or_default(),
+          }
+      }
+
+      pub fn version(v: usize) -> Entry {
+          Entry {
+              examples: None,
+              spec: None,
+              definition: Definition::Derived(coll::List::from_iter(vec![Item::Int(v as Int)])),
+          }
+      }
   }
 
   pub type Dictionary = coll::Arc<HashMap<Word, Entry>>;
+
+  impl Dictionary {
+      pub fn next_version(&mut self) -> usize {
+          let k = Word::from("+version+");
+          let v = self.get(&k).map_or(0 as usize, Entry::get_version_info) + 1;
+          let e = Entry::version(v);
+          self.make_mut().insert(k, e);
+          return v;
+      }
+
+      pub fn make_version(&mut self, word: Word) {
+          // copy the existing non-versioned entry
+          let mut unversioned = word.clone();
+          unversioned.dictversion = None;
+          let existing = self.get(&unversioned);
+          existing.map(|v| {
+              let wordv = word.clone();
+              self.insert(wordv, v.clone());
+          });
+      }
+  }
 
   impl Default for Dictionary {
       fn default() -> Self {
@@ -2429,11 +2478,11 @@ internally, to keep track of things like the stack, program, lists etc.
           3 // 3 fields
       }
 
-      pub fn new_dictversion(mut self) {
+      pub fn new_dictversion(&mut self) {
           self.dictversion += 1;
       }
 
-      pub fn prev_dictversion(mut self) {
+      pub fn prev_dictversion(&mut self) {
           self.dictversion -= 1;
       }
 
@@ -3083,7 +3132,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   use crate::types::*;
   use dynfmt::Format;
   use futures::future::FutureExt;
+  use internment::Intern;
   use num_integer::Roots;
+  use std::collections::HashMap;
   use std::collections::VecDeque;
   use std::ops::Deref;
   //use std::future::Future;
@@ -3329,6 +3380,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   "verify",
                   Box::leak(Box::new(f_stack3(crate::crypto::verify))),
               ),
+              //("version", Box::leak(Box::new(f_stack2(version)))),
               ("word?", Box::leak(Box::new(f_stack1(is_word)))),
               ("wrap", Box::leak(Box::new(wrap))),
               ("xor", Box::leak(Box::new(f_stack2(xor)))),
@@ -4667,9 +4719,12 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn define(mut env: Environment) -> Future<Environment> {
       let d = dict::Dictionary::try_from(env.pop());
+      //assume there's a program beneath the new dictionary that we
+      // intend to run
       match d {
           Ok(d) => {
               env.dictionary = d;
+              env.new_dictversion();
               env.pop_expr();
               env
           }
@@ -4686,6 +4741,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       match d {
           Ok(d) => {
               env.dictionary = d;
+              env.prev_dictversion();
               env.pop_expr();
               env
           }
@@ -4695,6 +4751,83 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           }
       }
       .into()
+  }
+
+  fn label(p: &mut coll::List, words: HashMap<Intern<String>, Word>) {
+      let p = p.make_mut();
+
+      for item in p.iter_mut() {
+          match item {
+              Item::Word(w) => {
+                  if let Some(replacement) = words.get(&w.data) {
+                      ,*item = Item::Word(replacement.clone());
+                  }
+              }
+
+              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(ref mut l))) => {
+                  label(l, words);
+              }
+              _ => {}
+          }
+      }
+  }
+
+  pub fn version(p: &mut coll::List, words: Vec<Word>) {
+      let words_map: HashMap<Intern<String>, Word> = words
+          .into_iter()
+          .map(|word| (word.data.clone(), word))
+          .collect();
+
+      label(p, words_map);
+  }
+
+  pub fn let_(mut env: Environment) -> Future<Environment> {
+      // Extract the bindings and program
+      let bindings = assoc::Associative::try_from(env.pop());
+      let program = coll::List::try_from(env.pop());
+      match (bindings, program) {
+          (Ok(bindings), Ok(ref mut program)) => {
+              let ver = env.dictionary.next_version();
+              // find the words we're working with
+              let bindings: Result<HashMap<assoc::KeyItem, Item>, Error> = bindings
+                  .into_iter()
+                  .map(|(k, v)| match k {
+                      assoc::KeyItem::Word(mut w) => Ok((
+                          {
+                              w.dictversion = Some(ver);
+                              assoc::KeyItem::Word(w)
+                          },
+                          v,
+                      )),
+                      k => Err(Error::expected("word", k.into())),
+                  })
+                  .collect();
+
+              match bindings {
+                  Ok(bindings) => {
+                      let backup_dict = env.dictionary.clone();
+                      let words = bindings
+                          .keys()
+                          .into_iter()
+                          .cloned()
+                          .map(|k| Word::try_from(k).unwrap())
+                          .collect::<Vec<Word>>();
+                      for word in words.clone() {
+                          env.dictionary.make_version(word);
+                      }
+                      let versioned_program = version(program, words);
+
+                      // start pushing into the expression
+
+                      // finally return the env
+                      env.into()
+                  }
+                  Err(e) => env.push(e.into()).into(),
+              }
+          }
+          (Err(e), _) => env.push(e.into()).into(),
+          (_, Err(e)) => env.push(e.into()).into(),
+      }
   }
 
   // Takes an inner environment from the top of the stack, and spawns a
@@ -10598,7 +10731,6 @@ foo
 
 **** DONE ismulti?
 - State "DONE"       from "TODO"       [2023-12-04 Mon 16:25]
-**** 
 *** TODO Library definitions and loading
 We don't have a good story yet for how new words are loaded and accessed.
 
@@ -11940,3 +12072,41 @@ private. I guess we'll have to just build the query string!
 | 5bbe2d70-a78d-11ee-8b8f-1ae1901992a7 | show_id      | s8697                                                                                                                                                                                                               |
 | 5bbe2d70-a78d-11ee-8b8f-1ae1901992a7 | title        | War Horse                                                                                                                                                                                                           |
 | 5bbe2d70-a78d-11ee-8b8f-1ae1901992a7 | type         | Movie                                                                                                                                                                                                               |
+**** INPROGRESS Template-based let macro 
+ - State "INPROGRESS" from "TODO"       [2024-01-01 Mon 22:00]
+***** DONE Versioned Words   
+- State "DONE"       from "TODO"       [2024-01-02 Tue 17:32]
+***** DONE Versioned dictionary
+- State "DONE"       from "TODO"       [2024-01-02 Tue 17:32]
+***** DONE Dict lookups respect version but = doesn't
+- State "DONE"       from "TODO"       [2024-01-02 Tue 17:32]
+***** INPROGRESS Version words in a program
+- State "INPROGRESS" from "TODO"       [2024-01-02 Tue 17:45]
+***** INPROGRESS Dictionary update to copy all touched words to versioned word
+- State "INPROGRESS" from "TODO"       [2024-01-02 Tue 17:45]
+Here's how I think it could work:
+
+A rust function would take:
++ A list or assoc of updates (word, update-prog)
++ A program to run
+
+Do the following:
++ [X] extract the words into a set
++ [X] clone the current dictionary, save it
++ [X] Increment the version in the current dictionary
++ [X] For each word, if the non-versioned word exists in the dictionary, copy it to the versioned word
++ [X] Recursively run through the program, updating words with the new version
++ [X] Change all the keys in the updates to the new version
++ [ ] place into expression: get dictionary, step through updates, calling update, redefine
++ [ ] place into expression: program (unwrapped)
++ [ ] place into expression: the old dictionary, redefine
+
+This should give us
++ The ability to do =let*= type stuff - refer to one function in the
+  definition of another but we would need to be careful to only update
+  program in the values with the words that have already been defined,
+  not the whole word list. - make tests for this
++ The implementation details don't leak into the language, this
+  function could just be called =let=. The existing one we could rename
+  to something more indicative of unsafe operations.
+***** TODO kcats impl
