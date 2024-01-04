@@ -1213,6 +1213,12 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  impl Default for ListContent {
+      fn default() -> Self {
+          Newtype(VecDeque::new())
+      }
+  }
+
   mod serde {
       use super::{Dispenser, Receptacle, Sized};
       use crate::serialize::Display;
@@ -4786,76 +4792,92 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       label(p, &words_map);
   }
 
+  fn version_bindings(b: &mut coll::List, ver: usize) -> Vec<Word> {
+      //let mut r = coll::ListContent::default();
+      let mut words = Vec::<Word>::new();
+      let bm = b.make_mut();
+      for item in bm.iter_mut() {
+          if let Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(ref mut l))) = item {
+              let lm = l.make_mut();
+              let bindword = {
+                  let front_item = lm.front().cloned(); // Cloning inside the block
+                  front_item
+              };
+              let update = lm.get_mut(1);
+              if let (Some(Item::Word(bindword)), Some(update)) = (bindword, update) {
+                  if let Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(ref mut program))) =
+                      update
+                  {
+                      bindword.versioned(ver);
+                      words.push(bindword);
+                      version(program, words.clone());
+                  }
+              }
+          }
+      }
+      words
+  }
+
   pub fn let_(mut env: Environment) -> Future<Environment> {
       // Extract the bindings and program
       let program = coll::List::try_from(env.pop());
-      let bindings = assoc::Associative::try_from(env.pop());
+      let bindings = coll::List::try_from(env.pop());
 
       match (bindings, program) {
-          (Ok(bindings), Ok(ref mut program)) => {
+          (Ok(ref mut bindings), Ok(ref mut program)) => {
               let ver = env.dictionary.next_version();
               // find the words we're working with
-              let bindings: Result<HashMap<assoc::KeyItem, Item>, Error> = bindings
-                  .into_iter()
-                  .map(|(k, v)| match k {
-                      assoc::KeyItem::Word(mut w) => Ok((
-                          {
-                              w.dictversion = Some(ver);
-                              assoc::KeyItem::Word(w)
-                          },
-                          v,
-                      )),
-                      k => Err(Error::expected("word", k.into())),
-                  })
-                  .collect();
-
-              match bindings {
-                  Ok(bindings) => {
-                      let backup_dict = env.dictionary.clone();
-                      let words = bindings
-                          .keys()
-                          .cloned()
-                          .map(|k| Word::try_from(k).unwrap())
-                          .collect::<Vec<Word>>();
-                      for word in words.clone() {
-                          env.dictionary.make_version(word);
-                      }
-                      version(program, words);
-
-                      // get ready to update the dictionary with the user's changes
-                      // first put dict and updates on stack
-                      let dict = env.dictionary.clone();
-                      let p = coll::List::from_iter([
-                          Item::from("unwrap"),
-                          coll::List::from_iter([
-                              Item::from("wrap"),
-                              coll::List::from_iter([Item::from("definition")]).into(),
-                              "join".into(),
-                          ])
-                          .into(),
-                          "dip".into(),
-                          "update".into(),
-                      ]);
-                      env = env
-                          .push(dict.into())
-                          .push(assoc::Association::from(bindings).into())
-                          .push(p.into());
-                      // now push a program to step through the updates
-
-                      env.pop_expr(); //pop off the let word
-
-                      env = env
-                          .push_expr("define".into())
-                          .push_expr(backup_dict.into())
-                          .append_program(program.clone())
-                          .push_expr("define".into())
-                          .push_expr("step".into());
-                      //println!("{:?}", env);
-                      // finally return the env
-                      env.into()
-                  }
-                  Err(e) => env.push(e.into()).into(),
+              // let bindings: Result<HashMap<assoc::KeyItem, Item>, Error> = bindings
+              //     .into_iter()
+              //     .map(|(k, v)| match k {
+              //         assoc::KeyItem::Word(mut w) => Ok((
+              //             {
+              //                 w.dictversion = Some(ver);
+              //                 assoc::KeyItem::Word(w)
+              //             },
+              //             v,
+              //         )),
+              //         k => Err(Error::expected("word", k.into())),
+              //     })
+              //     .collect();
+              let backup_dict = env.dictionary.clone();
+              let words = version_bindings(bindings, ver);
+              for word in words.clone() {
+                  env.dictionary.make_version(word);
               }
+              version(program, words);
+
+              // get ready to update the dictionary with the user's changes
+              // first put dict and updates on stack
+              let dict = env.dictionary.clone();
+              let p = coll::List::from_iter([
+                  Item::from("unwrap"),
+                  coll::List::from_iter([
+                      Item::from("wrap"),
+                      coll::List::from_iter([Item::from("definition")]).into(),
+                      "join".into(),
+                  ])
+                  .into(),
+                  "dip".into(),
+                  "update".into(),
+              ]);
+              env = env
+                  .push(dict.into())
+                  .push(Item::from(bindings.clone()))
+                  .push(p.into());
+              // now push a program to step through the updates
+
+              env.pop_expr(); //pop off the let word
+
+              env = env
+                  .push_expr("define".into())
+                  .push_expr(backup_dict.into())
+                  .append_program(program.clone())
+                  .push_expr("define".into())
+                  .push_expr("step".into());
+              //println!("{:?}", env);
+              // finally return the env
+              env.into()
           }
           (Err(e), _) => env.push(e.into()).into(),
           (_, Err(e)) => env.push(e.into()).into(),
@@ -10782,6 +10804,162 @@ to write =[poke mynewword]= instead of just calling =mynewword= like you
 normally would.
 
 Another approach is to just not allow =let= to overwrite.
+**** INPROGRESS Template-based let macro 
+ - State "INPROGRESS" from "TODO"       [2024-01-01 Mon 22:00]
+***** DONE Versioned Words   
+- State "DONE"       from "TODO"       [2024-01-02 Tue 17:32]
+***** DONE Versioned dictionary
+- State "DONE"       from "TODO"       [2024-01-02 Tue 17:32]
+***** DONE Dict lookups respect version but = doesn't
+- State "DONE"       from "TODO"       [2024-01-02 Tue 17:32]
+***** INPROGRESS Version words in a program
+- State "INPROGRESS" from "TODO"       [2024-01-02 Tue 17:45]
+***** INPROGRESS Dictionary update to copy all touched words to versioned word
+- State "INPROGRESS" from "TODO"       [2024-01-02 Tue 17:45]
+Here's how I think it could work:
+
+A rust function would take:
++ A list or assoc of updates (word, update-prog)
++ A program to run
+
+Do the following:
++ [X] extract the words into a set
++ [X] clone the current dictionary, save it
++ [X] Increment the version in the current dictionary
++ [X] For each word, if the non-versioned word exists in the dictionary, copy it to the versioned word
++ [X] Recursively run through the program, updating words with the new version
++ [X] Change all the keys in the updates to the new version
++ [X] place into expression: get dictionary, step through updates, calling update, redefine
++ [X] place into expression: program (unwrapped)
++ [X] place into expression: the old dictionary, redefine
++ [ ] All values in the updates need to get versioned with the words defined before it
+
+This should give us
++ The ability to do =let*= type stuff - refer to one function in the
+  definition of another but we would need to be careful to only update
+  program in the values with the words that have already been defined,
+  not the whole word list. - make tests for this
++ The implementation details don't leak into the language, this
+  function could just be called =let=. The existing one we could rename
+  to something more indicative of unsafe operations.
+
+  test it
+    Can call new words
+  #+begin_src kcats
+  [[foo [["foo"]]]] [foo] let*
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  No spec for foo!
+  "foo"
+  #+end_src
+
+    Can still access base words like swap
+  #+begin_src kcats
+  [[foo [["foo"]]]] [1 2 swap foo] let*
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  No spec for foo!
+  "foo" 1 2
+  #+end_src
+
+    Words no longer accessible after let ends
+  #+begin_src kcats
+  [[foo [["foo"]]]] [1 2 swap foo] let* foo
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  No spec for foo!
+  [[asked [foo]]
+   [type error]
+   [unwound [foo]]
+   [reason "word is not defined"]
+   [handled yes]]
+  "foo" 1 2
+  #+end_src
+
+   Previously defined words can be used inline
+  #+begin_src kcats
+    [[square [[clone *]]]
+     [fourth [[square square]]]]
+    [3 fourth] let* 
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  81
+  #+end_src
+
+  Words can call themselves
+  #+begin_src kcats
+    [[factorial [[[swap positive?]
+                 [[*] shielddown [dec] dip factorial]
+                 when]]]]
+    [6 1 factorial]
+    let*
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  720 0
+  #+end_src
+
+  We can update the definition of existing words
+  #+begin_src kcats
+    [[hash [[type [foo] unwrap =]
+            [drop "foo" hash]
+            addmethod]]]
+    [[[foo 1]] association hash] let*
+    "foo" hash =
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  yes
+  #+end_src
+
+  We can nest let blocks
+  #+begin_src kcats
+    [[foo [["foo"]]]]
+    [foo
+     [[bar [[foo "bar"]]]]
+     [1 2 3 bar]
+     let*]
+    let*
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  "bar" "foo" 3 2 1 "foo"
+  #+end_src
+
+***** TODO kcats impl
+#+begin_src kcats 
+  ;[foo] 1 version [foo] 2 version =
+  ;dictionary [*version*] [[definition [1]]] assign
+  [[foo [["foo"]]]
+   [bar [["bar"]]]
+   [lookup [["swappie"]]]] 
+  [foo bar swap]
+  dictionary
+  [+version+ definition] [[] [[inc] inject] [[0]] if] update ;; d p u
+
+  [[+version+ definition] lookup first] shield ;; v d p u
+  [sink] dip ;; v p u d
+  clone ;; v v p u d 
+  [version swap] dip version   ;; u p d
+
+   swapdown   ;; u d p
+  [ unwrap [wrap [definition] join] dip  update] step 
+  define
+  execute
+#+end_src
+
+
 *** INPROGRESS Database
 - State "INPROGRESS" from "TODO"       [2023-12-31 Sun 10:17]
 **** Simple Test
@@ -12104,119 +12282,3 @@ private. I guess we'll have to just build the query string!
 | 5bbe2d70-a78d-11ee-8b8f-1ae1901992a7 | show_id      | s8697                                                                                                                                                                                                               |
 | 5bbe2d70-a78d-11ee-8b8f-1ae1901992a7 | title        | War Horse                                                                                                                                                                                                           |
 | 5bbe2d70-a78d-11ee-8b8f-1ae1901992a7 | type         | Movie                                                                                                                                                                                                               |
-**** INPROGRESS Template-based let macro 
- - State "INPROGRESS" from "TODO"       [2024-01-01 Mon 22:00]
-***** DONE Versioned Words   
-- State "DONE"       from "TODO"       [2024-01-02 Tue 17:32]
-***** DONE Versioned dictionary
-- State "DONE"       from "TODO"       [2024-01-02 Tue 17:32]
-***** DONE Dict lookups respect version but = doesn't
-- State "DONE"       from "TODO"       [2024-01-02 Tue 17:32]
-***** INPROGRESS Version words in a program
-- State "INPROGRESS" from "TODO"       [2024-01-02 Tue 17:45]
-***** INPROGRESS Dictionary update to copy all touched words to versioned word
-- State "INPROGRESS" from "TODO"       [2024-01-02 Tue 17:45]
-Here's how I think it could work:
-
-A rust function would take:
-+ A list or assoc of updates (word, update-prog)
-+ A program to run
-
-Do the following:
-+ [X] extract the words into a set
-+ [X] clone the current dictionary, save it
-+ [X] Increment the version in the current dictionary
-+ [X] For each word, if the non-versioned word exists in the dictionary, copy it to the versioned word
-+ [X] Recursively run through the program, updating words with the new version
-+ [X] Change all the keys in the updates to the new version
-+ [X] place into expression: get dictionary, step through updates, calling update, redefine
-+ [X] place into expression: program (unwrapped)
-+ [X] place into expression: the old dictionary, redefine
-
-This should give us
-+ The ability to do =let*= type stuff - refer to one function in the
-  definition of another but we would need to be careful to only update
-  program in the values with the words that have already been defined,
-  not the whole word list. - make tests for this
-+ The implementation details don't leak into the language, this
-  function could just be called =let=. The existing one we could rename
-  to something more indicative of unsafe operations.
-
-  test it
-    Can call new words
-  #+begin_src kcats
-  [[foo [["foo"]]]] [foo] let*
-  #+end_src
-
-  #+RESULTS:
-  #+begin_src kcats
-  No spec for foo!
-  "foo"
-  #+end_src
-
-    Can still access base words like swap
-  #+begin_src kcats
-  [[foo [["foo"]]]] [1 2 swap foo] let*
-  #+end_src
-
-  #+RESULTS:
-  #+begin_src kcats
-  No spec for foo!
-  "foo" 1 2
-  #+end_src
-
-    Words no longer accessible after let ends
-  #+begin_src kcats
-  [[foo [["foo"]]]] [1 2 swap foo] let* foo
-  #+end_src
-
-  #+RESULTS:
-  #+begin_src kcats
-  No spec for foo!
-  [[unwound [foo]]
-   [reason "word is not defined"]
-   [asked [foo]]
-   [type error]
-   [handled yes]]
-  "foo" 1 2
-  #+end_src
-
-   Previously defined words can be used inline
-  #+begin_src kcats
-    [[square [[clone *]]]
-     [fourth [[square square]]]] [3 fourth] let* 
-  #+end_src
-
-  #+RESULTS:
-  #+begin_src kcats
-  No spec for fourth!
-  [[asked [square]]
-   [reason "word is not defined"]
-   [type error]
-   [unwound [square square dictionary_redacted define]]
-   [handled yes]]
-  3
-  #+end_src
-
-***** TODO kcats impl
-#+begin_src kcats 
-  ;[foo] 1 version [foo] 2 version =
-  ;dictionary [*version*] [[definition [1]]] assign
-  [[foo [["foo"]]]
-   [bar [["bar"]]]
-   [lookup [["swappie"]]]] 
-  [foo bar swap]
-  dictionary
-  [+version+ definition] [[] [[inc] inject] [[0]] if] update ;; d p u
-
-  [[+version+ definition] lookup first] shield ;; v d p u
-  [sink] dip ;; v p u d
-  clone ;; v v p u d 
-  [version swap] dip version   ;; u p d
-
-   swapdown   ;; u d p
-  [ unwrap [wrap [definition] join] dip  update] step 
-  define
-  execute
-#+end_src
-
