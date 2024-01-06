@@ -205,11 +205,8 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl Word {
-      pub fn versioned(&self, v: usize) -> Self {
-          Word {
-              data: self.data,
-              dictversion: Some(v),
-          }
+      pub fn versioned(&mut self, v: usize) {
+          self.dictversion = Some(v)
       }
   }
 
@@ -3328,10 +3325,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   Box::leak(Box::new(f_stack1(crate::crypto::hash))),
               ),
               ("inc", Box::leak(Box::new(f_stack1(inc)))),
+              ("inscribe", Box::leak(Box::new(inscribe))),
               ("inspect", Box::leak(Box::new(f_stack1(inspect)))),
               ("join", Box::leak(Box::new(f_stack2(join)))),
               ("key", Box::leak(Box::new(f_stack1(crate::crypto::key)))),
-              ("let*", Box::leak(Box::new(let_))),
               ("last", Box::leak(Box::new(f_stack1(last)))),
               ("list?", Box::leak(Box::new(f_stack1(is_list)))),
               ("log", Box::leak(Box::new(f_stack2(log)))),
@@ -4788,11 +4785,16 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }
   }
 
-  pub fn version(p: &mut coll::List, words: Vec<Word>) {
-      let words_map: HashMap<Intern<String>, Word> =
+  pub fn version(p: &mut coll::List, words: Vec<Word>, this: Option<&Word>) {
+      //println!("version: {:?} with {:?}", p, words);
+      let mut words_map: HashMap<Intern<String>, Word> =
           words.into_iter().map(|word| (word.data, word)).collect();
 
+      if let Some(this) = this {
+          words_map.insert(Intern::<String>::from("self"), this.clone());
+      }
       label(p, &words_map);
+      //println!("versioned: {:?}", p);
   }
 
   fn version_bindings(b: &mut coll::List, ver: usize) -> Vec<Word> {
@@ -4802,26 +4804,27 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       for item in bm.iter_mut() {
           if let Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(ref mut l))) = item {
               let lm = l.make_mut();
-              let bindword = {
-                  let front_item = lm.front().cloned(); // Cloning inside the block
-                  front_item
-              };
-              let update = lm.get_mut(1);
-              if let (Some(Item::Word(bindword)), Some(update)) = (bindword, update) {
+              let mut this: Option<Word> = None;
+              if let Some(Item::Word(ref mut bindword)) = lm.get_mut(0) {
+                  bindword.versioned(ver);
+                  this = Some(bindword.clone());
+              }
+
+              if let Some(update) = lm.get_mut(1) {
                   if let Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(ref mut program))) =
                       update
                   {
-                      bindword.versioned(ver);
-                      words.push(bindword);
-                      version(program, words.clone());
+                      version(program, words.clone(), this.as_ref());
+                      this.and_then(|t| Some(words.push(t)));
                   }
               }
           }
       }
+      //println!("new bindings: {:?}", bm);
       words
   }
 
-  pub fn let_(mut env: Environment) -> Future<Environment> {
+  pub fn inscribe(mut env: Environment) -> Future<Environment> {
       // Extract the bindings and program
       let program = coll::List::try_from(env.pop());
       let bindings = coll::List::try_from(env.pop());
@@ -4848,7 +4851,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               for word in words.clone() {
                   env.dictionary.make_version(word);
               }
-              version(program, words);
+              version(program, words, None);
 
               // get ready to update the dictionary with the user's changes
               // first put dict and updates on stack
@@ -4857,8 +4860,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   Item::from("unwrap"),
                   coll::List::from_iter([
                       Item::from("wrap"),
-                      coll::List::from_iter([Item::from("definition")]).into(),
-                      "join".into(),
+                      //coll::List::from_iter([Item::from("definition")]).into(),
+                      //                    "join".into(),
                   ])
                   .into(),
                   "dip".into(),
