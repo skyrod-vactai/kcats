@@ -118,16 +118,26 @@ the location where you installed the kcats binary.
   # backtrace = "0.3.61"
 
   # database
-  #indradb-lib = { version = "*", features = ["rocksdb-datastore"] }
-  #rocksdb = "0.21.0"
-  cozo = { version = "0.7", default-features = false, features = ["minimal", "rayon"], optional=true }
+  ## Figure out best place to store the db file
+  directories = "5.0"
+
+  #cozo = { version = "0.7", default-features = false, features = ["minimal", "rayon"], optional=true }
+  rusqlite = { version = "0.30", optional = true, features = ["uuid"] }
+
+  [dependencies.uuid]
+  version = "1.6.1"
+  features = [
+      "v4",                # Lets you generate random UUIDs
+      "v7",
+      "fast-rng",          # Use a faster (but still sufficiently random) RNG
+  ]
   #chrono = "0.4.31"
 
   [dev-dependencies]
   test-case = "2.0.0"
 
   [features]
-  database = ["cozo"]
+  database = ["rusqlite"]
 #+END_SRC
 *** Internal data types
 **** Basic internal types
@@ -235,6 +245,12 @@ internally, to keep track of things like the stack, program, lists etc.
   impl<'a> From<&'a Word> for &'a str {
       fn from(s: &'a Word) -> Self {
           s.data.as_str()
+      }
+  }
+
+  impl From<Word> for String {
+      fn from(s: Word) -> Self {
+          s.data.to_string()
       }
   }
 
@@ -3397,7 +3413,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       ];
 
       #[cfg(feature = "database")]
-      entries.push(("database", Box::leak(Box::new(f_stack1(db::query)))));
+      {
+          entries.push(("database", Box::leak(Box::new(f_stack1(db::query)))));
+          entries.push(("persist", Box::leak(Box::new(f_stack1(db::insert_object)))));
+      }
 
       update_axiom_entries(d, entries)
   }
@@ -6485,121 +6504,132 @@ Implement the =handoff= type
   use crate::types::collection as coll;
   use crate::types::error::Error;
   use crate::types::{self, Item};
+  use directories::ProjectDirs;
 
-  use std::collections::VecDeque;
-  use std::sync::OnceLock;
+  use rusqlite::types::ValueRef;
+  use rusqlite::{params, Connection, Result};
+  use uuid;
 
-  fn db() -> &'static cozo::DbInstance {
-      static DB: OnceLock<cozo::DbInstance> = OnceLock::new();
-      DB.get_or_init(|| {
-          cozo::DbInstance::new("sqlite", "/tmp/kcats-database.db", Default::default()).unwrap()
-      })
+  #[derive(Debug)]
+  pub struct Db {
+      conn: Connection,
   }
 
-  pub fn query(script: Item) -> axiom::ItemResult {
-      Ok(db()
-          .run_script(
-              String::try_from(script)?.as_str(),
-              Default::default(),
-              cozo::ScriptMutability::Mutable,
-          )?
-          .into())
-  }
+  impl Db {
+      pub fn new() -> Result<Self> {
+          let project_dirs = ProjectDirs::from("org", "skyrod", "kcats").unwrap();
+          let project_dir = project_dirs.data_dir();
+          std::fs::create_dir_all(project_dir).unwrap();
+          let db_file = project_dir.join("kcats-database.db");
+          let conn = Connection::open(db_file)?;
+          Ok(Db { conn })
+      }
 
-  impl From<cozo::NamedRows> for Item {
-      fn from(results: cozo::NamedRows) -> Self {
-          let headers = results
-              .headers
-              .iter()
-              .map(|s| Item::from(s.clone()))
-              .collect::<coll::List>();
-          let mut rows = results
-              .rows
-              .into_iter()
-              .map(|row| Item::from(row.into_iter().map(Item::from).collect::<coll::List>()))
-              .collect::<VecDeque<Item>>();
-          rows.push_front(Item::from(headers));
-          Item::from(coll::List::from(rows))
+      pub fn query(&self, query: &str) -> axiom::ItemResult {
+          let mut stmt = self.conn.prepare(query)?;
+
+          let rows = stmt.query_map([], |row| {
+              Ok(Item::from(
+                  (0..row.as_ref().column_count())
+                      .map(|column_index| {
+                          let column_name =
+                              row.as_ref().column_name(column_index).unwrap().to_string();
+                          let column_value: ValueRef = row.get_ref_unwrap(column_index);
+                          (
+                              assoc::KeyItem::from(column_name.as_str()),
+                              Item::from(column_value),
+                          )
+                      })
+                      .collect::<assoc::Association>(),
+              ))
+          })?;
+          Ok(rows.collect::<Result<coll::List, _>>()?.into())
+      }
+
+      fn insert_attribute(
+          &self,
+          id: uuid::Uuid,
+          attribute: String,
+          value: Item,
+      ) -> axiom::ItemResult {
+          let q = "INSERT INTO EAV (entity, attribute, value) VALUES (?, ?, ?)";
+          match value {
+              //TODO: differentiate between strings and words as values
+              Item::Word(v) => {
+                  self.conn
+                      .execute(q, params![id, attribute, String::from(v)])?;
+              }
+              Item::Int(i) => {
+                  self.conn.execute(q, params![id, attribute, i])?;
+              }
+              Item::Float(f) => {
+                  self.conn.execute(q, params![id, attribute, f])?;
+              }
+              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(s))) => {
+                  self.conn.execute(q, params![id, attribute, s])?;
+              }
+              Item::Receptacle(coll::Receptacle::Sized(coll::Sized::String(s))) => {
+                  self.conn.execute(q, params![id, attribute, s])?;
+              }
+              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(a))) => {
+                  let id = uuid::Uuid::new_v4();
+                  self.insert_item(a.into(), id)?;
+                  self.conn.execute(q, params![id, attribute, id])?;
+              }
+              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Set(s))) => {
+                  for v in s.iter() {
+                      self.insert_attribute(id, attribute.clone(), v.clone().into())?;
+                  }
+              }
+              _ => todo!("Other item types as values in db"),
+          }
+          Ok(Item::default())
+      }
+      pub fn insert_item(&self, i: Item, id: uuid::Uuid) -> axiom::ItemResult {
+          let obj = assoc::Associative::try_from(i)?;
+
+          for (k, v) in obj.into_iter() {
+              match k {
+                  assoc::KeyItem::Word(w) => {
+                      self.insert_attribute(id, String::from(w), v)?;
+                  }
+                  other => return Err(Error::expected("word", other.into())),
+              }
+          }
+          Ok(Item::default())
       }
   }
 
-  impl From<cozo::DataValue> for Item {
-      fn from(dv: cozo::DataValue) -> Self {
-          match dv {
-              cozo::DataValue::Null => Item::default(),
-              cozo::DataValue::Num(cozo::Num::Int(i)) => Item::Int(i),
-              cozo::DataValue::Num(cozo::Num::Float(f)) => Item::Float(f),
-              cozo::DataValue::Str(s) => {
-                  Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(s.to_string())))
+  pub fn query(i: Item) -> axiom::ItemResult {
+      let query: String = i.try_into()?;
+      let db = Db::new()?;
+      db.query(&query)
+  }
+
+  pub fn insert_object(i: Item) -> axiom::ItemResult {
+      let db = Db::new()?;
+      let id = uuid::Uuid::new_v4();
+      db.insert_item(i, id)
+  }
+
+  impl From<ValueRef<'_>> for Item {
+      fn from(value: ValueRef) -> Self {
+          match value {
+              ValueRef::Integer(i) => Item::Int(i),
+              ValueRef::Real(f) => Item::Float(f),
+              ValueRef::Text(t) => Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(
+                  String::from_utf8_lossy(t).into_owned(),
+              ))),
+              ValueRef::Blob(b) => {
+                  Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(b.to_vec())))
               }
-              cozo::DataValue::Bool(b) => Item::from(b),
-              cozo::DataValue::Bytes(b) => Item::from(b),
-              cozo::DataValue::Vec(_) => todo!("Support cozodb vector values"),
-              cozo::DataValue::Bot => panic!("Bot values are supposed to be internal only"),
-              cozo::DataValue::Validity(v) => Item::from(v),
-              cozo::DataValue::Uuid(u) => Item::from(u.0.to_string()),
-              cozo::DataValue::Regex(_) => todo!("Support cozodb regex values"),
-              cozo::DataValue::List(l) => coll::List::from_iter(l.into_iter().map(Item::from)).into(),
-              cozo::DataValue::Set(s) => coll::Set::from_iter(
-                  s.into_iter()
-                      .map(|i| assoc::KeyItem::try_from(Item::from(i)).unwrap()),
-              )
-              .into(),
-              cozo::DataValue::Json(_) => todo!("Support cozodb JSON values"),
+              ValueRef::Null => Item::default(),
           }
       }
   }
 
-  impl From<cozo::Validity> for Item {
-      fn from(v: cozo::Validity) -> Self {
-          coll::List::from_iter([Item::from(v.timestamp.0 .0), Item::from(v.is_assert.0)]).into()
-      }
-  }
-
-  // impl Db {
-  //     pub fn query(&self, query: &str) -> axiom::ItemResult {
-  //         let mut stmt = self.conn.prepare(query)?;
-
-  //         let rows = stmt.query_map([], |row| {
-  //             Ok(Item::from(
-  //                 (0..row.as_ref().column_count())
-  //                     .map(|column_index| {
-  //                         let column_name =
-  //                             row.as_ref().column_name(column_index).unwrap().to_string();
-  //                         let column_value: ValueRef = row.get_ref_unwrap(column_index);
-  //                         (assoc::KeyItem::from(column_name), Item::from(column_value))
-  //                     })
-  //                     .collect::<assoc::Association>(),
-  //             ))
-  //         })?;
-  //         Ok(rows.collect::<Result<coll::List, _>>()?.into())
-  //     }
-  // }
-
-  // pub fn db(i: Item) -> axiom::ItemResult {
-  //     let query: String = i.try_into()?;
-  //     let db = Db::new()?;
-  //     db.query(&query)
-  // }
-
-  // impl From<ValueRef<'_>> for Item {
-  //     fn from(value: ValueRef) -> Self {
-  //         match value {
-  //             ValueRef::Integer(i) => Item::Int(i),
-  //             ValueRef::Real(f) => Item::Float(f),
-  //             ValueRef::Text(t) => Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(
-  //                 String::from_utf8_lossy(t).into_owned(),
-  //             ))),
-  //             ValueRef::Blob(b) => {
-  //                 Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(b.to_vec())))
-  //             }
-  //             ValueRef::Null => Item::default(),
-  //         }
-  //     }
-  // }
-
-  impl From<cozo::Error> for Error {
-      fn from(error: cozo::Error) -> Self {
+  impl From<rusqlite::Error> for Error {
+      fn from(error: rusqlite::Error) -> Self {
           Error::create(types::wrap("io".into()), error.to_string().as_str(), None)
       }
   }
@@ -11127,11 +11157,17 @@ Let's create an EAV table
   "CREATE TABLE EAV
   ( Entity STRING,
     Attribute STRING,
-    ValueString TEXT,
-    ValueInteger INTEGER,
-    ValueReal REAL,
-    ValueBlob BLOB,
-    ValueNumeric NUMERIC );" database 
+    Value
+     );" database 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[]
+#+end_src
+
+#+begin_src kcats
+  "DROP TABLE EAV;" database 
 #+end_src
 
 #+RESULTS:
