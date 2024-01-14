@@ -6506,7 +6506,7 @@ Implement the =handoff= type
   use crate::types::{self, Item};
   use directories::ProjectDirs;
 
-  use rusqlite::types::ValueRef;
+  use rusqlite::types::{ToSqlOutput, Value, ValueRef};
   use rusqlite::{params, Connection, Result};
   use uuid;
 
@@ -6528,49 +6528,26 @@ Implement the =handoff= type
       pub fn query(&self, query: &str) -> axiom::ItemResult {
           let mut stmt = self.conn.prepare(query)?;
 
-          let rows = stmt.query_map([], |row| {
-              Ok(Item::from(
-                  (0..row.as_ref().column_count())
-                      .map(|column_index| {
-                          let column_name =
-                              row.as_ref().column_name(column_index).unwrap().to_string();
-                          let column_value: ValueRef = row.get_ref_unwrap(column_index);
-                          (
-                              assoc::KeyItem::from(column_name.as_str()),
-                              Item::from(column_value),
-                          )
-                      })
-                      .collect::<assoc::Association>(),
-              ))
+          let rows = stmt.query_and_then([], |row| {
+              (0..row.as_ref().column_count())
+                  .map(|column_index| {
+                      let column_name = row.as_ref().column_name(column_index).unwrap().to_string();
+                      let column_value: ValueRef = row.get_ref_unwrap(column_index);
+                      Item::try_from(column_value)
+                          .map(|v| (assoc::KeyItem::from(column_name.as_str()), v))
+                  })
+                  .collect::<Result<assoc::Association, _>>()
+                  .map(Item::from)
           })?;
           Ok(rows.collect::<Result<coll::List, _>>()?.into())
       }
 
-      fn insert_attribute(
-          &self,
-          id: uuid::Uuid,
-          attribute: String,
-          value: Item,
-      ) -> axiom::ItemResult {
+      fn insert_attribute(&self, id: uuid::Uuid, attribute: Item, value: Item) -> axiom::ItemResult {
           let q = "INSERT INTO EAV (entity, attribute, value) VALUES (?, ?, ?)";
+
           match value {
               //TODO: differentiate between strings and words as values
-              Item::Word(v) => {
-                  self.conn
-                      .execute(q, params![id, attribute, String::from(v)])?;
-              }
-              Item::Int(i) => {
-                  self.conn.execute(q, params![id, attribute, i])?;
-              }
-              Item::Float(f) => {
-                  self.conn.execute(q, params![id, attribute, f])?;
-              }
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(s))) => {
-                  self.conn.execute(q, params![id, attribute, s])?;
-              }
-              Item::Receptacle(coll::Receptacle::Sized(coll::Sized::String(s))) => {
-                  self.conn.execute(q, params![id, attribute, s])?;
-              }
+              // by prefixing with something like s: or w:
               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(a))) => {
                   let id = uuid::Uuid::new_v4();
                   self.insert_item(a.into(), id)?;
@@ -6581,17 +6558,20 @@ Implement the =handoff= type
                       self.insert_attribute(id, attribute.clone(), v.clone().into())?;
                   }
               }
-              _ => todo!("Other item types as values in db"),
+              i => {
+                  self.conn.execute(q, params![id, attribute, i])?;
+              } //_ => todo!("Other item types as values in db"),
           }
           Ok(Item::default())
       }
+
       pub fn insert_item(&self, i: Item, id: uuid::Uuid) -> axiom::ItemResult {
           let obj = assoc::Associative::try_from(i)?;
 
           for (k, v) in obj.into_iter() {
               match k {
                   assoc::KeyItem::Word(w) => {
-                      self.insert_attribute(id, String::from(w), v)?;
+                      self.insert_attribute(id, Item::Word(w), v)?;
                   }
                   other => return Err(Error::expected("word", other.into())),
               }
@@ -6612,18 +6592,76 @@ Implement the =handoff= type
       db.insert_item(i, id)
   }
 
-  impl From<ValueRef<'_>> for Item {
-      fn from(value: ValueRef) -> Self {
+  impl TryFrom<ValueRef<'_>> for Item {
+      type Error = Error;
+      fn try_from(value: ValueRef) -> Result<Self, Self::Error> {
           match value {
-              ValueRef::Integer(i) => Item::Int(i),
-              ValueRef::Real(f) => Item::Float(f),
-              ValueRef::Text(t) => Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(
-                  String::from_utf8_lossy(t).into_owned(),
-              ))),
-              ValueRef::Blob(b) => {
-                  Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(b.to_vec())))
+              ValueRef::Integer(i) => Ok(Item::Int(i)),
+              ValueRef::Real(f) => Ok(Item::Float(f)),
+              ValueRef::Text(t) => decode_string(String::from_utf8_lossy(t).into_owned()),
+
+              ValueRef::Blob(b) => Ok(Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(
+                  b.to_vec(),
+              )))),
+              ValueRef::Null => Ok(Item::default()),
+          }
+      }
+  }
+  /// Since sqlite doesn't have separate string/word/char types, we
+  /// store them all as String, and encode a prefix to note which type
+  /// it should be when decoded.
+  fn decode_string(s: String) -> axiom::ItemResult {
+      if s.starts_with("w|") {
+          Ok(Item::Word(s[2..].into()))
+      } else if s.starts_with("s|") {
+          Ok(Item::Dispenser(coll::Dispenser::Sized(
+              coll::Sized::String(s[2..].to_string()),
+          )))
+      } else if s.starts_with("c|") {
+          let char_seq = &s[2..];
+          if char_seq.chars().count() == 1 {
+              Ok(Item::Char(char_seq.chars().next().unwrap()))
+          } else {
+              Err(Error::expected("char", char_seq.into()))
+          }
+      } else {
+          Err(Error::expected("string", s.into()))
+      }
+  }
+
+  enum EncodeAs {
+      String(String),
+      Char(types::Char),
+      Word(types::Word),
+  }
+
+  impl EncodeAs {
+      fn encode(self: EncodeAs) -> ToSqlOutput<'static> {
+          ToSqlOutput::Owned(Value::Text(match self {
+              EncodeAs::String(s) => format!("s|{}", s),
+              EncodeAs::Word(w) => format!("w|{}", String::from(w)),
+              EncodeAs::Char(c) => format!("c|{}", String::from(c)),
+          }))
+      }
+  }
+
+  impl rusqlite::ToSql for Item {
+      fn to_sql(&self) -> Result<ToSqlOutput<'_>> {
+          match self {
+              Item::Int(i) => i.to_sql(),
+              Item::Float(f) => f.to_sql(),
+              Item::Char(c) => Ok(EncodeAs::Char(c.clone()).encode()),
+              Item::Word(w) => Ok(EncodeAs::Word(w.clone()).encode()),
+              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(s))) => {
+                  Ok(EncodeAs::String(s.clone()).encode())
               }
-              ValueRef::Null => Item::default(),
+              Item::Receptacle(coll::Receptacle::Sized(coll::Sized::String(s))) => {
+                  Ok(EncodeAs::String(s.clone()).encode())
+              }
+              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(b))) => b.to_sql(),
+              Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(b))) => b.to_sql(),
+
+              _ => todo!("convert item variants to sql values"),
           }
       }
   }
@@ -8582,7 +8620,7 @@ takes two hashes, returns the xor distance between them
 helper function that takes an int 0-255 and returns the most
 significant bit position, eg 33 is 5
 
-#+begin_src kcats :tangle src/kcats/dht.kcats
+#+begin_src kcats 
   [msb [[spec [[int] [int]]]
         [definition [8 swap [1 >] [2 / [dec] dip] while drop]]
         [examples [[[] []]]]]]
@@ -10253,7 +10291,7 @@ lingo
 - State "INPROGRESS" from "TODO"       [2023-10-19 Thu 21:08]
 Read inputs from stdin, eval in a nested env, write to stdout.
 
-#+begin_src kcats :tangle repl.kcats
+#+begin_src kcats 
   standard [take] 
   [string] each
   ""
@@ -11190,17 +11228,7 @@ CREATE INDEX idx_valuestring ON EAV (ValueString);
 #+end_src
 
 #+begin_src kcats
-  "INSERT INTO EAV (Entity, Attribute, ValueString, ValueInteger, ValueReal, ValueBlob, ValueNumeric) VALUES
-  ('Book1', 'Title', '1984', NULL, NULL, NULL, NULL),
-  ('Book1', 'Author', 'George Orwell', NULL, NULL, NULL, NULL),
-  ('Book1', 'Year', NULL, 1949, NULL, NULL, NULL),
-  ('Book2', 'Title', 'To Kill a Mockingbird', NULL, NULL, NULL, NULL),
-  ('Book2', 'Author', 'Harper Lee', NULL, NULL, NULL, NULL),
-  ('Book2', 'Year', NULL, 1960, NULL, NULL, NULL),
-  ('Author1', 'Name', 'George Orwell', NULL, NULL, NULL, NULL),
-  ('Author1', 'BirthYear', NULL, 1903, NULL, NULL, NULL),
-  ('Author2', 'Name', 'Harper Lee', NULL, NULL, NULL, NULL),
-  ('Author2', 'BirthYear', NULL, 1926, NULL, NULL, NULL); " database
+[[name "Butters"] [type dog] [weight 59.1] [breed [shepherd labrador]]] [breed] [set] update persist
 #+end_src
 
 #+RESULTS:
@@ -11209,54 +11237,28 @@ CREATE INDEX idx_valuestring ON EAV (ValueString);
 #+end_src
 
 #+begin_src kcats
-  "SELECT e1.ValueString AS Title
-  FROM EAV e1
-  JOIN EAV e2 ON e1.Entity = e2.Entity
-  WHERE e1.Attribute = 'Title'
-    AND e2.Attribute = 'Author'
-    AND e2.ValueString = 'George Orwell';
-  " database
+"select * from EAV;" database
 #+end_src
 
 #+RESULTS:
 #+begin_src kcats
-[[[Title "1984"]]]
+[[[Entity #b64 "oGAP/g0nSc6LRwQJJti3HA=="]
+  [Value 59.1]
+  [Attribute weight]]
+ [[Value "Butters"]
+  [Attribute name]
+  [Entity #b64 "oGAP/g0nSc6LRwQJJti3HA=="]]
+ [[Entity #b64 "oGAP/g0nSc6LRwQJJti3HA=="]
+  [Attribute type]
+  [Value dog]]
+ [[Entity #b64 "oGAP/g0nSc6LRwQJJti3HA=="]
+  [Value shepherd]
+  [Attribute breed]]
+ [[Attribute breed]
+  [Value labrador]
+  [Entity #b64 "oGAP/g0nSc6LRwQJJti3HA=="]]]
 #+end_src
 
-#+begin_src kcats
-  "SELECT e1.Entity as id, e1.Attribute, e1.ValueString, e1.ValueInteger, e1.ValueReal, e1.ValueBlob, e1.ValueNumeric
-  FROM EAV e1
-  INNER JOIN (
-      SELECT Entity 
-      FROM EAV 
-      WHERE Attribute = 'Author' AND ValueString = 'George Orwell'
-  ) AS e2 ON e1.Entity = e2.Entity;" database
-#+end_src
-
-#+RESULTS:
-#+begin_src kcats
-[[[ValueReal []]
-  [ValueNumeric []]
-  [ValueInteger []]
-  [id "Book1"]
-  [ValueString "George Orwell"]
-  [Attribute "Author"]
-  [ValueBlob []]]
- [[ValueBlob []]
-  [ValueReal []]
-  [ValueString "1984"]
-  [id "Book1"]
-  [ValueInteger []]
-  [Attribute "Title"]
-  [ValueNumeric []]]
- [[ValueBlob []]
-  [ValueReal []]
-  [ValueNumeric []]
-  [ValueString []]
-  [id "Book1"]
-  [Attribute "Year"]
-  [ValueInteger 1949]]]
-#+end_src
 **** Attribute database using CozoDB
 The idea here is to ignore identity in the database and make that the
 responsibility of the client. The database only links attributes, and
