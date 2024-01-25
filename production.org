@@ -3415,7 +3415,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
       #[cfg(feature = "database")]
       {
-          entries.push(("database", Box::leak(Box::new(f_stack1(db::query)))));
+          entries.push(("database", Box::leak(Box::new(f_stack2(db::query)))));
           entries.push(("persist", Box::leak(Box::new(f_stack1(db::insert_object)))));
       }
 
@@ -6516,7 +6516,7 @@ Implement the =handoff= type
   use crate::types::{self, Item};
   use directories::ProjectDirs;
 
-  use rusqlite::types::{ToSqlOutput, Value, ValueRef};
+  use rusqlite::types::{ToSql, ToSqlOutput, Value, ValueRef};
   use rusqlite::{params, Connection, Result};
   use uuid;
 
@@ -6535,10 +6535,13 @@ Implement the =handoff= type
           Ok(Db { conn })
       }
 
-      pub fn query(&self, query: &str) -> axiom::ItemResult {
+      pub fn query(&self, query: &str, params: Vec<Box<dyn ToSql>>) -> axiom::ItemResult {
           let mut stmt = self.conn.prepare(query)?;
 
-          let rows = stmt.query_and_then([], |row| {
+          // Convert Vec<Box<dyn ToSql>> to Vec<&dyn ToSql>
+          let params_refs: Vec<&dyn ToSql> = params.iter().map(|b| b.as_ref()).collect();
+
+          let rows = stmt.query_and_then(params_refs.as_slice(), |row| {
               (0..row.as_ref().column_count())
                   .map(|column_index| {
                       let column_name = row.as_ref().column_name(column_index).unwrap().to_string();
@@ -6590,10 +6593,16 @@ Implement the =handoff= type
       }
   }
 
-  pub fn query(i: Item) -> axiom::ItemResult {
-      let query: String = i.try_into()?;
+  pub fn query(q: Item, params: Item) -> axiom::ItemResult {
+      let query: String = q.try_into()?;
+      let params: coll::List = params.try_into()?;
+      let boxed_params: Vec<Box<dyn ToSql>> = params
+          .inner()
+          .into_iter()
+          .map(|item| Box::new(item) as Box<dyn ToSql>)
+          .collect();
       let db = Db::new()?;
-      db.query(&query)
+      db.query(&query, boxed_params)
   }
 
   pub fn insert_object(i: Item) -> axiom::ItemResult {
