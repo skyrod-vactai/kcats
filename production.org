@@ -6567,11 +6567,14 @@ Implement the =handoff= type
           Ok(Db { conn })
       }
 
-      pub fn query(&self, query: &str, params: Vec<Box<dyn ToSql>>) -> axiom::ItemResult {
+      pub fn query(&self, query: &str, params: Vec<(String, Item)>) -> axiom::ItemResult {
           let mut stmt = self.conn.prepare(query)?;
 
           // Convert Vec<Box<dyn ToSql>> to Vec<&dyn ToSql>
-          let params_refs: Vec<&dyn ToSql> = params.iter().map(|b| b.as_ref()).collect();
+          let params_refs: Vec<(&str, &dyn ToSql)> = params
+              .iter()
+              .map(|(s, b)| (s.as_str(), b as &dyn ToSql))
+              .collect();
 
           let rows = stmt.query_and_then(params_refs.as_slice(), |row| {
               (0..row.as_ref().column_count())
@@ -6627,12 +6630,18 @@ Implement the =handoff= type
 
   pub fn query(q: Item, params: Item) -> axiom::ItemResult {
       let query: String = q.try_into()?;
-      let params: coll::List = params.try_into()?;
-      let boxed_params: Vec<Box<dyn ToSql>> = params
-          .inner()
-          .into_iter()
-          .map(|item| Box::new(item) as Box<dyn ToSql>)
-          .collect();
+      // Needs to be association, and instead of a slice of ToSql,
+      // we need &[(&str, &dyn ToSql)] (slice of pairs of strings and ToSql)
+      let params: assoc::Associative = params.try_into()?;
+
+      let mut boxed_params: Vec<(String, Item)> = Vec::new();
+      for (k, v) in params.into_iter() {
+          match k {
+              assoc::KeyItem::String(s) => boxed_params.push((s, v)),
+              k => return Err(Error::expected("string", k.into())),
+          }
+      }
+
       let db = Db::new()?;
       db.query(&query, boxed_params)
   }
