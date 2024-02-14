@@ -4964,6 +4964,26 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }
   }
 
+  /// Given an item and a dictionary, resolve what namespace it is
+  /// referring to - it's either a hash already, or it's a word (an
+  /// alias), otherwise an error is returned. If it's a word, we look it
+  /// up in the dictionary to see if it's an existing alias, if so, we
+  /// return the value of that alias.
+  fn resolve_ns(dict: &Dictionary, i: Item) -> Result<dict::Namespace, Error> {
+      match i {
+          Item::Word(mut w) => {
+              w.namespaced(dict::Namespace::default());
+              match dict.get(&w) {
+                  Some(e) => Ok(e.get_namespace_info()),
+                  None => Err(Error::expected("module-alias", Item::Word(w))),
+              }
+          }
+          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(b))) => Ok(b.into()),
+          Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(b))) => Ok(b.into()),
+          i => Err(Error::expected("module", i)),
+      }
+  }
+
   fn using(mut env: Environment) -> Future<Environment> {
       let namespaces = coll::List::try_from(env.pop());
       let program = coll::List::try_from(env.pop());
@@ -4972,12 +4992,14 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               let ns: Result<Vec<dict::Namespace>, Error> = namespaces
                   .inner()
                   .into_iter()
-                  .map(|ns| Bytes::try_from(ns).map(dict::Namespace::from))
+                  .map(|ns| resolve_ns(&env.dictionary, ns))
                   .collect();
               match ns {
                   Ok(ns) => {
                       resolve_all(&mut program, &env.dictionary, &ns);
                       env.push(program.into());
+                      // pop the word 'using'
+                      env.pop_expr();
                       env.into()
                   }
                   Err(e) => {
@@ -5007,21 +5029,30 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   /// Takes a new dictionary, diffs it with the existing one, and marks
   /// all the deleted items as deleted.
   pub fn dictmerge(mut env: Environment) -> Future<Environment> {
+      println!("dictmerge: {:?}", env);
       let partialdict = dict::Dictionary::try_from(env.pop());
+      let namespace = Bytes::try_from(env.pop()).unwrap();
+      println!("Popped");
       // need to have the namespace hash in here to give namespaces to the updates
       match partialdict {
           Ok(pd) => {
+              println!("got a dict");
               let (adds, deletes) = env.dictionary.diff(pd);
+              // add namepaces to the adds
+              //let adds = adds.map(|e|);
               let d = env.dictionary.make_mut();
+              println!("Dict adds: {:?}", adds);
               d.extend(adds.into_iter());
               d.extend(make_deletes(deletes).into_iter());
-              env.into()
+              // pop the word dictmerge
+              env.pop_expr();
           }
           Err(e) => {
+              println!("Error: {:?}", e);
               env.push(e.into());
-              env.into()
           }
       }
+      env.into()
   }
 
   /// Load a new module and gives it an optional alias (either a word or
@@ -5033,15 +5064,21 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
       // first see if we can parse the module
       let module_string = String::from_utf8(module_raw.clone())?;
-      let program = parse(module_string)?;
+      let program: coll::List = coll::List::try_from(
+          parse(module_string)?
+              .inner()
+              .pop_front()
+              .unwrap_or_default(),
+      )?;
       let hash = sha2::Sha256::digest(module_raw.as_slice()).deref().to_vec();
       let dict = env.dictionary.clone();
 
       // add an alias, which goes in the dictionary's namespace
       alias.namespaced(dict::Namespace::default());
-      env.dictionary
-          .inner()
-          .insert(alias, dict::Entry::namespace(hash.into()));
+      let d = env.dictionary.make_mut();
+      let e = dict::Entry::namespace(hash.into());
+      println!("Adding alias {:?} -> {:?}", alias, e);
+      d.insert(alias, e);
 
       // let p = coll::List::from_iter([
       //     Item::from("unwrap"),
@@ -5053,8 +5090,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       env.push(dict.into());
       env.pop_expr(); //pop off the inscribe word
 
-      env.append_program(program);
       env.push_expr("dictmerge".into());
+      env.append_program(program);
+      println!("inscribe: {:?}", env);
       Ok(())
   }
 
@@ -11638,6 +11676,29 @@ So what would an inline library use look like?
 #+begin_src kcats
 #b64 "zVdD2s93lB4wmjuJJENqRljwx9qgWRtXiy+PWB4Qn+4=" [[clone *]
                                                      [square] assign]
+#+end_src
+
+#+begin_src kcats
+  [[cubez] [[clone clone * *] [definition] label] update] encode [math] unwrap inscribe
+  [[cube] [[clone clone * *] [definition] label] update] encode [math] unwrap inscribe
+   [9 cubez] [math] using execute 2 cubez
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+Adding alias Word { data: 0x5560cd77f2d0 : "math", namespace: Some([23, 124, 167, 15, 66, 222, 241, 35, 142, 54, 218, 50, 148, 115, 38, 62, 211, 254, 173, 209, 64, 148, 192, 121, 162, 35, 11, 224, 25, 52, 54, 245]) } -> Entry { examples: None, spec: None, definition: [Dispenser(Sized(Bytes([8, 144, 120, 65, 183, 207, 199, 239, 164, 219, 21, 117, 247, 69, 70, 93, 101, 41, 123, 60, 168, 227, 79, 116, 254, 78, 213, 121, 183, 246, 63, 36])))] }
+inscribe: { stack: [dictionary_redacted], program: [[cubez] [[clone clone * *] [definition] label] update dictmerge [[cube] [[clone clone * *] [definition] label] update] encode [math] unwrap inscribe [9 cubez] [math] using execute 2 cubez] }
+dictmerge: { stack: [dictionary_redacted], program: [dictmerge [[cube] [[clone clone * *] [definition] label] update] encode [math] unwrap inscribe [9 cubez] [math] using execute 2 cubez] }
+Popped
+got a dict
+Dict adds: [(Word { data: 0x5560cd79d0e0 : "cubez", namespace: None }, Entry { examples: None, spec: None, definition: [Word(Word { data: 0x5560cd67ffa0 : "clone", namespace: None }), Word(Word { data: 0x5560cd67ffa0 : "clone", namespace: None }), Word(Word { data: 0x5560cd654e20 : "*", namespace: None }), Word(Word { data: 0x5560cd654e20 : "*", namespace: None })] })]
+Adding alias Word { data: 0x5560cd77f2d0 : "math", namespace: Some([23, 124, 167, 15, 66, 222, 241, 35, 142, 54, 218, 50, 148, 115, 38, 62, 211, 254, 173, 209, 64, 148, 192, 121, 162, 35, 11, 224, 25, 52, 54, 245]) } -> Entry { examples: None, spec: None, definition: [Dispenser(Sized(Bytes([98, 154, 231, 103, 197, 12, 134, 52, 134, 25, 50, 25, 125, 9, 132, 204, 145, 83, 20, 183, 42, 83, 217, 149, 212, 94, 55, 76, 28, 22, 233, 150])))] }
+inscribe: { stack: [dictionary_redacted], program: [[cube] [[clone clone * *] [definition] label] update dictmerge [9 cubez] [math] using execute 2 cubez] }
+dictmerge: { stack: [dictionary_redacted], program: [dictmerge [9 cubez] [math] using execute 2 cubez] }
+Popped
+got a dict
+Dict adds: [(Word { data: 0x5560cd797fc0 : "cube", namespace: None }, Entry { examples: None, spec: None, definition: [Word(Word { data: 0x5560cd67ffa0 : "clone", namespace: None }), Word(Word { data: 0x5560cd67ffa0 : "clone", namespace: None }), Word(Word { data: 0x5560cd654e20 : "*", namespace: None }), Word(Word { data: 0x5560cd654e20 : "*", namespace: None })] })]
+8 729
 #+end_src
 
 **** TODO Nesting scopes
