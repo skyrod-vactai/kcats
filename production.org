@@ -213,12 +213,12 @@ internally, to keep track of things like the stack, program, lists etc.
   #[derive(Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord, Default)]
   pub struct Word {
       pub data: Intern<String>,
-      pub dictversion: Option<usize>,
+      pub namespace: Option<dict::Namespace>,
   }
 
   impl Word {
-      pub fn versioned(&mut self, v: usize) {
-          self.dictversion = Some(v)
+      pub fn namespaced(&mut self, v: dict::Namespace) {
+          self.namespace = Some(v)
       }
   }
 
@@ -232,7 +232,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn from(s: &str) -> Self {
           Word {
               data: Intern::<String>::from(s),
-              dictversion: None,
+              namespace: None,
           }
       }
   }
@@ -2071,6 +2071,9 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::types::associative as assoc;
   use crate::types::collection as coll;
   use crate::types::*;
+  use lazy_static::lazy_static;
+  use sha2::{self, Digest};
+  use std::collections::HashSet;
 
   #[derive(Debug, Clone)]
   pub struct Entry {
@@ -2102,49 +2105,92 @@ internally, to keep track of things like the stack, program, lists etc.
           })
       }
 
-      pub fn get_version_info(&self) -> usize {
+      pub fn get_namespace_info(&self) -> Namespace {
           match &self.definition {
-              Definition::Axiom(_) => 0,
+              Definition::Axiom(_) => Default::default(),
               Definition::Derived(l) => l
                   .front()
-                  .map(|i| match i {
-                      Item::Int(i) => *i as usize,
-                      _ => 0,
-                  })
+                  .map(|i| Bytes::try_from(i.clone()).unwrap_or_default().into())
                   .unwrap_or_default(),
           }
       }
 
-      pub fn version(v: usize) -> Entry {
+      pub fn namespace(ns: Namespace) -> Entry {
           Entry {
               examples: None,
               spec: None,
-              definition: Definition::Derived(coll::List::from_iter(vec![Item::Int(v as Int)])),
+              definition: Definition::Derived(coll::List::from_iter(vec![Item::from(Bytes::from(
+                  ns,
+              ))])),
           }
+      }
+  }
+
+  pub type Namespace = Newtype<Vec<u8>>;
+
+  lazy_static! {
+      static ref DICTIONARY_NAMESPACE: Namespace =
+          Newtype(sha2::Sha256::digest(b"dictionary").deref().to_vec());
+  }
+
+  impl Default for Namespace {
+      fn default() -> Namespace {
+          DICTIONARY_NAMESPACE.clone()
+      }
+  }
+
+  impl From<Bytes> for Namespace {
+      fn from(b: Bytes) -> Self {
+          Newtype(b)
+      }
+  }
+
+  impl From<Namespace> for Bytes {
+      fn from(ns: Namespace) -> Self {
+          ns.0
       }
   }
 
   pub type Dictionary = coll::Arc<HashMap<Word, Entry>>;
 
   impl Dictionary {
-      pub fn next_version(&mut self) -> usize {
-          let k = Word::from("+version+");
-          let v = self.get(&k).map_or(0_usize, Entry::get_version_info) + 1;
-          let e = Entry::version(v);
-          self.make_mut().insert(k, e);
-          v
-      }
-
       pub fn make_version(&mut self, word: Word) {
           // copy the existing non-versioned entry
           let mut unversioned = word.clone();
-          unversioned.dictversion = None;
+          unversioned.namespace = None;
           let d = self.make_mut();
 
           if let Some(existing) = d.get(&unversioned) {
               d.insert(word.clone(), existing.clone());
           }
       }
+
+      /// Returns the difference between this dictionary and a "newer"
+      /// one: The additions/updates, and the deletions.
+      pub fn diff(&self, newer: Dictionary) -> (Vec<(Word, Entry)>, Vec<Word>) {
+          diff_hashmaps(&self.inner(), &newer.inner())
+      }
+  }
+
+  fn diff_hashmaps<K, V>(a: &HashMap<K, V>, b: &HashMap<K, V>) -> (Vec<(K, V)>, Vec<K>)
+  where
+      K: Eq + Hash + Clone,
+      V: PartialEq + Clone,
+  {
+      let a_keys: HashSet<K> = a.keys().cloned().collect();
+      let b_keys: HashSet<K> = b.keys().cloned().collect();
+
+      // Keys that are in `b` but not in `a` or have updated values in `b`
+      let added_or_updated: Vec<(K, V)> = b
+          .iter()
+          .filter(|(k, v)| !a_keys.contains(k) || a.get(k) != Some(v))
+          .map(|(k, v)| (k.clone(), v.clone()))
+          .collect();
+
+      // Keys that are in `a` but not in `b`
+      let deleted: Vec<K> = a_keys.difference(&b_keys).cloned().collect();
+
+      (added_or_updated, deleted)
   }
 
   impl Default for Dictionary {
@@ -2459,9 +2505,8 @@ internally, to keep track of things like the stack, program, lists etc.
           self.read_lexicon(lexicon);
       }
 
-      pub fn push(mut self, i: Item) -> Environment {
+      pub fn push(&mut self, i: Item) {
           coll::Arc::make_mut(&mut self.stack).push_front(i);
-          self
       }
 
       pub fn pop(&mut self) -> Item {
@@ -2470,9 +2515,8 @@ internally, to keep track of things like the stack, program, lists etc.
 
       /// Pushes one item onto the front of the expression (so that it
       /// executes first)
-      pub fn push_expr(mut self, i: Item) -> Environment {
+      pub fn push_expr(&mut self, i: Item) {
           coll::Arc::make_mut(&mut self.program).push_front(i);
-          self
       }
 
       pub fn pop_expr(&mut self) -> Item {
@@ -2483,12 +2527,11 @@ internally, to keep track of things like the stack, program, lists etc.
       /// expression so that it executes first). The different between
       /// this and push_expr is that this function splices the program
       /// into the expression, joining them.
-      pub fn append_program(mut self, mut items: coll::List) -> Environment {
+      pub fn append_program(&mut self, mut items: coll::List) {
           let expr = self.program.make_mut();
           let ct = expr.len();
           expr.append(items.make_mut());
           expr.rotate_left(ct);
-          self
       }
 
       pub fn tos(&self) -> Option<&Item> {
@@ -2821,7 +2864,7 @@ example, in order to read/write to/from disk).
   use crate::types::{associative as assoc, collection as coll, error::Error, *};
   use std::collections::VecDeque;
   use std::fmt;
-
+  use std::string;
   pub trait Display {
       fn representation(&self) -> Item;
   }
@@ -2958,6 +3001,12 @@ example, in order to read/write to/from disk).
 
   impl From<edn_format::ParserError> for Error {
       fn from(e: edn_format::ParserError) -> Self {
+          Error::parse(e.to_string().as_str())
+      }
+  }
+
+  impl From<string::FromUtf8Error> for Error {
+      fn from(e: string::FromUtf8Error) -> Self {
           Error::parse(e.to_string().as_str())
       }
   }
@@ -3149,22 +3198,23 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   use crate::pipes;
   #[cfg(feature = "database")]
   use crate::pipes::db;
+  use crate::serialize::parse;
   use crate::types::associative as assoc;
   use crate::types::collection as coll;
   use crate::types::dictionary as dict;
   use crate::types::environment::Environment;
   use crate::types::error::Error;
   use crate::types::*;
+  use dict::Dictionary;
   use dynfmt::{Format, SimpleCurlyFormat};
   use futures::future::FutureExt;
-  use internment::Intern;
   use num_integer::Roots;
-  use std::collections::HashMap;
   use std::collections::VecDeque;
   //use std::future::Future;
+  use core::ops::Deref;
+  use sha2::{self, Digest};
   use std::mem;
   use std::ops::Range;
-
   pub type ItemResult = Result<Item, Error>;
 
   impl From<ItemResult> for Item {
@@ -3184,9 +3234,11 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   env.pop_expr();
                   env.pop();
               }
-              env.push(Item::from(res)).into()
+              env.push(Item::from(res));
+              env.into()
           } else {
-              env.push(Item::from(Error::stack_underflow())).into()
+              env.push(Item::from(Error::stack_underflow()));
+              env.into()
           }
       }
   }
@@ -3203,9 +3255,13 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       env.pop();
                       env.pop();
                   }
-                  env.push(Item::from(res)).into()
+                  env.push(Item::from(res));
+                  env.into()
               }
-              _ => env.push(Item::from(Error::stack_underflow())).into(),
+              _ => {
+                  env.push(Item::from(Error::stack_underflow()));
+                  env.into()
+              }
           }
       }
   }
@@ -3224,9 +3280,13 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       env.pop();
                       env.pop();
                   }
-                  env.push(Item::from(res)).into()
+                  env.push(Item::from(res));
+                  env.into()
               }
-              _ => env.push(Item::from(Error::stack_underflow())).into(),
+              _ => {
+                  env.push(Item::from(Error::stack_underflow()));
+                  env.into()
+              }
           }
       }
   }
@@ -3241,8 +3301,28 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               if r.is_ok() {
                   env.pop_expr();
               }
-              env.push(Item::from(r))
+              env.push(Item::from(r));
+              env
           }))
+      }
+  }
+
+  /// Wrapper function that allows you to use the ? operator in your own
+  /// functions. If that function returns an error result, it will
+  /// append that error to the env.
+  fn f_result<F>(f: F) -> impl Fn(Environment) -> Future<Environment>
+  where
+      F: Fn(&mut Environment) -> Result<(), Error>,
+  {
+      move |mut env: Environment| {
+          let r = f(&mut env);
+          match r {
+              Ok(_) => env.into(),
+              Err(e) => {
+                  env.push(e.into());
+                  env.into()
+              }
+          }
       }
   }
 
@@ -3299,6 +3379,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("decodejson", Box::leak(Box::new(f_stack1(decode_json)))),
           ("dip", Box::leak(Box::new(dip))),
           ("dictionary", Box::leak(Box::new(dictionary))),
+          ("dictmerge", Box::leak(Box::new(dictmerge))),
           ("dipdown", Box::leak(Box::new(dipdown))),
           ("drop", Box::leak(Box::new(drop))),
           ("emit", Box::leak(Box::new(f_stack1(emit)))),
@@ -3338,7 +3419,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               Box::leak(Box::new(f_stack1(crate::crypto::hash))),
           ),
           ("inc", Box::leak(Box::new(f_stack1(inc)))),
-          ("inscribe", Box::leak(Box::new(inscribe))),
+          ("inscribe", Box::leak(Box::new(f_result(inscribe)))),
           ("intersection", Box::leak(Box::new(f_stack2(intersection)))),
           ("inspect", Box::leak(Box::new(f_stack1(inspect)))),
           ("join", Box::leak(Box::new(f_stack2(join)))),
@@ -3402,6 +3483,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("unassign", Box::leak(Box::new(f_stack2(unassign)))),
           ("take", Box::leak(Box::new(take))),
           ("unwrap", Box::leak(Box::new(unwrap))),
+          ("using", Box::leak(Box::new(using))),
           (
               "verify",
               Box::leak(Box::new(f_stack3(crate::crypto::verify))),
@@ -3625,21 +3707,32 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let i2 = i.clone();
       let pr = coll::Receptacle::try_from(i);
       match pr {
-          Ok(p) => Box::pin(p.put(j).map(|f| match f {
-              Ok(p) => {
-                  env.pop_expr();
-                  env.push(Item::Receptacle(p))
-              }
-              Err(e) => env.push(i2).push(e.into()),
+          Ok(p) => Box::pin(p.put(j).map(|f| {
+              match f {
+                  Ok(p) => {
+                      env.pop_expr();
+                      env.push(Item::Receptacle(p))
+                  }
+                  Err(e) => {
+                      env.push(i2);
+                      env.push(e.into())
+                  }
+              };
+              env
           })),
-          Err(e) => env.push(i2).push(e.into()).into(),
+          Err(e) => {
+              env.push(i2);
+              env.push(e.into());
+              env.into()
+          }
       }
   }
 
   pub fn clone(mut env: Environment) -> Future<Environment> {
       let clone = env.stack.front().unwrap().clone();
       env.pop_expr();
-      env.push(clone).into()
+      env.push(clone);
+      env.into()
   }
 
   fn swap2(mut env: Environment, offset: usize) -> Future<Environment> {
@@ -3772,14 +3865,12 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   let pm = coll::Arc::make_mut(&mut p);
                   pm.push_back(Item::from(p2));
                   pm.push_back("loop".into());
-                  env.append_program(p)
-              } else {
-                  env
+                  env.append_program(p);
               }
           }
           Err(e) => env.push(Item::from(e)),
       }
-      .into()
+      env.into()
   }
 
   pub fn execute(mut env: Environment) -> Future<Environment> {
@@ -3787,17 +3878,20 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       match coll::List::try_from(i) {
           Ok(program) => {
               env.pop_expr();
-              env.append_program(program)
+              env.append_program(program);
           }
-          Err(e) => env.push(e.into()),
+          Err(e) => {
+              env.push(e.into());
+          }
       }
-      .into()
+      env.into()
   }
 
   pub fn wrap(mut env: Environment) -> Future<Environment> {
       let item = env.pop();
       env.pop_expr();
-      env.push(coll::List::from_iter([item]).into()).into()
+      env.push(coll::List::from_iter([item]).into());
+      env.into()
   }
 
   pub fn unwrap(mut env: Environment) -> Future<Environment> {
@@ -3808,11 +3902,14 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               let len = l.len();
               let l2 = (0..len).map(move |i| l[i].clone());
               for i in l2 {
-                  env = env.push(i);
+                  env.push(i);
               }
               env
           }
-          Err(e) => env.push(e.into()),
+          Err(e) => {
+              env.push(e.into());
+              env
+          }
       }
       .into()
   }
@@ -3829,7 +3926,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           }
           Err(e) => env.push(e.into()),
       }
-      .into()
+      env.into()
   }
 
   pub fn dipdown(mut env: Environment) -> Future<Environment> {
@@ -3845,7 +3942,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           }
           Err(e) => env.push(e.into()),
       }
-      .into()
+      env.into()
   }
 
   pub fn take(mut env: Environment) -> Future<Environment> {
@@ -3951,7 +4048,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           (Err(e), _) => env.push(e.into()),
           (_, Err(e)) => env.push(e.into()),
       }
-      .into()
+      env.into()
   }
 
   pub fn step(mut env: Environment) -> Future<Environment> {
@@ -3966,11 +4063,12 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               expr.push_front(it.into());
               expr.push_front("execute".into());
 
-              env.push(litem).push(p.into())
+              env.push(litem);
+              env.push(p.into());
           } else {
               env.pop_expr();
-              env
           }
+          env
       })
   }
 
@@ -3978,8 +4076,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let stepby = Int::try_from(env.pop()).unwrap();
       let to = Int::try_from(env.pop()).unwrap();
       let from = Int::try_from(env.pop()).unwrap();
-      let mut env =
-          env.push(coll::List::from_iter((from..to).step_by(stepby as usize).map(Item::Int)).into());
+      env.push(coll::List::from_iter((from..to).step_by(stepby as usize).map(Item::Int)).into());
       env.pop_expr();
       env.into()
   }
@@ -3996,7 +4093,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let then = coll::List::try_from(env.pop()).unwrap();
       let pred = coll::List::try_from(env.pop()).unwrap();
       env.pop_expr();
-      env = env.push_expr("if".into());
+      env.push_expr("if".into());
       let r = coll::List::from_iter([
           Item::from(pred.clone()),
           then.clone().into(),
@@ -4013,10 +4110,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       rm.push_back(r);
       rm.extend(rec2.make_mut().drain(..));
       //env.pop_expr();
-      env.push(pred.into())
-          .push(then.into())
-          .push(rec1.into())
-          .into()
+      env.push(pred.into());
+      env.push(then.into());
+      env.push(rec1.into());
+      env.into()
   }
 
   //(fn [{[l & others] 'stack :as env}]
@@ -4026,7 +4123,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let mut l = coll::List::try_from(env.pop()).unwrap();
       mem::swap(&mut env.stack, &mut l);
       env.pop_expr();
-      env.push(l.into()).into()
+      env.push(l.into());
+      env.into()
   }
 
   fn assoc_vec(mut l: coll::List, ks: &[assoc::KeyItem], k: Int, v: Item) -> Result<Item, Error> {
@@ -4303,7 +4401,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           match clause {
               Ok(mut clause) => {
                   if clause.len() != 2 {
-                      env.push(Error::list_count(2).into()).into()
+                      env.push(Error::list_count(2).into());
+                      env.into()
                   } else {
                       let clause_data = clause.make_mut();
                       let test: Result<coll::List, Error> = clause_data
@@ -4328,19 +4427,30 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                                   "if".into(),
                               ]);
                               env.pop_expr();
-                              env.append_program(newexpr).into()
+                              env.append_program(newexpr);
+                              env.into()
                           }
-                          (Err(test), _) => env.push(test.into()).into(),
-                          (_, Err(expr)) => env.push(expr.into()).into(),
+                          (Err(test), _) => {
+                              env.push(test.into());
+                              env.into()
+                          }
+                          (_, Err(expr)) => {
+                              env.push(expr.into());
+                              env.into()
+                          }
                       }
                   }
               }
-              Err(e) => env.push(e.into()).into(),
+              Err(e) => {
+                  env.push(e.into());
+                  env.into()
+              }
           }
       } else {
           // clauses empty, return nothing
           env.pop_expr();
-          env.push(Item::default()).into()
+          env.push(Item::default());
+          env.into()
       }
   }
 
@@ -4354,7 +4464,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           }
           Err(e) => e.into(),
       };
-      env.push(r).into()
+      env.push(r);
+      env.into()
   }
 
   pub fn emit(i: Item) -> ItemResult {
@@ -4494,7 +4605,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       {
                           if let Some(spec) = &dfn.spec {
                               if let Err(e) = check_input_spec(spec, &env) {
-                                  env = env.push(e.into());
+                                  env.push(e.into());
                                   return env.into();
                               }
                           } else {
@@ -4505,13 +4616,15 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                               dict::Definition::Derived(d) => {
                                   let items = d.clone();
                                   env.pop_expr();
-                                  env.append_program(items).into()
+                                  env.append_program(items);
+                                  env.into()
                               }
                           }
                       }
                   } else {
                       let w = word.clone();
-                      env.push(Error::undefined(w).into()).into()
+                      env.push(Error::undefined(w).into());
+                      env.into()
                   }
               }
               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
@@ -4519,7 +4632,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               ))) => {
                   if let Some(spec) = &entry.spec {
                       if let Err(e) = check_input_spec(spec, &env) {
-                          env = env.push(e.into());
+                          env.push(e.into());
                           return env.into();
                       }
                   }
@@ -4531,18 +4644,21 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       dict::Definition::Derived(d) => {
                           let d = d.clone();
                           env.pop_expr();
-                          env.append_program(d).into()
+                          env.append_program(d);
+                          env.into()
                       }
                   }
               }
               _ => {
                   // not a word, just push onto stack
                   let i = env.pop_expr();
-                  env.push(i).into()
+                  env.push(i);
+                  env.into()
               }
           }
       } else {
-          env.push(Error::short_list(1).into()).into()
+          env.push(Error::short_list(1).into());
+          env.into()
       }
   }
 
@@ -4646,7 +4762,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           }
           i => i,
       };
-      env = env.push(err);
+      env.push(err);
       env
   }
 
@@ -4678,12 +4794,21 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           Ok(inner) => {
               env.pop_expr();
               if inner.program.is_empty() {
-                  Box::pin(async move { env.push(Item::default()) })
+                  Box::pin(async move {
+                      env.push(Item::default());
+                      env
+                  })
               } else {
-                  Box::pin(eval_step(inner).map(|inner_next| env.push(inner_next.into())))
+                  Box::pin(eval_step(inner).map(|inner_next| {
+                      env.push(inner_next.into());
+                      env
+                  }))
               }
           }
-          Err(e) => env.push(e.into()).into(),
+          Err(e) => {
+              env.push(e.into());
+              env.into()
+          }
       }
   }
 
@@ -4693,9 +4818,13 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       match inner_env {
           Ok(inner) => Box::pin(eval(inner).map(|inner_done| {
               env.pop_expr();
-              env.push(inner_done.into())
+              env.push(inner_done.into());
+              env
           })),
-          Err(e) => env.push(e.into()).into(),
+          Err(e) => {
+              env.push(e.into());
+              env.into()
+          }
       }
   }
 
@@ -4707,7 +4836,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   pub fn dictionary(mut env: Environment) -> Future<Environment> {
       let d = env.dictionary.clone();
       env.pop_expr();
-      env.push(d.into()).into()
+      env.push(d.into());
+      env.into()
   }
 
   fn sqrt(i: Item) -> ItemResult {
@@ -4763,7 +4893,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   // itself onto the stack.
   pub fn yes(mut env: Environment) -> Future<Environment> {
       let t = env.pop_expr();
-      env.push(t).into()
+      env.push(t);
+      env.into()
   }
 
   pub fn fail(e: Item) -> ItemResult {
@@ -4772,125 +4903,159 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       Err(e)
   }
 
+  /// Set the environment's dictionary to the dictionary on ToS.
+  ///
+  /// Note: this word can be used to bypass all attempts as sandboxing,
+  /// so use caution and be sure to understand the mechanisms used to
+  /// prevent this.
   pub fn define(mut env: Environment) -> Future<Environment> {
       let d = dict::Dictionary::try_from(env.pop());
-      //assume there's a program beneath the new dictionary that we
-      // intend to run
       match d {
           Ok(d) => {
               env.dictionary = d;
-              env.new_dictversion();
               env.pop_expr();
               env
           }
           Err(e) => {
-              env = env.push(e.into());
+              env.push(e.into());
               env
           }
       }
       .into()
   }
 
-  fn label(p: &mut coll::List, words: &HashMap<Intern<String>, Word>) {
-      let p = p.make_mut();
+  /// Find the word in the dictionary in one of the given
+  /// namespaces. The first match is returned, or None if no matches.
+  fn resolve(w: Word, dict: &Dictionary, namespaces: &Vec<dict::Namespace>) -> Option<Word> {
+      // if the word is already namespaced we're done
+      if w.namespace.is_some() {
+          return Some(w);
+      }
+      // otherwise look for a match in provided namespaces
+      for namespace in namespaces.iter().cloned() {
+          let w_ns = Word {
+              data: w.data.clone(),
+              namespace: Some(namespace),
+          };
+          if dict.contains_key(&w_ns) {
+              return Some(w_ns);
+          }
+      }
+      None
+  }
 
+  /// resolve all the namespaces in the given program recursively,
+  /// using the given list of library ids
+  fn resolve_all(p: &mut coll::List, dict: &Dictionary, namespaces: &Vec<dict::Namespace>) {
+      let p = p.make_mut();
       for item in p.iter_mut() {
           match item {
               Item::Word(w) => {
-                  if let Some(replacement) = words.get(&w.data) {
+                  if let Some(replacement) = resolve(w.clone(), dict, namespaces) {
                       ,*item = Item::Word(replacement.clone());
                   }
               }
 
               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(ref mut l))) => {
-                  label(l, words);
+                  resolve_all(l, dict, namespaces);
               }
               _ => {}
           }
       }
   }
 
-  pub fn version(p: &mut coll::List, words: Vec<Word>, this: Option<&Word>) {
-      //println!("version: {:?} with {:?}", p, words);
-      let mut words_map: HashMap<Intern<String>, Word> =
-          words.into_iter().map(|word| (word.data, word)).collect();
-
-      if let Some(this) = this {
-          words_map.insert(Intern::<String>::from("self"), this.clone());
-      }
-      label(p, &words_map);
-      //println!("versioned: {:?}", p);
-  }
-
-  fn version_bindings(b: &mut coll::List, ver: usize) -> Vec<Word> {
-      //let mut r = coll::ListContent::default();
-      let mut words = Vec::<Word>::new();
-      let bm = b.make_mut();
-      for item in bm.iter_mut() {
-          if let Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(ref mut l))) = item {
-              let lm = l.make_mut();
-              let mut this: Option<Word> = None;
-              if let Some(Item::Word(ref mut bindword)) = lm.get_mut(0) {
-                  bindword.versioned(ver);
-                  this = Some(bindword.clone());
-              }
-
-              if let Some(update) = lm.get_mut(1) {
-                  if let Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(ref mut program))) =
-                      update
-                  {
-                      version(program, words.clone(), this.as_ref());
-                      this.and_then(|t| Some(words.push(t)));
+  fn using(mut env: Environment) -> Future<Environment> {
+      let namespaces = coll::List::try_from(env.pop());
+      let program = coll::List::try_from(env.pop());
+      match (program, namespaces) {
+          (Ok(mut program), Ok(namespaces)) => {
+              let ns: Result<Vec<dict::Namespace>, Error> = namespaces
+                  .inner()
+                  .into_iter()
+                  .map(|ns| Bytes::try_from(ns).map(dict::Namespace::from))
+                  .collect();
+              match ns {
+                  Ok(ns) => {
+                      resolve_all(&mut program, &env.dictionary, &ns);
+                      env.push(program.into());
+                      env.into()
+                  }
+                  Err(e) => {
+                      env.push(e.into());
+                      env.into()
                   }
               }
           }
-      }
-      //println!("new bindings: {:?}", bm);
-      words
-  }
-
-  pub fn inscribe(mut env: Environment) -> Future<Environment> {
-      // Extract the bindings and program
-      let program = coll::List::try_from(env.pop());
-      let bindings = coll::List::try_from(env.pop());
-
-      match (bindings, program) {
-          (Ok(ref mut bindings), Ok(ref mut program)) => {
-              let ver = env.dictionary.next_version();
-              let words = version_bindings(bindings, ver);
-              for word in words.clone() {
-                  env.dictionary.make_version(word);
-              }
-              version(program, words, None);
-
-              // get ready to update the dictionary with the user's changes
-              // first put dict and updates on stack
-              let dict = env.dictionary.clone();
-              let p = coll::List::from_iter([
-                  Item::from("unwrap"),
-                  coll::List::from_iter([Item::from("wrap")]).into(),
-                  "dip".into(),
-                  "update".into(),
-              ]);
-              env = env
-                  .push(dict.into())
-                  .push(Item::from(bindings.clone()))
-                  .push(p.into());
-              // now push a program to step through the updates
-
-              env.pop_expr(); //pop off the inscribe word
-
-              env = env
-                  .append_program(program.clone())
-                  .push_expr("define".into())
-                  .push_expr("step".into());
-              //println!("{:?}", env);
-              // finally return the env
+          (Err(e), _) => {
+              env.push(e.into());
               env.into()
           }
-          (Err(e), _) => env.push(e.into()).into(),
-          (_, Err(e)) => env.push(e.into()).into(),
+          (_, Err(e)) => {
+              env.push(e.into());
+              env.into()
+          }
       }
+  }
+
+  // Each word should run a program that calls fail (already namespaced
+  // to the stdlib so that the word acts like it isn't in the dictionary
+  // even though it is.)
+  fn make_deletes(_: Vec<Word>) -> Vec<(Word, dict::Entry)> {
+      Vec::new()
+  }
+
+  /// Takes a new dictionary, diffs it with the existing one, and marks
+  /// all the deleted items as deleted.
+  pub fn dictmerge(mut env: Environment) -> Future<Environment> {
+      let partialdict = dict::Dictionary::try_from(env.pop());
+      // need to have the namespace hash in here to give namespaces to the updates
+      match partialdict {
+          Ok(pd) => {
+              let (adds, deletes) = env.dictionary.diff(pd);
+              let d = env.dictionary.make_mut();
+              d.extend(adds.into_iter());
+              d.extend(make_deletes(deletes).into_iter());
+              env.into()
+          }
+          Err(e) => {
+              env.push(e.into());
+              env.into()
+          }
+      }
+  }
+
+  /// Load a new module and gives it an optional alias (either a word or
+  /// nothing). Takes the raw bytes or string or a program (the latter
+  /// two are converted to bytes)
+  pub fn inscribe(env: &mut Environment) -> Result<(), Error> {
+      let mut alias = Word::try_from(env.pop())?;
+      let module_raw = Bytes::try_from(env.pop())?;
+
+      // first see if we can parse the module
+      let module_string = String::from_utf8(module_raw.clone())?;
+      let program = parse(module_string)?;
+      let hash = sha2::Sha256::digest(module_raw.as_slice()).deref().to_vec();
+      let dict = env.dictionary.clone();
+
+      // add an alias, which goes in the dictionary's namespace
+      alias.namespaced(dict::Namespace::default());
+      env.dictionary
+          .inner()
+          .insert(alias, dict::Entry::namespace(hash.into()));
+
+      // let p = coll::List::from_iter([
+      //     Item::from("unwrap"),
+      //     coll::List::from_iter([Item::from("wrap")]).into(),
+      //     "dip".into(),
+      //     "update".into(),
+      // ]);
+
+      env.push(dict.into());
+      env.pop_expr(); //pop off the inscribe word
+
+      env.append_program(program);
+      env.push_expr("dictmerge".into());
+      Ok(())
   }
 
   // Takes an inner environment from the top of the stack, and spawns a
@@ -4904,7 +5069,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               tokio::spawn(async move { eval(inner).await });
               env.into()
           }
-          Err(e) => env.push(e.into()).into(),
+          Err(e) => {
+              env.push(e.into());
+              env.into()
+          }
       }
   }
   fn xor_(i: Bytes, j: Bytes) -> Bytes {
@@ -4943,16 +5111,16 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn timestamps(mut env: Environment) -> Future<Environment> {
       env.pop_expr();
-      env.push(Item::Dispenser(coll::Dispenser::Out(pipes::Out::Time)))
-          .into()
+      env.push(Item::Dispenser(coll::Dispenser::Out(pipes::Out::Time)));
+      env.into()
   }
 
   pub fn standard(mut env: Environment) -> Future<Environment> {
       env.pop_expr();
       env.push(Item::Dispenser(coll::Dispenser::Tunnel(
           pipes::Tunnel::Standard,
-      )))
-      .into()
+      )));
+      env.into()
   }
 
   pub fn set(i: Item) -> ItemResult {
@@ -6331,8 +6499,8 @@ Implement the =handoff= type
 
   pub fn handoff(mut env: Environment) -> types::Future<Environment> {
       env.pop_expr();
-      env.push(pipes::Tunnel::Handoff(Handoff::new(false)).into())
-          .into()
+      env.push(pipes::Tunnel::Handoff(Handoff::new(false)).into());
+      env.into()
   }
 
   impl From<flume::RecvError> for error::Error {
@@ -11358,8 +11526,9 @@ map now doesn't require you to bind values (the map function has access to the r
  [2 4]
  5
  #+end_src
-***** INPROGRESS inscribe currently re-defines words repeatedly at runtime
+*** INPROGRESS inscribe currently re-defines words repeatedly at runtime
 - State "INPROGRESS" from "TODO"       [2024-02-08 Thu 17:17]
+**** Problem statement
 The way it works now, it does the dictionary update and then runs the
 program. It should instead alter a program.
 
@@ -11413,63 +11582,98 @@ Problems that need to be avoided:
   1:many. I should be able to bind a 2nd program such that it uses the
   library's vocab. There's no way to do that with the current impl of
   =inscribe=.
-***** INPROGRESS inscribe currently re-defines words repeatedly at runtime
-- State "INPROGRESS" from "TODO"       [2024-02-08 Thu 17:17]
-The way it works now, it does the dictionary update and then runs the
-program. It should instead alter a program.
+**** INPROGRESS Current design
+- State "INPROGRESS" from "TODO"       [2024-02-12 Mon 08:22]
+Have two separate words: one for loading new modules =loadlib=, and
+other =using= for activating them in a given program.
+**** TODO Library loading
+***** TODO Hash-based namespace identification
+We identify which module a word's definition came from, by its
+hash. However it's not clear what exactly we hash or when.
 
-Even with this functionality, the problem is the code will be
-difficult to read: instead of defining programs as inline literals,
-we'd have to "inscribe" the program so that its component words refer
-to the right definitions, and then bring that new program into an
-inscribe call by pulling it from the stack into a nested update structure. 
+There are several ways to implement
 
++ Take a hash from the user of what module he wants (mapping hashes to
+  documentation and version numbers is done elsewhere)
++ Contact peers to retrieve the bytes corresponding to that hash
++ Check the retrieved bytes in fact match the hash
++ call =read= on those bytes to get a program datastructure
++ Call =loadlib= and pass it a hash to execute that program on the
+  dictionary to add that hash's namespace.
 
+However that makes =loadlib= unsafe because malicious code would be able
+to masquerade as a trusted lib. We could do this
+
++ Call loadlib and pass it the raw bytes, loadlib calculates the hash
+  itself and then calls =read=.
+
+This is not ideal either, since then defining modules inline would
+involve a round trip of serialization (you'd have to =emit= to get the
+bytes, and then loadlib would re-read). I don't really see any way
+around this though, as there's no other way to hash a program other
+than through =emit=.
+
+So what would an inline library use look like?
 #+begin_src kcats
-  [[pt [+ *]]]
-  vocab
-  -> partial dictionary with math = [[pt [+ *]]]
+  [[clone *] [square] assign] [emit hash] shield loadlib
+  wrap
+  [9 square] using
 
-  [9 3 pt] lingo
-  ;; iterate through the partial dict, for each word update the version
-  ;; in the program (to avoid having inner functions' meaning changed)
-  ;; 
+  ;; we could define `draft` to allow this:
+  [[clone *] [square] assign]
+  [9 square] draft
+
+  ;; but you can't nest, you'd have to do this:
+  [[clone *] [square] assign] [math] loadlib
+  [[[math]
+    [clone square *] resolve]
+
+   [cube] update]
+  [math2] loadlib
+  [[math2] [9 cube] using]
+
 #+end_src
 
-Problems that need to be avoided:
+#+RESULTS:
+#+begin_src kcats
+#b64 "zVdD2s93lB4wmjuJJENqRljwx9qgWRtXiy+PWB4Qn+4=" [[clone *]
+                                                     [square] assign]
+#+end_src
 
-+ When code is defining new vocabulary, and it gets called in a tight
-  loop, it should not be modifying the dictionary each
-  time. Dictionary shoud be append only (to avoid having to swap back
-  and forth between a modified and unmodified version)
-+ Dictionary modification should not happen at "runtime" (when the
-  program is actually being executed) - it should be modified when the
-  program is *built*. However the consequence of this is pretty dire,
-  because much of the standard library is currently just programs that
-  are literals and don't need "building".
-+ Nested library calls need to work - I should be able to call =af= that
-  loads (or depends on  =b= and calls =bf= that loads =c= and calls =cf=, and those loads
-  should only happen once even if i call =af= in a tight loop.
-+ Building vocabulary and the programs that use that vocabulary need
-  to be separable (that's the whole point of a library). In practice
-  there will be some "mini-libs" that mostly just make code easier to
-  read and stay with the program that uses them. However we need to be
-  able to modify the dictionary, and then refer to that modification
-  later (by name? hash?), to support the typical library use
-  case. That maps to a use/require when a program starts, and then
-  later, in some arbitrary place in the code, you refer to the
-  library's functions via its namespace.
-  
-  This is starting to sound a lot like namespaces: It's an impl where
-  there's only a 'use' without aliasing that overrides any existing
-  definitions. Currently we avoid the whole issue of referring to
-  namespaces by name by insisting you pair the library to a program at
-  definition time. But that is a 1:1 relationship and it should be
-  1:many. I should be able to bind a 2nd program such that it uses the
-  library's vocab. There's no way to do that with the current impl of
-  =inscribe=.
+**** TODO Nesting scopes
+We should be able to nest calls to =using= without repeating any
+expensive calls.
 
-  
+That means we need a word that only modifies a program by resolving
+the words in it (could call it =resolve=?)
+**** TODO Stack escape protection
+If a program refers to a word, and at the time that program is put on
+the stack, that word means something, it should still carry the same
+meaning if that program is later run with =execute=. That means that
+module changes must be permanent.
+**** TODO Sandboxing support
+It must be possible for a module to *deny* access to a given word. Given
+that dictionary changes are permanent, we can't just delete words from
+the dictionary (once the given program is done, that word needs to be
+available again somehow).
+
+We can implement this with some sort of shadowing mechanism during
+resolving: If we "delete" a word, we could actually define the word in
+the module's namespace, such that all it does is throw a 'no such
+word' error. That's one somewhat hacky way to implement it, but there
+may be others.
+
++ There should be no way for code using the module to access the
+  "deleted" word. (Check for escape hatches via arbitrary dictionary
+  modification)
++ The word should be accessible again after the program using the
+  module has completed.
+**** TODO Access control
+Take the word =define= which allows the caller to make arbitrary and
+permanent changes to the dictionary. What if we wanted to restrict
+access to that word such that authoritzed programs can call it but
+others can't?
+**** TODO Words can refer to other words in the same library
 *** INPROGRESS Database
 - State "INPROGRESS" from "TODO"       [2023-12-31 Sun 10:17]
 **** Simple Test
