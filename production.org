@@ -2074,7 +2074,7 @@ internally, to keep track of things like the stack, program, lists etc.
   use lazy_static::lazy_static;
   use sha2::{self, Digest};
   use std::collections::HashSet;
-
+  use std::ptr;
   #[derive(Debug, Clone)]
   pub struct Entry {
       pub examples: Option<coll::List>,
@@ -2129,7 +2129,7 @@ internally, to keep track of things like the stack, program, lists etc.
   pub type Namespace = Newtype<Vec<u8>>;
 
   lazy_static! {
-      static ref DICTIONARY_NAMESPACE: Namespace =
+      pub static ref DICTIONARY_NAMESPACE: Namespace =
           Newtype(sha2::Sha256::digest(b"dictionary").deref().to_vec());
   }
 
@@ -3216,6 +3216,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   //use std::future::Future;
   use core::ops::Deref;
   use sha2::{self, Digest};
+  use std::collections::HashMap;
   use std::mem;
   use std::ops::Range;
   pub type ItemResult = Result<Item, Error>;
@@ -3450,6 +3451,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               Box::leak(Box::new(f_stack1(crate::pipes::channel::receiver))),
           ),
           ("recur", Box::leak(Box::new(recur))),
+          ("resolve", Box::leak(Box::new(resolve))),
           ("resume", Box::leak(Box::new(identity))),
           ("reverse", Box::leak(Box::new(f_stack1(reverse)))),
           ("round", Box::leak(Box::new(f_stack1(round)))),
@@ -3486,7 +3488,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("unassign", Box::leak(Box::new(f_stack2(unassign)))),
           ("take", Box::leak(Box::new(take))),
           ("unwrap", Box::leak(Box::new(unwrap))),
-          ("using", Box::leak(Box::new(using))),
           (
               "verify",
               Box::leak(Box::new(f_stack3(crate::crypto::verify))),
@@ -4929,7 +4930,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   /// Find the word in the dictionary in one of the given
   /// namespaces. The first match is returned, or None if no matches.
-  fn resolve(w: Word, dict: &Dictionary, namespaces: &Vec<dict::Namespace>) -> Option<Word> {
+  fn resolve_word(w: Word, dict: &Dictionary, namespaces: &Vec<dict::Namespace>) -> Option<Word> {
       // if the word is already namespaced we're done
       if w.namespace.is_some() {
           return Some(w);
@@ -4954,7 +4955,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       for item in p.iter_mut() {
           match item {
               Item::Word(w) => {
-                  if let Some(replacement) = resolve(w.clone(), dict, namespaces) {
+                  if let Some(replacement) = resolve_word(w.clone(), dict, namespaces) {
                       ,*item = Item::Word(replacement.clone());
                   }
               }
@@ -4987,11 +4988,19 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }
   }
 
-  fn using(mut env: Environment) -> Future<Environment> {
-      let namespaces = coll::List::try_from(env.pop());
+  fn resolve(mut env: Environment) -> Future<Environment> {
       let program = coll::List::try_from(env.pop());
+      let namespaces = coll::List::try_from(env.pop());
+
       match (program, namespaces) {
-          (Ok(mut program), Ok(namespaces)) => {
+          (Ok(mut program), Ok(mut namespaces)) => {
+              {
+                  // Prepend the Dictionary's namespace so that
+                  // deletions are respected (via shadowing the existing
+                  // word with one that throws an error.)
+                  let namespaces = namespaces.make_mut();
+                  namespaces.push_front(Bytes::from(dict::DICTIONARY_NAMESPACE.clone()).into());
+              }
               let ns: Result<Vec<dict::Namespace>, Error> = namespaces
                   .inner()
                   .into_iter()
@@ -5029,29 +5038,70 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       Vec::new()
   }
 
+  /// Takes a set of additions to the dictionary. Resolves all of the
+  /// references to the words added, in any of the other words, to the
+  /// words being added. This allows modules to call other words in the
+  /// same module. The additions should have the word keys already set
+  /// to the proper namespace. So for example, if you're adding the
+  /// words `foo` and `bar` and `foo` calls `bar`, the `bar` that `foo`
+  /// refers to will be the one from this module.
+  fn resolve_local(adds: &mut dict::Dictionary) {
+      // grab the first namespace (they should all be the same)
+      if !adds.is_empty() {
+          let adds_ro = adds.clone();
+          let ns = &vec![adds_ro
+              .inner()
+              .keys()
+              .next()
+              .unwrap()
+              .namespace
+              .clone()
+              .unwrap()];
+          let adds_m = adds.make_mut();
+          for entry in adds_m.values_mut() {
+              match &mut entry.definition {
+                  dict::Definition::Axiom(_) => {}
+                  dict::Definition::Derived(ref mut d) => {
+                      resolve_all(d, &adds_ro, ns);
+                  }
+              }
+              if let Some(e) = entry.examples.as_mut() {
+                  resolve_all(e, &adds_ro, ns);
+              }
+          }
+      } else {
+          println!("Warning: empty local module")
+      }
+  }
+
   /// Takes a new dictionary, diffs it with the existing one, and marks
   /// all the deleted items as deleted.
   pub fn dictmerge(mut env: Environment) -> Future<Environment> {
-      println!("dictmerge: {:?}", env);
+      //println!("dictmerge: {:?}", env);
       let partialdict = dict::Dictionary::try_from(env.pop());
       let namespace = Bytes::try_from(env.pop()).unwrap();
-      println!("Popped");
       // need to have the namespace hash in here to give namespaces to the updates
       match partialdict {
           Ok(pd) => {
-              println!("got a dict");
               let (adds, deletes) = env.dictionary.diff(pd);
               // add namepaces to the adds
-              //let adds = adds.map(|e|);
+              let adds: Vec<_> = adds
+                  .into_iter()
+                  .map(|(mut w, e)| {
+                      w.namespaced(namespace.clone().into());
+                      (w, e)
+                  })
+                  .collect();
+              // make a mini dictionary with the adds
+              let mut dict: Dictionary = coll::Arc::wrap(HashMap::from_iter(adds.into_iter()));
+              resolve_local(&mut dict);
               let d = env.dictionary.make_mut();
-              println!("Dict adds: {:?}", adds);
-              d.extend(adds.into_iter());
+              d.extend(dict.inner().into_iter());
               d.extend(make_deletes(deletes).into_iter());
               // pop the word dictmerge
               env.pop_expr();
           }
           Err(e) => {
-              println!("Error: {:?}", e);
               env.push(e.into());
           }
       }
@@ -5079,8 +5129,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       // add an alias, which goes in the dictionary's namespace
       alias.namespaced(dict::Namespace::default());
       let d = env.dictionary.make_mut();
-      let e = dict::Entry::namespace(hash.into());
-      println!("Adding alias {:?} -> {:?}", alias, e);
+      let e = dict::Entry::namespace(hash.clone().into());
+      //println!("Adding alias {:?} -> {:?}", alias, e);
       d.insert(alias, e);
 
       // let p = coll::List::from_iter([
@@ -5089,13 +5139,13 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       //     "dip".into(),
       //     "update".into(),
       // ]);
-
+      env.push(hash.into());
       env.push(dict.into());
       env.pop_expr(); //pop off the inscribe word
 
       env.push_expr("dictmerge".into());
       env.append_program(program);
-      println!("inscribe: {:?}", env);
+      //println!("inscribe: {:?}", env);
       Ok(())
   }
 
@@ -5493,8 +5543,8 @@ We'll also define how to run unit tests.
           expected: coll::List,
       ) -> Option<Error> {
           let mut exp_env = prog_env.clone();
-          prog_env = prog_env.append_program(program.clone());
-          exp_env = exp_env.append_program(expected.clone());
+          prog_env.append_program(program.clone());
+          exp_env.append_program(expected.clone());
 
           let p_fut = tokio::spawn(async move { axiom::eval(prog_env).await });
 
@@ -11627,8 +11677,10 @@ Problems that need to be avoided:
 - State "INPROGRESS" from "TODO"       [2024-02-12 Mon 08:22]
 Have two separate words: one for loading new modules =loadlib=, and
 other =using= for activating them in a given program.
-**** TODO Library loading
-***** TODO Hash-based namespace identification
+**** INPROGRESS Library loading
+- State "INPROGRESS" from "TODO"       [2024-02-17 Sat 14:51]
+***** INPROGRESS Hash-based namespace identification
+- State "INPROGRESS" from "TODO"       [2024-02-14 Wed 19:22]
 We identify which module a word's definition came from, by its
 hash. However it's not clear what exactly we hash or when.
 
@@ -11675,43 +11727,63 @@ So what would an inline library use look like?
 
 #+end_src
 
+Test basic functionality: can define a new word in a scope and call it, but not outside the scope.
+#+begin_src kcats
+  [[cubez]
+   [[clone clone * *]
+    [[number] [number]]
+    [spec definition] label]
+   update] encode
+  [math] unwrap inscribe
+
+  [math] [9 cubez] using  ;; in scope
+  2 cubez ;; out of scope
+#+end_src
+
 #+RESULTS:
 #+begin_src kcats
-#b64 "zVdD2s93lB4wmjuJJENqRljwx9qgWRtXiy+PWB4Qn+4=" [[clone *]
-                                                     [square] assign]
+[[type error]
+ [asked [cubez]]
+ [reason "word is not defined"]
+ [unwound [cubez]]
+ [handled yes]]
+2 729
 #+end_src
 
+Words in a library can call each other
 #+begin_src kcats
-  [[cubez] [[clone clone * *] [definition] label] update] encode [math] unwrap inscribe
-  [[cube] [[clone clone * *] [definition] label] update] encode [math] unwrap inscribe
-   [9 cubez] [math] using execute 2 cubez
+  [[square]
+   [[clone *]
+    [[number] [number]]
+    [spec definition] label]
+   update
+   [cube]
+   [[clone square *]
+    [[number] [number]]
+    [spec definition] label]
+   update]
+
+  encode [math] unwrap inscribe
+  [math] [9 cube] using 
+  ; tracer collect 
+  ;  [math] [9 cube] using execute ;; in scope
+
 #+end_src
 
 #+RESULTS:
 #+begin_src kcats
-Adding alias Word { data: 0x5560cd77f2d0 : "math", namespace: Some([23, 124, 167, 15, 66, 222, 241, 35, 142, 54, 218, 50, 148, 115, 38, 62, 211, 254, 173, 209, 64, 148, 192, 121, 162, 35, 11, 224, 25, 52, 54, 245]) } -> Entry { examples: None, spec: None, definition: [Dispenser(Sized(Bytes([8, 144, 120, 65, 183, 207, 199, 239, 164, 219, 21, 117, 247, 69, 70, 93, 101, 41, 123, 60, 168, 227, 79, 116, 254, 78, 213, 121, 183, 246, 63, 36])))] }
-inscribe: { stack: [dictionary_redacted], program: [[cubez] [[clone clone * *] [definition] label] update dictmerge [[cube] [[clone clone * *] [definition] label] update] encode [math] unwrap inscribe [9 cubez] [math] using execute 2 cubez] }
-dictmerge: { stack: [dictionary_redacted], program: [dictmerge [[cube] [[clone clone * *] [definition] label] update] encode [math] unwrap inscribe [9 cubez] [math] using execute 2 cubez] }
-Popped
-got a dict
-Dict adds: [(Word { data: 0x5560cd79d0e0 : "cubez", namespace: None }, Entry { examples: None, spec: None, definition: [Word(Word { data: 0x5560cd67ffa0 : "clone", namespace: None }), Word(Word { data: 0x5560cd67ffa0 : "clone", namespace: None }), Word(Word { data: 0x5560cd654e20 : "*", namespace: None }), Word(Word { data: 0x5560cd654e20 : "*", namespace: None })] })]
-Adding alias Word { data: 0x5560cd77f2d0 : "math", namespace: Some([23, 124, 167, 15, 66, 222, 241, 35, 142, 54, 218, 50, 148, 115, 38, 62, 211, 254, 173, 209, 64, 148, 192, 121, 162, 35, 11, 224, 25, 52, 54, 245]) } -> Entry { examples: None, spec: None, definition: [Dispenser(Sized(Bytes([98, 154, 231, 103, 197, 12, 134, 52, 134, 25, 50, 25, 125, 9, 132, 204, 145, 83, 20, 183, 42, 83, 217, 149, 212, 94, 55, 76, 28, 22, 233, 150])))] }
-inscribe: { stack: [dictionary_redacted], program: [[cube] [[clone clone * *] [definition] label] update dictmerge [9 cubez] [math] using execute 2 cubez] }
-dictmerge: { stack: [dictionary_redacted], program: [dictmerge [9 cubez] [math] using execute 2 cubez] }
-Popped
-got a dict
-Dict adds: [(Word { data: 0x5560cd797fc0 : "cube", namespace: None }, Entry { examples: None, spec: None, definition: [Word(Word { data: 0x5560cd67ffa0 : "clone", namespace: None }), Word(Word { data: 0x5560cd67ffa0 : "clone", namespace: None }), Word(Word { data: 0x5560cd654e20 : "*", namespace: None }), Word(Word { data: 0x5560cd654e20 : "*", namespace: None })] })]
-8 729
+729
 #+end_src
-
-**** TODO Nesting scopes
-We should be able to nest calls to =using= without repeating any
+**** INPROGRESS Nesting scopes
+- State "INPROGRESS" from "TODO"       [2024-02-14 Wed 20:07]
+We should be able to chain calls to =using= without repeating any
 expensive calls.
 
 That means we need a word that only modifies a program by resolving
 the words in it (could call it =resolve=?)
 **** TODO Stack escape protection
-If a program refers to a word, and at the time that program is put on
+If a program refers to a wor
+d, and at the time that program is put on
 the stack, that word means something, it should still carry the same
 meaning if that program is later run with =execute=. That means that
 module changes must be permanent.
@@ -11735,9 +11807,130 @@ may be others.
 **** TODO Access control
 Take the word =define= which allows the caller to make arbitrary and
 permanent changes to the dictionary. What if we wanted to restrict
-access to that word such that authoritzed programs can call it but
+access to that word such that authorized programs can call it but
 others can't?
-**** TODO Words can refer to other words in the same library
+**** INPROGRESS Words can refer to other words in the same library
+- State "INPROGRESS" from "TODO"       [2024-02-17 Sat 14:51]
+**** TODO Convenient module definition
+We need a word that takes care of the common case: we want to define a
+set of vocabulary, it's all additive, and some of the words refer to
+each other. Previously we called that =draft=. Here's what the new =draft=
+could look like, it breaks down into generating dictionary updates:
+
+#+begin_src kcats
+  [[square]
+   [[clone *]
+    [[number] [number]]
+    [spec definition] label]
+   update
+   [cube]
+   [[clone square *]
+    [[number] [number]]
+    [spec definition] label]
+   update]
+
+    encode [math] unwrap inscribe
+#+end_src
+
+So we want the user to be able to write this:
+
+#+begin_src kcats
+  [[square [clone *]]
+   [cube [clone square *]]]
+  [math]
+  [[[0] [wrap] update
+    [1] [[definition] label wrap] update] map
+   [[update] join] map
+  [joiner] assemble unwrap encode] dip ;; under the module name
+  unwrap inscribe
+  [math] [6 cube] using
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+216
+#+end_src
+
+can we recurse?
+
+#+begin_src kcats
+  [[square [clone *]]
+   [cube [clone square *]]
+   [factorial [[swap positive?]
+               [[*] shielddown [dec] dip factorial]
+               when]]]
+  [math]
+  [[[0] [wrap] update
+    [1] [[definition] label wrap] update] map
+   [[update] join] map
+  [joiner] assemble unwrap encode] dip ;; under the module name
+  unwrap inscribe
+  [math] [6 1 factorial dropdown] using
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+720
+#+end_src
+
+let's see if we can make revise first
+
+#+begin_src kcats
+  [[hash [[type [foo] unwrap =]
+          [drop "foo" hash]
+          addmethod]]]
+  [hh]
+
+  [[[0] [wrap [definition] join] update] map
+   [[update] join] map
+   [joiner] assemble unwrap encode] dip ;; under the module name
+  unwrap inscribe
+  [hh] [[[foo myfoo]] association hash] using
+  "foo" hash =
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+yes
+#+end_src
+
+lets see if the draft in terms of revise works
+#+begin_src kcats
+  [[square [clone *]]
+   [cube [clone square *]]
+   [factorial [[swap positive?]
+               [[*] shielddown [dec] dip factorial]
+               when]]]
+  [math]
+  draft
+  [math] [6 1 factorial dropdown] using
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+720
+#+end_src
+
+
+**** TODO Break up the standard library
+Question: how do we break it up? For example, does =io= refer to all I/O
+operations or just the base stuff that they all depend on?
+
+Some areas of functionality that already exist:
++ Debugger
++ Generators
++ Pipes
+  + File
+  + Network
+  + Channel
++ Encoding
++ Associations
++ Collections
+***** TODO Figure out where to put modules on disk
+This will make the build and packaging more complex as it will have to
+include other files besides the binary and deal with platform-specific
+issues. The standard env could, however, still load a bunch of libs,
+but maybe this could be overridden with cmdline args.
 *** INPROGRESS Database
 - State "INPROGRESS" from "TODO"       [2023-12-31 Sun 10:17]
 **** Simple Test
@@ -12351,4 +12544,61 @@ test 'triangle'
 [[title? [value 2]]
  [author? [value 3]]]
 #+end_src
+*** TODO Reduce CPU cost of `shield`
+#+begin_src kcats
+[[program [1 2 3 [+] shield]]] environment stepper 0 [drop inc] cram
+#+end_src
 
+#+RESULTS:
+#+begin_src kcats
+25 [eval-step clone]
+[]
+#+end_src
+
+
+#+begin_src kcats
+   [[program [1 2 3 [+]
+              [] evert clone evert [execute] dip first swap; [restore] dip dropdown
+              ;first take drop swap prepend restore ; take clonedown dip
+              ]]] environment
+   stepper collect
+   ;0 [drop inc] cram
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[[program [2 3 [+] [] evert clone evert [execute] dip first swap]]
+  [stack [1]]]
+ [[program [3 [+] [] evert clone evert [execute] dip first swap]]
+  [stack [2 1]]]
+ [[stack [3 2 1]]
+  [program [[+] [] evert clone evert [execute] dip first swap]]]
+ [[stack [[+] 3 2 1]]
+  [program [[] evert clone evert [execute] dip first swap]]]
+ [[stack [[] [+] 3 2 1]]
+  [program [evert clone evert [execute] dip first swap]]]
+ [[program [clone evert [execute] dip first swap]]
+  [stack [[[+] 3 2 1]]]]
+ [[stack [[[+] 3 2 1] [[+] 3 2 1]]]
+  [program [evert [execute] dip first swap]]]
+ [[program [[execute] dip first swap]]
+  [stack [[[[+] 3 2 1]] [+] 3 2 1]]]
+ [[program [dip first swap]]
+  [stack [[execute] [[[+] 3 2 1]] [+] 3 2 1]]]
+ [[stack [[+] 3 2 1]]
+  [program [execute [[[[+] 3 2 1]]] unwrap first swap]]]
+ [[stack [3 2 1]]
+  [program [+ [[[[+] 3 2 1]]] unwrap first swap]]]
+ [[stack [5 1]]
+  [program [[[[[+] 3 2 1]]] unwrap first swap]]]
+ [[stack [[[[[+] 3 2 1]]] 5 1]]
+  [program [unwrap first swap]]]
+ [[program [first swap]]
+  [stack [[[[+] 3 2 1]] 5 1]]]
+ [[program [swap]]
+  [stack [[[+] 3 2 1] 5 1]]]
+ [[stack [5 [[+] 3 2 1] 1]]
+  [program []]]]
+[eval-step clone]
+[]
+#+end_src
