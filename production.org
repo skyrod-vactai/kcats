@@ -5157,8 +5157,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   /// nothing). Takes the raw bytes or string or a program (the latter
   /// two are converted to bytes)
   pub fn inscribe(env: &mut Environment) -> Result<(), Error> {
-      let mut alias = Word::try_from(env.pop())?;
       let module_raw = Bytes::try_from(env.pop())?;
+      let mut alias = Word::try_from(env.pop())?;
 
       // first see if we can parse the module
       let module_string = String::from_utf8(module_raw.clone())?;
@@ -11930,16 +11930,17 @@ can we recurse?
 let's see if we can make revise first
 
 #+begin_src kcats
-  [[fff ["foo"]]]
-  [f] draft
-  
+  [f]
+  [[fff ["foo"]]] draft
+
+  [hh]
   [[hash [[type [foo] unwrap =]
            [drop fff hash]
-           addmethod [f] swap resolve]]]
-  [hh]
-  revise
+           addmethod [f] swap resolve]]] revise
 
-  [hh] [[[foo myfoo]] association hash] using
+  [hh]
+  [[[foo myfoo]] association hash] using
+
   "foo" hash =
 #+end_src
 
@@ -11949,11 +11950,11 @@ yes
 #+end_src
 
 #+begin_src kcats
-  [[f ["foo"]]]
-  [ff] draft
+  [ff]
+  [[f ["foo"]]] draft
 
-  [[g [[ff] [f] resolve]]]
   [gg]
+  [[g [[ff] [f] resolve]]]
   revise
 
   [gg] [g] using
@@ -11967,14 +11968,15 @@ yes
 
 lets see if the draft in terms of revise works
 #+begin_src kcats
+  [math]
   [[square [clone *]]
    [cube [clone square *]]
    [factorial [[swap positive?]
                [[*] shielddown [dec] dip factorial]
-               when]]]
+               when]]] draft
+
   [math]
-  draft
-  [math] [6 1 factorial dropdown] using
+  [6 1 factorial dropdown] using
 #+end_src
 
 #+RESULTS:
@@ -11982,6 +11984,42 @@ lets see if the draft in terms of revise works
 720
 #+end_src
 
+Test if we can use resolve before a draft, to refer to existing
+modules within a module. No, this does not work, we cannot try to
+resolve the module code, we can only resolve during the actual
+dictionary update. Reason: we emit/parse which strips namespace info.
+#+begin_src kcats 
+  [[program [[innermodule]
+             [[innerfn ["foo"]]] draft
+
+             [outermodule]
+             [innermodule] [[outerfn [innerfn]]] resolve
+             draft
+
+             [outermodule] [outerfn] using
+            ]]] environment
+  [advance] 8 times [dictionary] lookup [[[[0] lookup] [[1 definition] lookup inspect]] [execute] map] map
+#+end_src
+
+
+#+begin_src kcats 
+  [[program [[innermodule]
+             [[innerfn ["foo"]]] draft
+
+             [outermodule]
+             [[outerfn [[innermodule] [innerfn] resolve]]] 
+             revise
+
+             [outermodule] [outerfn] using
+            ]]] environment
+  [advance] 10 times 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[stack ["foo"]]
+ [program []]]
+#+end_src
 
 **** TODO Break up the standard library
 Question: how do we break it up? For example, does =io= refer to all I/O
@@ -12368,87 +12406,93 @@ test 'triangle'
 [[take] dip swap [[put] shield sink swap pair] bail] [1 2 3 4] []
 #+end_src
 
-#+begin_src kcats :tangle query.kcats
-  [[query [[[variable? [[[word?]
-                         [string last \? =]] [execute] every?]]
-            [variable= [[[pair [variable?] every?] [=]] [execute] every?]]
-            [fork [[execute] map]]
-            [triangle [[[] [[take] dip swap [[put] shield sink swap pair] bail] collect] shielddown]]
-            [slots [[entity attribute value]]]
-            [constraint [unwrap slots reverse label]]
-            [indexed-as-property [swap indexed
-                                  [[unwrap sink assign]
-                                   binddown]
-                                  dive map]]
-            [join-all [[first empty] shield swap [join] step]]
-            ;;[slot-name [[entity attribute value] indexed association swap wrap lookup]]
-            [slot-combos [slots [slots [pair] map] map join-all]]
-            [table-names [[pair] shield [[0] lookup] map]]
-            [param-name [[string] map ":c{0}{1}" swap format]]
-            [anded-together [" AND " interpose join-all]]
-            ;; between 2 constraints
-            [links [slot-combos
-                    [[wrap] map unwrap swapdown 
-                     [[[lookup] inject] both] pairwise 
-                     variable=]
-                    filter   
-                    [unwrap pair sink pair [[index] lookup] map swap zip] map]]
-            [all-links [[] sink
-                        [[[[index] lookup] shield] both ;; lookup the indices of both constraints
-                         [swapdown] dip sink ;; move the indices under the constraints
-                         [links] shielddown
-                         swap [dropdown dropdown join] dip]
+#+begin_src kcats
+  ;; Module to operate on generic data, that are used throughout
+  [generic]
+  [[fork [[execute] map]]
+   [triangle [[[] [[take] dip swap [[put] shield sink swap pair] bail] collect] shielddown]]
+   [indexed-as-property [swap indexed
+                         [[unwrap sink assign]
+                          binddown]
+                         dive map]]
+   [join-all [[first empty] shield swap [join] step]]
+   [selectkeys [set swap [first contains?] filter]]
+   [invert [[reverse] map association]]] draft
 
-                        step drop]]
-            [format-link [[join] inject unwrap [string] map
-                          "c{0}.{1} = c{2}.{3}" swap format]]
-            ;; between 1 constraint and a list of others
+  ;; Module for datalog variables
+  [variables]
+  [[variable? [[[word?]
+                [string last \? =]] [execute] every?]]
+   [variable= [[[pair [variable?] every?] [=]] [execute] every?]]] draft
 
-            [where-data [[[index] lookup] shield swap 
-                         [[[second variable? not]
-                           [first [index] unwrap = not]] [execute] every?] filter 
-                         [swap prepend] map dropdown]]
-            [format-where [[string] map 
-                           "c{0}.{1} = :c{0}{1}" swap format]]
-            [extract-params [[] association swap [[params] lookup join] step]]
-            [format-join [[[[on] lookup]
-                           [[where] lookup]
-                           [[index] lookup string]] [execute] map
-                          [join anded-together] inject 
-                          "JOIN EAV c{1} ON {0}" swap format]] 
-            [make-query [rest [[on]
-                               [[format-link] map] update
-                               [format-join] shield [join] swap assign] map]]
-            [make-where [first [where] lookup anded-together]]
-            [select-data [[[selectkeys [set swap [first contains?] filter]]
-                           [wordval? [second word?]]
-                           [invert [[reverse] map association]]
-                           [validate [[[second not]
-                                       [first "All selected query variables must appear somewhere in constraints"
-                                        [reason variable] label fail]
-                                       when] map]]]
-                          [swap
-                           [[[entity attribute value] selectkeys invert] shield
-                            [wordval?] filter join association] map
-                           swap
-                           [[[index] swap put ;; make a list of the variable and 'index'
-                             wrap [selectkeys] join ;; make the program to cut down
-                             map [count 2 =] filter first [second] map
-                             [first number?] [reverse] when] ;; items are in random order due to coming from association, fix the order
-                            map]
-                           shield dropdeep zip
-                           validate]
-                          draft]]
-            [format-select [[unwrap swap
-                             string butlast ;; remove the ? from the variable name for result column
-                             put
-                             [string] map
-                             "c{1}.{0} as {2}" swap format] map ", " interpose join-all]]]
 
-           ;; work with the constraints first
-           [swap
-            ;; expand all combinations of constraints
-            [constraint] map 
+  ;; Module for datalog constraints
+  [eav]
+  [[slots [[entity attribute value]]]
+   [slot-combos [slots [slots [pair] map] map join-all]]
+   [constraint [unwrap slots reverse label]]] draft
+
+  ;; Module for links between datalog constraints
+  [links]
+  [[links [slot-combos
+           [[wrap] map unwrap swapdown 
+            [[[lookup] inject] both] pairwise 
+            variable=]
+           filter   
+           [unwrap pair sink pair [[index] lookup] map swap zip] map]]
+   [all-links [[] sink
+               [[[[index] lookup] shield] both ;; lookup the indices of both constraints
+                [swapdown] dip sink ;; move the indices under the constraints
+                [links] shielddown
+                swap [dropdown dropdown join] dip]
+
+               step drop]]
+   [format-link [[join] inject unwrap [string] map
+                 "c{0}.{1} = c{2}.{3}" swap format]]]
+
+  ;; Module for formatting pieces of query data into text
+  [formatting]
+  [[anded-together [" AND " interpose join-all]]]
+
+  ;; Module for where clause data processing
+  [where-clauses]
+  [[where-data [[[index] lookup] shield swap 
+                [[[second variable? not]
+                  [first [index] unwrap = not]] [execute] every?] filter 
+                [swap prepend] map dropdown]]
+   [format-where [[string] map 
+                  "c{0}.{1} = :c{0}{1}" swap format]]
+   [make-where [first [where] lookup anded-together]]]
+
+  ;; Module for SQL parameters for rusqlite
+  [params]
+  [[param-name [[string] map ":c{0}{1}" swap format]]
+   [extract-params [[] association swap [[params] lookup join] step]]]
+
+  ;; Module for SELECT clause
+  [select]
+  [[wordval? [second word?]]
+   [invert [[reverse] map association]]
+   [validate [[[second not]
+               [first "All selected query variables must appear somewhere in constraints"
+                [reason variable] label fail]
+               when] map]]
+   [select-data [swap
+                 [[slots selectkeys invert] shield
+                  [wordval?] filter join association] map
+                 swap
+                 [[[index] swap put ;; make a list of the variable and 'index'
+                   wrap [selectkeys] join ;; make the program to cut down
+                   map [count 2 =] filter first [second] map
+                   [first number?] [reverse] when] ;; items are in random order due to coming from association, fix the order
+                  map]
+                 shield dropdeep zip
+                 validate]]]
+
+  [database]
+  ;; work with the constraints first [swap
+  ;; expand all combinations of constraints
+  [[query] [[constraint] map 
             ;;[] prepend ;; an empty constraint to represent the orignal EAV table we're joining with
             [index] indexed-as-property
             triangle
@@ -12482,8 +12526,10 @@ test 'triangle'
             "SELECT {0} from EAV as c0 {1} WHERE {2}" swap format
             swap dropdeep]
 
-           draft]]]
+   draft]
 
+
+  [database]
   [[[book? subjects love]
     [book? title title?]
     [book? author-last author-last?]
@@ -12492,23 +12538,67 @@ test 'triangle'
     [author? last-name author-last?]
     [author? birth-year birth-year?]]
    [title? author-first? author-last? birth-year?]
+   query] using
 
-   query]
 
-  draft
 #+end_src
 
 #+RESULTS:
 #+begin_src kcats
-[[":c6attribute" birth-year]
- [":c1attribute" title]
- [":c5attribute" last-name]
- [":c0attribute" subjects]
- [":c0value" love]
- [":c4attribute" first-name]
- [":c3attribute" author-first]
- [":c2attribute" author-last]]
-"SELECT c1.value as \"title\", c3.value as \"author-first\", c2.value as \"author-last\", c6.value as \"birth-year\" from EAV as c0 JOIN EAV c1 ON c1.attribute = :c1attribute AND c0.entity = c1.entity JOIN EAV c2 ON c2.attribute = :c2attribute AND c0.entity = c2.entity AND c1.entity = c2.entity JOIN EAV c3 ON c3.attribute = :c3attribute AND c0.entity = c3.entity AND c1.entity = c3.entity AND c2.entity = c3.entity JOIN EAV c4 ON c4.attribute = :c4attribute AND c3.value = c4.value JOIN EAV c5 ON c5.attribute = :c5attribute AND c2.value = c5.value AND c4.entity = c5.entity JOIN EAV c6 ON c6.attribute = :c6attribute AND c4.entity = c6.entity AND c5.entity = c6.entity WHERE c0.value = :c0value AND c0.attribute = :c0attribute"
+[[unwound [resolve execute]]
+ [reason "type mismatch"]
+ [type error]
+ [asked [module-alias]]
+ [actual database]
+ [handled yes]]
+[[query] [[constraint] map [index] indexed-as-property triangle [[[[unwrap all-links]
+                                                                   [first where-data [[[] swap [[param-name] shield [last] dip wrap swap assign]
+                                                                                       step]
+                                                                                      [[format-where] map]]
+                                                                    fork]]
+                                                                  fork]
+                                                                 shield [first] dip unwrap unwrap [where params on] label join]
+          map [[extract-params] [make-query] [make-where] [swap select-data]] fork dropdown
+          unwrap float [[join] lookup]
+          map swap format-select [" " interpose join-all] dip triplet reverse
+          "SELECT {0} from EAV as c0 {1} WHERE {2}" swap format swap dropdeep]
+ draft]
+[database] [[wordval? [second word?]]
+            [invert [[reverse] map association]]
+            [validate [[[second not]
+                        [first "All selected query variables must appear somewhere in constraints" [reason
+                                                                                                    variable]
+                         label fail]
+                        when]
+                       map]]
+            [select-data [swap [[slots selectkeys invert] shield [wordval?] filter join association]
+                          map swap [[[index] swap put wrap [selectkeys] join map [count 2 =] filter first [second]
+                                     map [first number?]
+                                     [reverse] when]
+                                    map]
+                          shield dropdeep zip validate]]]
+[select] [[param-name [[string] map ":c{0}{1}" swap format]]
+          [extract-params [[] association swap [[params] lookup join] step]]]
+[params] [[where-data [[[index] lookup]
+                       shield swap [[[second variable? not] [first [index] unwrap = not]]
+                                    [execute] every?]
+                       filter [swap prepend]
+                       map dropdown]]
+          [format-where [[string] map "c{0}.{1} = :c{0}{1}" swap format]]
+          [make-where [first [where] lookup anded-together]]]
+[where-clauses] [[anded-together [" AND " interpose join-all]]] [formatting] [[links
+                                                                               [slot-combos [[wrap] map unwrap swapdown [[[lookup] inject]
+                                                                                                                         both]
+                                                                                             pairwise variable=]
+                                                                                filter [unwrap pair sink pair [[index] lookup]
+                                                                                        map swap zip]
+                                                                                map]]
+                                                                              [all-links [[] sink [[[[index] lookup]
+                                                                                                    shield]
+                                                                                                   both [swapdown] dip sink [links] shielddown swap [dropdown dropdown join] dip]
+                                                                                          step drop]]
+                                                                              [format-link [[join] inject unwrap [string] map "c{0}.{1} = c{2}.{3}" swap format]]]
+[links]
 #+end_src
 
 #+begin_src kcats
