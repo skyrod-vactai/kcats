@@ -5157,18 +5157,30 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   /// nothing). Takes the raw bytes or string or a program (the latter
   /// two are converted to bytes)
   pub fn inscribe(env: &mut Environment) -> Result<(), Error> {
-      let module_raw = Bytes::try_from(env.pop())?;
+      let module_raw = coll::Sized::try_from(env.pop())?;
+      let (module_program, hash) = match module_raw {
+          coll::Sized::Bytes(b) => {
+              let module_string = String::from_utf8(b.clone())?;
+              let program: coll::List = coll::List::try_from(
+                  parse(module_string)?
+                      .inner()
+                      .pop_front()
+                      .unwrap_or_default(),
+              )?;
+              let hash = sha2::Sha256::digest(b.as_slice()).deref().to_vec();
+              (program, hash)
+          }
+          coll::Sized::List(l) => {
+              let bytes = serialize::emit(&l.clone().into()).as_bytes().to_vec();
+              let hash = sha2::Sha256::digest(bytes.as_slice()).deref().to_vec();
+              (l, hash)
+          }
+          i => Err(Error::expected("program", i.into()))?,
+      };
       let mut alias = Word::try_from(env.pop())?;
 
       // first see if we can parse the module
-      let module_string = String::from_utf8(module_raw.clone())?;
-      let program: coll::List = coll::List::try_from(
-          parse(module_string)?
-              .inner()
-              .pop_front()
-              .unwrap_or_default(),
-      )?;
-      let hash = sha2::Sha256::digest(module_raw.as_slice()).deref().to_vec();
+
       let dict = env.dictionary.clone();
 
       // add an alias, which goes in the dictionary's namespace
@@ -5189,7 +5201,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       env.pop_expr(); //pop off the inscribe word
 
       env.push_expr("dictmerge".into());
-      env.append_program(program);
+      env.append_program(module_program);
       //println!("inscribe: {:?}", env);
       Ok(())
   }
@@ -11760,6 +11772,20 @@ around this though, as there's no other way to hash a program other
 than through =emit=. Note we need a deterministic =emit=. Add an issue for
 that.
 
+Should inscribe be responsible for hash checking? Options:
++ First impl, inscribe takes bytes, hashes it itself, and calls
+  read. The problem is this causes a serialization round trip before
+  the library is interpreted, even when the library is "local" (inside
+  the main program or another lib). That erases word namespaces which
+  can be inconvenient.
++ Inscribe takes list already parsed, and trusts the hash it is
+  given. Then the calling code has to be secure.
++ Inscribe takes a list already parsed, but emits it itself, just to
+  calculate the hash. Then it could potentially do a serialize round
+  trip and a half (if it was read from disk) - serialized to disk,
+  parsed into program, and then serialized again to get the hash.
++ Inscribe has two different modes, 1) bytes where it operates in the
+  first mode, and 2) program where it operates in the 3rd mode
 So what would an inline library use look like?
 #+begin_src kcats
   [[clone *] [square] assign] [emit hash] shield loadlib
@@ -11985,20 +12011,23 @@ lets see if the draft in terms of revise works
 #+end_src
 
 Test if we can use resolve before a draft, to refer to existing
-modules within a module. No, this does not work, we cannot try to
-resolve the module code, we can only resolve during the actual
-dictionary update. Reason: we emit/parse which strips namespace info.
+modules within a module. Now this works because inscribe can take
+either serialized bytes or a parsed datastructure. If we pass the
+latter, it can have words already resolved.
 #+begin_src kcats 
-  [[program [[innermodule]
-             [[innerfn ["foo"]]] draft
+  [innermodule]
+  [[innerfn ["foo"]]] draft
 
-             [outermodule]
-             [innermodule] [[outerfn [innerfn]]] resolve
-             draft
+  [outermodule]
+  [innermodule] [[outerfn [innerfn]]] resolve
+  draft
 
-             [outermodule] [outerfn] using
-            ]]] environment
-  [advance] 8 times [dictionary] lookup [[[[0] lookup] [[1 definition] lookup inspect]] [execute] map] map
+  [outermodule] [outerfn] using
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+"foo"
 #+end_src
 
 
