@@ -297,6 +297,16 @@ internally, to keep track of things like the stack, program, lists etc.
       Receptacle(coll::Receptacle),
   }
 
+  impl Item {
+      pub fn is_empty(&self) -> bool {
+          match self {
+              Item::Dispenser(coll::Dispenser::Sized(s)) => s.is_empty(),
+              Item::Receptacle(coll::Receptacle::Sized(s)) => s.is_empty(),
+              _ => false,
+          }
+      }
+  }
+
   pub type Future<T> = Pin<Box<dyn std::future::Future<Output = T> + Send>>;
   pub type StepFn = dyn Fn(env::Environment) -> Future<env::Environment> + Sync + Send;
 
@@ -367,12 +377,28 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  /// Converts Item to Word but also considers a quoted word as a word,
+  /// eg [foo] -> foo.
   impl TryFrom<Item> for Word {
       type Error = Error;
       fn try_from(i: Item) -> Result<Self, Self::Error> {
           match i {
               Item::Word(i) => Ok(i),
-              i => Err(Error::expected("word", i)),
+              i => {
+                  let i2 = i.clone();
+                  let l = coll::List::try_from(i);
+                  match l {
+                      Ok(l) => {
+                          if l.len() == 1 {
+                              let i = l.inner().pop_front().unwrap();
+                              i.try_into()
+                          } else {
+                              Err(Error::expected("word", l.into()))
+                          }
+                      }
+                      Err(_) => Err(Error::expected("word", i2)),
+                  }
+              }
           }
       }
   }
@@ -3688,11 +3714,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn is_empty(i: Item) -> ItemResult {
-      Ok(Item::from(match i {
-          Item::Dispenser(coll::Dispenser::Sized(s)) => s.is_empty(),
-          Item::Receptacle(coll::Receptacle::Sized(s)) => s.is_empty(),
-          _ => false,
-      }))
+      Ok(Item::from(i.is_empty()))
   }
 
   pub fn gt(i: Item, j: Item) -> ItemResult {
@@ -5128,11 +5150,14 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   /// Load a new module and gives it an optional alias (either a word or
   /// nothing). Takes the raw bytes or string or a program (the latter
-  /// two are converted to bytes)
+  /// two are converted to bytes). Returns either the module alias or
+  /// hash (either of which can be used to refer to the module later)
   pub fn inscribe(env: &mut Environment) -> Result<(), Error> {
       let module_raw = coll::Sized::try_from(env.pop())?;
+      let hash: Bytes;
       let (module_program, hash) = match module_raw {
           coll::Sized::Bytes(b) => {
+              // first see if we can parse the module
               let module_string = String::from_utf8(b.clone())?;
               let program: coll::List = coll::List::try_from(
                   parse(module_string)?
@@ -5140,28 +5165,41 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       .pop_front()
                       .unwrap_or_default(),
               )?;
-              let hash = sha2::Sha256::digest(b.as_slice()).deref().to_vec();
+              hash = sha2::Sha256::digest(b.as_slice()).deref().to_vec();
               (program, hash)
           }
           coll::Sized::List(l) => {
               let bytes = serialize::emit(&l.clone().into()).as_bytes().to_vec();
-              let hash = sha2::Sha256::digest(bytes.as_slice()).deref().to_vec();
+              hash = sha2::Sha256::digest(bytes.as_slice()).deref().to_vec();
               (l, hash)
           }
           i => Err(Error::expected("program", i.into()))?,
       };
-      let mut alias = Word::try_from(env.pop())?;
-
-      // first see if we can parse the module
 
       let dict = env.dictionary.clone();
 
+      // the module alias
+      let maybe_alias = env.pop();
+      let maybe_word: Result<Word, Error> = maybe_alias.clone().try_into();
+      match maybe_word {
+          Ok(mut alias) => {
+              alias.namespaced(dict::Namespace::default());
+              let d = env.dictionary.make_mut();
+              let e = dict::Entry::namespace(hash.clone().into());
+              //println!("Adding alias {:?} -> {:?}", alias, e);
+              d.insert(alias.clone(), e);
+              env.push(Item::Word(alias));
+          }
+          Err(_) => {
+              if !maybe_alias.is_empty() {
+                  Err(Error::expected("module-alias", maybe_alias))?
+              } else {
+                  env.push(hash.clone().into());
+              }
+          }
+      }
+
       // add an alias, which goes in the dictionary's namespace
-      alias.namespaced(dict::Namespace::default());
-      let d = env.dictionary.make_mut();
-      let e = dict::Entry::namespace(hash.clone().into());
-      //println!("Adding alias {:?} -> {:?}", alias, e);
-      d.insert(alias, e);
 
       // let p = coll::List::from_iter([
       //     Item::from("unwrap"),
@@ -5169,6 +5207,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       //     "dip".into(),
       //     "update".into(),
       // ]);
+
       env.push(hash.into());
       env.push(dict.into());
       env.pop_expr(); //pop off the inscribe word
@@ -11852,6 +11891,96 @@ expensive calls.
 
 That means we need a word that only modifies a program by resolving
 the words in it (could call it =resolve=?)
+
+test overriding behavior
+#+begin_src kcats
+  [[+ ["oo"]]]
+  ["a" "b" +]
+  let
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+Resolved: Word { data: 0x55b105c8ce50 : "+", namespace: Some([95, 8, 227, 46, 226, 44, 177, 198, 142, 175, 56, 167, 55, 63, 227, 254, 126, 182, 160, 134, 28, 68, 164, 57, 208, 15, 103, 59, 84, 173, 128, 139]) }
+["oo"] "b" "a"
+#+end_src
+
+The issue is we're updating the definition but we end up keeping the
+old spec and examples. we need to clear the whole entry.
+
+#+begin_src kcats
+  [foo]
+  [[swap [[6]]]]
+  [[0] [wrap] update ;; wrap the word name to get a path to update
+   [1] [[definition] label] update ] map
+  [[update] join] map
+  [joiner] assemble unwrap  inscribe
+  wrap [swap] using
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[actual [[definition [[6]]]]]
+ [asked [program]]
+ [handled yes]
+ [reason "type mismatch"]
+ [type error]
+ [unwound [update dictmerge wrap [swap] using]]]
+[[definition [[6]]]] [swap] dictionary_redacted #b64 "DFyCLJSxw6T5kHmcZ0+a4jZT0gNq29vn/BE9oKcRSTU="
+foo
+#+end_src
+
+ok this is too rigid, let's get rid of revise/draft in their current
+terms and make words that bulld what =inscribe= needs.
+
+After some internal debate, i think it's best to have inscribe take a
+single update program - rationale is that there's no need at that
+point to treat them separately, that can be done before.
+
+So inscribe is currently correct, we need to ... revise =revise=. First
+thing is a function that takes a list of word updates and translates
+to a single dictionary update.
+#+begin_src kcats
+  [foo]
+  [[swap [[[definition [6]]
+            [spec [[] [number]]]]]]]
+  [[take]
+   [[0] [wrap] update ;; wrap the word name to get a path to update
+    [update] join] each
+   joiner generate] shielddown 
+  inscribe
+  wrap [swap] using
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+Resolved: Word { data: 0x56294637f420 : "swap", namespace: Some([59, 133, 203, 149, 9, 0, 17, 144, 86, 83, 103, 44, 36, 226, 184, 25, 62, 38, 28, 127, 173, 154, 55, 144, 71, 243, 173, 235, 59, 37, 10, 18]) }
+6
+#+end_src
+
+Now we need a shortcut for when we don't want to specify the whole entry, just the definition
+#+begin_src kcats
+  [foo]
+  [[swap [6]]]
+  [entry] map
+  updates inscribe wrap [swap] using
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+6
+#+end_src
+
+Test draft
+#+begin_src kcats
+ [[swap [6]]] draft [swap] let
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+6
+#+end_src
+
 **** TODO Stack escape protection
 If a program refers to a wor
 d, and at the time that program is put on
@@ -11935,8 +12064,8 @@ can we recurse?
     [1] [[definition] label wrap] update] map
    [[update] join] map
   [joiner] assemble unwrap encode] dip ;; under the module name
-  unwrap inscribe
-  [math] [6 1 factorial dropdown] using
+  unwrap ; inscribe
+  ;[math] [6 1 factorial dropdown] resolve [2] lookup inspect
 #+end_src
 
 #+RESULTS:
@@ -12039,6 +12168,43 @@ latter, it can have words already resolved.
 #+begin_src kcats
 [[stack ["foo"]]
  [program []]]
+#+end_src
+**** TODO convenient 'let'
+We want define a module and use it inline without having to worry about its alias.
+Let's see if we can implement =partition= this way.
+#+begin_src kcats
+
+  ;; the module
+
+  [[square [clone *]]
+   [cube [clone square *]]]
+  [9 cube]
+  [] sink [draft wrap] dip using 
+  ; [
+  ;  [[]
+  ;   [over wrap take [join shift] bail]
+  ;   [[over] dive wrap take swap drop shift]
+  ;   if]
+  ;  draft]
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+729
+#+end_src
+
+
+#+begin_src kcats
+  [[] [[foo [1]]] [[1] [wrap] update] map revise] execute ;tracer 100 taker collect
+#+end_src
+
+#+begin_src kcats
+[] [[foo [1]]] [[1] [wrap] update]  map
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[foo [[1]]]] []
 #+end_src
 
 **** TODO Break up the standard library
@@ -12487,7 +12653,7 @@ test 'triangle'
 
   ;; Module for where clause data processing
   [where-clauses]
-  [generic formatting]
+  [generic formatting variables]
   [[where-data [[[index] lookup] shield swap 
                 [[[second variable? not]
                   [first [index] unwrap = not]] [execute] every?] filter 
@@ -12529,39 +12695,41 @@ test 'triangle'
   ;; work with the constraints first [swap
   ;; expand all combinations of constraints
   [select eav params generic links where-clauses params]
-  [[query [[constraint] map 
-             ;;[] prepend ;; an empty constraint to represent the orignal EAV table we're joining with
-             [index] indexed-as-property
-             triangle
-             ;; for each pair of constraints, build the "ON" clause data for the JOIN
-             [[[[unwrap all-links]
-                [first where-data  ; [join] inject unwrap
-                 ;; build the query param map
-                 [[[] swap
-                   [[param-name] shield [last] dip wrap swap assign]
-                   step]
-                  ;; build the actual query where clauses
-                  [[format-where] map]]
-                 fork]]
-               fork] shield
+  [[query [swap
+           ;; expand all combinations of constraints
+           [constraint] map 
+           ;;[] prepend ;; an empty constraint to represent the orignal EAV table we're joining with
+           [index] indexed-as-property
+           triangle
+           ;; for each pair of constraints, build the "ON" clause data for the JOIN
+           [[[[unwrap all-links]
+              [first where-data  ; [join] inject unwrap
+               ;; build the query param map
+               [[[] swap
+                 [[param-name] shield [last] dip wrap swap assign]
+                 step]
+                ;; build the actual query where clauses
+                [[format-where] map]]
+               fork]]
+             fork] shield
 
-              ;; combine extracted items
+            ;; combine extracted items
 
-              [first] dip ;; keep the original constraint to add properties to
-              unwrap unwrap [where params on] label join]
-             map 
+            [first] dip ;; keep the original constraint to add properties to
+            unwrap unwrap [where params on] label join]
+           map 
 
-             [[extract-params]
-              [make-query]
-              [make-where]
-              [swap select-data]] fork 
-             dropdown ;; don't need original anymore
-             unwrap float
-             [[join] lookup] map  
-             swap format-select 
-             [" " interpose join-all] dip triplet reverse
-             "SELECT {0} from EAV as c0 {1} WHERE {2}" swap format
-             swap dropdeep]]] resolve
+           [[extract-params]
+            [make-query]
+            [make-where]
+            [swap select-data]] fork 
+           dropdown ;; don't need original anymore
+           unwrap float
+           [[join] lookup] map  
+           swap format-select 
+           [" " interpose join-all] dip triplet reverse
+           "SELECT {0} from EAV as c0 {1} WHERE {2}" swap format
+           swap dropdeep]]] resolve
   draft
 
   ;; main functions
@@ -12579,35 +12747,252 @@ test 'triangle'
 
 #+RESULTS:
 #+begin_src kcats
-[[actual title?]
- [asked [list]]
+[[actual if]
+ [asked [sized]]
  [handled yes]
  [reason "type mismatch"]
  [type error]
- [unwound [unwrap slots reverse label [[title? [[book? subjects love] [book? title
-                                                                       title?]
-                                                [book? author-last author-last?] [book? author-first author-first?] [author? first-name
-                                                                                                                     author-first?]
-                                                [author? last-name author-last?] [author? birth-year birth-year?]]]] unwrap evert
-           first dropdown [[]] unwrap swap put [author-first? author-last? birth-year?] [swap
-                                                                                         [[constraint] shielddown]
-                                                                                         dip swap put]
-           step [index] indexed-as-property triangle [[[[unwrap all-links]
-                                                        [first where-data [[[] swap [[param-name] shield [last] dip wrap swap assign]
-                                                                            step]
-                                                                           [[format-where] map]]
-                                                         fork]]
-                                                       fork]
-                                                      shield [first] dip unwrap unwrap [where params on] label join]
+ [unwound [update [[if [[take [[taker collect dropdown dropdown] join divedeep]]
+                        [shift [[[count <=]
+                                 [swap 0 slice] [[]] if]
+                                shield swap]]]
+                    [] 2 2 [take] [[entity] [[attribute subjects]
+                                             [entity book?]
+                                             [index 0]
+                                             [value love]]
+                                   [entity] [[attribute title]
+                                             [entity book?]
+                                             [index 1]
+                                             [value title?]]
+                                   0 1 [] [title? author-first? author-last? birth-year?]]]] unwrap evert first dropdown
+           [[[[] [[]]]
+             [over [wrap] take [join shift]
+              bail]
+             [[over] [dive] wrap take swap drop shift]]] unwrap swap put [] [swap [[[1] [wrap]
+                                                                                    update]
+                                                                                   shielddown]
+                                                                             dip swap put]
+           step revise [[[[take [[taker collect dropdown dropdown] join divedeep]]
+                          [shift [[[count <=]
+                                   [swap 0 slice] [[]] if]
+                                  shield swap]]]
+                         [[] [over wrap take [join shift]
+                              bail]
+                          [[over] dive wrap take swap drop shift]
+                          if]
+                         draft]] unwrap swap [[]] unwrap swap
+           clone [put [generate] dip swap clone] loop drop [[]] unwrap evert first [[[[lookup]
+                                                                                      inject]
+                                                                                     both]] unwrap inject [joiner] assemble unwrap [] swap evert drop variable= [[[entity
+                                                                                                                                                                   entity]
+                                                                                                                                                                  [[attribute subjects]
+                                                                                                                                                                   [entity book?]
+                                                                                                                                                                   [index 0]
+                                                                                                                                                                   [value love]]
+                                                                                                                                                                  [[attribute title]
+                                                                                                                                                                   [entity book?]
+                                                                                                                                                                   [index 1]
+                                                                                                                                                                   [value title?]]
+                                                                                                                                                                  0 1 [] [title? author-first? author-last? birth-year?]]]
+           unwrap evert first [[]] unwrap swap [] [drop swap put] [drop dropdown]
+           if [[entity attribute]
+               [entity value]
+               [attribute entity]
+               [attribute attribute]
+               [attribute value]
+               [value entity]
+               [value attribute]
+               [value value]]
+           [swap [[[wrap] map unwrap swapdown [[[lookup] inject]
+                                               both]
+                   pairwise variable=]
+                  shield]
+            dip swap [] [drop swap put] [drop dropdown]
+            if]
+           step [unwrap pair sink pair [[index] lookup]
+                 map swap zip]
+           map [[[[attribute subjects]
+                  [entity book?]
+                  [index 0]
+                  [value love]]
+                 [[attribute title]
+                  [entity book?]
+                  [index 1]
+                  [value title?]]
+                 0 1 [] [title? author-first? author-last? birth-year?]]] unwrap evert first dropdown
+           swap [dropdown dropdown join] dip [] [[[[index] lookup]
+                                                  shield]
+                                                 both [swapdown] dip sink [links] shielddown swap [dropdown dropdown join] dip]
+           step drop [[[unwrap all-links]
+                       [[[attribute title]
+                         [entity book?]
+                         [index 1]
+                         [value title?]]
+                        [[[attribute subjects]
+                          [entity book?]
+                          [index 0]
+                          [value love]]]]
+                       [title? author-first? author-last? birth-year?]]] unwrap evert first dropdown [[]]
+           unwrap swap put [[first where-data [[[] swap [[param-name] shield [last] dip wrap
+                                                         swap assign]
+                                                step]
+                                               [[format-where] map]]
+                             fork]] [swap [[execute] shielddown]
+                                     dip swap put]
+           step [[[[[attribute title]
+                    [entity book?]
+                    [index 1]
+                    [value title?]]
+                   [[[attribute subjects]
+                     [entity book?]
+                     [index 0]
+                     [value love]]]]
+                  [title? author-first? author-last? birth-year?]]]
+           unwrap evert first [first] dip unwrap unwrap [where params on] label join [[[[[attribute
+                                                                                          title]
+                                                                                         [entity book?]
+                                                                                         [index 1]
+                                                                                         [value title?]]
+                                                                                        [[[attribute subjects]
+                                                                                          [entity book?]
+                                                                                          [index 0]
+                                                                                          [value love]]]]
+                                                                                       [title? author-first? author-last? birth-year?]]] unwrap evert first dropdown [[[[attribute
+                                                                                                                                                                         subjects]
+                                                                                                                                                                        [entity book?]
+                                                                                                                                                                        [index 0]
+                                                                                                                                                                        [on []]
+                                                                                                                                                                        [params [[":c0attribute" subjects]
+                                                                                                                                                                                 [":c0value" love]]]
+                                                                                                                                                                        [value love]
+                                                                                                                                                                        [where ["c0.attribute = :c0attribute" "c0.value = :c0value"]]]]] unwrap swap put
+           [[[[attribute author-last]
+              [entity book?]
+              [index 2]
+              [value author-last?]]
+             [[[attribute subjects]
+               [entity book?]
+               [index 0]
+               [value love]]
+              [[attribute title]
+               [entity book?]
+               [index 1]
+               [value title?]]]]
+            [[[attribute author-first]
+              [entity book?]
+              [index 3]
+              [value author-first?]]
+             [[[attribute subjects]
+               [entity book?]
+               [index 0]
+               [value love]]
+              [[attribute title]
+               [entity book?]
+               [index 1]
+               [value title?]]
+              [[attribute author-last]
+               [entity book?]
+               [index 2]
+               [value author-last?]]]]
+            [[[attribute first-name]
+              [entity author?]
+              [index 4]
+              [value author-first?]]
+             [[[attribute subjects]
+               [entity book?]
+               [index 0]
+               [value love]]
+              [[attribute title]
+               [entity book?]
+               [index 1]
+               [value title?]]
+              [[attribute author-last]
+               [entity book?]
+               [index 2]
+               [value author-last?]]
+              [[attribute author-first]
+               [entity book?]
+               [index 3]
+               [value author-first?]]]]
+            [[[attribute last-name]
+              [entity author?]
+              [index 5]
+              [value author-last?]]
+             [[[attribute subjects]
+               [entity book?]
+               [index 0]
+               [value love]]
+              [[attribute title]
+               [entity book?]
+               [index 1]
+               [value title?]]
+              [[attribute author-last]
+               [entity book?]
+               [index 2]
+               [value author-last?]]
+              [[attribute author-first]
+               [entity book?]
+               [index 3]
+               [value author-first?]]
+              [[attribute first-name]
+               [entity author?]
+               [index 4]
+               [value author-first?]]]]
+            [[[attribute birth-year]
+              [entity author?]
+              [index 6]
+              [value birth-year?]]
+             [[[attribute subjects]
+               [entity book?]
+               [index 0]
+               [value love]]
+              [[attribute title]
+               [entity book?]
+               [index 1]
+               [value title?]]
+              [[attribute author-last]
+               [entity book?]
+               [index 2]
+               [value author-last?]]
+              [[attribute author-first]
+               [entity book?]
+               [index 3]
+               [value author-first?]]
+              [[attribute first-name]
+               [entity author?]
+               [index 4]
+               [value author-first?]]
+              [[attribute last-name]
+               [entity author?]
+               [index 5]
+               [value author-last?]]]]]
            
-           map [[extract-params] [make-query] [make-where] [swap select-data]] fork dropdown
+           [swap [[[[[unwrap all-links]
+                     [first where-data [[[] swap [[param-name] shield [last] dip wrap swap assign]
+                                         step]
+                                        [[format-where] map]]
+                      fork]]
+                    fork]
+                   shield [first] dip unwrap unwrap [where params on] label join]
+                  shielddown]
+            dip swap put]
+           step [[extract-params] [make-query] [make-where] [swap select-data]] fork dropdown
            unwrap float [[join] lookup]
            map swap format-select [" " interpose join-all] dip triplet reverse "SELECT {0} from EAV as c0 {1} WHERE {2}"
            swap format swap dropdeep]]]
-title? [[book? subjects love] [book? title title?] [book? author-last author-last?]
-        [book? author-first author-first?] [author? first-name author-first?] [author? last-name
-                                                                               author-last?]
-        [author? birth-year birth-year?]]
+[wrap] [1] if [[take [[taker collect dropdown dropdown] join divedeep]]
+               [shift [[[count <=]
+                        [swap 0 slice] [[]] if]
+                       shield swap]]]
+[] 2 2 [take] [[entity] [[attribute subjects]
+                         [entity book?]
+                         [index 0]
+                         [value love]]
+               [entity] [[attribute title]
+                         [entity book?]
+                         [index 1]
+                         [value title?]]
+               0 1 [] [title? author-first? author-last? birth-year?]]
 #+end_src
 
 #+begin_src kcats
