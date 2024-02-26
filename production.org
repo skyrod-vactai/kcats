@@ -7079,6 +7079,18 @@ state, clear it, write to file, etc.
 It would be nice if we could tell which file any given word was read
 from. We could do this at read time, but i don't think our edn parser
 remembers byte positions, so that might need modification.
+*** TODO Call stack in errors :debugging:errorHandling:
+It would be nice to see the call stack, if possible. For example if
+foo calls bar, and bar fails, it'd be nice to know we're in the middle
+of executing foo also. I have no idea how to implement this at the
+moment though. Each time we look up a word during eval-step we could
+add it to the call stack, and place a special word at the end of the
+program to 'pop' from that stack. But I think if we ran =step= on 10,000
+item list, the call stack would get at least that deep because step
+puts itself back in the program.
+
+So maybe a "call stack" isn't exactly what we want, I'm not even sure
+it's possible to get what we want here.
 *** INPROGRESS Implement pipes :stdlib:
 **** DONE Write to a file
 #+begin_src kcats
@@ -9358,7 +9370,19 @@ stack that does what foo does, use =[foo]=. =foo= itself should perform the acti
 There's some confusion because =each= does perform an action: it
 modifies the program already on the stack. So you would write =5 [taker]= but =[inc] each=.
 
+One issue is with something like =partition= where there's boilerplate initial state
+that needs to go on the stack before the generator program. With =taker=
+the user provides the initial state because we don't know what it is in advance.
 
+#+begin_src kcats
+  [1 2 3 4 5] 2 2 [partition] generate
+#+end_src
+
+It's possible for partition to check if the state is present and
+create it (since the state is always a list and otherwise it would see
+a number). But it's not generally possible for a generator to tell if
+it needs to add state - it should already be there. So if we're just
+quoting the generator, then what will add it?
 *** TODO Data compression
 Data streams that we intend to produce later are going to need
 compression - the streams should be as small as possible (they'll be
@@ -9407,260 +9431,6 @@ foo
 
 **** DONE ismulti?
 - State "DONE"       from "TODO"       [2023-12-04 Mon 16:25]
-*** TODO Library definitions and loading
-We don't have a good story yet for how new words are loaded and accessed.
-
-Right now I'm using =let= but the danger with this method is that you
-can pretty easily accidentally overwrite some word that your program
-depends on deep in its expanded expression, and that causes behavior
-that's both unexpected and difficult to debug.
-
-So what I think we really want is for the new definitions to only
-apply for the literal program we write. A naive implementation would
-just recursively replace words in the program with their definitions,
-but that could be problematic when a word is used as data and not
-meant to be an action word.
-
-Really =template= is close to what we want here. It's just ugly to have
-to write =[poke mynewword]= instead of just calling =mynewword= like you
-normally would.
-
-Another approach is to just not allow =let= to overwrite.
-**** INPROGRESS Template-based let macro 
- - State "INPROGRESS" from "TODO"       [2024-01-01 Mon 22:00]
-***** DONE Versioned Words   
-- State "DONE"       from "TODO"       [2024-01-02 Tue 17:32]
-***** DONE Versioned dictionary
-- State "DONE"       from "TODO"       [2024-01-02 Tue 17:32]
-***** DONE Dict lookups respect version but = doesn't
-- State "DONE"       from "TODO"       [2024-01-02 Tue 17:32]
-***** DONE Version words in a program
-- State "DONE"       from "INPROGRESS" [2024-01-07 Sun 09:11]
-- State "INPROGRESS" from "TODO"       [2024-01-02 Tue 17:45]
-***** DONE Dictionary update to copy all touched words to versioned word
-- State "DONE"       from "INPROGRESS" [2024-01-07 Sun 09:11]
-- State "INPROGRESS" from "TODO"       [2024-01-02 Tue 17:45]
-Here's how I think it could work:
-
-A rust function would take:
-+ A list or assoc of updates (word, update-prog)
-+ A program to run
-
-Do the following:
-+ [X] extract the words into a set
-+ [X] clone the current dictionary, save it
-+ [X] Increment the version in the current dictionary
-+ [X] For each word, if the non-versioned word exists in the dictionary, copy it to the versioned word
-+ [X] Recursively run through the program, updating words with the new version
-+ [X] Change all the keys in the updates to the new version
-+ [X] place into expression: get dictionary, step through updates, calling update, redefine
-+ [X] place into expression: program (unwrapped)
-+ [X] place into expression: the old dictionary, redefine
-+ [ ] All values in the updates need to get versioned with the words defined before it
-
-This should give us
-+ The ability to do =let*= type stuff - refer to one function in the
-  definition of another but we would need to be careful to only update
-  program in the values with the words that have already been defined,
-  not the whole word list. - make tests for this
-+ The implementation details don't leak into the language, this
-  function could just be called =let=. The existing one we could rename
-  to something more indicative of unsafe operations.
-
-  test it
-    Can call new words
-  #+begin_src kcats
-    
-    [[foo [[[definition [inc bar]]
-            [spec [[number] [number]]]]]]]
-    [1 foo] inscribe
-  #+end_src
-
-  #+RESULTS:
-  #+begin_src kcats
-  2
-  #+end_src
-
-    Can still access base words like swap
-  #+begin_src kcats
-  [[foo ["foo"]]] [1 2 swap foo] draft
-  #+end_src
-
-  #+RESULTS:
-  #+begin_src kcats
-  "foo" 1 2
-  #+end_src
-
-    Words no longer accessible after let ends
-  #+begin_src kcats
-  [[[foo ["foo"]]] [1 2 swap foo] draft foo] [] recover type [error] unwrap =
-  #+end_src
-
-  #+RESULTS:
-  #+begin_src kcats
-  yes
-  #+end_src
-
-   Previously defined words can be used inline
-  #+begin_src kcats
-    [[square [clone *]]
-     [fourth [square square]]]
-    [3 fourth] draft
-  #+end_src
-
-  #+RESULTS:
-  #+begin_src kcats
-  81
-  #+end_src
-
-  Words can call themselves
-  #+begin_src kcats
-    [[factorial [[swap positive?]
-                 [[*] shielddown [dec] dip self]
-                 when]]]
-    [6 1 factorial dropdown]
-    draft
-  #+end_src
-
-  #+RESULTS:
-  #+begin_src kcats
-  720
-  #+end_src
-
-  We can update the definition of existing words
-  #+begin_src kcats
-    [[hash [[type [foo] unwrap =]
-            [drop "foo" hash]
-            addmethod]]]
-    [[[foo 1]] association hash] let*
-    "foo" hash =
-  #+end_src
-
-  #+RESULTS:
-  #+begin_src kcats
-  yes
-  #+end_src
-
-  We can nest let blocks
-  #+begin_src kcats
-    [[foo ["foo"]]
-     [quux ["quux"]]]
-    [foo
-     [[foo [foo "foo2"]]
-      [bar [foo "bar"]]]
-     [1 2 3 bar quux]
-     draft]
-    draft
-  #+end_src
-
-  #+RESULTS:
-  #+begin_src kcats
-  "quux" "bar" "foo2" "foo" 3 2 1 "foo"
-  #+end_src
-
-  We can modify previous let words
-  #+begin_src kcats
-    [[foo ["foo"]]]
-    [foo
-     [[foo ["bar" put]]]
-     [foo]
-     revise]
-    draft
-  #+end_src
-
-  #+RESULTS:
-  #+begin_src kcats
-  "bar" "foo"
-  #+end_src
-
-  We can modify axiom words
-
-  #+begin_src kcats
-    [[swap [[[definition [dump swap]]]]]]
-    [1 2 swap]
-    inscribe
-  #+end_src
-
-  #+RESULTS:
-  #+begin_src kcats
-  [2 1]
-  1 2
-  #+end_src
-
-***** TODO Word to create full dictentry update from just the definition update
-#+begin_src kcats
-[[foo [[definition] [["foo"]] update]]] [foo] let*
-#+end_src
-
-#+RESULTS:
-#+begin_src kcats
-"foo"
-#+end_src
-
-#+begin_src kcats
-  [[foo [["foo"]]]]
-  [[1] [[[definition]] swap wrap join [update] join] update] map
-  ;[foo] let*
-#+end_src
-
-#+RESULTS:
-#+begin_src kcats
-[[foo [[definition] [["foo"]] update]]]
-#+end_src
-
-Maybe we should stick a default spec in there?
-
-#+begin_src kcats
-  [[foo ["foo"]]]
-  
-  [foo] draft
-#+end_src
-
-#+RESULTS:
-#+begin_src kcats
-"foo"
-#+end_src
-
-***** TODO kcats impl
-#+begin_src kcats 
-  ;[foo] 1 version [foo] 2 version =
-  ;dictionary [*version*] [[definition [1]]] assign
-  [[foo [["foo"]]]
-   [bar [["bar"]]]
-   [lookup [["swappie"]]]] 
-  [foo bar swap]
-  dictionary
-  [+version+ definition] [[] [[inc] inject] [[0]] if] update ;; d p u
-
-  [[+version+ definition] lookup first] shield ;; v d p u
-  [sink] dip ;; v p u d
-  clone ;; v v p u d 
-  [version swap] dip version   ;; u p d
-
-   swapdown   ;; u d p
-  [ unwrap [wrap [definition] join] dip  update] step 
-  define
-  execute
-#+end_src
-
-***** TODO Discussion
-In the context of loading libraries, how do we do it? It seems like
-some libraries may need both kinds of changes (global/local): some
-changes are method additions and others are new words. What is loading
-a library? Is it just arbitrary code execution? That would be
-flexible, but not very secure. Maybe it's ok if the library publisher
-is authenticated?
-
-What does loading a library look like? Presumably we load it by its
-hash. And it's not a permanent change, it's only for a given block of
-code. But it seems clear that the library's words need to apply not
-just to the top level? Or do they? Libraries can do lots of things,
-including extending the language so it's hard to predict exactly how
-they would be loaded.
-#+begin_src kcats
-[
-#+end_src
-
 *** TODO run multiple programs on same argument to get list
 #+begin_src kcats
   5 2 [[+] [*]] [execute] map
@@ -9998,6 +9768,33 @@ Test draft
 foo
 #+end_src
 
+Ok this is all seems to be in order, there's now a problem in the
+stdlib where a word calls =let= and defines some local functions, eg
+=partition=. What we actually need is to do =resolve= as the stdlib is
+being built, perhaps defining =partition= in its own little module, and
+then resolving the module once. Something like this:
+
+#+begin_src kcats
+  ;; functions partition uses
+  [partition]
+  [[take [[taker collect
+           dropdown dropdown] ; drop the used-up taker generator
+          join divedeep]]
+   [shift [[[count <=]
+            [swap 0 slice]
+            [[]] if] shield swap]] 
+  ] [entry] map
+  [partition] [[spec [[] [program]]]
+               [definition [[] ;; state
+                            ;; the generator
+                            [[[]
+                              [over wrap take [join shift] bail]
+                              [[over] dive wrap take swap drop shift]
+                              if]]]]] assign
+  updates inscribe
+
+#+end_src
+
 **** TODO Stack escape protection
 If a program refers to a wor
 d, and at the time that program is put on
@@ -10243,50 +10040,16 @@ This will make the build and packaging more complex as it will have to
 include other files besides the binary and deal with platform-specific
 issues. The standard env could, however, still load a bunch of libs,
 but maybe this could be overridden with cmdline args.
+***** TODO Figure out what to do about builtins
+***** TODO Group functions
++ Math
+**** TODO Disallow module alias overwriting
+It is a security problem to allow code to overwrite some other code's
+alias for a module. Throw an error in this case. We should call insert
+on the aliases, and if it returns something, it better be equal to
+what we inserted.
 *** INPROGRESS Database
 - State "INPROGRESS" from "TODO"       [2023-12-31 Sun 10:17]
-**** Simple Test
-#+begin_src kcats
-"create table Person (firstName text not null, lastName text not null, email text)" database 
-#+end_src
-
-#+RESULTS:
-#+begin_src kcats
-[]
-#+end_src
-
-#+begin_src kcats
-"insert into Person (firstName, lastName, email) values ('Skywife', 'Vactai', 'skywife@skyrod.me')" database 
-#+end_src
-
-#+RESULTS:
-#+begin_src kcats
-[]
-#+end_src
-
-#+begin_src kcats
-  "select (firstName) from Person where lastName='Vactai'" database 
-#+end_src
-
-#+RESULTS:
-#+begin_src kcats
-[[[firstName "Skyrod"]] [[firstName "Skykid"]] [[firstName "Skywife"]]]
-#+end_src
-
-
-#+begin_src kcats
-dictionary [swap] lookup
-#+end_src
-
-#+RESULTS:
-#+begin_src kcats
-[[definition builtin-function]
- [examples [[[1 2 3 swap] [1 3 2]]]]
- [spec [[[item a]
-         [item b]]
-        [[item b]
-         [item a]]]]]
-#+end_src
 **** Books db
 #+begin_src kcats
   [[author-first "George"] [author-last "Orwell"] [title "1984"] [year 1949] [subjects [government dystopia surveillance totalitarianism freedom]]]
@@ -10584,31 +10347,6 @@ it? (May need to add some set-based words here).
   
 #+end_src
 
-test 'triangle'
-#+begin_src kcats 
-[1 2 3 4] reverse [[take [clonedown swap pair] bail] collect butlast] shielddown reverse
-#+end_src
-
-#+RESULTS:
-#+begin_src kcats
-[[2 [1]]
- [3 [2 1]]
- [4 [3 2 1]]]
-#+end_src
-
-#+begin_src kcats
-[1 2 3 4] [] [[take] dip swap [[put] shield sink swap pair] bail] collect
-#+end_src
-
-#+RESULTS:
-#+begin_src kcats
-[[1 []]
- [2 [1]]
- [3 [1 2]]
- [4 [1 2 3]]]
-[[take] dip swap [[put] shield sink swap pair] bail] [1 2 3 4] []
-#+end_src
-
 #+begin_src kcats
   ;; Module to operate on generic data, that are used throughout
   [generic]
@@ -10620,7 +10358,7 @@ test 'triangle'
                          dive map]]
    [join-all [[first empty] shield swap [join] step]]
    [selectkeys [set swap [first contains?] filter]]
-   [invert [[reverse] map association]]] draft inscribe
+   [invert [[reverse] map association]]] draft inscribe drop 
 
   ;; Module for datalog variables
   [variables]
@@ -10628,7 +10366,7 @@ test 'triangle'
   [[variable? [[[word?]
                 [string last \? =]] [execute] every?]]
    [variable= [[[pair [variable?] every?] [=]] [execute] every?]]] resolve
-  draft inscribe
+  draft inscribe drop
 
   ;; Module for datalog constraints
   [eav]
@@ -10636,7 +10374,7 @@ test 'triangle'
   [[slots [[entity attribute value]]]
    [slot-combos [slots [slots [pair] map] map join-all]]
    [constraint [unwrap slots reverse label]]] resolve
-  draft inscribe
+  draft inscribe drop
 
   ;; Module for links between datalog constraints
   [links]
@@ -10653,19 +10391,19 @@ test 'triangle'
                [[[[index] lookup] shield] both ;; lookup the indices of both constraints
                 [swapdown] dip sink ;; move the indices under the constraints
                 [links] shielddown
-                swap [dropdown dropdown join] dip]
+                swap [dropdown dropdown join] dip] 
 
                step drop]]
    [format-link [[join] inject unwrap [string] map
                  "c{0}.{1} = c{2}.{3}" swap format]]] resolve
-  draft inscribe
+  draft inscribe drop
 
   ;; Module for formatting pieces of query data into text
   [formatting]
   [generic]
   [[anded-together [[" AND " interpose join-all] resolve]]] resolve
-  draft inscribe
-  
+  draft inscribe drop
+
   ;; Module for where clause data processing
   [where-clauses]
   [generic formatting variables]
@@ -10676,13 +10414,13 @@ test 'triangle'
    [format-where [[string] map 
                   "c{0}.{1} = :c{0}{1}" swap format]]
    [make-where [first [where] lookup anded-together]]] resolve
-  draft inscribe
+  draft inscribe drop
 
   ;; Module for SQL parameters for rusqlite
   [params]
   [[param-name [[string] map ":c{0}{1}" swap format]]
    [extract-params [[] association swap [[params] lookup join] step]]]
-  draft inscribe
+  draft inscribe drop
 
   ;; Module for SELECT clause
   [select]
@@ -10704,35 +10442,34 @@ test 'triangle'
                   map]
                  shield dropdeep zip
                  validate]]] resolve
-  draft inscribe
+  draft inscribe drop
 
   [database]
   ;; work with the constraints first [swap
   ;; expand all combinations of constraints
   [select eav params generic links where-clauses params]
-  [[query [swap
+  [[extract-data [[[[unwrap all-links]
+                    [first where-data   ; [join] inject unwrap
+                     ;; build the query param map
+                     [[[] swap
+                       [[param-name] shield [last] dip wrap swap assign]
+                       step]
+                      ;; build the actual query where clauses
+                      [[format-where] map]]
+                     fork]]
+                   fork] shield
+                  ;; combine extracted items
+
+                  [first] dip ;; keep the original constraint to add properties to
+                  unwrap unwrap [where params on] label join]]
+   [query [swap
            ;; expand all combinations of constraints
            [constraint] map 
            ;;[] prepend ;; an empty constraint to represent the orignal EAV table we're joining with
            [index] indexed-as-property
            triangle
            ;; for each pair of constraints, build the "ON" clause data for the JOIN
-           [[[[unwrap all-links]
-              [first where-data   ; [join] inject unwrap
-               ;; build the query param map
-               [[[] swap
-                 [[param-name] shield [last] dip wrap swap assign]
-                 step]
-                ;; build the actual query where clauses
-                [[format-where] map]]
-               fork]]
-             fork] shield
-             dump
-            ;; combine extracted items
-
-            [first] dip ;; keep the original constraint to add properties to
-            unwrap unwrap [where params on] label join]
-           map
+           [extract-data] map
 
            [[extract-params]
             [make-query]
@@ -10745,7 +10482,8 @@ test 'triangle'
            [" " interpose join-all] dip triplet reverse
            "SELECT {0} from EAV as c0 {1} WHERE {2}" swap format
            swap dropdeep]]] resolve
-  draft inscribe
+  draft inscribe drop
+
   ;; main functions
   [database]
   [[[book? subjects love]
@@ -10757,254 +10495,6 @@ test 'triangle'
     [author? birth-year birth-year?]]
    [title? author-first? author-last? birth-year?]
    query] using
-#+end_src
-
-#+RESULTS:
-#+begin_src kcats
-[[[] [[[":c0attribute" subjects]
-       [":c0value" love]]
-      ["c0.attribute = :c0attribute" "c0.value = :c0value"]]]
- [[[attribute subjects]
-   [entity book?]
-   [index 0]
-   [value love]]
-  []]
- [title? author-first? author-last? birth-year?] database select params where-clauses
- formatting links eav variables generic]
-[[actual shift]
- [asked [sized]]
- [handled yes]
- [reason "type mismatch"]
- [type error]
- [unwound [dictmerge wrap [[[] [over wrap take [join shift]
-                                bail]
-                            [[over] dive wrap take swap drop shift]
-                            if]] unwrap using [[[[take [[taker collect dropdown dropdown] join divedeep]]
-                                                 [shift [[[count <=]
-                                                          [swap 0 slice] [[]] if]
-                                                         shield swap]]]
-                                                [[] [over wrap take [join shift]
-                                                     bail]
-                                                 [[over] dive wrap take swap drop shift]
-                                                 if]
-                                                let]] unwrap swap [[]] unwrap swap clone [put [generate] dip swap clone] loop drop
-           [[]] unwrap evert first [[[[lookup] inject]
-                                     both]]
-           unwrap inject [joiner] assemble unwrap [] swap evert drop variable= [[[entity entity]
-                                                                                 [[attribute subjects]
-                                                                                  [entity book?]
-                                                                                  [index 0]
-                                                                                  [value love]]
-                                                                                 [[attribute title]
-                                                                                  [entity book?]
-                                                                                  [index 1]
-                                                                                  [value title?]]
-                                                                                 0 1 [] [title? author-first? author-last? birth-year?] database select params where-clauses
-                                                                                 formatting links eav variables generic]] unwrap evert first [[]] unwrap swap [] [drop
-                                                                                                                                                                  swap put]
-           [drop dropdown]
-           
-           if [[entity attribute]
-               [entity value]
-               [attribute entity]
-               [attribute attribute]
-               [attribute value]
-               [value entity]
-               [value attribute]
-               [value value]]
-           [swap [[[wrap] map unwrap swapdown [[[lookup] inject]
-                                               both]
-                   pairwise variable=]
-                  shield]
-            dip swap [] [drop swap put] [drop dropdown]
-            if]
-           step [unwrap pair sink pair [[index] lookup]
-                 map swap zip]
-           map [[[[attribute subjects]
-                  [entity book?]
-                  [index 0]
-                  [value love]]
-                 [[attribute title]
-                  [entity book?]
-                  [index 1]
-                  [value title?]]
-                 0 1 [] [title? author-first? author-last? birth-year?] database select params where-clauses
-                 formatting links eav variables generic]] unwrap evert first dropdown swap [dropdown
-                                                                                            dropdown join]
-           dip [] [[[[index] lookup]
-                    shield]
-                   both [swapdown] dip sink [links] shielddown swap [dropdown dropdown join] dip]
-           step drop [[[unwrap all-links]
-                       [[[attribute title]
-                         [entity book?]
-                         [index 1]
-                         [value title?]]
-                        [[[attribute subjects]
-                          [entity book?]
-                          [index 0]
-                          [value love]]]]
-                       [title? author-first? author-last? birth-year?] database select params where-clauses
-                       formatting links eav variables generic]] unwrap
-           evert first dropdown [[]] unwrap swap put [[first where-data [[[] swap [[param-name]
-                                                                                   shield [last] dip wrap swap assign]
-                                                                          step]
-                                                                         [[format-where] map]]
-                                                       fork]] [swap [[execute] shielddown]
-                                                               dip swap put]
-           step [[[[[attribute title]
-                    [entity book?]
-                    [index 1]
-                    [value title?]]
-                   [[[attribute subjects]
-                     [entity book?]
-                     [index 0]
-                     [value love]]]]
-                  [title? author-first? author-last? birth-year?] database select params where-clauses
-                  formatting links eav variables generic]] unwrap evert first dump [first] dip unwrap
-           unwrap [where params on]
-           label join [[[[[attribute title]
-                          [entity book?]
-                          [index 1]
-                          [value title?]]
-                         [[[attribute subjects]
-                           [entity book?]
-                           [index 0]
-                           [value love]]]]
-                        [title? author-first? author-last? birth-year?] database select params where-clauses
-                        formatting links eav variables generic]] unwrap evert first dropdown [[[[attribute
-                                                                                                 subjects]
-                                                                                                [entity book?]
-                                                                                                [index 0]
-                                                                                                [on []]
-                                                                                                [params [[":c0attribute" subjects]
-                                                                                                         [":c0value" love]]]
-                                                                                                [value love]
-                                                                                                [where ["c0.attribute = :c0attribute" "c0.value = :c0value"]]]]] unwrap swap put
-           [[[[attribute author-last]
-              [entity book?]
-              [index 2]
-              [value author-last?]]
-             [[[attribute subjects]
-               [entity book?]
-               [index 0]
-               [value love]]
-              [[attribute title]
-               [entity book?]
-               [index 1]
-               [value title?]]]]
-            [[[attribute author-first]
-              [entity book?]
-              [index 3]
-              [value author-first?]]
-             [[[attribute subjects]
-               [entity book?]
-               [index 0]
-               [value love]]
-              [[attribute title]
-               [entity book?]
-               [index 1]
-               [value title?]]
-              [[attribute author-last]
-               [entity book?]
-               [index 2]
-               [value author-last?]]]]
-            [[[attribute first-name]
-              [entity author?]
-              [index 4]
-              [value author-first?]]
-             [[[attribute subjects]
-               [entity book?]
-               [index 0]
-               [value love]]
-              [[attribute title]
-               [entity book?]
-               [index 1]
-               [value title?]]
-              [[attribute author-last]
-               [entity book?]
-               [index 2]
-               [value author-last?]]
-              [[attribute author-first]
-               [entity book?]
-               [index 3]
-               [value author-first?]]]]
-            [[[attribute last-name]
-              [entity author?]
-              [index 5]
-              [value author-last?]]
-             [[[attribute subjects]
-               [entity book?]
-               [index 0]
-               [value love]]
-              [[attribute title]
-               [entity book?]
-               [index 1]
-               [value title?]]
-              [[attribute author-last]
-               [entity book?]
-               [index 2]
-               [value author-last?]]
-              [[attribute author-first]
-               [entity book?]
-               [index 3]
-               [value author-first?]]
-              [[attribute first-name]
-               [entity author?]
-               [index 4]
-               [value author-first?]]]]
-            [[[attribute birth-year]
-              [entity author?]
-              [index 6]
-              [value birth-year?]]
-             [[[attribute subjects]
-               [entity book?]
-               [index 0]
-               [value love]]
-              [[attribute title]
-               [entity book?]
-               [index 1]
-               [value title?]]
-              [[attribute author-last]
-               [entity book?]
-               [index 2]
-               [value author-last?]]
-              [[attribute author-first]
-               [entity book?]
-               [index 3]
-               [value author-first?]]
-              [[attribute first-name]
-               [entity author?]
-               [index 4]
-               [value author-first?]]
-              [[attribute last-name]
-               [entity author?]
-               [index 5]
-               [value author-last?]]]]]
-           [swap [[[[[unwrap all-links]
-                     [first where-data [[[] swap [[param-name] shield [last] dip wrap swap assign]
-                                         step]
-                                        [[format-where] map]]
-                      fork]]
-                    fork]
-                   shield dump [first] dip unwrap unwrap [where params on] label join]
-                  shielddown]
-            dip swap put]
-           step [[extract-params] [make-query] [make-where] [swap select-data]] fork dropdown
-           unwrap float [[join] lookup]
-           
-           map swap format-select [" " interpose join-all] dip triplet reverse "SELECT {0} from EAV as c0 {1} WHERE {2}"
-           swap format swap dropdeep]]]
-#b64 "FRKeHtiisKXmb+nOmZtnX5kul9/xzQwp5aHoqnlsh58=" [] 2 2 [take] [[entity] [[attribute
-                                                                              subjects]
-                                                                             [entity book?]
-                                                                             [index 0]
-                                                                             [value love]]
-                                                                   [entity] [[attribute title]
-                                                                             [entity book?]
-                                                                             [index 1]
-                                                                             [value title?]]
-                                                                   0 1 [] [title? author-first? author-last? birth-year?] database select params where-clauses
-                                                                   formatting links eav variables generic]
 #+end_src
 
 #+begin_src kcats
