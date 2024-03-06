@@ -67,8 +67,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         if src_stdlib_path.exists() && src_stdlib_path.is_dir() {
             let entries = fs::read_dir(src_stdlib_path)?;
             // Write a source file hardcoding the hashes of the stdlib files
-            let out_dir = Path::new("src/kcats");
-            let dest_path = Path::new(&out_dir).join("module_hashes_map.rs");
+            let out_dir = Path::new("src");
+            let dest_path = Path::new(&out_dir).join("module_map.rs");
             let mut f = File::create(&dest_path)?;
 
             writeln!(f, "use std::collections::HashMap;\n")?;
