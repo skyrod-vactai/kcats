@@ -119,7 +119,7 @@ the location where you installed the kcats binary.
   # backtrace = "0.3.61"
 
   # database
-  ## Figure out best place to store the db file
+  ## Figure out best place to store the db and stdlib files
   directories = "5.0"
 
   #cozo = { version = "0.7", default-features = false, features = ["minimal", "rayon"], optional=true }
@@ -2214,8 +2214,10 @@ internally, to keep track of things like the stack, program, lists etc.
                   .unwrap_or_default(),
           }
       }
+  }
 
-      pub fn namespace(ns: Namespace) -> Entry {
+  impl From<Namespace> for Entry {
+      fn from(ns: Namespace) -> Entry {
           Entry {
               examples: None,
               spec: None,
@@ -2668,9 +2670,13 @@ internally, to keep track of things like the stack, program, lists etc.
 **** Environment types
 #+begin_src rust :tangle src/types/environment.rs :mkdirp yes
   use crate::axiom;
+  use crate::crypto;
+  use crate::list;
+  use crate::module_map;
   use crate::serialize;
   use crate::types::*;
   use crate::types::{associative as assoc, collection as coll, dictionary as dict};
+  use directories::ProjectDirs;
   use std::future;
 
   #[derive(Clone, PartialEq)]
@@ -2678,7 +2684,6 @@ internally, to keep track of things like the stack, program, lists etc.
       pub stack: Stack,
       pub program: Stack,
       pub dictionary: dict::Dictionary,
-      dictversion: usize, // used to track newly defined words
   }
 
   impl Environment {
@@ -2689,9 +2694,18 @@ internally, to keep track of things like the stack, program, lists etc.
               stack: stack.unwrap_or_default(),
               program: prog_expr,
               dictionary: dict::Dictionary::default(),
-              dictversion: 0,
           };
-          env.add_standard_dictionary();
+          env.push(
+              list!(
+                  "stack-builtins",
+                  "motion-builtins",
+                  "motion",
+                  "collections-builtins",
+                  "execute-builtins"
+              )
+              .into(),
+          );
+          env.bootstrap().unwrap();
           //print!("Env: {:?}", env.dictionary);
           env
       }
@@ -2721,10 +2735,11 @@ internally, to keep track of things like the stack, program, lists etc.
               String::from_utf8(include_bytes!("../kcats/builtins.kcats").to_vec()).unwrap();
           self.read_lexicon(builtins);
           //println!("with builtins {:?}", env.dictionary);
-          axiom::add_builtins(&mut self.dictionary);
+
           //env = add_derivations(env);
           let lexicon = String::from_utf8(include_bytes!("../kcats/lexicon.kcats").to_vec()).unwrap();
           self.read_lexicon(lexicon);
+          axiom::add_builtins(&mut self.dictionary);
       }
 
       pub fn push(&mut self, i: Item) {
@@ -2751,14 +2766,6 @@ internally, to keep track of things like the stack, program, lists etc.
 
       pub fn len(&self) -> usize {
           3 // 3 fields
-      }
-
-      pub fn new_dictversion(&mut self) {
-          self.dictversion += 1;
-      }
-
-      pub fn prev_dictversion(&mut self) {
-          self.dictversion -= 1;
       }
 
       pub fn get(&self, key: &str) -> Option<Item> {
@@ -2839,6 +2846,66 @@ internally, to keep track of things like the stack, program, lists etc.
                   (assoc::Associative::Assoc(a), old)
               }
           }
+      }
+
+      fn import_stdlib_module_map(&mut self) {
+          let modmap = module_map::module_hashes();
+          let d = self.dictionary.make_mut();
+
+          for (alias, hash) in modmap.into_iter() {
+              //namespace the alias
+              let mut alias_word: Word = alias.into();
+              alias_word.namespaced(Default::default());
+              d.insert(alias_word, dict::Entry::from(dict::Namespace::from(hash)));
+          }
+      }
+
+      /// Reads a stdlib module and updates the dictionary.
+      fn bootstrap_stdlib_module(&mut self, module_alias: Word) -> Result<(), Error> {
+          let module_hash = self.dictionary.resolve_ns(module_alias.clone().into())?;
+          let module_content = read_module(module_alias, module_hash.into())?;
+          self.read_lexicon(String::from_utf8(module_content)?);
+          Ok(())
+      }
+
+      fn bootstrap(&mut self) -> Result<(), Error> {
+          self.import_stdlib_module_map();
+          let module_aliases = coll::List::try_from(self.pop())?;
+          for item in module_aliases.inner().into_iter() {
+              let module_alias = Word::try_from(item)?;
+              self.bootstrap_stdlib_module(module_alias)?
+          }
+          axiom::add_builtins(&mut self.dictionary);
+          Ok(())
+      }
+  }
+
+  /// Reads the module from the data cache and verifies its hash matches
+  fn read_module(alias: Word, expected_hash: Bytes) -> Result<Bytes, Error> {
+      if let Some(proj_dirs) = ProjectDirs::from("org", "skyrod", "kcats") {
+          let data_dir = proj_dirs.data_dir();
+
+          let std_path = data_dir.join("stdlib");
+
+          // Look up the file
+          if std_path.exists() && std_path.is_dir() {
+              let file = std_path.join(format!("{}.kcats", alias));
+              let contents = std::fs::read(file)?;
+              let actual_hash = crypto::hash_bytes(contents.clone())?;
+              if actual_hash == expected_hash {
+                  Ok(contents)
+              } else {
+                  Err(Error::create(
+                      list!(expected_hash, "="),
+                      "module integrity check failed",
+                      Some(actual_hash.into()),
+                  ))
+              }
+          } else {
+              Err(Error::expected("stdlibdir", Default::default()))
+          }
+      } else {
+          Err(Error::expected("stdlibdir", Default::default()))
       }
   }
 
@@ -2929,7 +2996,7 @@ words for them (hashing, encryption, signing)
   use rand::RngCore as RandRngCore;
   use rand_core::{CryptoRng, RngCore};
   use sha2::{self, Digest}; // Import RngCore for the fill_bytes method
-
+  use std::io;
   pub fn hash(i: Item) -> ItemResult {
       let b = Bytes::try_from(i).unwrap();
       Ok(sha2::Sha256::digest(b).deref().to_vec().into())
@@ -2969,6 +3036,15 @@ words for them (hashing, encryption, signing)
           self.fill_bytes(dest);
           Ok(())
       }
+  }
+
+  pub fn hash_bytes(contents: Vec<u8>) -> io::Result<Vec<u8>> {
+      let mut hasher = sha2::Sha256::new();
+      //let mut buffer = [0; 1024]; // Read in chunks of 1024 bytes
+      let count = contents.len();
+      hasher.update(&contents[..count]);
+
+      Ok(hasher.finalize().to_vec())
   }
 
   impl CryptoRng for SeededRNG {}
@@ -3445,27 +3521,27 @@ example, in order to read/write to/from disk).
 *** Builtin words
 We'll define some words as axioms (not in terms of other words, only defined in Rust). 
 #+begin_src rust :tangle src/axiom.rs :mkdirp yes
-  use super::serialize;
   use crate::list;
   use crate::pipes;
   #[cfg(feature = "database")]
   use crate::pipes::db;
-  use crate::serialize::parse;
+  use crate::serialize;
   use crate::types::associative as assoc;
   use crate::types::collection as coll;
   use crate::types::dictionary as dict;
   use crate::types::environment::Environment;
   use crate::types::error::Error;
   use crate::types::*;
+  use core::ops::Deref;
   use dynfmt::{Format, SimpleCurlyFormat};
   use futures::future::FutureExt;
   use num_integer::Roots;
-  use std::collections::VecDeque;
-  //use std::future::Future;
-  use core::ops::Deref;
   use sha2::{self, Digest};
+  use std::collections::VecDeque;
+  use std::default::Default;
   use std::mem;
   use std::ops::Range;
+
   pub type ItemResult = Result<Item, Error>;
 
   impl From<ItemResult> for Item {
@@ -5229,7 +5305,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               // first see if we can parse the module
               let module_string = String::from_utf8(b.clone())?;
               let program: coll::List = coll::List::try_from(
-                  parse(module_string)?
+                  serialize::parse(module_string)?
                       .inner()
                       .pop_front()
                       .unwrap_or_default(),
@@ -5254,7 +5330,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           Ok(mut alias) => {
               alias.namespaced(dict::Namespace::default());
               let d = env.dictionary.make_mut();
-              let e = dict::Entry::namespace(hash.clone().into());
+              let e = dict::Entry::from(dict::Namespace::from(hash.clone()));
               //println!("Adding alias {:?} -> {:?}", alias, e);
               d.insert(alias.clone(), e);
               env.push(Item::Word(alias));
@@ -5476,6 +5552,7 @@ We'll also define how to run unit tests.
 #+begin_src rust :tangle src/main.rs :mkdirp yes
   mod axiom;
   mod crypto;
+  mod module_map;
   mod pipes;
   mod serialize;
   mod types;
