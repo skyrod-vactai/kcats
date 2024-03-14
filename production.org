@@ -2168,6 +2168,7 @@ internally, to keep track of things like the stack, program, lists etc.
 #+end_src
 **** Dictionary types
 #+begin_src rust :tangle src/types/dictionary.rs :mkdirp yes
+  use crate::list;
   use crate::types::associative as assoc;
   use crate::types::collection as coll;
   use crate::types::*;
@@ -2232,6 +2233,8 @@ internally, to keep track of things like the stack, program, lists etc.
   lazy_static! {
       pub static ref MODULE_NAMESPACE: Namespace =
           Newtype(sha2::Sha256::digest(b"modules").deref().to_vec());
+      pub static ref SHADOW_NAMESPACE: Namespace =
+          Newtype(sha2::Sha256::digest(b"shadow").deref().to_vec());
   }
 
   impl Default for Namespace {
@@ -2283,12 +2286,12 @@ internally, to keep track of things like the stack, program, lists etc.
               })
               .collect();
           // make a mini dictionary with the adds
-          let mut dict: Dictionary = coll::Arc::wrap(HashMap::from_iter(adds.into_iter()));
+          let mut dict: Dictionary = coll::Arc::wrap(HashMap::from_iter(adds));
           dict.resolve_local();
           let d = self.make_mut();
 
-          d.extend(dict.inner().into_iter());
-          d.extend(make_deletes(deletes).into_iter());
+          d.extend(dict.inner());
+          d.extend(make_deletes(deletes));
       }
 
       /// Takes a set of additions to the dictionary. Resolves all of the
@@ -2329,9 +2332,9 @@ internally, to keep track of things like the stack, program, lists etc.
 
       /// Find the word in the dictionary in one of the given
       /// namespaces. The first match is returned, or None if no matches.
-      fn resolve_word(&self, w: &mut Word, namespaces: &Vec<dict::Namespace>) {
+      fn resolve_word(&self, w: &mut Word, namespaces: &[dict::Namespace]) {
           // if the word is already namespaced we're done
-          if !w.namespace.is_some() {
+          if w.namespace.is_none() {
               for namespace in namespaces.iter().cloned() {
                   w.namespace = Some(namespace);
                   if self.contains_key(w) {
@@ -2376,7 +2379,11 @@ internally, to keep track of things like the stack, program, lists etc.
                   w.namespaced(dict::Namespace::default());
                   match self.get(&w) {
                       Some(e) => Ok(e.get_namespace_info()),
-                      None => Err(Error::expected("module-alias", Item::Word(w))),
+                      None => Err(Error::create(
+                          list!("resolve"),
+                          "module not found",
+                          Some(Item::Word(w)),
+                      )),
                   }
               }
               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(b))) => Ok(b.into()),
@@ -2695,13 +2702,16 @@ internally, to keep track of things like the stack, program, lists etc.
               program: prog_expr,
               dictionary: dict::Dictionary::default(),
           };
+          env.load_core_modules()
+              .expect("failed to load core modules");
           env.push(
               list!(
-                  "stack-builtins",
-                  "motion-builtins",
-                  "motion",
-                  "collections-builtins",
-                  "execute-builtins"
+                  "errors",
+                  "environment-builtins",
+                  "encode",
+                  "sets-builtins",
+                  "time",
+                  "generators" // END default namespace
               )
               .into(),
           );
@@ -2710,11 +2720,14 @@ internally, to keep track of things like the stack, program, lists etc.
           env
       }
 
-      pub fn read_lexicon(&mut self, lexicon: String) {
+      pub fn insert_core_module(&mut self, lexicon: String, namespace: Option<dict::Namespace>) {
           let items = serialize::parse(lexicon).unwrap();
           for r in Box::new(items.inner().into_iter()) {
               let (k, def): (assoc::KeyItem, Item) = r.try_into().unwrap();
-              let word: Word = k.try_into().unwrap();
+              let mut word: Word = k.try_into().unwrap();
+              if let Some(ref ns) = namespace {
+                  word.namespaced(ns.clone());
+              }
               let iter: Box<dyn Iterator<Item = Item>> = def.try_into().unwrap();
               let new_entry: dict::Entry = iter.try_into().unwrap();
               let new_entry2 = new_entry.clone();
@@ -2727,19 +2740,6 @@ internally, to keep track of things like the stack, program, lists etc.
                   })
                   .or_insert(new_entry2);
           }
-      }
-
-      pub fn add_standard_dictionary(&mut self) {
-          // read builtins
-          let builtins =
-              String::from_utf8(include_bytes!("../kcats/builtins.kcats").to_vec()).unwrap();
-          self.read_lexicon(builtins);
-          //println!("with builtins {:?}", env.dictionary);
-
-          //env = add_derivations(env);
-          let lexicon = String::from_utf8(include_bytes!("../kcats/lexicon.kcats").to_vec()).unwrap();
-          self.read_lexicon(lexicon);
-          axiom::add_builtins(&mut self.dictionary);
       }
 
       pub fn push(&mut self, i: Item) {
@@ -2861,10 +2861,54 @@ internally, to keep track of things like the stack, program, lists etc.
       }
 
       /// Reads a stdlib module and updates the dictionary.
-      fn bootstrap_stdlib_module(&mut self, module_alias: Word) -> Result<(), Error> {
+      pub fn load_cached_module(
+          &mut self,
+          module_alias: Word,
+          is_namespaced: bool,
+      ) -> Result<(), Error> {
           let module_hash = self.dictionary.resolve_ns(module_alias.clone().into())?;
-          let module_content = read_module(module_alias, module_hash.into())?;
-          self.read_lexicon(String::from_utf8(module_content)?);
+          let module_content = read_module(module_alias, module_hash.clone().into())?;
+          self.insert_core_module(String::from_utf8(module_content)?, {
+              if is_namespaced {
+                  Some(module_hash)
+              } else {
+                  None
+              }
+          });
+          Ok(())
+      }
+
+      fn load_core_modules(&mut self) -> Result<(), Error> {
+          // Assuming /project/core/ is in your project's root directory and part of the source
+          let files: Vec<&[u8]> = vec![
+              include_bytes!("../kcats/core/stack-builtins.kcats"),
+              include_bytes!("../kcats/core/motion-builtins.kcats"),
+              include_bytes!("../kcats/core/compare-builtins.kcats"),
+              include_bytes!("../kcats/core/math-builtins.kcats"),
+              include_bytes!("../kcats/core/boolean-builtins.kcats"),
+              include_bytes!("../kcats/core/serialize-builtins.kcats"),
+              include_bytes!("../kcats/core/encode-builtins.kcats"),
+              include_bytes!("../kcats/core/strings-builtins.kcats"),
+              include_bytes!("../kcats/core/errors-builtins.kcats"),
+              include_bytes!("../kcats/core/pipe-builtins.kcats"),
+              include_bytes!("../kcats/core/stack.kcats"),
+              include_bytes!("../kcats/core/motion.kcats"),
+              include_bytes!("../kcats/core/collections-builtins.kcats"),
+              include_bytes!("../kcats/core/execute-builtins.kcats"),
+              include_bytes!("../kcats/core/execute.kcats"),
+              include_bytes!("../kcats/core/dictionary-builtins.kcats"),
+              include_bytes!("../kcats/core/math.kcats"),
+              include_bytes!("../kcats/core/compare.kcats"),
+              include_bytes!("../kcats/core/collections.kcats"),
+              include_bytes!("../kcats/core/associations-builtins.kcats"),
+              include_bytes!("../kcats/core/associations.kcats"),
+              include_bytes!("../kcats/core/dictionary.kcats"), // END core libs
+          ];
+
+          for &file_contents in &files {
+              let lexicon = String::from_utf8_lossy(file_contents).into_owned();
+              self.insert_core_module(lexicon, None);
+          }
           Ok(())
       }
 
@@ -2873,15 +2917,14 @@ internally, to keep track of things like the stack, program, lists etc.
           let module_aliases = coll::List::try_from(self.pop())?;
           for item in module_aliases.inner().into_iter() {
               let module_alias = Word::try_from(item)?;
-              self.bootstrap_stdlib_module(module_alias)?
+              self.load_cached_module(module_alias, false)?
           }
           axiom::add_builtins(&mut self.dictionary);
           Ok(())
       }
   }
 
-  /// Reads the module from the data cache and verifies its hash matches
-  fn read_module(alias: Word, expected_hash: Bytes) -> Result<Bytes, Error> {
+  pub fn read_blob(alias: &Word) -> Result<Bytes, Error> {
       if let Some(proj_dirs) = ProjectDirs::from("org", "skyrod", "kcats") {
           let data_dir = proj_dirs.data_dir();
 
@@ -2890,22 +2933,27 @@ internally, to keep track of things like the stack, program, lists etc.
           // Look up the file
           if std_path.exists() && std_path.is_dir() {
               let file = std_path.join(format!("{}.kcats", alias));
-              let contents = std::fs::read(file)?;
-              let actual_hash = crypto::hash_bytes(contents.clone())?;
-              if actual_hash == expected_hash {
-                  Ok(contents)
-              } else {
-                  Err(Error::create(
-                      list!(expected_hash, "="),
-                      "module integrity check failed",
-                      Some(actual_hash.into()),
-                  ))
-              }
+              Ok(std::fs::read(file)?)
           } else {
               Err(Error::expected("stdlibdir", Default::default()))
           }
       } else {
           Err(Error::expected("stdlibdir", Default::default()))
+      }
+  }
+
+  /// Reads the module from the data cache and verifies its hash matches
+  pub fn read_module(alias: Word, expected_hash: Bytes) -> Result<Bytes, Error> {
+      let contents = read_blob(&alias)?;
+      let actual_hash = crypto::hash_bytes(contents.clone())?;
+      if actual_hash == expected_hash {
+          Ok(contents)
+      } else {
+          Err(Error::create(
+              list!(expected_hash, "="),
+              format!("{} module integrity check failed", alias).as_str(),
+              Some(actual_hash.into()),
+          ))
       }
   }
 
@@ -3701,6 +3749,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("compare", Box::leak(Box::new(f_stack2(compare)))),
           ("count", Box::leak(Box::new(f_stack1(count)))),
           ("dec", Box::leak(Box::new(f_stack1(dec)))),
+          ("decache", Box::leak(Box::new(f_result(read_blob)))),
           ("decide", Box::leak(Box::new(decide))),
           ("define", Box::leak(Box::new(define))),
           ("decodejson", Box::leak(Box::new(f_stack1(decode_json)))),
@@ -5240,12 +5289,24 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   // deletions are respected (via shadowing the existing
                   // word with one that throws an error.)
                   let namespaces = namespaces.make_mut();
-                  namespaces.push_front(Bytes::from(dict::MODULE_NAMESPACE.clone()).into());
+                  namespaces.push_front(Bytes::from(dict::SHADOW_NAMESPACE.clone()).into());
               }
+
               let ns: Result<Vec<dict::Namespace>, Error> = namespaces
                   .inner()
                   .into_iter()
-                  .map(|ns| env.dictionary.resolve_ns(ns))
+                  .map(|ns| {
+                      env.dictionary.resolve_ns(ns.clone()).or_else(|e| {
+                          // try to load the missing module and try again
+                          let ns2 = ns.clone();
+                          match ns2 {
+                              Item::Word(w) => env
+                                  .load_cached_module(w, true)
+                                  .and_then(|_| env.dictionary.resolve_ns(ns)),
+                              _ => Err(e),
+                          }
+                      })
+                  })
                   .collect();
               match ns {
                   Ok(ns) => {
@@ -5354,6 +5415,14 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       env.push_expr("dictmerge".into());
       env.program.append(module_program);
       //println!("inscribe: {:?}", env);
+      Ok(())
+  }
+
+  pub fn read_blob(env: &mut Environment) -> Result<(), Error> {
+      let alias = Word::try_from(env.pop())?;
+      let blob = environment::read_blob(&alias)?;
+      env.push(blob.into());
+      env.pop_expr();
       Ok(())
   }
 
@@ -5802,7 +5871,11 @@ We'll also define how to run unit tests.
                   })
                   .collect::<Vec<Error>>()
           } else {
-              vec![Error::expected("word", Item::Word(w.clone()))]
+              vec![Error::create(
+                  list!("dictionary", list!(w.clone()), "lookup"),
+                  "word is not defined",
+                  None,
+              )]
           }
       }
 
@@ -5824,9 +5897,6 @@ We'll also define how to run unit tests.
       #[test_case("association")]
       #[test_case("association?" ; "is_association")]
       #[test_case("bail")]
-      #[test_case("bind")]
-      #[test_case("binddown")]
-      #[test_case("binddeep")]
       #[test_case("bits")]
       #[test_case("both?" ; "is_both")]
       #[test_case("branch")]
@@ -7139,14 +7209,14 @@ Implement the =handoff= type
   /// store them all as String, and encode a prefix to note which type
   /// it should be when decoded.
   fn decode_string(s: String) -> axiom::ItemResult {
-      if s.starts_with("w|") {
-          Ok(Item::Word(s[2..].into()))
-      } else if s.starts_with("s|") {
+      if let Some(w) = s.strip_prefix("w|") {
+          Ok(Item::Word(w.into()))
+      } else if let Some(s) = s.strip_prefix("s|") {
           Ok(Item::Dispenser(coll::Dispenser::Sized(
-              coll::Sized::String(s[2..].to_string()),
+              coll::Sized::String(s.to_string()),
           )))
-      } else if s.starts_with("c|") {
-          let char_seq = &s[2..];
+      } else if let Some(c) = s.strip_prefix("c|") {
+          let char_seq = c;
           if char_seq.chars().count() == 1 {
               Ok(Item::Char(char_seq.chars().next().unwrap()))
           } else {
@@ -7178,7 +7248,7 @@ Implement the =handoff= type
           match self {
               Item::Int(i) => i.to_sql(),
               Item::Float(f) => f.to_sql(),
-              Item::Char(c) => Ok(EncodeAs::Char(c.clone()).encode()),
+              Item::Char(c) => Ok(EncodeAs::Char(*c).encode()),
               Item::Word(w) => Ok(EncodeAs::Word(w.clone()).encode()),
               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(s))) => {
                   Ok(EncodeAs::String(s.clone()).encode())
@@ -10175,12 +10245,214 @@ Some areas of functionality that already exist:
 + Encoding
 + Associations
 + Collections
+
+There seem to be 3 types of modules:
++ Stuff that's part of the core functionality (can't do basic language
+  stuff without it, should be part of the binary). Could be up to and
+  including what's needed to call inscribe/using, which allows callers
+  to load their own modules.
++ Not core but can still be in the default namespace because it likely
+  doesn't collide with other stuff (io, nested env etc)
++ Stuff that's not used often enough to be in default namespace, or is
+  easy enough to refer in when needed (crypto, debugger) 
 ***** INPROGRESS Figure out where to put modules on disk
 - State "INPROGRESS" from "TODO"       [2024-03-04 Mon 20:22]
 This will make the build and packaging more complex as it will have to
 include other files besides the binary and deal with platform-specific
 issues. The standard env could, however, still load a bunch of libs,
 but maybe this could be overridden with cmdline args.
+
+#+begin_src kcats
+[[program [[foo] clone unwrap decache inscribe]]] environment [eval-step clone] collect
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+Warning, failed to insert into dictionary: Dispenser(Sized(List([Int(5), Word(Word { data: 0x55782137afc0 : "+", namespace: None })])))
+Warning: empty local module
+[[[program [clone unwrap decache inscribe]]
+  [stack [[foo]]]]
+ [[program [unwrap decache inscribe]]
+  [stack [[foo] [foo]]]]
+ [[program [decache inscribe]]
+  [stack [foo [foo]]]]
+ [[program [inscribe]]
+  [stack [#b64 "W1tiYXJdIFs1ICtdIGFzc2lnbl0=" [foo]]]]
+ [[program [[[bar] [5 +]
+             assign]
+            shielddown dictmerge]]
+  [stack [dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40="
+          foo]]]
+ [[program [shielddown dictmerge]]
+  [stack [[[bar] [5 +]
+           assign]
+          dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40=" foo]]]
+ [[program [shield dropdown dictmerge]]
+  [stack [[[bar] [5 +]
+           assign]
+          dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40=" foo]]]
+ [[program [[snapshot] dip inject first dropdown dictmerge]]
+  [stack [[[bar] [5 +]
+           assign]
+          dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40=" foo]]]
+ [[program [dip inject first dropdown dictmerge]]
+  [stack [[snapshot] [[bar] [5 +]
+                      assign]
+          dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40=" foo]]]
+ [[program [snapshot [[[bar] [5 +]
+                       assign]] unwrap inject first dropdown dictmerge]]
+  [stack [dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40="
+          foo]]]
+ [[program [[] evert clone evert unwrap [[[bar] [5 +]
+                                          assign]] unwrap inject first dropdown dictmerge]]
+  [stack [dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40="
+          foo]]]
+ [[program [evert clone evert unwrap [[[bar] [5 +]
+                                       assign]] unwrap inject first dropdown dictmerge]]
+  [stack [[] dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40="
+          foo]]]
+ [[program [clone evert unwrap [[[bar] [5 +]
+                                 assign]] unwrap inject first dropdown dictmerge]]
+  [stack [[dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40="
+           foo]]]]
+ [[program [evert unwrap [[[bar] [5 +]
+                           assign]] unwrap inject first dropdown dictmerge]]
+  [stack [[dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40="
+           foo]
+          [dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40=" foo]]]]
+ [[program [unwrap [[[bar] [5 +]
+                     assign]] unwrap inject first dropdown dictmerge]]
+  [stack [[[dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40="
+            foo]] dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40=" foo]]]
+ [[program [[[[bar] [5 +]
+              assign]] unwrap inject first dropdown dictmerge]]
+  [stack [[dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40="
+           foo]
+          dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40=" foo]]]
+ [[program [unwrap inject first dropdown dictmerge]]
+  [stack [[[[bar] [5 +]
+            assign]] [dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40="
+                      foo]
+          dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40=" foo]]]
+ [[program [inject first dropdown dictmerge]]
+  [stack [[[bar] [5 +]
+           assign]
+          [dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40=" foo] dictionary_redacted
+          #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40=" foo]]]
+ [[program [swap evert take dip evert first dropdown dictmerge]]
+  [stack [[[bar] [5 +]
+           assign]
+          [dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40=" foo] dictionary_redacted
+          #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40=" foo]]]
+ [[program [evert take dip evert first dropdown dictmerge]]
+  [stack [[dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40="
+           foo]
+          [[bar] [5 +]
+           assign]
+          dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40=" foo]]]
+ 
+ [[program [take dip evert first dropdown dictmerge]]
+  [stack [[[[bar] [5 +]
+            assign]
+           dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40=" foo]
+          dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40=" foo]]]
+ [[program [dip evert first dropdown dictmerge]]
+  [stack [[[bar] [5 +]
+           assign]
+          [dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40=" foo] dictionary_redacted
+          #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40=" foo]]]
+ [[program [[bar] [5 +]
+            assign [[dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40="
+                     foo]] unwrap evert first dropdown dictmerge]]
+  [stack [dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40="
+          foo]]]
+ [[program [[5 +]
+            assign [[dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40="
+                     foo]] unwrap evert first dropdown dictmerge]]
+  [stack [[bar] dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40="
+          foo]]]
+ [[program [assign [[dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40="
+                     foo]] unwrap evert first dropdown dictmerge]]
+  [stack [[5 +]
+          [bar] dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40=" foo]]]
+ [[program [[[dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40="
+              foo]] unwrap evert first dropdown dictmerge]]
+  [stack [dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40="
+          foo]]]
+ [[program [unwrap evert first dropdown dictmerge]]
+  [stack [[[dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40="
+            foo]] dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40=" foo]]]
+ [[program [evert first dropdown dictmerge]]
+  [stack [[dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40="
+           foo]
+          dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40=" foo]]]
+ [[program [first dropdown dictmerge]]
+  [stack [[dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40="
+           foo]
+          dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40=" foo]]]
+ [[program [dropdown dictmerge]]
+  [stack [dictionary_redacted dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40="
+          foo]]]
+ [[program [swap drop dictmerge]]
+  [stack [dictionary_redacted dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40="
+          foo]]]
+ [[program [drop dictmerge]]
+  [stack [dictionary_redacted dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40="
+          foo]]]
+ [[program [dictmerge]]
+  [stack [dictionary_redacted #b64 "mz5w5sBIFt1413HhyrFOWKaa8MhJFlgZE/PeBAiaz40="
+          foo]]]
+ [[program []]
+  [stack [foo]]]]
+[eval-step clone]
+[]
+#+end_src
+
+#+begin_src kcats
+  [crypto-builtins] clone unwrap decache
+  string read
+  [[1] [wrap] update] map ;; wrap the definition so update leaves the literal value
+  updates inscribe
+  wrap ;; the module alias
+  ["foobar" encode hashbytes] using
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+#b64 "Zm9vYmFy"
+#+end_src
+
+#+begin_src kcats
+  [foo] unwrap [[baryyyy] [5 +] assign] inscribe wrap [6 baryyyy] using
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+Warning, failed to insert into dictionary: Dispenser(Sized(List([Int(5), Word(Word { data: 0x55a8be888030 : "+", namespace: None })])))
+Warning: empty local module
+[[asked [baryyyy]]
+ [handled yes]
+ [reason "word is not defined"]
+ [type error]
+ [unwound [baryyyy]]]
+6
+#+end_src
+
+#+begin_src kcats
+[foo]  [bar] resolve
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[actual foo]
+ [asked [resolve]]
+ [handled yes]
+ [reason "module not found"]
+ [type error]
+ [unwound [resolve]]]
+#+end_src
+***** INPROGRESS Move core libs back to using include_bytes
+- State "INPROGRESS" from "TODO"       [2024-03-14 Thu 17:11]
 ***** INPROGRESS Figure out what to do about builtins
 - State "INPROGRESS" from "TODO"       [2024-03-04 Mon 20:22]
 ***** INPROGRESS Group functions

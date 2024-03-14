@@ -53,6 +53,7 @@ fn vec_to_byte_literal(vec: Vec<u8>) -> String {
 fn main() -> Result<(), Box<dyn Error>> {
     //panic!("oh noes");
     println!("Starting build.rs!");
+
     if let Some(proj_dirs) = ProjectDirs::from("org", "skyrod", "kcats") {
         let data_dir = proj_dirs.data_dir();
         fs::create_dir_all(data_dir).expect("Failed to create data directory");
@@ -69,7 +70,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             // Write a source file hardcoding the hashes of the stdlib files
             let out_dir = Path::new("src");
             let dest_path = Path::new(&out_dir).join("module_map.rs");
-            let mut f = File::create(&dest_path)?;
+            let mut f = File::create(dest_path)?;
 
             writeln!(f, "use std::collections::HashMap;\n")?;
             writeln!(
@@ -77,17 +78,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                 "pub fn module_hashes() -> HashMap<&'static str, Vec<u8>> {{"
             )?;
             writeln!(f, "    let mut map = HashMap::new();")?;
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    let path = entry.path();
-                    if path.is_file() {
-                        if let Some(filename) = path.file_name() {
-                            let dest_path = std_path.join(filename);
-                            fs::copy(&path, &dest_path)
-                                .expect(&format!("Failed to copy file {:?}", filename));
-                        }
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    if let Some(filename) = path.file_name() {
+                        let dest_path = std_path.join(filename);
+                        fs::copy(&path, &dest_path)
+                            .expect(&format!("Failed to copy file {:?}", filename));
                     }
-
                     let module_name = <PathBuf as AsRef<Path>>::as_ref(&path)
                         .file_stem()
                         .unwrap()
