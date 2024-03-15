@@ -758,10 +758,14 @@ internally, to keep track of things like the stack, program, lists etc.
 
   impl List {
       pub fn append(&mut self, mut items: List) {
-          let m = self.make_mut();
-          let ct = m.len();
-          m.append(items.make_mut());
-          m.rotate_left(ct);
+          // Ensure both VecDeques are uniquely owned to avoid cloning during modifications
+          let self_mut = self.make_mut();
+          let items_mut = items.make_mut();
+
+          // Prepend the elements of `items` to `self`
+          while let Some(item) = items_mut.pop_back() {
+              self_mut.push_front(item);
+          }
       }
 
       pub fn extend<T: IntoIterator<Item = Item>>(&mut self, items: T) {
@@ -1594,7 +1598,7 @@ internally, to keep track of things like the stack, program, lists etc.
                           let l = coll::List::try_from(v);
                           match l {
                               Ok(l) => {
-                                  de.spec = Some(l);
+                                  de.spec = l.try_into().ok();
                                   (Associative::DictEntry(de), None) // TODO: return the old spec
                               }
                               Err(_) => (Associative::DictEntry(de), None),
@@ -2179,8 +2183,96 @@ internally, to keep track of things like the stack, program, lists etc.
   #[derive(Debug, Clone)]
   pub struct Entry {
       pub examples: Option<coll::List>,
-      pub spec: Option<coll::List>,
+      pub spec: Option<Spec>,
       pub definition: Definition,
+  }
+
+  #[derive(Debug, Clone, PartialEq)]
+  pub struct SpecElement {
+      pub elemtype: Word,
+      pub name: Option<Word>,
+  }
+
+  pub type StackSpec = Vec<SpecElement>;
+  pub type Spec = (StackSpec, StackSpec);
+
+  impl TryFrom<Item> for SpecElement {
+      type Error = Error;
+      fn try_from(i: Item) -> Result<SpecElement, Error> {
+          match i {
+              Item::Word(w) => Ok(SpecElement {
+                  elemtype: w,
+                  name: None,
+              }),
+              i => {
+                  let s = coll::List::try_from(i)?;
+                  if s.len() != 2 {
+                      Err(Error::list_count(2))
+                  } else {
+                      let t = Word::try_from(s.get(0).unwrap().clone())?;
+                      let n = Word::try_from(s.get(1).unwrap().clone())?;
+                      Ok(SpecElement {
+                          elemtype: t,
+                          name: Some(n),
+                      })
+                  }
+              }
+          }
+      }
+  }
+
+  impl TryFrom<coll::List> for StackSpec {
+      type Error = Error;
+      fn try_from(s: coll::List) -> Result<StackSpec, Error> {
+          s.inner()
+              .into_iter()
+              .map(SpecElement::try_from)
+              //.map(|r| r.and_then(SpecElement::try_from))
+              .collect::<Result<StackSpec, Error>>()
+      }
+  }
+
+  impl TryFrom<coll::List> for Spec {
+      type Error = Error;
+      fn try_from(s: coll::List) -> Result<Spec, Error> {
+          if s.len() != 2 {
+              Err(Error::list_count(2))
+          } else {
+              Ok((
+                  StackSpec::try_from(coll::List::try_from(s.get(0).unwrap().clone())?)?,
+                  StackSpec::try_from(coll::List::try_from(s.get(1).unwrap().clone())?)?,
+              ))
+          }
+      }
+  }
+
+  impl TryFrom<Item> for Spec {
+      type Error = Error;
+      fn try_from(i: Item) -> Result<Spec, Error> {
+          Spec::try_from(coll::List::try_from(i)?)
+      }
+  }
+
+  impl From<StackSpec> for Item {
+      fn from(ss: StackSpec) -> Item {
+          coll::List::from_iter(ss.into_iter().map(Item::from)).into()
+      }
+  }
+
+  impl From<SpecElement> for Item {
+      fn from(se: SpecElement) -> Item {
+          if se.name.is_some() {
+              list!(se.elemtype, se.name).into()
+          } else {
+              Item::Word(se.elemtype).into()
+          }
+      }
+  }
+
+  impl From<Spec> for Item {
+      fn from(s: Spec) -> Item {
+          Item::from(list!(s.0, s.1))
+      }
   }
 
   impl Entry {
@@ -2492,7 +2584,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn try_from(iter: Box<dyn Iterator<Item = Item>>) -> Result<Self, Error> {
           let mut examples: Option<coll::List> = None;
           let mut definition: Option<Definition> = None;
-          let mut spec: Option<coll::List> = None;
+          let mut spec: Option<Spec> = None;
           for i in iter {
               let (k, v): (assoc::KeyItem, Item) = i.try_into()?;
               //println!("k: {:?}, v: {:?}", k, v);
@@ -2501,7 +2593,7 @@ internally, to keep track of things like the stack, program, lists etc.
               } else if k == "definition".into() {
                   definition = Some(v.try_into()?);
               } else if k == "spec".into() {
-                  spec = Some(v.try_into()?);
+                  spec = v.try_into().ok();
               } else {
                   continue;
               }
@@ -2685,6 +2777,7 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::types::{associative as assoc, collection as coll, dictionary as dict};
   use directories::ProjectDirs;
   use std::future;
+  use std::ops::Range;
 
   #[derive(Clone, PartialEq)]
   pub struct Environment {
@@ -2890,7 +2983,7 @@ internally, to keep track of things like the stack, program, lists etc.
               include_bytes!("../kcats/core/encode-builtins.kcats"),
               include_bytes!("../kcats/core/strings-builtins.kcats"),
               include_bytes!("../kcats/core/errors-builtins.kcats"),
-              include_bytes!("../kcats/core/pipe-builtins.kcats"),
+              include_bytes!("../kcats/core/pipes-builtins.kcats"),
               include_bytes!("../kcats/core/stack.kcats"),
               include_bytes!("../kcats/core/motion.kcats"),
               include_bytes!("../kcats/core/collections-builtins.kcats"),
@@ -2921,6 +3014,102 @@ internally, to keep track of things like the stack, program, lists etc.
           }
           axiom::add_builtins(&mut self.dictionary);
           Ok(())
+      }
+
+      fn check_stack_depth(&self, min_depth: usize) -> Result<(), Error> {
+          //println!("Checking stack has at least {} items", min_depth);
+          if self.stack.len() < min_depth {
+              Err(Error::stack_underflow())
+          } else {
+              Ok(())
+          }
+      }
+
+      pub fn check_input_spec(&self, specs: &dict::StackSpec) -> Result<(), Error> {
+          self.check_stack_depth(specs.len())?;
+          let indexes = Range {
+              start: 0,
+              end: specs.len(),
+          };
+
+          indexes.into_iter().try_for_each(|i| {
+              let item = self.stack.get(i).unwrap();
+              let spec = specs.get(i).unwrap();
+              check_type(item, &spec.elemtype)
+          })
+      }
+  }
+
+  fn check_type(i: &Item, w: &Word) -> Result<(), Error> {
+      match (w, i) {
+          (w, _) if *w == *S_ITEM => Ok(()),
+          (w, Item::Dispenser(_) | Item::Receptacle(_)) if *w == *S_DISPENSER => Ok(()),
+          (w, Item::Receptacle(_) | Item::Dispenser(_)) if *w == *S_RECEPTACLE => Ok(()),
+          (w, Item::Int(_)) if *w == *S_INTEGER || *w == *S_NUMBER => Ok(()),
+          (w, Item::Float(_)) if *w == *S_FLOAT || *w == *S_NUMBER => Ok(()),
+          // TODO: also handle cases where bytes/string is a list
+          (
+              w,
+              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(_)))
+              | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(_))),
+          ) if *w == *S_BYTES || *w == *S_ORDERED => Ok(()),
+
+          (
+              w,
+              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(_)))
+              | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::String(_))),
+          ) if *w == *S_STRING => Ok(()),
+          (w, Item::Word(_)) if *w == *S_WORD => Ok(()),
+
+          (
+              w,
+              Item::Dispenser(coll::Dispenser::Out(_))
+              | Item::Dispenser(coll::Dispenser::Tunnel(_))
+              | Item::Receptacle(coll::Receptacle::Tunnel(_))
+              | Item::Receptacle(coll::Receptacle::In(_)),
+          ) if *w == *S_PIPE => Ok(()),
+
+          (
+              w,
+              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(_)))
+              | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::List(_))),
+          ) if *w == *S_LIST || *w == *S_PROGRAM => Ok(()),
+
+          (
+              w,
+              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(_)))
+              | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(_))),
+          ) if *w == *S_ASSOC => Ok(()),
+
+          (
+              w,
+              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
+                  assoc::Associative::Error(_),
+              )))
+              | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(
+                  assoc::Associative::Error(_),
+              ))),
+          ) if *w == *S_ERROR => Ok(()),
+
+          (
+              w,
+              Item::Dispenser(coll::Dispenser::Sized(_))
+              | Item::Receptacle(coll::Receptacle::Sized(_)),
+          ) if *w == *S_SIZED || *w == *S_ORDERED => Ok(()),
+
+          (
+              w,
+              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
+                  assoc::Associative::Env(_),
+              )))
+              | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(
+                  assoc::Associative::Env(_),
+              ))),
+          ) if *w == *S_ENVIRONMENT => Ok(()),
+          (w, i) => {
+              //println!("Type check failed! wanted {} got {:?}", w, i);
+              Err(Error::expected(w.into(), i.clone()))
+          }
       }
   }
 
@@ -3588,7 +3777,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   use std::collections::VecDeque;
   use std::default::Default;
   use std::mem;
-  use std::ops::Range;
 
   pub type ItemResult = Result<Item, Error>;
 
@@ -4386,7 +4574,11 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn is_truthy(i: Item) -> bool {
-      coll::Sized::try_from(i).map_or(true, |s| !s.is_empty())
+      match i {
+          Item::Dispenser(coll::Dispenser::Sized(d)) => !d.is_empty(),
+          Item::Receptacle(coll::Receptacle::Sized(r)) => !r.is_empty(),
+          _ => true,
+      }
   }
 
   // fn boolean_value(b: bool) -> Item {
@@ -4857,119 +5049,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       )))
   }
 
-  fn check_type(i: &Item, w: &Word) -> Result<(), Error> {
-      match (w, i) {
-          (w, _) if *w == *S_ITEM => Ok(()),
-          (w, Item::Dispenser(_) | Item::Receptacle(_)) if *w == *S_DISPENSER => Ok(()),
-          (w, Item::Receptacle(_) | Item::Dispenser(_)) if *w == *S_RECEPTACLE => Ok(()),
-          (w, Item::Int(_)) if *w == *S_INTEGER || *w == *S_NUMBER => Ok(()),
-          (w, Item::Float(_)) if *w == *S_FLOAT || *w == *S_NUMBER => Ok(()),
-          // TODO: also handle cases where bytes/string is a list
-          (
-              w,
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(_)))
-              | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(_))),
-          ) if *w == *S_BYTES || *w == *S_ORDERED => Ok(()),
-
-          (
-              w,
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(_)))
-              | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::String(_))),
-          ) if *w == *S_STRING => Ok(()),
-          (w, Item::Word(_)) if *w == *S_WORD => Ok(()),
-
-          (
-              w,
-              Item::Dispenser(coll::Dispenser::Out(_))
-              | Item::Dispenser(coll::Dispenser::Tunnel(_))
-              | Item::Receptacle(coll::Receptacle::Tunnel(_))
-              | Item::Receptacle(coll::Receptacle::In(_)),
-          ) if *w == *S_PIPE => Ok(()),
-
-          (
-              w,
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(_)))
-              | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::List(_))),
-          ) if *w == *S_LIST || *w == *S_PROGRAM => Ok(()),
-
-          (
-              w,
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(_)))
-              | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(_))),
-          ) if *w == *S_ASSOC => Ok(()),
-
-          (
-              w,
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
-                  assoc::Associative::Error(_),
-              )))
-              | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(
-                  assoc::Associative::Error(_),
-              ))),
-          ) if *w == *S_ERROR => Ok(()),
-
-          (
-              w,
-              Item::Dispenser(coll::Dispenser::Sized(_))
-              | Item::Receptacle(coll::Receptacle::Sized(_)),
-          ) if *w == *S_SIZED || *w == *S_ORDERED => Ok(()),
-
-          (
-              w,
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
-                  assoc::Associative::Env(_),
-              )))
-              | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(
-                  assoc::Associative::Env(_),
-              ))),
-          ) if *w == *S_ENVIRONMENT => Ok(()),
-          (w, i) => {
-              //println!("Type check failed! wanted {} got {:?}", w, i);
-              Err(Error::expected(w.into(), i.clone()))
-          }
-      }
-  }
-
-  fn check_stack_depth(env: &Environment, min_depth: usize) -> Result<(), Error> {
-      //println!("Checking stack has at least {} items", min_depth);
-      if env.stack.len() < min_depth {
-          Err(Error::stack_underflow())
-      } else {
-          Ok(())
-      }
-  }
-
-  fn check_input_spec(spec: &coll::List, env: &Environment) -> Result<(), Error> {
-      let specs: coll::List = spec
-          .front()
-          .ok_or_else(|| Error::expected("specs", Default::default()))
-          .and_then(|i| i.clone().try_into())?;
-
-      check_stack_depth(env, specs.len())?;
-      let indexes = Range {
-          start: 0,
-          end: specs.len(),
-      };
-
-      indexes.into_iter().try_for_each(|i| {
-          let item = env.stack.get(i).unwrap();
-          let spec = specs.get(i).unwrap();
-
-          match spec {
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(named))) => {
-                  match named.get(0).unwrap() {
-                      Item::Word(w) => check_type(item, w),
-                      i => Err(Error::expected("list", i.clone())),
-                  }
-              }
-              Item::Word(w) => check_type(item, w),
-              // the type might happen to also be a defined
-              // word, like 'association'
-              i => Err(Error::expected("list", i.clone())),
-          }
-      })
-  }
-
   pub fn eval_step(mut env: Environment) -> Future<Environment> {
       //println!("{:?}", env);
       let next_item = env.program.front();
@@ -4980,7 +5059,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   if let Some(dfn) = env.dictionary.get(word) {
                       {
                           if let Some(spec) = &dfn.spec {
-                              if let Err(e) = check_input_spec(spec, &env) {
+                              if let Err(e) = env.check_input_spec(&spec.0) {
                                   env.push(e.into());
                                   return env.into();
                               }
@@ -10254,7 +10333,11 @@ There seem to be 3 types of modules:
 + Not core but can still be in the default namespace because it likely
   doesn't collide with other stuff (io, nested env etc)
 + Stuff that's not used often enough to be in default namespace, or is
-  easy enough to refer in when needed (crypto, debugger) 
+  easy enough to refer in when needed (crypto, debugger)
+
+The 2nd type, we can now use "inscribe" and make them normal modules,
+but then they won't be in the default namespace. We can at least leave
+them out of the binary. 
 ***** INPROGRESS Figure out where to put modules on disk
 - State "INPROGRESS" from "TODO"       [2024-03-04 Mon 20:22]
 This will make the build and packaging more complex as it will have to
