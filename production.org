@@ -149,6 +149,7 @@ the location where you installed the kcats binary.
 We'll start by defining the basic data structures that kcats will use
 internally, to keep track of things like the stack, program, lists etc.
 #+begin_src rust :tangle src/types.rs :mkdirp yes
+  use crate::list;
   use crate::types::collection as coll;
   use crate::types::dictionary as dict;
   use crate::types::environment as env;
@@ -170,11 +171,12 @@ internally, to keep track of things like the stack, program, lists etc.
   pub mod environment;
   pub mod error;
 
-  // A generic newtype to contain various kinds
+  /// A generic newtype to contain various types, so that we can
+  /// implement traits on them.
   #[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
   pub struct Newtype<T>(pub T);
 
-  // Access the inner value easily
+  /// Access the inner value easily
   impl<T> Deref for Newtype<T> {
       type Target = T;
 
@@ -205,8 +207,8 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  // Implement Debug trait for Newtype, so it hides
-  // itself and only prints the inner type.
+  /// Implement Debug trait for Newtype, so it hides
+  /// itself and only prints the inner type.
   impl<T: fmt::Debug> fmt::Debug for Newtype<T> {
       fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
           // Directly print the wrapped value
@@ -214,6 +216,9 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  /// A Word causes a kcats program to do something, usually taking some
+  /// items from the top of the stack, and using them to create new
+  /// stack items. (examples: `swap`, `+`, `dip`).
   #[derive(Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord, Default)]
   pub struct Word {
       pub data: Intern<String>,
@@ -221,6 +226,7 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl Word {
+      /// Modifies the Word by adding the given [dict::Namespace].
       pub fn namespaced(&mut self, v: dict::Namespace) {
           self.namespace = Some(v)
       }
@@ -259,14 +265,21 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  /// Represents a stack (the part of an
+  /// [crate::types::environment::Environment] that holds the data
+  /// values being manipulated by the program).
   pub type Stack = collection::List;
 
+  /// A byte array type
   pub type Bytes = Vec<u8>;
 
+  /// An integer type
   pub type Int = i64;
 
+  /// A floating point type
   pub type Float = f64;
 
+  /// A character type
   pub type Char = char;
 
   lazy_static! {
@@ -291,6 +304,9 @@ internally, to keep track of things like the stack, program, lists etc.
       pub static ref S_WORD: Word = Word::from("word");
   }
 
+  /// A kcats data value. Values can be numbers, words, characters, and
+  /// containers of various kinds (which include lists, maps, sets,
+  /// strings, etc). Items can contain other items.
   #[derive(Debug, Clone)]
   pub enum Item {
       Int(Int),
@@ -302,6 +318,7 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl Item {
+      /// Returns whether the item is empty - only containers can be empty.
       pub fn is_empty(&self) -> bool {
           match self {
               Item::Dispenser(coll::Dispenser::Sized(s)) => s.is_empty(),
@@ -311,7 +328,12 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  /// A Future value, used for async execution, which is how
+  /// multithreading is implemented in kcats.
   pub type Future<T> = Pin<Box<dyn std::future::Future<Output = T> + Send>>;
+
+  /// A type for a function that advances the execution of a kcats
+  /// program by one step.
   pub type StepFn = dyn Fn(env::Environment) -> Future<env::Environment> + Sync + Send;
 
   impl PartialEq for Item {
@@ -322,7 +344,7 @@ internally, to keep track of things like the stack, program, lists etc.
               (Item::Float(a), Item::Float(b)) => a == b,
               (Item::Float(a), Item::Int(b)) => *a == *b as Float,
               (Item::Int(a), Item::Float(b)) => *a as Float == *b,
-              // Don't use the dictversion when comparing words
+              // Don't use the namespace when comparing words
               (Item::Word(a), Item::Word(b)) => a.data == b.data,
               (
                   Item::Dispenser(coll::Dispenser::Sized(a)),
@@ -339,15 +361,11 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  // The default Item is empty list.
+  /// The default Item is empty list.
   impl Default for Item {
       fn default() -> Self {
           coll::Dispenser::default().into()
       }
-  }
-
-  pub fn wrap(i: Item) -> coll::List {
-      coll::List::from_iter([i])
   }
 
   impl TryFrom<Item> for Int {
@@ -382,7 +400,7 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   /// Converts Item to Word but also considers a quoted word as a word,
-  /// eg [foo] -> foo.
+  /// eg \[foo\] -> foo.
   impl TryFrom<Item> for Word {
       type Error = Error;
       fn try_from(i: Item) -> Result<Self, Self::Error> {
@@ -418,26 +436,10 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  // impl TryFrom<Item> for Association {
-  //     type Error = Error;
-  //     fn try_from(i: Item) -> Result<Self, Self::Error> {
-  //         match i {
-  //             Item::Assoc(a) => Ok(a),
-  //             Item::List(l) => Ok(to_hash(l)?),
-  //             Item::Nothing => Ok(Arc::new(AssociationContent::new())),
-  //             Item::DerivedDef(d) => Ok(Association::from(d)),
-  //             Item::AxiomDef(a) => Ok(Association::from(a)),
-  //             Item::Env(e) => Ok(Association::from(e)),
-  //             Item::Error(e) => Ok(Association::from(e)),
-  //             _ => Err(Error::expected("association")),
-  //         }
-  //     }
-  // }
-
-  // As there are no real booleans, we use the word 'yes' but literally
-  // any value except empty containers is truthy. If we read a value
-  // 'false' in edn, that's not actually a boolean, it's just the
-  // symbol/word false.
+  /// As there are no real booleans, we use the word 'yes' but literally
+  /// any value except empty containers is truthy. If we read a value
+  /// 'false', that's not actually a boolean, it's just the [Word]
+  /// false.
   impl From<bool> for Item {
       fn from(b: bool) -> Item {
           if b {
@@ -448,19 +450,9 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  // impl From<Environment> for Association {
-  //     fn from(env: Environment) -> Association {
-  //         let mut a = AssociationContent::new();
-  //         a.insert(word_key("stack"), Item::List(env.stack.clone()));
-  //         a.insert(word_key("program"), Item::List(env.program.clone()));
-  //         a.insert(word_key("dictionary"), Item::Assoc(env.dictionary.clone()));
-  //         Arc::new(a)
-  //     }
-  // }
-
   impl From<std::io::Error> for Error {
       fn from(err: std::io::Error) -> Error {
-          Error::create(wrap("io".into()), &err.to_string(), None)
+          Error::create(list!("io"), &err.to_string(), None)
       }
   }
 
@@ -519,41 +511,16 @@ internally, to keep track of things like the stack, program, lists etc.
               let v: Vec<Item> = vec![
                   $( $x.into(), )*
               ];
-              coll::List::from_iter(v.into_iter())
+              crate::types::collection::List::from_iter(v.into_iter())
           }
       };
   }
-
-  // #[macro_export]
-  // macro_rules! list {
-  //     // Base case: empty list
-  //     () => {
-  //         {
-  //             let temp_list = coll::List::new();
-  //             temp_list
-  //         }
-  //     };
-
-  //     // Recursive case: at least one item followed by comma and possibly more items
-  //     ($head:expr $(, $tail:expr)*) => {
-  //         {
-  //             let mut list = coll::ListContent::default();
-  //             let head_item: Item = $head.into();
-  //             list.push_front(head_item);
-  //             $(
-  //                 let tail_item: Item = $tail.into();
-  //                 list.push_front(tail_item);
-  //             )*
-  //                 coll::List::from_iter(list.into_iter().rev())
-  //         }
-  //     };
-  // }
 
   mod serde {
       use super::Item;
       use crate::types::associative as assoc;
       use crate::types::collection as coll;
-      use crate::types::{wrap, Error};
+      use crate::types::Error;
       use serde::de::{self, Deserialize, Deserializer, Visitor};
       use serde::ser::{Serialize, Serializer};
       use std::collections::HashMap;
@@ -657,7 +624,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
       impl From<serde_json::Error> for Error {
           fn from(err: serde_json::Error) -> Error {
-              Error::create(wrap("serialize".into()), &err.to_string(), None)
+              Error::create(list!("serialize"), &err.to_string(), None)
           }
       }
 
@@ -689,32 +656,39 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::types::*;
   use std::{collections::HashSet, future, sync};
 
+  /// A generic Arc type that we control
   pub type Arc<T> = Newtype<sync::Arc<T>>;
+
+  /// A generic List type
   pub type Listy<I> = Newtype<VecDeque<I>>;
+
+  /// A generic Set type
   pub type Setty<I> = Newtype<HashSet<I>>;
-  // impl<T: PartialEq> PartialEq for Newtype<Arc<T>> {
-  //     fn eq(&self, other: &Self) -> bool {
-  //         **self.0 == **other.0
-  //     }
-  // }
+
+  /// A specific List type
+  pub type ListContent = Listy<Item>;
+
+  pub type List = Arc<ListContent>;
+  pub type Set = Arc<Setty<assoc::KeyItem>>;
 
   impl<T: Clone> Arc<T> {
+      /// Returns a mutable reference to the value inside this Arc, just
+      /// passes through to [sync::Arc].
       pub fn make_mut(&mut self) -> &mut T {
           sync::Arc::make_mut(&mut self.0)
       }
 
+      /// Returns the inner value - cloning if this Arc is not the only
+      /// pointer to the inner value.
       pub fn inner(&self) -> T {
           sync::Arc::try_unwrap(self.0.clone()).unwrap_or_else(|rc| (*rc).clone())
       }
 
+      /// Wraps the given value in an Arc.
       pub fn wrap(inner: T) -> Self {
           Self(sync::Arc::new(inner))
       }
   }
-
-  pub type ListContent = Listy<Item>;
-  pub type List = Arc<ListContent>;
-  pub type Set = Arc<Setty<assoc::KeyItem>>;
 
   impl From<HashSet<assoc::KeyItem>> for Set {
       fn from(h: HashSet<assoc::KeyItem>) -> Set {
@@ -757,6 +731,9 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl List {
+      /// Appends the items to the beginning of this list, preserving
+      /// their order. eg `[1, 2, 3].append([4, 5, 6])` -> `[4, 5, 6, 1,
+      /// 2, 3]`.
       pub fn append(&mut self, mut items: List) {
           // Ensure both VecDeques are uniquely owned to avoid cloning during modifications
           let self_mut = self.make_mut();
@@ -768,6 +745,8 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
+      /// Appends the items in the iterator to the beginning of this
+      /// list, preserving order.
       pub fn extend<T: IntoIterator<Item = Item>>(&mut self, items: T) {
           let m = self.make_mut();
           let ct = m.len();
@@ -775,14 +754,16 @@ internally, to keep track of things like the stack, program, lists etc.
           m.rotate_left(ct);
       }
 
+      /// Reverses the order of the list.
       pub fn reverse(&mut self) {
           let m = self.make_mut();
           m.make_contiguous().reverse();
       }
   }
 
-  // Most generic collection type, all we know is it can contain
-  // multiple items.
+  /// A generic container type, all we know is it can contain multiple
+  /// items. Includes things like lists, sets, and IO channels. Items
+  /// can be taken out.
   #[derive(Debug, Clone, PartialEq)]
   pub enum Dispenser {
       Sized(Sized),
@@ -790,6 +771,9 @@ internally, to keep track of things like the stack, program, lists etc.
       Tunnel(pipe::Tunnel),
   }
 
+  /// A generic container type, all we know is it can contain multiple
+  /// items. Includes things like lists, sets, and IO channels. Items
+  /// can be put in.
   #[derive(Debug, Clone, PartialEq)]
   pub enum Receptacle {
       Sized(Sized),
@@ -797,8 +781,8 @@ internally, to keep track of things like the stack, program, lists etc.
       Tunnel(pipe::Tunnel),
   }
 
-  // Collection that has a definite size that we can access. Implies
-  // that it can also be appended to.
+  /// Collections that have a definite size that we can access. Implies
+  /// that it can also be appended to.
   #[derive(Debug, Clone)]
   pub enum Sized {
       Associative(assoc::Associative),
@@ -825,6 +809,9 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl Dispenser {
+      /// Takes an item out of the [Dispenser], and returns a future
+      /// that gives a new [Dispenser], and the [Item] that was removed
+      /// (if there was one).
       pub fn take(self) -> Future<(Dispenser, Option<Item>)> {
           match self {
               Dispenser::Sized(s) => {
@@ -863,10 +850,12 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl Sized {
+      /// Returns whether the collection is empty
       pub fn is_empty(&self) -> bool {
           self.len() == 0
       }
 
+      /// Returns the number of items in the collection.
       pub fn len(&self) -> usize {
           match self {
               Sized::Associative(a) => a.len(),
@@ -877,6 +866,9 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
+      /// Takes an item out of the collection, returning the item and
+      /// the rest of the collection separately. Items are taken from
+      /// the front (beginning) of the collection.
       pub fn take(self) -> (Self, Option<Item>) {
           match self {
               Sized::Associative(a) => {
@@ -915,6 +907,7 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
+      /// Takes an item from the back (end) of the collection.
       pub fn pop(self) -> (Self, Option<Item>) {
           match self {
               Sized::Associative(a) => {
@@ -945,6 +938,7 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
+      /// Puts an item into the collection, at the end.
       pub fn put(self, other: Item) -> Result<Sized, Error> {
           match (self, other) {
               (Sized::List(mut c), i) => {
@@ -969,6 +963,8 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
+      /// Joins two collections into one, with this collection at the
+      /// beginning and the other collection at the end.
       pub fn join(self, other: Sized) -> Result<Sized, Error> {
           Ok(match (self, other) {
               (Sized::Associative(a), Sized::List(l)) => Sized::Associative({
@@ -1041,6 +1037,7 @@ internally, to keep track of things like the stack, program, lists etc.
           })
       }
 
+      /// Returns whether this collection contains the given [Item].
       pub fn contains(&self, other: &Item) -> bool {
           match (self, other) {
               (Sized::Associative(a), other) => {
@@ -1070,6 +1067,10 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
+      /// Returns a new empty version of this collection. Does not
+      /// modify this collection. The new collection will be the same
+      /// type as this one (if this is a [Sized::String], you'll get an empty
+      /// [Sized::String], etc)
       pub fn empty(&self) -> Sized {
           match self {
               Sized::Associative(_) => {
@@ -1084,6 +1085,8 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl Receptacle {
+      /// Puts the given [Item] into this collection, items are added at
+      /// the end.
       pub fn put(self, i: Item) -> Future<Result<Receptacle, Error>> {
           match self {
               Receptacle::Sized(s) => Box::pin(future::ready(s.put(i).map(Receptacle::Sized))),
@@ -1982,7 +1985,7 @@ internally, to keep track of things like the stack, program, lists etc.
 #+end_src
 **** Error types
 #+begin_src rust :tangle src/types/error.rs :mkdirp yes
-  use crate::types;
+  use crate::list;
   use crate::types::associative as assoc;
   use crate::types::collection as coll;
   use crate::types::{Int, Item, Word};
@@ -2013,19 +2016,15 @@ internally, to keep track of things like the stack, program, lists etc.
       }
 
       pub fn stack_underflow() -> Error {
-          Error::create(
-              types::wrap("consume".into()),
-              "not enough items on stack",
-              None,
-          )
+          Error::create(list!("consume"), "not enough items on stack", None)
       }
 
       pub fn overflow() -> Error {
-          Error::create(types::wrap("arithmetic".into()), "number overflow", None)
+          Error::create(list!("arithmetic"), "number overflow", None)
       }
 
       pub fn undefined(w: Word) -> Error {
-          Error::create(types::wrap(Item::Word(w)), "word is not defined", None)
+          Error::create(list!(w), "word is not defined", None)
       }
 
       pub fn type_mismatch(asked: coll::List, actual: Option<Item>) -> Error {
@@ -2033,11 +2032,11 @@ internally, to keep track of things like the stack, program, lists etc.
       }
 
       pub fn division_by_zero() -> Error {
-          Error::create(types::wrap("/".into()), "division by zero", None)
+          Error::create(list!("/"), "division by zero", None)
       }
 
       pub fn expected(typestr: &str, actual: Item) -> Error {
-          Error::type_mismatch(types::wrap(typestr.into()), Some(actual))
+          Error::type_mismatch(list!(typestr), Some(actual))
       }
 
       pub fn short_list(expected: Int) -> Error {
@@ -2077,7 +2076,7 @@ internally, to keep track of things like the stack, program, lists etc.
       }
 
       pub fn parse(reason: &str) -> Error {
-          Error::create(types::wrap("read".into()), reason, None)
+          Error::create(list!("read"), reason, None)
       }
 
       pub fn test_assertion(program: coll::List, expected: coll::List, actual: coll::List) -> Error {
@@ -2173,6 +2172,7 @@ internally, to keep track of things like the stack, program, lists etc.
 **** Dictionary types
 #+begin_src rust :tangle src/types/dictionary.rs :mkdirp yes
   use crate::list;
+  use crate::serialize;
   use crate::types::associative as assoc;
   use crate::types::collection as coll;
   use crate::types::*;
@@ -2180,6 +2180,9 @@ internally, to keep track of things like the stack, program, lists etc.
   use sha2::{self, Digest};
   use std::collections::HashSet;
   use std::ptr;
+
+  /// The definition of a [Word], contains its actual code (the
+  /// definition), and also documentation like specs and examples.
   #[derive(Debug, Clone)]
   pub struct Entry {
       pub examples: Option<coll::List>,
@@ -2187,6 +2190,7 @@ internally, to keep track of things like the stack, program, lists etc.
       pub definition: Definition,
   }
 
+  // TODO: move specs to their own module
   #[derive(Debug, Clone, PartialEq)]
   pub struct SpecElement {
       pub elemtype: Word,
@@ -2347,33 +2351,29 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  /// One of the main components of an
+  /// [crate::types::environment::Environment], holds [Word]s and their
+  /// definitions.
   pub type Dictionary = coll::Arc<HashMap<Word, Entry>>;
 
   impl Dictionary {
-      pub fn make_version(&mut self, word: Word) {
-          // copy the existing non-versioned entry
-          let mut unversioned = word.clone();
-          unversioned.namespace = None;
-          let d = self.make_mut();
-
-          if let Some(existing) = d.get(&unversioned) {
-              d.insert(word.clone(), existing.clone());
-          }
-      }
-
       /// Returns the difference between this dictionary and a "newer"
       /// one: The additions/updates, and the deletions.
       pub fn diff(&self, newer: Dictionary) -> (Vec<(Word, Entry)>, Vec<Word>) {
           diff_hashmaps(&self.inner(), &newer.inner())
       }
 
-      pub fn merge(&mut self, new: Dictionary, namespace: Namespace) {
+      /// Merges this dictionary with the given new dictionary. The new
+      /// entries are added with the given namespace.
+      pub fn merge(&mut self, new: Dictionary, namespace: Option<Namespace>) {
           let (adds, deletes) = self.diff(new);
           // add namepaces to the adds
           let adds: Vec<_> = adds
               .into_iter()
               .map(|(mut w, e)| {
-                  w.namespaced(namespace.clone());
+                  if let Some(ns) = &namespace {
+                      w.namespaced(ns.clone())
+                  };
                   (w, e)
               })
               .collect();
@@ -2438,6 +2438,9 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
+      /// Resolves all the words in the given program
+      /// (recursively). Uses the given namespaces as possible
+      /// resolution targets.
       pub fn resolve_all(&self, p: &mut coll::List, namespaces: &Vec<Namespace>) {
           let p = p.make_mut();
           for item in p.iter_mut() {
@@ -2445,7 +2448,6 @@ internally, to keep track of things like the stack, program, lists etc.
                   Item::Word(w) => {
                       self.resolve_word(w, namespaces);
                   }
-
                   Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(ref mut l))) => {
                       self.resolve_all(l, namespaces);
                   }
@@ -2460,11 +2462,13 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
-      /// Given an item and a dictionary, resolve what namespace it is
-      /// referring to - it's either a hash already, or it's a word (an
-      /// alias), otherwise an error is returned. If it's a word, we look it
-      /// up in the dictionary to see if it's an existing alias, if so, we
-      /// return the value of that alias.
+      /// Given an [Item] and a Dictionary, resolve what [Namespace] it is
+      /// referring to - it's either a hash already, or it's a [Word] (an
+      /// alias), otherwise an error is returned. If it's a [Word], we
+      /// look it up in the dictionary to see if it's an existing alias,
+      /// if so, we return the value of that alias. If it's a hash, we
+      /// don't check to see if it's valid, we just return it in
+      /// [Namespace] form.
       pub fn resolve_ns(&self, i: Item) -> Result<dict::Namespace, Error> {
           match i {
               Item::Word(mut w) => {
@@ -2483,6 +2487,45 @@ internally, to keep track of things like the stack, program, lists etc.
               i => Err(Error::expected("module", i)),
           }
       }
+
+      /// Takes a core module (in string form - should contain a series
+      /// of word definitions, not wrapped in a single list), and
+      /// inserts all the definitions into the dictionary, with an
+      /// optional namespace.
+      pub fn insert_core_module(&mut self, lexicon: String, namespace: Option<dict::Namespace>) {
+          let items = serialize::parse(lexicon).unwrap();
+          for r in Box::new(items.inner().into_iter()) {
+              let (k, def): (assoc::KeyItem, Item) = r.try_into().unwrap();
+              let mut word: Word = k.try_into().unwrap();
+              if let Some(ref ns) = namespace {
+                  word.namespaced(ns.clone());
+              }
+              let iter: Box<dyn Iterator<Item = Item>> = def.try_into().unwrap();
+              let new_entry: dict::Entry = iter.try_into().unwrap();
+              let new_entry2 = new_entry.clone();
+              let dict = self.make_mut();
+              dict.entry(word)
+                  .and_modify(|e| {
+                      e.examples = new_entry.examples;
+                      e.spec = new_entry.spec;
+                      e.definition = new_entry.definition;
+                  })
+                  .or_insert(new_entry2);
+          }
+      }
+
+      /// Takes a mapping of word to definition, and updates all the
+      /// dictionary entries so that the word will call that definition
+      /// when the word is executed. The definitions should be Axiom
+      /// variants, since those are the ones we have to define in rust.
+      ///
+      /// This method is used during bootstrap of the default environment.
+      pub fn insert_axiom_fns(&mut self, updates: Vec<(Word, Definition)>) {
+          let dm = self.make_mut();
+          for (w, f) in updates {
+              dm.entry(w).and_modify(|e| e.definition = f);
+          }
+      }
   }
 
   // Each word should run a program that calls fail (already namespaced
@@ -2492,6 +2535,9 @@ internally, to keep track of things like the stack, program, lists etc.
       Vec::new()
   }
 
+  /// Returns the differences between two hashmaps, including the keys
+  /// that have been added or changed (including the new values), and
+  /// the keys that were deleted.
   fn diff_hashmaps<K, V>(a: &HashMap<K, V>, b: &HashMap<K, V>) -> (Vec<(K, V)>, Vec<K>)
   where
       K: Eq + Hash + Clone,
@@ -2519,6 +2565,9 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  /// The actual code for what a [Word] should do, it can be either
+  /// [Definition::Axiom] (defined in the base language), or
+  /// [Definition::Derived] (defined in terms of other words).
   #[derive(Clone)]
   pub enum Definition {
       Axiom(&'static StepFn),
@@ -2650,73 +2699,6 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  // impl TryFrom<Associative> for Entry {
-  //     type Error = Error;
-  //     fn try_from(d: Associative) -> Result<Self, Error> {
-  //         // TODO: This should handle cases where there's no def present
-  //         // and return error
-  //         let (d, def) = d.remove(&"definition".into());
-  //         let (d, examples) = d.remove(&"examples".into());
-  //         let (_, spec) = d.remove(&"spec".into());
-
-  //         Ok(Entry {
-  //             definition: if let Some(d) = def {
-  //                 Definition::Derived(List::try_from(d).unwrap())
-  //             } else {
-  //                 //Err(Error::expected("definition field"))?  use a
-  //                 // dummy value, presumably if this is during
-  //                 // bootstrap,the definition will be replaced later.
-  //                 Definition::Derived(Arc::new(ListContent::new()))
-  //             },
-
-  //             // {Box::leak(Box::new(move |env: Environment| {
-  //             //    env.push(Item::Error(Error::undefined(w)))
-  //             //}))}
-  //             examples: examples.and_then(|i| List::try_from(i).ok()),
-  //             spec: spec.and_then(|i| List::try_from(i).ok()),
-  //         })
-  //     }
-  // }
-
-  // impl TryFrom<List> for Entry {
-  //     type Error = Error;
-  //     fn try_from(l: List) -> Result<Self, Error> {
-  //         let a: Associative = l.try_into()?;
-  //         a.try_into()
-  //     }
-  // }
-
-  // impl TryFrom<assoc::Associative> for Dictionary {
-  //     type Error = Error;
-  //     fn try_from(a: assoc::Associative) -> Result<Self, Self::Error> {
-  //         match a {
-  //             assoc::Associative::Dictionary(e) => Ok(e),
-  //             assoc::Associative::Assoc(a) => {
-  //                 let h = rc_inner(&a)
-  //                     .into_iter()
-  //                     .map(|(k, v)| {
-  //                         let e: (Word, Entry) = (k.try_into()?, v.try_into()?);
-  //                         Ok(e)
-  //                     })
-  //                     .collect::<Result<HashMap<Word, Entry>, Error>>()?;
-  //                 Ok(Arc::new(h))
-  //             }
-  //             _ => Err(Error::expected("dictionary")),
-  //         }
-  //     }
-  // }
-
-  // impl From<Dictionary> for assoc::Associative {
-  //     fn from(d: Dictionary) -> Self {
-  //         Associative::Assoc(Arc::new(
-  //             rc_inner(&d)
-  //                 .into_iter()
-  //                 .map(|(k, v)| (assoc::KeyItem::Word(k), Item::Entry(v)))
-  //                 .collect(),
-  //         ))
-  //     }
-  // }
-
   impl TryFrom<Item> for Dictionary {
       type Error = Error;
       fn try_from(i: Item) -> Result<Self, Self::Error> {
@@ -2811,28 +2793,6 @@ internally, to keep track of things like the stack, program, lists etc.
           env.bootstrap().unwrap();
           //print!("Env: {:?}", env.dictionary);
           env
-      }
-
-      pub fn insert_core_module(&mut self, lexicon: String, namespace: Option<dict::Namespace>) {
-          let items = serialize::parse(lexicon).unwrap();
-          for r in Box::new(items.inner().into_iter()) {
-              let (k, def): (assoc::KeyItem, Item) = r.try_into().unwrap();
-              let mut word: Word = k.try_into().unwrap();
-              if let Some(ref ns) = namespace {
-                  word.namespaced(ns.clone());
-              }
-              let iter: Box<dyn Iterator<Item = Item>> = def.try_into().unwrap();
-              let new_entry: dict::Entry = iter.try_into().unwrap();
-              let new_entry2 = new_entry.clone();
-              let dict = coll::Arc::make_mut(&mut self.dictionary);
-              dict.entry(word)
-                  .and_modify(|e| {
-                      e.examples = new_entry.examples;
-                      e.spec = new_entry.spec;
-                      e.definition = new_entry.definition;
-                  })
-                  .or_insert(new_entry2);
-          }
       }
 
       pub fn push(&mut self, i: Item) {
@@ -2954,20 +2914,21 @@ internally, to keep track of things like the stack, program, lists etc.
       }
 
       /// Reads a stdlib module and updates the dictionary.
-      pub fn load_cached_module(
+      pub fn load_builtin_module(
           &mut self,
           module_alias: Word,
           is_namespaced: bool,
       ) -> Result<(), Error> {
           let module_hash = self.dictionary.resolve_ns(module_alias.clone().into())?;
           let module_content = read_module(module_alias, module_hash.clone().into())?;
-          self.insert_core_module(String::from_utf8(module_content)?, {
-              if is_namespaced {
-                  Some(module_hash)
-              } else {
-                  None
-              }
-          });
+          self.dictionary
+              .insert_core_module(String::from_utf8(module_content)?, {
+                  if is_namespaced {
+                      Some(module_hash)
+                  } else {
+                      None
+                  }
+              });
           Ok(())
       }
 
@@ -3000,7 +2961,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
           for &file_contents in &files {
               let lexicon = String::from_utf8_lossy(file_contents).into_owned();
-              self.insert_core_module(lexicon, None);
+              self.dictionary.insert_core_module(lexicon, None);
           }
           Ok(())
       }
@@ -3010,7 +2971,7 @@ internally, to keep track of things like the stack, program, lists etc.
           let module_aliases = coll::List::try_from(self.pop())?;
           for item in module_aliases.inner().into_iter() {
               let module_alias = Word::try_from(item)?;
-              self.load_cached_module(module_alias, false)?
+              self.load_builtin_module(module_alias, false)?
           }
           axiom::add_builtins(&mut self.dictionary);
           Ok(())
@@ -3889,15 +3850,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }
   }
 
-  fn update_axiom_entries(d: &mut dict::Dictionary, updates: Vec<(&str, &'static StepFn)>) {
-      let dm = d.make_mut();
-      for (w, f) in updates {
-          dm.entry(Word::from(w)).and_modify(|e| {
-              e.definition = dict::Definition::Axiom(f);
-          });
-      }
-  }
-
   pub fn add_builtins(d: &mut dict::Dictionary) {
       #[cfg(not(feature = "database"))]
       let entries: Vec<(&str, &'static StepFn)>;
@@ -4066,7 +4018,12 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           entries.push(("persist", Box::leak(Box::new(f_stack1(db::insert_object)))));
       }
 
-      update_axiom_entries(d, entries)
+      d.insert_axiom_fns(
+          entries
+              .into_iter()
+              .map(|(w, f)| (Word::from(w), dict::Definition::Axiom(f)))
+              .collect(),
+      )
   }
 
   pub fn invalid_type_error(asked: coll::List, actual: Item) -> ItemResult {
@@ -4074,7 +4031,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   fn number_type_error(i: Item) -> ItemResult {
-      invalid_type_error(crate::types::wrap(Item::Word(Word::from("number"))), i)
+      invalid_type_error(list!("number"), i)
   }
 
   fn pair(i: Item, j: Item) -> Item {
@@ -5380,7 +5337,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                           let ns2 = ns.clone();
                           match ns2 {
                               Item::Word(w) => env
-                                  .load_cached_module(w, true)
+                                  .load_builtin_module(w, true)
                                   .and_then(|_| env.dictionary.resolve_ns(ns)),
                               _ => Err(e),
                           }
@@ -5422,7 +5379,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       // need to have the namespace hash in here to give namespaces to the updates
       match partialdict {
           Ok(pd) => {
-              env.dictionary.merge(pd, namespace.into());
+              env.dictionary.merge(pd, Some(namespace.into()));
               // pop the word dictmerge
               env.pop_expr();
           }
@@ -5631,7 +5588,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }
       if start > end {
           return Err(Error::create(
-              crate::types::wrap("<=".into()),
+              list!("<="),
               "invalid index range",
               Some(pair(start.into(), end.into())),
           ));
@@ -5679,7 +5636,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   impl<'a> From<dynfmt::Error<'a>> for Error {
       fn from(err: dynfmt::Error) -> Error {
-          Error::create(crate::types::wrap("format".into()), &err.to_string(), None)
+          Error::create(list!("format"), &err.to_string(), None)
       }
   }
 
@@ -5941,9 +5898,7 @@ We'll also define how to run unit tests.
                       let p = coll::List::try_from(get_item(ex.clone(), 0).unwrap());
                       let exp = coll::List::try_from(get_item(ex.clone(), 1).unwrap());
                       match (p, exp) {
-                          (Ok(p), Ok(exp)) => {
-                              test_example(standard_env.clone(), p.clone(), exp.clone())
-                          }
+                          (Ok(p), Ok(exp)) => test_example(standard_env.clone(), p, exp),
                           (Err(e), _) => Some(e),
                           (_, Err(e)) => Some(e),
                       }
@@ -6577,9 +6532,10 @@ How to interact with files on disk
 How to interact with the network (TCP/IP sockets)
 #+begin_src rust :tangle src/pipes/net.rs :mkdirp yes
   use crate::axiom::ItemResult;
+  use crate::list;
   use crate::types::associative as assoc;
   use crate::types::error::Error;
-  use crate::types::{self, wrap, Int, Item};
+  use crate::types::{self, Int, Item};
   use futures::future::FutureExt;
   use std::future::{self};
   use std::net::{Ipv4Addr, SocketAddrV4};
@@ -6743,7 +6699,7 @@ How to interact with the network (TCP/IP sockets)
 
   impl From<std::net::AddrParseError> for Error {
       fn from(err: std::net::AddrParseError) -> Error {
-          Error::create(wrap("addrparse".into()), &err.to_string(), None)
+          Error::create(list!("addrparse"), &err.to_string(), None)
       }
   }
 #+end_src
@@ -7159,6 +7115,7 @@ Implement the =handoff= type
 ***** Database
 #+begin_src rust :tangle src/pipes/db.rs :mkdirp yes
   use crate::axiom;
+  use crate::list;
   use crate::types::associative as assoc;
   use crate::types::collection as coll;
   use crate::types::error::Error;
@@ -7345,7 +7302,7 @@ Implement the =handoff= type
 
   impl From<rusqlite::Error> for Error {
       fn from(error: rusqlite::Error) -> Self {
-          Error::create(types::wrap("io".into()), error.to_string().as_str(), None)
+          Error::create(list!("io"), error.to_string().as_str(), None)
       }
   }
 #+end_src
