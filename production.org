@@ -222,14 +222,7 @@ internally, to keep track of things like the stack, program, lists etc.
   #[derive(Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord, Default)]
   pub struct Word {
       pub data: Intern<String>,
-      pub namespace: Option<dict::Namespace>,
-  }
-
-  impl Word {
-      /// Modifies the Word by adding the given [dict::Namespace].
-      pub fn namespaced(&mut self, v: dict::Namespace) {
-          self.namespace = Some(v)
-      }
+      pub namespace: dict::Namespace,
   }
 
   impl Display for Word {
@@ -242,7 +235,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn from(s: &str) -> Self {
           Word {
               data: Intern::<String>::from(s),
-              namespace: None,
+              namespace: Default::default(),
           }
       }
   }
@@ -2307,7 +2300,7 @@ internally, to keep track of things like the stack, program, lists etc.
               Definition::Axiom(_) => Default::default(),
               Definition::Derived(l) => l
                   .front()
-                  .map(|i| Bytes::try_from(i.clone()).unwrap_or_default().into())
+                  .map(|i| dict::bytes_to_ns(Bytes::try_from(i.clone()).unwrap_or_default()))
                   .unwrap_or_default(),
           }
       }
@@ -2318,36 +2311,50 @@ internally, to keep track of things like the stack, program, lists etc.
           Entry {
               examples: None,
               spec: None,
-              definition: Definition::Derived(coll::List::from_iter(vec![Item::from(Bytes::from(
-                  ns,
-              ))])),
+              definition: Definition::Derived(list!(Item::from(dict::ns_to_bytes(ns)))),
           }
       }
   }
-  pub type Namespace = Newtype<Vec<u8>>;
+  pub type Namespace = Option<Newtype<Vec<u8>>>;
 
   lazy_static! {
       pub static ref MODULE_NAMESPACE: Namespace =
-          Newtype(sha2::Sha256::digest(b"modules").deref().to_vec());
+          Some(Newtype(sha2::Sha256::digest(b"modules").deref().to_vec()));
       pub static ref SHADOW_NAMESPACE: Namespace =
-          Newtype(sha2::Sha256::digest(b"shadow").deref().to_vec());
+          Some(Newtype(sha2::Sha256::digest(b"shadow").deref().to_vec()));
   }
 
-  impl Default for Namespace {
-      fn default() -> Namespace {
-          MODULE_NAMESPACE.clone()
+  pub fn bytes_to_ns(b: Bytes) -> Namespace {
+      if b.is_empty() {
+          Default::default()
+      } else {
+          Some(Newtype(b))
       }
   }
 
-  impl From<Bytes> for Namespace {
-      fn from(b: Bytes) -> Self {
-          Newtype(b)
-      }
-  }
-
-  impl From<Namespace> for Bytes {
-      fn from(ns: Namespace) -> Self {
+  pub fn ns_to_bytes(ns: Namespace) -> Bytes {
+      if let Some(ns) = ns {
           ns.0
+      } else {
+          Default::default()
+      }
+  }
+
+  impl TryFrom<Item> for Namespace {
+      type Error = Error;
+      fn try_from(i: Item) -> Result<Namespace, Error> {
+          match i {
+              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(b))) => Ok(bytes_to_ns(b)),
+              Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(b))) => Ok(bytes_to_ns(b)),
+              i => {
+                  let s = coll::Sized::try_from(i)?;
+                  if s.is_empty() {
+                      Ok(Default::default())
+                  } else {
+                      Err(Error::expected("namespace", s.into()))
+                  }
+              }
+          }
       }
   }
 
@@ -2372,7 +2379,7 @@ internally, to keep track of things like the stack, program, lists etc.
               .into_iter()
               .map(|(mut w, e)| {
                   if let Some(ns) = &namespace {
-                      w.namespaced(ns.clone())
+                      w.namespace = ns.clone();
                   };
                   (w, e)
               })
@@ -2397,14 +2404,7 @@ internally, to keep track of things like the stack, program, lists etc.
           // grab the first namespace (they should all be the same)
           if !self.is_empty() {
               let adds_ro = self.clone();
-              let ns = &vec![adds_ro
-                  .inner()
-                  .keys()
-                  .next()
-                  .unwrap()
-                  .namespace
-                  .clone()
-                  .unwrap()];
+              let ns = &vec![adds_ro.inner().keys().next().unwrap().namespace.clone()];
               let adds_m = self.make_mut();
               for entry in adds_m.values_mut() {
                   match &mut entry.definition {
@@ -2428,13 +2428,13 @@ internally, to keep track of things like the stack, program, lists etc.
           // if the word is already namespaced we're done
           if w.namespace.is_none() {
               for namespace in namespaces.iter().cloned() {
-                  w.namespace = Some(namespace);
+                  w.namespace = namespace;
                   if self.contains_key(w) {
                       return;
                   }
               }
               // no match found, clear the namespace
-              w.namespace = None;
+              w.namespace = Default::default();
           }
       }
 
@@ -2469,10 +2469,10 @@ internally, to keep track of things like the stack, program, lists etc.
       /// if so, we return the value of that alias. If it's a hash, we
       /// don't check to see if it's valid, we just return it in
       /// [Namespace] form.
-      pub fn resolve_ns(&self, i: Item) -> Result<dict::Namespace, Error> {
+      pub fn resolve_ns(&self, i: Item) -> Result<Namespace, Error> {
           match i {
               Item::Word(mut w) => {
-                  w.namespaced(dict::Namespace::default());
+                  w.namespace = Default::default();
                   match self.get(&w) {
                       Some(e) => Ok(e.get_namespace_info()),
                       None => Err(Error::create(
@@ -2482,8 +2482,8 @@ internally, to keep track of things like the stack, program, lists etc.
                       )),
                   }
               }
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(b))) => Ok(b.into()),
-              Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(b))) => Ok(b.into()),
+              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(b))) => Ok(bytes_to_ns(b)),
+              Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(b))) => Ok(bytes_to_ns(b)),
               i => Err(Error::expected("module", i)),
           }
       }
@@ -2492,14 +2492,13 @@ internally, to keep track of things like the stack, program, lists etc.
       /// of word definitions, not wrapped in a single list), and
       /// inserts all the definitions into the dictionary, with an
       /// optional namespace.
-      pub fn insert_core_module(&mut self, lexicon: String, namespace: Option<dict::Namespace>) {
+      pub fn insert_core_module(&mut self, lexicon: String, namespace: Namespace) {
           let items = serialize::parse(lexicon).unwrap();
           for r in Box::new(items.inner().into_iter()) {
               let (k, def): (assoc::KeyItem, Item) = r.try_into().unwrap();
               let mut word: Word = k.try_into().unwrap();
-              if let Some(ref ns) = namespace {
-                  word.namespaced(ns.clone());
-              }
+
+              word.namespace = namespace.clone();
               let iter: Box<dyn Iterator<Item = Item>> = def.try_into().unwrap();
               let new_entry: dict::Entry = iter.try_into().unwrap();
               let new_entry2 = new_entry.clone();
@@ -2908,8 +2907,8 @@ internally, to keep track of things like the stack, program, lists etc.
           for (alias, hash) in modmap.into_iter() {
               //namespace the alias
               let mut alias_word: Word = alias.into();
-              alias_word.namespaced(Default::default());
-              d.insert(alias_word, dict::Entry::from(dict::Namespace::from(hash)));
+              alias_word.namespace = Default::default();
+              d.insert(alias_word, dict::Entry::from(dict::bytes_to_ns(hash)));
           }
       }
 
@@ -2920,11 +2919,11 @@ internally, to keep track of things like the stack, program, lists etc.
           is_namespaced: bool,
       ) -> Result<(), Error> {
           let module_hash = self.dictionary.resolve_ns(module_alias.clone().into())?;
-          let module_content = read_module(module_alias, module_hash.clone().into())?;
+          let module_content = read_module(module_alias, dict::ns_to_bytes(module_hash.clone()))?;
           self.dictionary
               .insert_core_module(String::from_utf8(module_content)?, {
                   if is_namespaced {
-                      Some(module_hash)
+                      module_hash
                   } else {
                       None
                   }
@@ -3895,7 +3894,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("decodejson", Box::leak(Box::new(f_stack1(decode_json)))),
           ("dip", Box::leak(Box::new(dip))),
           ("dictionary", Box::leak(Box::new(dictionary))),
-          ("dictmerge", Box::leak(Box::new(dictmerge))),
+          ("dictmerge", Box::leak(Box::new(f_result(dictmerge)))),
           ("dipdown", Box::leak(Box::new(dipdown))),
           ("drop", Box::leak(Box::new(drop))),
           ("emit", Box::leak(Box::new(f_stack1(emit)))),
@@ -5325,7 +5324,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   // deletions are respected (via shadowing the existing
                   // word with one that throws an error.)
                   let namespaces = namespaces.make_mut();
-                  namespaces.push_front(Bytes::from(dict::SHADOW_NAMESPACE.clone()).into());
+                  namespaces.push_front(dict::ns_to_bytes(dict::SHADOW_NAMESPACE.clone()).into());
               }
 
               let ns: Result<Vec<dict::Namespace>, Error> = namespaces
@@ -5371,23 +5370,14 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   /// Takes a new dictionary, diffs it with the existing one, and marks
   /// all the deleted items as deleted.
-  pub fn dictmerge(mut env: Environment) -> Future<Environment> {
+  pub fn dictmerge(env: &mut Environment) -> Result<(), Error> {
       //println!("dictmerge: {:?}", env);
-      let partialdict = dict::Dictionary::try_from(env.pop());
-      let namespace = Bytes::try_from(env.pop()).unwrap();
-      //println!("Dictmerge: {:?} {:?}", namespace, partialdict);
-      // need to have the namespace hash in here to give namespaces to the updates
-      match partialdict {
-          Ok(pd) => {
-              env.dictionary.merge(pd, Some(namespace.into()));
-              // pop the word dictmerge
-              env.pop_expr();
-          }
-          Err(e) => {
-              env.push(e.into());
-          }
-      }
-      env.into()
+      let partialdict = dict::Dictionary::try_from(env.pop())?;
+      let namespace = dict::Namespace::try_from(env.pop())?;
+      env.dictionary.merge(partialdict, Some(namespace.into()));
+      // pop the word dictmerge
+      env.pop_expr();
+      Ok(())
   }
 
   /// Load a new module and gives it an optional alias (either a word or
@@ -5425,9 +5415,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let maybe_word: Result<Word, Error> = maybe_alias.clone().try_into();
       match maybe_word {
           Ok(mut alias) => {
-              alias.namespaced(dict::Namespace::default());
+              alias.namespace = dict::MODULE_NAMESPACE.clone();
               let d = env.dictionary.make_mut();
-              let e = dict::Entry::from(dict::Namespace::from(hash.clone()));
+              let e = dict::Entry::from(dict::bytes_to_ns(hash.clone()));
               //println!("Adding alias {:?} -> {:?}", alias, e);
               d.insert(alias.clone(), e);
               env.push(Item::Word(alias));
@@ -5436,7 +5426,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               if !maybe_alias.is_empty() {
                   Err(Error::expected("module-alias", maybe_alias))?
               } else {
-                  env.push(hash.clone().into());
+                  // push Nothing, meaning that we want this module
+                  // loaded into the default (no) namespace.
+                  env.push(Default::default());
               }
           }
       }
