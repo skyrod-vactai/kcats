@@ -191,6 +191,15 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  impl<T> Default for Newtype<T>
+  where
+      T: Default,
+  {
+      fn default() -> Newtype<T> {
+          Newtype(T::default())
+      }
+  }
+
   impl<T: IntoIterator> IntoIterator for Newtype<T> {
       type Item = T::Item;
       type IntoIter = T::IntoIter;
@@ -449,7 +458,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
   impl From<std::io::Error> for Error {
       fn from(err: std::io::Error) -> Error {
-          Error::create(list!("io"), &err.to_string(), None)
+          Error::create(list!("io"), &err.to_string(), Option::<Item>::None)
       }
   }
 
@@ -501,8 +510,8 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  /// A macro to build a kcats List, accepts any values that implements
-  /// Into<Item>.
+  /// A macro to build a kcats List, accepts any values that are
+  /// convertible to [Item].
   #[macro_export]
   macro_rules! list {
       ( $( $x:expr ),* $(,)? ) => {
@@ -624,7 +633,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
       impl From<serde_json::Error> for Error {
           fn from(err: serde_json::Error) -> Error {
-              Error::create(list!("serialize"), &err.to_string(), None)
+              Error::create(list!("serialize"), &err.to_string(), Option::<Item>::None)
           }
       }
 
@@ -1299,18 +1308,6 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  impl Default for List {
-      fn default() -> Self {
-          Newtype(sync::Arc::new(Newtype(VecDeque::new())))
-      }
-  }
-
-  impl Default for Set {
-      fn default() -> Self {
-          Set::from(HashSet::new())
-      }
-  }
-
   impl Default for Sized {
       fn default() -> Self {
           Sized::List(List::default())
@@ -1326,12 +1323,6 @@ internally, to keep track of things like the stack, program, lists etc.
   impl Default for Receptacle {
       fn default() -> Self {
           Receptacle::Sized(Sized::default())
-      }
-  }
-
-  impl Default for ListContent {
-      fn default() -> Self {
-          Newtype(VecDeque::new())
       }
   }
 
@@ -1997,7 +1988,7 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl Error {
-      pub fn create(asked: coll::List, reason: &str, actual: Option<Item>) -> Error {
+      pub fn create<T: Into<Item>>(asked: coll::List, reason: &str, actual: Option<T>) -> Error {
           // let bt = backtrace::Backtrace::new();
           let mut data: Vec<(assoc::KeyItem, Item)> = vec![
               ("type".into(), "error".into()),
@@ -2006,7 +1997,7 @@ internally, to keep track of things like the stack, program, lists etc.
               //("backtrace".into(), Item::String(format!("{:?}", bt))),
           ];
           if let Some(actual) = actual {
-              data.push(("actual".into(), actual));
+              data.push(("actual".into(), actual.into()));
           }
           Error {
               is_handled: false,
@@ -2016,15 +2007,19 @@ internally, to keep track of things like the stack, program, lists etc.
       }
 
       pub fn stack_underflow() -> Error {
-          Error::create(list!("consume"), "not enough items on stack", None)
+          Error::create(
+              list!("consume"),
+              "not enough items on stack",
+              Option::<Item>::None,
+          )
       }
 
       pub fn overflow() -> Error {
-          Error::create(list!("arithmetic"), "number overflow", None)
+          Error::create(list!("arithmetic"), "number overflow", Option::<Item>::None)
       }
 
       pub fn undefined(w: Word) -> Error {
-          Error::create(list!(w), "word is not defined", None)
+          Error::create(list!(w), "word is not defined", Option::<Item>::None)
       }
 
       pub fn type_mismatch(asked: coll::List, actual: Option<Item>) -> Error {
@@ -2032,7 +2027,7 @@ internally, to keep track of things like the stack, program, lists etc.
       }
 
       pub fn division_by_zero() -> Error {
-          Error::create(list!("/"), "division by zero", None)
+          Error::create(list!("/"), "division by zero", Option::<Item>::None)
       }
 
       pub fn expected(typestr: &str, actual: Item) -> Error {
@@ -2043,7 +2038,7 @@ internally, to keep track of things like the stack, program, lists etc.
           Error::create(
               coll::List::from_iter(["count".into(), Item::Int(expected), ">=".into()]),
               "list had too few items",
-              None,
+              Option::<Item>::None,
           )
       }
 
@@ -2051,7 +2046,7 @@ internally, to keep track of things like the stack, program, lists etc.
           Error::create(
               coll::List::from_iter(["count".into(), Item::Int(expected), "=".into()]),
               "list had wrong number of items",
-              None,
+              Option::<Item>::None,
           )
       }
 
@@ -2076,11 +2071,11 @@ internally, to keep track of things like the stack, program, lists etc.
       }
 
       pub fn parse(reason: &str) -> Error {
-          Error::create(list!("read"), reason, None)
+          Error::create(list!("read"), reason, Option::<Item>::None)
       }
 
       pub fn test_assertion(program: coll::List, expected: coll::List, actual: coll::List) -> Error {
-          let mut e = Error::create(program, "assertion failed", Some(actual.into()));
+          let mut e = Error::create(program, "assertion failed", Some(actual));
           let d = e.data.make_mut();
           d.insert("expected-program".into(), expected.into());
           e
@@ -2532,6 +2527,26 @@ internally, to keep track of things like the stack, program, lists etc.
               dm.entry(w).and_modify(|e| e.definition = f);
           }
       }
+
+      pub fn insert_module_alias(
+          &mut self,
+          mut alias: Word,
+          module_hash: Bytes,
+      ) -> Result<Word, Error> {
+          alias.namespace = dict::MODULE_NAMESPACE.clone();
+          let d = self.make_mut();
+          let e = Entry::from(dict::bytes_to_ns(module_hash.clone()));
+          //println!("Adding alias {:?} -> {:?}", alias, e);
+          if d.contains_key(&alias) {
+              return Err(Error::create(
+                  list!("module-alias"),
+                  "Module alias already exists, overwriting is not allowed",
+                  Some(alias),
+              ));
+          };
+          d.insert(alias.clone(), e);
+          Ok(alias)
+      }
   }
 
   // Each word should run a program that calls fail (already namespaced
@@ -2563,12 +2578,6 @@ internally, to keep track of things like the stack, program, lists etc.
       let deleted: Vec<K> = a_keys.difference(&b_keys).cloned().collect();
 
       (added_or_updated, deleted)
-  }
-
-  impl Default for Dictionary {
-      fn default() -> Self {
-          coll::Arc::wrap(HashMap::new())
-      }
   }
 
   /// The actual code for what a [Word] should do.
@@ -2768,6 +2777,8 @@ internally, to keep track of things like the stack, program, lists etc.
   use std::future;
   use std::ops::Range;
 
+  use super::dict::MODULE_NAMESPACE;
+
   #[derive(Clone, PartialEq)]
   pub struct Environment {
       pub stack: Stack,
@@ -2788,12 +2799,12 @@ internally, to keep track of things like the stack, program, lists etc.
               .expect("failed to load core modules");
           env.push(
               list!(
-                  "errors",
-                  "environment-builtins",
-                  "encode",
-                  "sets-builtins",
-                  "time",
-                  "generators" // END default namespace
+                  // "errors",
+                  // "environment-builtins",
+                  // "encode",
+                  // "sets-builtins",
+                  // "time",
+                  // "generators" // END default namespace
               )
               .into(),
           );
@@ -2915,7 +2926,7 @@ internally, to keep track of things like the stack, program, lists etc.
           for (alias, hash) in modmap.into_iter() {
               //namespace the alias
               let mut alias_word: Word = alias.into();
-              alias_word.namespace = Default::default();
+              alias_word.namespace = MODULE_NAMESPACE.clone();
               d.insert(alias_word, dict::Entry::from(dict::bytes_to_ns(hash)));
           }
       }
@@ -3109,7 +3120,7 @@ internally, to keep track of things like the stack, program, lists etc.
           Err(Error::create(
               list!(expected_hash, "="),
               format!("{} module integrity check failed", alias).as_str(),
-              Some(actual_hash.into()),
+              Some(actual_hash),
           ))
       }
   }
@@ -3748,10 +3759,16 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub type ItemResult = Result<Item, Error>;
 
-  impl From<ItemResult> for Item {
-      fn from(i: ItemResult) -> Self {
+  /// Convert results into Items, for use when we intend to put the
+  /// result on the stack whether it's an [Error] or some other [Item].
+  impl<T, U> From<Result<T, U>> for Item
+  where
+      T: Into<Item>,
+      U: Into<Item>,
+  {
+      fn from(i: Result<T, U>) -> Self {
           match i {
-              Ok(i) => i,
+              Ok(i) => i.into(),
               Err(e) => e.into(),
           }
       }
@@ -3875,6 +3892,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           (">", Box::leak(Box::new(f_stack2(gt)))),
           (">=", Box::leak(Box::new(f_stack2(gte)))),
           ("abs", Box::leak(Box::new(f_stack1(abs)))),
+          ("alias", Box::leak(Box::new(f_result(alias_module)))),
           ("and", Box::leak(Box::new(f_stack2(and)))),
           ("animate", Box::leak(Box::new(animate))),
           ("assign", Box::leak(Box::new(f_stack3(assign)))),
@@ -3952,6 +3970,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("log", Box::leak(Box::new(f_stack2(log)))),
           ("loop", Box::leak(Box::new(loop_))),
           ("mod", Box::leak(Box::new(f_stack2(mod_)))),
+          ("namespaced", Box::leak(Box::new(f_stack2(namespaced)))),
           ("not", Box::leak(Box::new(f_stack1(not)))),
           ("number?", Box::leak(Box::new(f_stack1(is_number)))),
           ("odd?", Box::leak(Box::new(f_stack1(is_odd)))),
@@ -5376,6 +5395,25 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }
   }
 
+  /// Takes a word, and gives it a namespace. The namespace should be
+  /// [Bytes]. Overwrites any previous namespace the word had.
+  pub fn namespaced(i: Item, j: Item) -> ItemResult {
+      let b = Bytes::try_from(i)?;
+      let mut w = Word::try_from(j)?;
+      w.namespace = Some(Newtype(b));
+      Ok(w.into())
+  }
+
+  /// Creates an alias for a module. Takes a word and bytes and creates
+  /// a module alias from it in the dictionary.
+  pub fn alias_module(env: &mut Environment) -> Result<(), Error> {
+      let b = Bytes::try_from(env.pop())?;
+      let w = Word::try_from(env.pop())?;
+      let r: Result<Word, Error> = env.dictionary.insert_module_alias(w, b).into();
+      env.push(r.into());
+      Ok(())
+  }
+
   /// Takes a new dictionary, diffs it with the existing one, and marks
   /// all the deleted items as deleted.
   pub fn dictmerge(env: &mut Environment) -> Result<(), Error> {
@@ -5422,13 +5460,36 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let maybe_alias = env.pop();
       let maybe_word: Result<Word, Error> = maybe_alias.clone().try_into();
       match maybe_word {
-          Ok(mut alias) => {
-              alias.namespace = dict::MODULE_NAMESPACE.clone();
-              let d = env.dictionary.make_mut();
-              let e = dict::Entry::from(dict::bytes_to_ns(hash.clone()));
-              //println!("Adding alias {:?} -> {:?}", alias, e);
-              d.insert(alias.clone(), e);
-              env.push(Item::Word(alias));
+          Ok(alias) => {
+              match env
+                  .dictionary
+                  .insert_module_alias(alias.clone(), hash.clone())
+                  .map(Item::from)
+              {
+                  Ok(_) => {}
+                  Err(_) => {
+                      // The module already exists, ensure what
+                      // we're loading is actually that module:
+                      // check the hash matches.
+                      let mut alias = alias.clone();
+                      alias.namespace = dict::MODULE_NAMESPACE.clone();
+                      let exp_hash = env
+                          .dictionary
+                          .get(&alias)
+                          .unwrap()
+                          .get_namespace_info()
+                          .unwrap_or_default()
+                          .0;
+                      if exp_hash != hash {
+                          return Err(Error::create(
+                              list!(list!("hash"), "both", "="),
+                              "module integrity check failed",
+                              Some(alias),
+                          )
+                          .into());
+                      }
+                  }
+              }
           }
           Err(_) => {
               if !maybe_alias.is_empty() {
@@ -5636,7 +5697,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   impl<'a> From<dynfmt::Error<'a>> for Error {
       fn from(err: dynfmt::Error) -> Error {
-          Error::create(list!("format"), &err.to_string(), None)
+          Error::create(list!("format"), &err.to_string(), Option::<Item>::None)
       }
   }
 
@@ -6366,7 +6427,7 @@ The basic pipe contracts.
               if on_take { "take" } else { "put" }.into(),
           ]),
           "attempt to use closed pipe",
-          None,
+          Option::<Item>::None,
       )
   }
 
@@ -6699,7 +6760,7 @@ How to interact with the network (TCP/IP sockets)
 
   impl From<std::net::AddrParseError> for Error {
       fn from(err: std::net::AddrParseError) -> Error {
-          Error::create(list!("addrparse"), &err.to_string(), None)
+          Error::create(list!("addrparse"), &err.to_string(), Option::<Item>::None)
       }
   }
 #+end_src
@@ -7302,7 +7363,11 @@ Implement the =handoff= type
 
   impl From<rusqlite::Error> for Error {
       fn from(error: rusqlite::Error) -> Self {
-          Error::create(list!("io"), error.to_string().as_str(), None)
+          Error::create(
+              list!("io"),
+              error.to_string().as_str(),
+              Option::<Item>::None,
+          )
       }
   }
 #+end_src
@@ -9949,11 +10014,48 @@ Words in a library can call each other
 729
 #+end_src
 ***** TODO Make library loading primitives
-****** INPROGRESS Move hash to earlier loading module
+****** DONE Move hash to earlier loading module
+- State "DONE"       from "INPROGRESS" [2024-03-19 Tue 11:39]
 - State "INPROGRESS" from "TODO"       [2024-03-19 Tue 11:14]
 We need it for library loading, can't stay as part of crypto lib.
-****** TODO Primitive for namespacing a word
-****** TODO Primitive for loading a blob from cache via hash or alias
+****** DONE Primitive for namespacing a word
+- State "DONE"       from "INPROGRESS" [2024-03-19 Tue 16:50]
+- State "INPROGRESS" from "TODO"       [2024-03-19 Tue 11:44]
+****** DONE Primitive for loading a blob from cache via hash or alias
+- State "DONE"       from "INPROGRESS" [2024-03-19 Tue 16:50]
+- State "INPROGRESS" from "TODO"       [2024-03-19 Tue 16:34]
+
+  This verifies the module being loaded from cache matches the builtin hash.
+  #+begin_src kcats
+    [crypto] clone unwrap
+    decache swap "modules" encodestring hashbytes
+    swap unwrap namespaced wrap [definition] join
+     dictionary swap lookup first swap
+     hashbytes =
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  yes
+  #+end_src
+
+    this just inscribes the module
+
+  #+begin_src kcats
+  [crypto] clone unwrap
+    decache  inscribe
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  [[actual crypto]
+   [asked [module-alias]]
+   [handled yes]
+   [reason "Module alias already exists, overwriting is not allowed"]
+   [type error]
+   [unwound [inscribe]]]
+  #+end_src
+
 ****** TODO Primitive for aliasing a module
 Needs to respect the "no overwrite" rule.
 **** INPROGRESS Nesting scopes
@@ -10091,8 +10193,7 @@ then resolving the module once. Something like this:
 #+end_src
 
 **** TODO Stack escape protection
-If a program refers to a wor
-d, and at the time that program is put on
+If a program refers to a word, and at the time that program is put on
 the stack, that word means something, it should still carry the same
 meaning if that program is later run with =execute=. That means that
 module changes must be permanent.
