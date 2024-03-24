@@ -154,6 +154,7 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::types::dictionary as dict;
   use crate::types::environment as env;
   use crate::types::error::Error;
+
   use core::default::Default;
   use internment::Intern;
   use lazy_static::lazy_static;
@@ -170,6 +171,7 @@ internally, to keep track of things like the stack, program, lists etc.
   pub mod dictionary;
   pub mod environment;
   pub mod error;
+  pub mod number;
 
   /// A generic newtype to contain various types, so that we can
   /// implement traits on them.
@@ -275,12 +277,6 @@ internally, to keep track of things like the stack, program, lists etc.
   /// A byte array type
   pub type Bytes = Vec<u8>;
 
-  /// An integer type
-  pub type Int = i64;
-
-  /// A floating point type
-  pub type Float = f64;
-
   /// A character type
   pub type Char = char;
 
@@ -310,9 +306,7 @@ internally, to keep track of things like the stack, program, lists etc.
   #[derive(Debug, Clone)]
   pub enum Item {
       /// An integer number value
-      Int(Int),
-      /// A floating point number value
-      Float(Float),
+      Number(number::Number),
       /// A word value
       Word(Word),
       /// A character value
@@ -346,10 +340,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn eq(&self, other: &Self) -> bool {
           match (self, other) {
               // same types, just use their own eq
-              (Item::Int(a), Item::Int(b)) => a == b,
-              (Item::Float(a), Item::Float(b)) => a == b,
-              (Item::Float(a), Item::Int(b)) => *a == *b as Float,
-              (Item::Int(a), Item::Float(b)) => *a as Float == *b,
+              (Item::Number(a), Item::Number(b)) => a == b,
               // Don't use the namespace when comparing words
               (Item::Word(a), Item::Word(b)) => a.data == b.data,
               (
@@ -374,33 +365,13 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  impl TryFrom<Item> for Int {
-      type Error = Error;
-      fn try_from(i: Item) -> Result<Self, Self::Error> {
-          match i {
-              Item::Int(i) => Ok(i),
-              i => Err(Error::expected("integer", i)),
-          }
-      }
-  }
-
-  impl TryFrom<Item> for Float {
-      type Error = Error;
-      fn try_from(i: Item) -> Result<Self, Self::Error> {
-          match i {
-              Item::Float(i) => Ok(i),
-              i => Err(Error::expected("float", i)),
-          }
-      }
-  }
-
   impl TryFrom<Item> for String {
       type Error = Error;
       fn try_from(i: Item) -> Result<Self, Self::Error> {
           let s = coll::Sized::try_from(i)?;
           match s {
               coll::Sized::String(i) => Ok(i),
-              i => Err(Error::expected("string", i.into())),
+              i => Err(Error::expected("string", i)),
           }
       }
   }
@@ -421,7 +392,7 @@ internally, to keep track of things like the stack, program, lists etc.
                               let i = l.inner().pop_front().unwrap();
                               i.try_into()
                           } else {
-                              Err(Error::expected("word", l.into()))
+                              Err(Error::expected("word", l))
                           }
                       }
                       Err(_) => Err(Error::expected("word", i2)),
@@ -437,7 +408,7 @@ internally, to keep track of things like the stack, program, lists etc.
           let s = coll::Sized::try_from(i)?;
           match s {
               coll::Sized::Bytes(b) => Ok(b),
-              b => Err(Error::expected("bytes", b.into())),
+              b => Err(Error::expected("bytes", b)),
           }
       }
   }
@@ -492,12 +463,6 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  impl From<Int> for Item {
-      fn from(c: Int) -> Self {
-          Item::Int(c)
-      }
-  }
-
   impl<T> From<Option<T>> for Item
   where
       Item: From<T>,
@@ -519,7 +484,7 @@ internally, to keep track of things like the stack, program, lists etc.
               let v: Vec<Item> = vec![
                   $( $x.into(), )*
               ];
-              crate::types::collection::List::from_iter(v.into_iter())
+              $crate::types::collection::List::from_iter(v.into_iter())
           }
       };
   }
@@ -529,6 +494,7 @@ internally, to keep track of things like the stack, program, lists etc.
       use super::Item;
       use crate::types::associative as assoc;
       use crate::types::collection as coll;
+      use crate::types::number;
       use crate::types::Error;
       use serde::de::{self, Deserialize, Deserializer, Visitor};
       use serde::ser::{Serialize, Serializer};
@@ -548,21 +514,21 @@ internally, to keep track of things like the stack, program, lists etc.
           where
               E: de::Error,
           {
-              Ok(Item::Int(value))
+              Ok(Item::Number(number::Number::Int(value)))
           }
 
           fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
           where
               E: de::Error,
           {
-              Ok(Item::Int(value as i64))
+              Ok(Item::Number(number::Number::Int(value as i64)))
           }
 
           fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
           where
               E: de::Error,
           {
-              Ok(Item::Float(value))
+              Ok(Item::Number(number::Number::Float(value)))
           }
 
           fn visit_none<E>(self) -> Result<Self::Value, E>
@@ -643,8 +609,7 @@ internally, to keep track of things like the stack, program, lists etc.
               S: Serializer,
           {
               match self {
-                  Item::Int(i) => serializer.serialize_i64(*i),
-                  Item::Float(f) => serializer.serialize_f64(*f),
+                  Item::Number(num) => num.serialize(serializer),
                   Item::Char(c) => serializer.serialize_char(*c),
                   Item::Word(w) => serializer.serialize_str(w.into()),
 
@@ -662,6 +627,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
   use crate::pipes as pipe;
   use crate::types::associative as assoc;
+  use crate::types::number::{Int, Number};
   use crate::types::*;
   use std::{collections::HashSet, future, sync};
 
@@ -900,7 +866,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   if b.is_empty() {
                       (Sized::Bytes(b), None)
                   } else {
-                      let i = Some(Item::Int(b[0] as Int));
+                      let i = Some(Item::Number(Number::Int(b[0] as Int)));
                       b.drain(..1);
                       (Sized::Bytes(b), i)
                   }
@@ -959,7 +925,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   s.make_mut().insert(assoc::KeyItem::try_from(i)?);
                   Ok(Sized::Set(s))
               }
-              (Sized::Bytes(mut b), Item::Int(i)) => {
+              (Sized::Bytes(mut b), Item::Number(Number::Int(i))) => {
                   b.push(i as u8);
                   Ok(Sized::Bytes(b))
               }
@@ -1037,10 +1003,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   } else if other.is_empty() {
                       s
                   } else {
-                      Err(Error::expected(
-                          "joinable",
-                          List::from(vec![Item::from(s), Item::from(other)]).into(),
-                      ))?
+                      Err(Error::expected("joinable", list!(s, other)))?
                   }
               }
           })
@@ -1136,7 +1099,7 @@ internally, to keep track of things like the stack, program, lists etc.
           //println!("from iterable {:?}", c);
           match c {
               Dispenser::Sized(s) => Ok(s),
-              i => Err(Error::expected("sized", i.into())),
+              i => Err(Error::expected("sized", i)),
           }
       }
   }
@@ -1159,7 +1122,7 @@ internally, to keep track of things like the stack, program, lists etc.
           match s {
               Sized::List(l) => Ok(l),
               Sized::Associative(a) => Ok(List::from_iter(a.into_iter().map(Item::from))),
-              i => Err(Error::expected("list", i.into())),
+              i => Err(Error::expected("list", i)),
           }
       }
   }
@@ -1216,7 +1179,7 @@ internally, to keep track of things like the stack, program, lists etc.
           match c {
               Dispenser::Sized(s) => Ok(Receptacle::Sized(s)),
               Dispenser::Tunnel(t) => Ok(Receptacle::Tunnel(t)),
-              i => Err(Error::expected("packable", i.into())),
+              i => Err(Error::expected("packable", i)),
           }
       }
   }
@@ -1250,6 +1213,18 @@ internally, to keep track of things like the stack, program, lists etc.
   impl From<List> for Sized {
       fn from(l: List) -> Self {
           Sized::List(l)
+      }
+  }
+
+  impl From<String> for Sized {
+      fn from(s: String) -> Self {
+          Sized::String(s)
+      }
+  }
+
+  impl From<Bytes> for Sized {
+      fn from(b: Bytes) -> Self {
+          Sized::Bytes(b)
       }
   }
 
@@ -1404,6 +1379,7 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::types::collection as coll;
   use crate::types::dictionary as dict;
   use crate::types::environment as env;
+  use crate::types::number::{Int, Number};
   use crate::types::*;
   use std::iter::FromIterator;
   use std::sync;
@@ -1439,7 +1415,7 @@ internally, to keep track of things like the stack, program, lists etc.
   impl From<KeyItem> for Item {
       fn from(i: KeyItem) -> Self {
           match i {
-              KeyItem::Int(i) => Item::Int(i),
+              KeyItem::Int(i) => Item::Number(Number::Int(i)),
               KeyItem::String(i) => i.into(),
               KeyItem::List(l) => coll::List::from_iter(l.inner().into_iter().map(Item::from)).into(),
               KeyItem::Word(w) => Item::Word(w),
@@ -1465,7 +1441,7 @@ internally, to keep track of things like the stack, program, lists etc.
       type Error = Error;
       fn try_from(i: Item) -> Result<Self, Error> {
           match i {
-              Item::Int(i) => Ok(KeyItem::Int(i)),
+              Item::Number(Number::Int(i)) => Ok(KeyItem::Int(i)),
               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(i))) => {
                   Ok(KeyItem::String(i))
               }
@@ -1492,7 +1468,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn try_from(k: KeyItem) -> Result<Self, Self::Error> {
           match k {
               KeyItem::Word(w) => Ok(w),
-              i => Err(Error::expected("word", i.into())),
+              i => Err(Error::expected("word", i)),
           }
       }
   }
@@ -1761,8 +1737,8 @@ internally, to keep track of things like the stack, program, lists etc.
       fn try_from(s: coll::Sized) -> Result<Self, Error> {
           match s {
               coll::Sized::Associative(a) => Ok(a),
-              coll::Sized::String(i) => Err(Error::expected("associative", i.into())),
-              coll::Sized::Bytes(i) => Err(Error::expected("associative", i.into())),
+              coll::Sized::String(i) => Err(Error::expected("associative", i)),
+              coll::Sized::Bytes(i) => Err(Error::expected("associative", i)),
               s => Ok(Associative::Assoc(Association::try_from_iter(s)?)),
           }
       }
@@ -1849,7 +1825,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn try_from(i: Item) -> Result<Self, Error> {
           let s = coll::Sized::try_from(i)?;
           if s.len() != 2 {
-              Err(Error::expected("pair", s.into()))
+              Err(Error::expected("pair", s))
           } else {
               let mut iter = s.into_iter();
               let key: KeyItem = iter.next().unwrap().try_into()?;
@@ -1979,7 +1955,9 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::list;
   use crate::types::associative as assoc;
   use crate::types::collection as coll;
-  use crate::types::{Int, Item, Word};
+  use crate::types::number::Int;
+  use crate::types::{Item, Word};
+  use std::convert::Infallible;
 
   #[derive(Clone, PartialEq)]
   pub struct Error {
@@ -2022,7 +2000,7 @@ internally, to keep track of things like the stack, program, lists etc.
           Error::create(list!(w), "word is not defined", Option::<Item>::None)
       }
 
-      pub fn type_mismatch(asked: coll::List, actual: Option<Item>) -> Error {
+      pub fn type_mismatch<T: Into<Item>>(asked: coll::List, actual: Option<T>) -> Error {
           Error::create(asked, "type mismatch", actual)
       }
 
@@ -2030,13 +2008,13 @@ internally, to keep track of things like the stack, program, lists etc.
           Error::create(list!("/"), "division by zero", Option::<Item>::None)
       }
 
-      pub fn expected(typestr: &str, actual: Item) -> Error {
+      pub fn expected<T: Into<Item>>(typestr: &str, actual: T) -> Error {
           Error::type_mismatch(list!(typestr), Some(actual))
       }
 
       pub fn short_list(expected: Int) -> Error {
           Error::create(
-              coll::List::from_iter(["count".into(), Item::Int(expected), ">=".into()]),
+              list!("count", expected, ">="),
               "list had too few items",
               Option::<Item>::None,
           )
@@ -2044,7 +2022,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
       pub fn list_count(expected: Int) -> Error {
           Error::create(
-              coll::List::from_iter(["count".into(), Item::Int(expected), "=".into()]),
+              list!("count", expected, "="),
               "list had wrong number of items",
               Option::<Item>::None,
           )
@@ -2055,19 +2033,11 @@ internally, to keep track of things like the stack, program, lists etc.
       }
 
       pub fn too_small(actual: Int, expected: Int) -> Error {
-          Error::create(
-              coll::List::from_iter([Item::Int(expected), Item::from(">=")]),
-              "number too small",
-              Some(Item::Int(actual)),
-          )
+          Error::create(list!(expected, ">="), "number too small", Some(actual))
       }
 
       pub fn too_large(actual: Int, expected: Int) -> Error {
-          Error::create(
-              coll::List::from_iter([Item::Int(expected), Item::from("<=")]),
-              "number too large",
-              Some(Item::Int(actual)),
-          )
+          Error::create(list!(expected, "<="), "number too large", Some(actual))
       }
 
       pub fn parse(reason: &str) -> Error {
@@ -2083,6 +2053,18 @@ internally, to keep track of things like the stack, program, lists etc.
 
       pub fn len(&self) -> usize {
           self.data.len()
+      }
+  }
+
+  impl From<Infallible> for Error {
+      fn from(_x: Infallible) -> Self {
+          match _x {} // Since Infallible can never be instantiated, this will never run
+      }
+  }
+
+  impl From<Infallible> for Item {
+      fn from(_x: Infallible) -> Self {
+          match _x {} // Since Infallible can never be instantiated, this will never run
       }
   }
 
@@ -2103,7 +2085,7 @@ internally, to keep track of things like the stack, program, lists etc.
               | Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(_)))
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::String(_)))
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(_))) => {
-                  Err(Error::expected("error", Default::default()))
+                  Err(Error::expected("error", Item::default()))
               }
               Item::Dispenser(coll::Dispenser::Sized(c)) => c.into_iter().try_into(),
               i => Err(Error::expected("error", i)),
@@ -2131,7 +2113,7 @@ internally, to keep track of things like the stack, program, lists etc.
               assoc::Associative::Error(e) => Ok(e),
               assoc::Associative::Assoc(a) => {
                   if a.get(&assoc::KeyItem::from("type")) != Some(&Item::from("error")) {
-                      Err(Error::expected("error", a.into()))
+                      Err(Error::expected("error", a))
                   } else {
                       Ok(Error {
                           data: a.clone(),
@@ -2139,7 +2121,7 @@ internally, to keep track of things like the stack, program, lists etc.
                       })
                   }
               }
-              i => Err(Error::expected("error", i.into())),
+              i => Err(Error::expected("error", i)),
           }
       }
   }
@@ -2263,7 +2245,7 @@ internally, to keep track of things like the stack, program, lists etc.
           if se.name.is_some() {
               list!(se.elemtype, se.name).into()
           } else {
-              Item::Word(se.elemtype).into()
+              Item::Word(se.elemtype)
           }
       }
   }
@@ -2353,7 +2335,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   if s.is_empty() {
                       Ok(Default::default())
                   } else {
-                      Err(Error::expected("namespace", s.into()))
+                      Err(Error::expected("namespace", s))
                   }
               }
           }
@@ -2754,7 +2736,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn try_from(i: Item) -> Result<Self, Self::Error> {
           let s = coll::Sized::try_from(i)?;
           if s.len() != 2 {
-              Err(Error::expected("pair", s.into()))
+              Err(Error::expected("pair", s))
           } else {
               let mut iter = s.into_iter();
               let key: Word = iter.next().unwrap().try_into()?;
@@ -2771,6 +2753,7 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::list;
   use crate::module_map;
   use crate::serialize;
+  use crate::types::number::Number;
   use crate::types::*;
   use crate::types::{associative as assoc, collection as coll, dictionary as dict};
   use directories::ProjectDirs;
@@ -2797,24 +2780,21 @@ internally, to keep track of things like the stack, program, lists etc.
           };
           env.load_core_modules()
               .expect("failed to load core modules");
-          env.push(
-              list!(
-                  // "errors",
-                  // "environment-builtins",
-                  // "encode",
-                  // "sets-builtins",
-                  // "time",
-                  // "generators" // END default namespace
-              )
-              .into(),
-          );
+          env.push(list!(
+              // "errors",
+              // "environment-builtins",
+              // "encode",
+              // "sets-builtins",
+              // "time",
+              // "generators" // END default namespace
+          ));
           env.bootstrap().unwrap();
           //print!("Env: {:?}", env.dictionary);
           env
       }
 
-      pub fn push(&mut self, i: Item) {
-          coll::Arc::make_mut(&mut self.stack).push_front(i);
+      pub fn push<T: Into<Item>>(&mut self, i: T) {
+          coll::Arc::make_mut(&mut self.stack).push_front(i.into());
       }
 
       pub fn pop(&mut self) -> Item {
@@ -3024,8 +3004,8 @@ internally, to keep track of things like the stack, program, lists etc.
           (w, _) if *w == *S_ITEM => Ok(()),
           (w, Item::Dispenser(_) | Item::Receptacle(_)) if *w == *S_DISPENSER => Ok(()),
           (w, Item::Receptacle(_) | Item::Dispenser(_)) if *w == *S_RECEPTACLE => Ok(()),
-          (w, Item::Int(_)) if *w == *S_INTEGER || *w == *S_NUMBER => Ok(()),
-          (w, Item::Float(_)) if *w == *S_FLOAT || *w == *S_NUMBER => Ok(()),
+          (w, Item::Number(Number::Int(_))) if *w == *S_INTEGER || *w == *S_NUMBER => Ok(()),
+          (w, Item::Number(Number::Float(_))) if *w == *S_FLOAT || *w == *S_NUMBER => Ok(()),
           // TODO: also handle cases where bytes/string is a list
           (
               w,
@@ -3103,10 +3083,10 @@ internally, to keep track of things like the stack, program, lists etc.
               let file = std_path.join(format!("{}.kcats", alias));
               Ok(std::fs::read(file)?)
           } else {
-              Err(Error::expected("stdlibdir", Default::default()))
+              Err(Error::expected("stdlibdir", None::<Item>))
           }
       } else {
-          Err(Error::expected("stdlibdir", Default::default()))
+          Err(Error::expected("stdlibdir", None::<Item>))
       }
   }
 
@@ -3203,7 +3183,7 @@ We'll implement certain cryptography functions in rust and make kcats
 words for them (hashing, encryption, signing)
 #+begin_src rust :tangle src/crypto.rs :mkdirp yes
   use crate::axiom::ItemResult;
-  use crate::types::Int;
+  use crate::types::number::Int;
   use crate::types::{associative as assoc, error::Error, Bytes, Item};
   use core::ops::Deref;
   use ed25519_dalek as signing;
@@ -3299,13 +3279,13 @@ words for them (hashing, encryption, signing)
               let sk = signing::SecretKey::from_bytes(
                   &Bytes::try_from(
                       a.get(&"secret".into())
-                          .ok_or_else(|| Error::expected("secret", Default::default()))?,
+                          .ok_or_else(|| Error::expected("secret", None::<Item>))?,
                   )?[..],
               )
-              .map_err(|_e| Error::expected("valid-secret-key", Default::default()))?;
+              .map_err(|_e| Error::expected("valid-secret-key", None::<Item>))?;
               Ok(sk)
           } else {
-              Err(Error::expected("keypair", a.clone().into()))
+              Err(Error::expected("keypair", a))
           }
       }
   }
@@ -3318,13 +3298,13 @@ words for them (hashing, encryption, signing)
               let pk = signing::PublicKey::from_bytes(
                   &Bytes::try_from(
                       a.get(&"public".into())
-                          .ok_or_else(|| Error::expected("public", Default::default()))?,
+                          .ok_or_else(|| Error::expected("public", None::<Item>))?,
                   )?[..],
               )
-              .map_err(|_e| Error::expected("valid-public-key", Default::default()))?;
+              .map_err(|_e| Error::expected("valid-public-key", None::<Item>))?;
               Ok(pk)
           } else {
-              Err(Error::expected("public-key", a.clone().into()))
+              Err(Error::expected("public-key", a))
           }
       }
   }
@@ -3343,7 +3323,7 @@ words for them (hashing, encryption, signing)
       let mbs: Bytes = m.try_into()?;
       let sbs: Bytes = s.try_into()?;
       let sig = signing::Signature::from_bytes(&sbs)
-          .map_err(|_e| Error::expected("signature", Default::default()))?;
+          .map_err(|_e| Error::expected("signature", None::<Item>))?;
       Ok(pk.verify(&mbs, &sig).map(|_| mret).unwrap_or_default())
   }
 
@@ -3364,6 +3344,7 @@ example, in order to read/write to/from disk).
 #+begin_src rust :tangle src/serialize.rs :mkdirp yes
   extern crate edn_format;
   use crate::types::environment::Environment;
+  use crate::types::number::Number;
   use crate::types::{associative as assoc, collection as coll, error::Error, *};
   use std::collections::VecDeque;
   use std::fmt;
@@ -3377,7 +3358,7 @@ example, in order to read/write to/from disk).
   fn to_item(item: &edn_format::Value) -> Result<Item, Error> {
       //println!("to item {:?}", item);
       match item {
-          edn_format::Value::Integer(i) => Ok(Item::Int(*i)),
+          edn_format::Value::Integer(i) => Ok(Item::Number(Number::Int(*i))),
           edn_format::Value::Vector(v) => Ok({
               coll::List::from_iter(
                   v.iter()
@@ -3392,7 +3373,7 @@ example, in order to read/write to/from disk).
           // language, but might be user-defined later.
           edn_format::Value::Boolean(b) => Ok(if *b { "yes".into() } else { "false".into() }),
           edn_format::Value::String(s) => Ok(s.to_string().into()),
-          edn_format::Value::Float(f) => Ok(Item::Float(f.into_inner())),
+          edn_format::Value::Float(f) => Ok(Item::Number(Number::Float(f.into_inner()))),
           edn_format::Value::TaggedElement(tag, e) => {
               if *tag == edn_format::Symbol::from_name(BYTE_TAG) {
                   if let edn_format::Value::String(s) = &**e {
@@ -3423,8 +3404,8 @@ example, in order to read/write to/from disk).
           Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
               assoc::Associative::Env(e),
           ))) => from_item(&e.representation()),
-          Item::Int(i) => edn_format::Value::Integer(*i),
-          Item::Float(f) => edn_format::Value::from(*f),
+          Item::Number(Number::Int(i)) => edn_format::Value::Integer(*i),
+          Item::Number(Number::Float(f)) => edn_format::Value::from(*f),
           Item::Char(c) => edn_format::Value::Character(*c),
           Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(s))) => {
               edn_format::Value::String(s.to_string())
@@ -3747,13 +3728,14 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   use crate::types::dictionary as dict;
   use crate::types::environment::Environment;
   use crate::types::error::Error;
+  use crate::types::number::{Float, Int, Number};
   use crate::types::*;
   use core::ops::Deref;
   use dynfmt::{Format, SimpleCurlyFormat};
   use futures::future::FutureExt;
-  use num_integer::Roots;
   use sha2::{self, Digest};
   use std::collections::VecDeque;
+  use std::convert::Infallible;
   use std::default::Default;
   use std::mem;
 
@@ -3774,68 +3756,142 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }
   }
 
-  fn f_stack1(f: fn(Item) -> ItemResult) -> impl Fn(Environment) -> Future<Environment> {
+  fn f_stack1<T, U, R>(f: fn(U) -> Result<T, R>) -> impl Fn(Environment) -> Future<Environment>
+  where
+      T: Into<Item>,
+      U: TryFrom<Item>,
+      U::Error: Into<Error>,
+      R: Into<Error>,
+  {
       move |mut env: Environment| {
-          if let Some(x) = env.tos() {
-              let res = f(x.clone());
-              if res.is_ok() {
-                  env.pop_expr();
-                  env.pop();
+          let x = env
+              .tos()
+              .ok_or_else(Error::stack_underflow)
+              .and_then(|x| U::try_from(x.clone()).map_err(Into::into));
+          match x {
+              Ok(x) => {
+                  let res = f(x);
+                  match res {
+                      Ok(r) => {
+                          env.pop_expr();
+                          env.pop();
+                          env.push(r.into());
+                      }
+                      Err(e) => {
+                          let err: Error = e.into();
+                          env.push(Item::from(err));
+                      }
+                  }
               }
-              env.push(Item::from(res));
-              env.into()
-          } else {
-              env.push(Item::from(Error::stack_underflow()));
-              env.into()
+              Err(e) => {
+                  env.push(e);
+              }
           }
+          env.into()
       }
   }
 
-  fn f_stack2(f: fn(Item, Item) -> ItemResult) -> impl Fn(Environment) -> Future<Environment> {
+  fn f_stack2<T, U, V, R>(f: fn(U, V) -> Result<T, R>) -> impl Fn(Environment) -> Future<Environment>
+  where
+      T: Into<Item>,
+      U: TryFrom<Item>,
+      U::Error: Into<Error>,
+      V: TryFrom<Item>,
+      V::Error: Into<Error>,
+      R: Into<Error>,
+  {
       move |mut env: Environment| {
-          let x = env.tos();
-          let y = env.stack.get(1);
+          let x = env
+              .tos()
+              .ok_or_else(Error::stack_underflow)
+              .and_then(|x| V::try_from(x.clone()).map_err(Into::into));
+          let y = env
+              .stack
+              .get(1)
+              .ok_or_else(Error::stack_underflow)
+              .and_then(|y| U::try_from(y.clone()).map_err(Into::into));
+
           match (x, y) {
-              (Some(x), Some(y)) => {
-                  let res = f(y.clone(), x.clone());
-                  if res.is_ok() {
-                      env.pop_expr();
-                      env.pop();
-                      env.pop();
+              (Ok(x), Ok(y)) => {
+                  let res = f(y, x);
+                  match res {
+                      Ok(r) => {
+                          env.pop_expr();
+                          env.pop();
+                          env.pop();
+                          env.push(r.into());
+                      }
+                      Err(e) => {
+                          env.push(e.into());
+                      }
                   }
-                  env.push(Item::from(res));
-                  env.into()
               }
-              _ => {
-                  env.push(Item::from(Error::stack_underflow()));
-                  env.into()
+              (Err(e), _) => {
+                  env.push(e);
+              }
+              (_, Err(e)) => {
+                  env.push(e);
               }
           }
+          env.into()
       }
   }
 
-  fn f_stack3(f: fn(Item, Item, Item) -> ItemResult) -> impl Fn(Environment) -> Future<Environment> {
+  fn f_stack3<T, U, V, W, R>(
+      f: fn(U, V, W) -> Result<T, R>,
+  ) -> impl Fn(Environment) -> Future<Environment>
+  where
+      T: Into<Item>,
+      U: TryFrom<Item>,
+      U::Error: Into<Error>,
+      V: TryFrom<Item>,
+      V::Error: Into<Error>,
+      W: TryFrom<Item>,
+      W::Error: Into<Error>,
+      R: Into<Error>,
+  {
       move |mut env: Environment| {
-          let x = env.tos();
-          let y = env.stack.get(1);
-          let z = env.stack.get(2);
+          let x = env
+              .tos()
+              .ok_or_else(Error::stack_underflow)
+              .and_then(|x| W::try_from(x.clone()).map_err(Into::into));
+          let y = env
+              .stack
+              .get(1)
+              .ok_or_else(Error::stack_underflow)
+              .and_then(|y| V::try_from(y.clone()).map_err(Into::into));
+          let z = env
+              .stack
+              .get(2)
+              .ok_or_else(Error::stack_underflow)
+              .and_then(|z| U::try_from(z.clone()).map_err(Into::into));
           match (x, y, z) {
-              (Some(x), Some(y), Some(z)) => {
-                  let res = f(z.clone(), y.clone(), x.clone());
-                  if res.is_ok() {
-                      env.pop_expr();
-                      env.pop();
-                      env.pop();
-                      env.pop();
+              (Ok(x), Ok(y), Ok(z)) => {
+                  let res = f(z, y, x);
+                  match res {
+                      Ok(r) => {
+                          env.pop_expr();
+                          env.pop();
+                          env.pop();
+                          env.pop();
+                          env.push(r.into());
+                      }
+                      Err(e) => {
+                          env.push(e.into());
+                      }
                   }
-                  env.push(Item::from(res));
-                  env.into()
               }
-              _ => {
-                  env.push(Item::from(Error::stack_underflow()));
-                  env.into()
+              (Err(e), _, _) => {
+                  env.push(e);
+              }
+              (_, Err(e), _) => {
+                  env.push(e);
+              }
+              (_, _, Err(e)) => {
+                  env.push(e);
               }
           }
+          env.into()
       }
   }
 
@@ -3867,7 +3923,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           match r {
               Ok(_) => env.into(),
               Err(e) => {
-                  env.push(e.into());
+                  env.push(e);
                   env.into()
               }
           }
@@ -3888,7 +3944,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("/", Box::leak(Box::new(f_stack2(div)))),
           ("<", Box::leak(Box::new(f_stack2(lt)))),
           ("<=", Box::leak(Box::new(f_stack2(lte)))),
-          ("=", Box::leak(Box::new(f_stack2(eq)))),
+          ("=", Box::leak(Box::new(eq))),
           (">", Box::leak(Box::new(f_stack2(gt)))),
           (">=", Box::leak(Box::new(f_stack2(gte)))),
           ("abs", Box::leak(Box::new(f_stack1(abs)))),
@@ -3896,7 +3952,12 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("and", Box::leak(Box::new(f_stack2(and)))),
           ("animate", Box::leak(Box::new(animate))),
           ("assign", Box::leak(Box::new(f_stack3(assign)))),
-          ("association", Box::leak(Box::new(f_stack1(association)))),
+          (
+              "association",
+              Box::leak(Box::new(f_stack1::<assoc::Associative, Item, Error>(
+                  assoc::Associative::try_from,
+              ))),
+          ),
           (
               "association?",
               Box::leak(Box::new(f_stack1(is_association))),
@@ -3929,7 +3990,12 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("encodestring", Box::leak(Box::new(f_stack1(encode_string)))),
           ("encodenumber", Box::leak(Box::new(f_stack1(encode_number)))),
           ("encodejson", Box::leak(Box::new(f_stack1(encode_json)))),
-          ("environment", Box::leak(Box::new(f_stack1(environment)))),
+          (
+              "environment",
+              Box::leak(Box::new(f_stack1::<Environment, Item, Error>(
+                  Environment::try_from,
+              ))),
+          ),
           ("error?", Box::leak(Box::new(f_stack1(is_error)))),
           ("eval-step", Box::leak(Box::new(eval_step_outer))),
           ("evaluate", Box::leak(Box::new(evaluate))),
@@ -3982,8 +4048,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               "random",
               Box::leak(Box::new(f_stack1(crate::crypto::random))),
           ),
-          ("range", Box::leak(Box::new(range))),
-          ("read", Box::leak(Box::new(read))),
+          ("range", Box::leak(Box::new(f_stack3(range)))),
+          ("read", Box::leak(Box::new(f_stack1(serialize::parse)))),
           (
               "receiver",
               Box::leak(Box::new(f_stack1(crate::pipes::channel::receiver))),
@@ -4002,7 +4068,12 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               "serversocket",
               Box::leak(Box::new(f_stack2_async(crate::pipes::net::server_socket))),
           ),
-          ("set", Box::leak(Box::new(f_stack1(set)))),
+          (
+              "set",
+              Box::leak(Box::new(f_stack1::<coll::Set, Item, Error>(
+                  coll::Set::try_from,
+              ))),
+          ),
           ("set?", Box::leak(Box::new(f_stack1(is_set)))),
           ("sign", Box::leak(Box::new(f_stack2(crate::crypto::sign)))),
           ("sink", Box::leak(Box::new(sink))),
@@ -4052,196 +4123,113 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       )
   }
 
-  pub fn invalid_type_error(asked: coll::List, actual: Item) -> ItemResult {
-      Err(Error::type_mismatch(asked, Some(actual)))
-  }
-
-  fn number_type_error(i: Item) -> ItemResult {
-      invalid_type_error(list!("number"), i)
-  }
-
   fn pair(i: Item, j: Item) -> Item {
       list!(i, j).into()
   }
 
-  pub fn plus(i: Item, j: Item) -> ItemResult {
-      match (i, j) {
-          (Item::Int(i), Item::Int(j)) => Ok(Item::Int(i + j)),
-          (Item::Float(i), Item::Float(j)) => Ok(Item::Float(i + j)),
-          (Item::Int(i), Item::Float(j)) => Ok(Item::Float(i as Float + j)),
-          (Item::Float(i), Item::Int(j)) => Ok(Item::Float(i + j as Float)),
-          (i, j) => number_type_error(pair(i, j)),
-      }
+  pub fn plus(i: Number, j: Number) -> Result<Number, Error> {
+      Ok(i.add(j))
   }
 
-  pub fn minus(i: Item, j: Item) -> ItemResult {
-      match (i, j) {
-          (Item::Int(i), Item::Int(j)) => Ok(Item::Int(i - j)),
-          (Item::Float(i), Item::Float(j)) => Ok(Item::Float(i - j)),
-          (Item::Int(i), Item::Float(j)) => Ok(Item::Float(i as Float - j)),
-          (Item::Float(i), Item::Int(j)) => Ok(Item::Float(i - j as Float)),
-          (i, j) => number_type_error(pair(i, j)),
-      }
+  pub fn minus(i: Number, j: Number) -> Result<Number, Error> {
+      Ok(i.subtract(j))
   }
 
-  pub fn mult(i: Item, j: Item) -> ItemResult {
-      match (i, j) {
-          (Item::Int(i), Item::Int(j)) => Ok(Item::Int(i * j)),
-          (Item::Float(i), Item::Float(j)) => Ok(Item::Float(i * j)),
-          (Item::Int(i), Item::Float(j)) => Ok(Item::Float(i as Float * j)),
-          (Item::Float(i), Item::Int(j)) => Ok(Item::Float(i * j as Float)),
-          (i, j) => number_type_error(pair(i, j)),
-      }
+  pub fn mult(i: Number, j: Number) -> Result<Number, Error> {
+      Ok(i.multiply(j))
   }
 
-  fn divide(i: Float, j: Float) -> ItemResult {
-      let q = i / j;
-      if q.is_nan() {
-          Err(Error::division_by_zero())
-      } else {
-          Ok(Item::Float(q))
-      }
-  }
-
-  pub fn div(i: Item, j: Item) -> ItemResult {
+  pub fn div(i: Number, j: Number) -> Result<Number, Error> {
       match (i, j) {
-          (Item::Int(i), Item::Int(j)) => i
+          (Number::Int(i), Number::Int(j)) => i
               .checked_div(j)
               .ok_or_else(Error::division_by_zero)
-              .map(Item::Int),
+              .map(Number::Int),
 
-          (Item::Float(i), Item::Float(j)) => divide(i, j),
-          (Item::Int(i), Item::Float(j)) => divide(i as Float, j),
-          (Item::Float(i), Item::Int(j)) => divide(i, j as Float),
-          (i, j) => number_type_error(pair(i, j)),
+          (Number::Float(i), Number::Float(j)) => Number::divide(i, j).map(Number::Float),
+          (Number::Int(i), Number::Float(j)) => Number::divide(i as Float, j).map(Number::Float),
+          (Number::Float(i), Number::Int(j)) => Number::divide(i, j as Float).map(Number::Float),
       }
   }
 
-  pub fn mod_(i: Item, j: Item) -> ItemResult {
-      let i = Int::try_from(i)?;
-      let j = Int::try_from(j)?;
-      Ok(Item::Int(i % j))
+  pub fn mod_(i: Int, j: Int) -> Result<Int, Error> {
+      Ok(i % j)
   }
 
-  pub fn floor(i: Item) -> ItemResult {
+  pub fn floor(i: Number) -> Result<Int, Error> {
       match i {
-          Item::Int(i) => Ok(Item::Int(i)),
-          Item::Float(i) => Ok(Item::Int(i.floor() as Int)),
-          i => number_type_error(i),
+          Number::Int(i) => Ok(i),
+          Number::Float(i) => Ok(i.floor() as Int),
       }
   }
 
-  pub fn ceiling(i: Item) -> ItemResult {
+  pub fn ceiling(i: Number) -> Result<Int, Error> {
       match i {
-          Item::Int(i) => Ok(Item::Int(i)),
-          Item::Float(i) => Ok(Item::Int(i.ceil() as Int)),
-          i => number_type_error(i),
+          Number::Int(i) => Ok(i),
+          Number::Float(i) => Ok(i.ceil() as Int),
       }
   }
 
-  pub fn round(i: Item) -> ItemResult {
+  pub fn round(i: Number) -> Result<Int, Error> {
       match i {
-          Item::Int(i) => Ok(Item::Int(i)),
-          Item::Float(i) => Ok(Item::Int(i.round() as Int)),
-          i => number_type_error(i),
+          Number::Int(i) => Ok(i),
+          Number::Float(i) => Ok(i.round() as Int),
       }
   }
 
-  pub fn exp(base: Item, exponent: Item) -> ItemResult {
-      match (base, exponent) {
-          (Item::Int(base), Item::Int(exponent)) => base
-              .checked_pow(exponent as u32)
-              .ok_or(Error::overflow())
-              .map(Item::Int),
-          (base, exponent) => number_type_error(pair(base, exponent)),
+  pub fn exp(base: Int, exponent: Int) -> Result<Int, Error> {
+      base.checked_pow(exponent as u32).ok_or(Error::overflow())
+  }
+
+  pub fn log(value: Int, base: Int) -> Result<Float, Error> {
+      if base <= 1 {
+          Err(Error::too_small(base, 1))
+      } else if value <= 0 {
+          Err(Error::too_small(value, 0))
+      } else {
+          let base = base as Float;
+          let value = value as Float;
+          Ok(value.log(base))
       }
   }
 
-  pub fn log(value: Item, base: Item) -> ItemResult {
-      match (base, value) {
-          (Item::Int(base), Item::Int(value)) => {
-              if base <= 1 {
-                  Err(Error::too_small(base, 1))
-              } else if value <= 0 {
-                  Err(Error::too_small(value, 0))
-              } else {
-                  let base = base as Float;
-                  let value = value as Float;
-                  Ok(Item::Float(value.log(base)))
-              }
-          }
-          (base, value) => number_type_error(pair(base, value)),
-      }
+  pub fn inc(i: Int) -> Result<Int, Infallible> {
+      Ok(i + 1)
   }
 
-  pub fn inc(i: Item) -> ItemResult {
-      Ok(Item::Int(Int::try_from(i)? + 1))
+  pub fn dec(i: Int) -> Result<Int, Infallible> {
+      Ok(i - 1)
   }
 
-  pub fn dec(i: Item) -> ItemResult {
-      Ok(Item::Int(Int::try_from(i)? - 1))
-  }
-
-  pub fn is_zero(i: Item) -> ItemResult {
+  pub fn is_zero(i: Number) -> Result<bool, Infallible> {
       match i {
-          Item::Int(i) => Ok(Item::from(i == 0)),
-          Item::Float(i) => Ok(Item::from(i == 0.0)),
-          i => number_type_error(i),
+          Number::Int(i) => Ok(i == 0),
+          Number::Float(i) => Ok(i == 0.0),
       }
   }
 
-  pub fn is_empty(i: Item) -> ItemResult {
-      Ok(Item::from(i.is_empty()))
+  pub fn is_empty(i: Item) -> Result<bool, Infallible> {
+      Ok(i.is_empty())
   }
 
-  pub fn gt(i: Item, j: Item) -> ItemResult {
-      match (i, j) {
-          (Item::Int(i), Item::Int(j)) => Ok(Item::from(i > j)),
-          (Item::Float(i), Item::Float(j)) => Ok(Item::from(i > j)),
-          (Item::Int(i), Item::Float(j)) => Ok(Item::from(i as Float > j)),
-          (Item::Float(i), Item::Int(j)) => Ok(Item::from(i > j as Float)),
-
-          (i, j) => number_type_error(pair(i, j)),
-      }
+  pub fn gt(i: Number, j: Number) -> Result<bool, Infallible> {
+      Ok(Number::gt(i, j))
   }
 
-  pub fn lt(i: Item, j: Item) -> ItemResult {
-      match (i, j) {
-          (Item::Int(i), Item::Int(j)) => Ok(Item::from(i < j)),
-          (Item::Float(i), Item::Float(j)) => Ok(Item::from(i < j)),
-          (Item::Int(i), Item::Float(j)) => Ok(Item::from((i as Float) < j)),
-          (Item::Float(i), Item::Int(j)) => Ok(Item::from(i < j as Float)),
-
-          (i, j) => number_type_error(pair(i, j)),
-      }
+  pub fn lt(i: Number, j: Number) -> Result<bool, Infallible> {
+      Ok(Number::lt(i, j))
   }
 
-  pub fn gte(i: Item, j: Item) -> ItemResult {
-      match (i, j) {
-          (Item::Int(i), Item::Int(j)) => Ok(Item::from(i >= j)),
-          (Item::Float(i), Item::Float(j)) => Ok(Item::from(i >= j)),
-          (Item::Int(i), Item::Float(j)) => Ok(Item::from(i as Float >= j)),
-          (Item::Float(i), Item::Int(j)) => Ok(Item::from(i >= j as Float)),
-
-          (i, j) => number_type_error(pair(i, j)),
-      }
+  pub fn gte(i: Number, j: Number) -> Result<bool, Infallible> {
+      Ok(Number::gte(i, j))
   }
 
-  pub fn lte(i: Item, j: Item) -> ItemResult {
-      match (i, j) {
-          (Item::Int(i), Item::Int(j)) => Ok(Item::from(i <= j)),
-          (Item::Float(i), Item::Float(j)) => Ok(Item::from(i <= j)),
-          (Item::Int(i), Item::Float(j)) => Ok(Item::from((i as Float).le(&j))),
-          (Item::Float(i), Item::Int(j)) => Ok(Item::from(i <= j as Float)),
-
-          (i, j) => number_type_error(pair(i, j)),
-      }
+  pub fn lte(i: Number, j: Number) -> Result<bool, Infallible> {
+      Ok(Number::lte(i, j))
   }
 
-  pub fn join(i: Item, j: Item) -> ItemResult {
-      let i = coll::Sized::try_from(i)?;
-      let j = coll::Sized::try_from(j)?;
-      Ok(i.join(j)?.into())
+  pub fn join(i: coll::Sized, j: coll::Sized) -> Result<coll::Sized, Error> {
+      i.join(j)
   }
 
   pub fn put(mut env: Environment) -> Future<Environment> {
@@ -4258,14 +4246,14 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   }
                   Err(e) => {
                       env.push(i2);
-                      env.push(e.into())
+                      env.push(e)
                   }
               };
               env
           })),
           Err(e) => {
               env.push(i2);
-              env.push(e.into());
+              env.push(e);
               env.into()
           }
       }
@@ -4315,86 +4303,77 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       env.into()
   }
 
-  pub fn eq(i: Item, j: Item) -> ItemResult {
-      Ok(Item::from(i == j))
+  pub fn eq(mut env: Environment) -> Future<Environment> {
+      let i = env.pop();
+      let j = env.pop();
+      env.pop_expr();
+      env.push(i == j);
+      env.into()
   }
 
-  pub fn count(i: Item) -> ItemResult {
-      match i {
-          Item::Dispenser(coll::Dispenser::Sized(i)) => Ok(Item::Int(i.len() as Int)),
-          Item::Receptacle(coll::Receptacle::Sized(i)) => Ok(Item::Int(i.len() as Int)),
-          i => Err(Error::expected("sized", i)),
-      }
+  pub fn count(i: coll::Sized) -> Result<Int, Infallible> {
+      Ok(i.len() as Int)
   }
 
-  pub fn is_string(i: Item) -> ItemResult {
-      Ok(Item::from(matches!(
+  pub fn is_string(i: Item) -> Result<bool, Infallible> {
+      Ok(matches!(
           i,
           Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(_)))
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::String(_)))
-      )))
+      ))
   }
 
-  pub fn is_bytes(i: Item) -> ItemResult {
-      Ok(Item::from(matches!(
+  pub fn is_bytes(i: Item) -> Result<bool, Infallible> {
+      Ok(matches!(
           i,
           Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(_)))
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(_)))
-      )))
+      ))
   }
 
-  pub fn is_error(i: Item) -> ItemResult {
-      Ok(Item::from(matches!(
+  pub fn is_error(i: Item) -> Result<bool, Infallible> {
+      Ok(matches!(
           i,
           Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
               assoc::Associative::Error(_),
           )))
-      )))
+      ))
   }
 
-  pub fn is_word(i: Item) -> ItemResult {
-      Ok(Item::from(match i {
-          Item::Word(_) => true,
-          //Item::Iterable(Item(_)) => true,
-          // TODO maybe also check if it's an associative that looks like a Def?
-          _ => false,
-      }))
+  pub fn is_word(i: Item) -> Result<bool, Infallible> {
+      Ok(matches!(i, Item::Word(_)))
   }
 
-  pub fn is_pipe(i: Item) -> ItemResult {
-      Ok(Item::from(matches!(
+  pub fn is_pipe(i: Item) -> Result<bool, Infallible> {
+      Ok(matches!(
           i,
           Item::Dispenser(coll::Dispenser::Out(_))
               | Item::Dispenser(coll::Dispenser::Tunnel(_))
               | Item::Receptacle(coll::Receptacle::In(_))
               | Item::Receptacle(coll::Receptacle::Tunnel(_))
-      )))
+      ))
   }
-  pub fn is_number(i: Item) -> ItemResult {
-      Ok(Item::from(matches!(i, Item::Int(_) | Item::Float(_))))
+  pub fn is_number(i: Item) -> Result<bool, Infallible> {
+      Ok(matches!(i, Item::Number(_)))
   }
 
-  pub fn is_list(i: Item) -> ItemResult {
+  pub fn is_list(i: Item) -> Result<bool, Infallible> {
       Ok(coll::Sized::try_from(i)
           .map(|s| matches!(s, coll::Sized::List(_)))
-          .unwrap_or(false)
-          .into())
+          .unwrap_or(false))
   }
 
-  pub fn first(i: Item) -> ItemResult {
-      let s = coll::Sized::try_from(i)?;
-      let (_, i) = s.take();
+  pub fn first(c: coll::Sized) -> ItemResult {
+      let (_, i) = c.take();
       Ok(i.into())
   }
 
-  pub fn second(i: Item) -> ItemResult {
-      let l = coll::List::try_from(i)?;
-      Ok(l.get(1).cloned().unwrap_or_default())
+  pub fn second(c: coll::List) -> ItemResult {
+      Ok(c.get(1).cloned().unwrap_or_default())
   }
 
-  pub fn last(i: Item) -> ItemResult {
-      let s = coll::Sized::try_from(i)?;
-      Ok(s.into_iter().last().unwrap_or_default())
+  pub fn last(c: coll::Sized) -> ItemResult {
+      Ok(c.into_iter().last().unwrap_or_default())
   }
 
   pub fn loop_(mut env: Environment) -> Future<Environment> {
@@ -4424,7 +4403,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               env.program.append(program);
           }
           Err(e) => {
-              env.push(e.into());
+              env.push(e);
           }
       }
       env.into()
@@ -4433,7 +4412,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   pub fn wrap(mut env: Environment) -> Future<Environment> {
       let item = env.pop();
       env.pop_expr();
-      env.push(list!(item).into());
+      env.push(list!(item));
       env.into()
   }
 
@@ -4445,7 +4424,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               env
           }
           Err(e) => {
-              env.push(e.into());
+              env.push(e);
               env
           }
       }
@@ -4462,7 +4441,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               expr.push_front(list!(item).into());
               env.program.append(program)
           }
-          Err(e) => env.push(e.into()),
+          Err(e) => env.push(e),
       }
       env.into()
   }
@@ -4478,7 +4457,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               expr.push_front(list!(item2, item1).into());
               env.program.append(program)
           }
-          Err(e) => env.push(e.into()),
+          Err(e) => env.push(e),
       }
       env.into()
   }
@@ -4535,25 +4514,20 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   Ok(it) => {
                       let (c, i) = it.pop();
                       env.pop_expr();
-                      let stack = env.stack.make_mut();
-                      stack.push_front(c.into());
-                      stack.push_front(i.unwrap_or_default());
-                      env.into()
+                      env.push(c);
+                      env.push(i.unwrap_or_default());
                   }
                   Err(e) => {
-                      let stack = env.stack.make_mut();
-                      stack.push_front(i2);
-                      stack.push_front(e.into());
-                      env.into()
+                      env.push(i2);
+                      env.push(e);
                   }
               }
           }
           None => {
-              let stack = env.stack.make_mut();
-              stack.push_front(Error::stack_underflow().into());
-              env.into()
+              env.push(Error::stack_underflow());
           }
       }
+      env.into()
   }
 
   pub fn is_truthy(i: Item) -> bool {
@@ -4563,14 +4537,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           _ => true,
       }
   }
-
-  // fn boolean_value(b: bool) -> Item {
-  //     if b {
-  //         "true".into()
-  //     } else {
-  //         coll::Item::default()
-  //     }
-  // }
 
   pub fn branch(mut env: Environment) -> Future<Environment> {
       match (
@@ -4587,8 +4553,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   false_branch
               })
           }
-          (Err(e), _) => env.push(e.into()),
-          (_, Err(e)) => env.push(e.into()),
+          (Err(e), _) => env.push(e),
+          (_, Err(e)) => env.push(e),
       }
       env.into()
   }
@@ -4615,13 +4581,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       })
   }
 
-  pub fn range(mut env: Environment) -> Future<Environment> {
-      let stepby = Int::try_from(env.pop()).unwrap();
-      let to = Int::try_from(env.pop()).unwrap();
-      let from = Int::try_from(env.pop()).unwrap();
-      env.push(coll::List::from_iter((from..to).step_by(stepby as usize).map(Item::Int)).into());
-      env.pop_expr();
-      env.into()
+  pub fn range(from: Int, to: Int, stepby: Int) -> Result<coll::List, Infallible> {
+      Ok(coll::List::from_iter(
+          (from..to).step_by(stepby as usize).map(Item::from),
+      ))
   }
 
   // (effect [rec2 rec1 then pred]
@@ -4653,9 +4616,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       rm.push_back(r);
       rm.extend(rec2.make_mut().drain(..));
       //env.pop_expr();
-      env.push(pred.into());
-      env.push(then.into());
-      env.push(rec1.into());
+      env.push(pred);
+      env.push(then);
+      env.push(rec1);
       env.into()
   }
 
@@ -4666,7 +4629,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let mut l = coll::List::try_from(env.pop()).unwrap();
       mem::swap(&mut env.stack, &mut l);
       env.pop_expr();
-      env.push(l.into());
+      env.push(l);
       env.into()
   }
 
@@ -4850,17 +4813,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       unassoc_in(m, ks)
   }
 
-  pub fn association(m: Item) -> ItemResult {
-      match assoc::Associative::try_from(m) {
-          Ok(m) => Ok(m.into()),
-          Err(e) => Err(e),
-      }
-  }
-
-  pub fn lookup(i: Item, k: Item) -> ItemResult {
+  pub fn lookup(i: coll::Sized, k: assoc::KeyItem) -> ItemResult {
       //println!("lookup {:?} \n {:?}", i, k);
-      let k = assoc::KeyItem::try_from(k)?;
-      let i = coll::Sized::try_from(i)?;
+      //let k = assoc::KeyItem::try_from(k)?;
+      //let i = coll::Sized::try_from(i)?;
       match (i, k) {
           (coll::Sized::List(l), assoc::KeyItem::Int(k)) => {
               Ok(l.get(k as usize).cloned().unwrap_or_default())
@@ -4874,7 +4830,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           (coll::Sized::Bytes(b), assoc::KeyItem::Int(k)) => b
               .get(k as usize)
               .cloned()
-              .map_or(Ok(Item::default()), |c| Ok(Item::Int(c as i64))),
+              .map_or(Ok(Item::default()), |c| Ok((c as i64).into())),
           (i, k) => {
               let m = assoc::Associative::try_from(i)?;
               Ok(m.get(&k).unwrap_or_default())
@@ -4882,9 +4838,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }
   }
 
-  pub fn contains(c: Item, i: Item) -> ItemResult {
-      let s = coll::Sized::try_from(c)?;
-      Ok(s.contains(&i).into())
+  pub fn contains(c: coll::Sized, i: Item) -> Result<bool, Infallible> {
+      Ok(c.contains(&i))
   }
 
   pub fn or(i: Item, j: Item) -> ItemResult {
@@ -4910,28 +4865,24 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       Ok(Item::from(!is_truthy(i)))
   }
 
-  pub fn is_association(i: Item) -> ItemResult {
+  pub fn is_association(i: Item) -> Result<bool, Error> {
       Ok(coll::Sized::try_from(i)
           .map(|s| matches!(s, coll::Sized::Associative(_)))
-          .unwrap_or(false)
-          .into())
+          .unwrap_or(false))
   }
 
-  pub fn is_set(i: Item) -> ItemResult {
+  pub fn is_set(i: Item) -> Result<bool, Error> {
       Ok(coll::Sized::try_from(i)
           .map(|s| matches!(s, coll::Sized::Set(_)))
-          .unwrap_or(false)
-          .into())
+          .unwrap_or(false))
   }
 
-  pub fn is_odd(i: Item) -> ItemResult {
-      let i = Int::try_from(i)?;
-      Ok(Item::from(i & 1 == 1))
+  pub fn is_odd(i: Int) -> Result<bool, Error> {
+      Ok(i & 1 == 1)
   }
 
-  pub fn is_even(i: Item) -> ItemResult {
-      let i = Int::try_from(i)?;
-      Ok(Item::from(i & 1 == 0))
+  pub fn is_even(i: Int) -> Result<bool, Error> {
+      Ok(i & 1 == 0)
   }
 
   pub fn decide(mut env: Environment) -> Future<Environment> {
@@ -4944,8 +4895,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           match clause {
               Ok(mut clause) => {
                   if clause.len() != 2 {
-                      env.push(Error::list_count(2).into());
-                      env.into()
+                      env.push(Error::list_count(2));
                   } else {
                       let clause_data = clause.make_mut();
                       let test: Result<coll::List, Error> = clause_data
@@ -4979,43 +4929,25 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                               );
                               env.pop_expr();
                               env.program.append(newexpr);
-                              env.into()
                           }
                           (Err(test), _) => {
-                              env.push(test.into());
-                              env.into()
+                              env.push(test);
                           }
                           (_, Err(expr)) => {
-                              env.push(expr.into());
-                              env.into()
+                              env.push(expr);
                           }
                       }
                   }
               }
               Err(e) => {
-                  env.push(e.into());
-                  env.into()
+                  env.push(e);
               }
           }
       } else {
           // clauses empty, return nothing
           env.pop_expr();
           env.push(Item::default());
-          env.into()
       }
-  }
-
-  pub fn read(mut env: Environment) -> Future<Environment> {
-      let s = String::try_from(env.pop()).unwrap();
-      let parsed = serialize::parse(s);
-      let r = match parsed {
-          Ok(l) => {
-              env.pop_expr();
-              l.into()
-          }
-          Err(e) => e.into(),
-      };
-      env.push(r);
       env.into()
   }
 
@@ -5043,7 +4975,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       {
                           if let Some(spec) = &dfn.spec {
                               if let Err(e) = env.check_input_spec(&spec.0) {
-                                  env.push(e.into());
+                                  env.push(e);
                                   return env.into();
                               }
                           } else {
@@ -5061,7 +4993,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       }
                   } else {
                       let w = word.clone();
-                      env.push(Error::undefined(w).into());
+                      env.push(Error::undefined(w));
                       env.into()
                   }
               }
@@ -5073,70 +5005,54 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               }
           }
       } else {
-          env.push(Error::short_list(1).into());
+          env.push(Error::short_list(1));
           env.into()
       }
   }
 
-  fn reverse(i: Item) -> ItemResult {
-      let s = coll::Sized::try_from(i)?;
+  fn reverse(s: coll::Sized) -> Result<coll::Sized, Error> {
       match s {
           coll::Sized::List(l) => Ok(coll::List::from_iter(l.inner().into_iter().rev()).into()),
           coll::Sized::String(s) => Ok(s.chars().rev().collect::<String>().into()),
           coll::Sized::Bytes(b) => Ok(b.into_iter().rev().collect::<Vec<u8>>().into()),
-          s => Err(Error::expected("ordered", s.into())),
+          s => Err(Error::expected("ordered", s)),
       }
   }
 
-  fn encode_string(i: Item) -> ItemResult {
-      Ok(String::try_from(i)?.as_bytes().to_vec().into())
+  fn encode_string(s: String) -> Result<Bytes, Infallible> {
+      Ok(s.as_bytes().to_vec())
   }
 
-  fn encode_number(i: Item) -> ItemResult {
-      match i {
-          Item::Int(i) => Ok(i.to_be_bytes().to_vec().into()),
-          Item::Float(f) => Ok(f.to_be_bytes().to_vec().into()),
-          _ => Err(Error::expected("number", i)),
+  fn encode_number(n: Number) -> Result<Bytes, Infallible> {
+      match n {
+          Number::Int(i) => Ok(i.to_be_bytes().to_vec()),
+          Number::Float(f) => Ok(f.to_be_bytes().to_vec()),
       }
   }
 
-  fn string(i: Item) -> ItemResult {
+  fn string(i: Item) -> Result<String, Infallible> {
       match i {
           Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(b))) => {
-              Ok(Item::Dispenser(coll::Dispenser::Sized(
-                  coll::Sized::String(std::str::from_utf8(&b).unwrap().to_string()),
-              )))
+              Ok(std::str::from_utf8(&b).unwrap().to_string())
           }
           Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(b))) => {
-              Ok(Item::Receptacle(coll::Receptacle::Sized(
-                  coll::Sized::String(std::str::from_utf8(&b).unwrap().to_string()),
-              )))
+              Ok(std::str::from_utf8(&b).unwrap().to_string())
           }
           Item::Dispenser(coll::Dispenser::Sized(s)) => {
               if s.is_empty() {
-                  Ok(Item::Dispenser(coll::Dispenser::Sized(
-                      coll::Sized::String("".to_string()),
-                  )))
+                  Ok("".to_string())
               } else {
-                  Ok(Item::Dispenser(coll::Dispenser::Sized(
-                      coll::Sized::String(serialize::emit(&s.into())),
-                  )))
+                  Ok(serialize::emit(&s.into()))
               }
           }
           Item::Receptacle(coll::Receptacle::Sized(s)) => {
               if s.is_empty() {
-                  Ok(Item::Dispenser(coll::Dispenser::Sized(
-                      coll::Sized::String("".to_string()),
-                  )))
+                  Ok("".to_string())
               } else {
-                  Ok(Item::Dispenser(coll::Dispenser::Sized(
-                      coll::Sized::String(serialize::emit(&s.into())),
-                  )))
+                  Ok(serialize::emit(&s.into()))
               }
           }
-          i => Ok(Item::Dispenser(coll::Dispenser::Sized(
-              coll::Sized::String(serialize::emit(&i)),
-          ))),
+          i => Ok(serialize::emit(&i)),
       }
   }
 
@@ -5198,10 +5114,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       env
   }
 
-  fn environment(p: Item) -> ItemResult {
-      Environment::try_from(p).map(|e| e.into())
-  }
-
   pub fn eval_step_outer(mut env: Environment) -> Future<Environment> {
       let tos = env.pop();
       let inner_env = Environment::try_from(tos);
@@ -5216,13 +5128,13 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   })
               } else {
                   Box::pin(eval_step(inner).map(|inner_next| {
-                      env.push(inner_next.into());
+                      env.push(inner_next);
                       env
                   }))
               }
           }
           Err(e) => {
-              env.push(e.into());
+              env.push(e);
               env.into()
           }
       }
@@ -5234,11 +5146,11 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       match inner_env {
           Ok(inner) => Box::pin(eval(inner).map(|inner_done| {
               env.pop_expr();
-              env.push(inner_done.into());
+              env.push(inner_done);
               env
           })),
           Err(e) => {
-              env.push(e.into());
+              env.push(e);
               env.into()
           }
       }
@@ -5252,24 +5164,16 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   pub fn dictionary(mut env: Environment) -> Future<Environment> {
       let d = env.dictionary.clone();
       env.pop_expr();
-      env.push(d.into());
+      env.push(d);
       env.into()
   }
 
-  fn sqrt(i: Item) -> ItemResult {
-      match i {
-          Item::Int(i) => Ok(Item::Int(i.sqrt())),
-          Item::Float(f) => Ok(Item::Float(f.sqrt())),
-          i => number_type_error(i),
-      }
+  fn sqrt(i: Number) -> Result<Number, Infallible> {
+      Ok(i.sqrt())
   }
 
-  fn abs(i: Item) -> ItemResult {
-      match i {
-          Item::Int(i) => Ok(Item::Int(i.abs())),
-          Item::Float(f) => Ok(Item::Float(f.abs())),
-          i => number_type_error(i),
-      }
+  fn abs(i: Number) -> Result<Number, Infallible> {
+      Ok(i.abs())
   }
 
   fn handle(i: Item) -> ItemResult {
@@ -5284,37 +5188,18 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }
   }
 
-  // fn inscription(env: &mut Environment) -> Result<(Word, dict::Entry), Error> {
-  //     let d = env.pop();
-  //     let mut wl = coll::List::try_from(env.pop())?;
-  //     let w1 = coll::Arc::make_mut(&mut wl).pop_front();
-  //     let x = w1.ok_or(Error::short_list(1))?;
-  //     let w = Word::try_from(x.clone())?;
-  //     Ok((w, dict::Entry::try_from(d)?))
-  // }
-
-  // pub fn inscribe(mut env: Environment) -> Environment {
-  //     let r = inscription(&mut env);
-  //     match r {
-  //         Ok((w, def)) => {
-  //             let d = coll::Arc::make_mut(&mut env.dictionary);
-  //             d.insert(assoc::KeyItem::Word(w), Item::Entry(def));
-  //             env
-  //         }
-  //         Err(e) => env.push(e.into()),
-  //     }
-  // }
-
-  // make 'yes' a word that doesn't have to be quoted, just pushes
-  // itself onto the stack.
+  /// Makes 'yes' a word that doesn't have to be quoted, just pushes
+  /// itself onto the stack.
   pub fn yes(mut env: Environment) -> Future<Environment> {
       let t = env.pop_expr();
       env.push(t);
       env.into()
   }
 
-  pub fn fail(e: Item) -> ItemResult {
-      let mut e: Error = e.try_into()?;
+  /// Even though we say the return type is [Infallible] what we really
+  /// mean is "a type that can never happen in this case", because it's
+  /// always returning an error.
+  pub fn fail(mut e: Error) -> Result<Infallible, Error> {
       e.is_handled = false;
       Err(e)
   }
@@ -5333,7 +5218,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               env
           }
           Err(e) => {
-              env.push(e.into());
+              env.push(e);
               env
           }
       }
@@ -5373,35 +5258,30 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               match ns {
                   Ok(ns) => {
                       env.dictionary.resolve_all(&mut program, &ns);
-                      env.push(program.into());
+                      env.push(program);
                       // pop the word 'using'
                       env.pop_expr();
-                      env.into()
                   }
                   Err(e) => {
-                      env.push(e.into());
-                      env.into()
+                      env.push(e);
                   }
               }
           }
           (Err(e), _) => {
-              env.push(e.into());
-              env.into()
+              env.push(e);
           }
           (_, Err(e)) => {
-              env.push(e.into());
-              env.into()
+              env.push(e);
           }
       }
+      env.into()
   }
 
   /// Takes a word, and gives it a namespace. The namespace should be
   /// [Bytes]. Overwrites any previous namespace the word had.
-  pub fn namespaced(i: Item, j: Item) -> ItemResult {
-      let b = Bytes::try_from(i)?;
-      let mut w = Word::try_from(j)?;
-      w.namespace = Some(Newtype(b));
-      Ok(w.into())
+  pub fn namespaced(namespace: Bytes, mut word: Word) -> Result<Word, Infallible> {
+      word.namespace = Some(Newtype(namespace));
+      Ok(word)
   }
 
   /// Creates an alias for a module. Takes a word and bytes and creates
@@ -5409,8 +5289,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   pub fn alias_module(env: &mut Environment) -> Result<(), Error> {
       let b = Bytes::try_from(env.pop())?;
       let w = Word::try_from(env.pop())?;
-      let r: Result<Word, Error> = env.dictionary.insert_module_alias(w, b).into();
-      env.push(r.into());
+      let r: Result<Word, Error> = env.dictionary.insert_module_alias(w, b);
+      env.push(r);
       Ok(())
   }
 
@@ -5420,7 +5300,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       //println!("dictmerge: {:?}", env);
       let partialdict = dict::Dictionary::try_from(env.pop())?;
       let namespace = dict::Namespace::try_from(env.pop())?;
-      env.dictionary.merge(partialdict, Some(namespace.into()));
+      env.dictionary.merge(partialdict, Some(namespace));
       // pop the word dictmerge
       env.pop_expr();
       Ok(())
@@ -5451,7 +5331,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               hash = sha2::Sha256::digest(bytes.as_slice()).deref().to_vec();
               (l, hash)
           }
-          i => Err(Error::expected("program", i.into()))?,
+          i => Err(Error::expected("program", i))?,
       };
 
       let dict = env.dictionary.clone();
@@ -5485,8 +5365,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                               list!(list!("hash"), "both", "="),
                               "module integrity check failed",
                               Some(alias),
-                          )
-                          .into());
+                          ));
                       }
                   }
               }
@@ -5497,7 +5376,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               } else {
                   // push Nothing, meaning that we want this module
                   // loaded into the default (no) namespace.
-                  env.push(Default::default());
+                  env.push(Item::default());
               }
           }
       }
@@ -5505,8 +5384,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       // shielddown to let it only consume the copy of the original dictionary
       let module_program = list!(module_program, "shielddown");
 
-      env.push(hash.into());
-      env.push(dict.into());
+      env.push(hash);
+      env.push(dict);
       env.pop_expr(); //pop off the inscribe word
 
       env.push_expr("dictmerge".into());
@@ -5518,7 +5397,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   pub fn read_blob(env: &mut Environment) -> Result<(), Error> {
       let alias = Word::try_from(env.pop())?;
       let blob = environment::read_blob(&alias)?;
-      env.push(blob.into());
+      env.push(blob);
       env.pop_expr();
       Ok(())
   }
@@ -5535,7 +5414,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               env.into()
           }
           Err(e) => {
-              env.push(e.into());
+              env.push(e);
               env.into()
           }
       }
@@ -5554,7 +5433,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
   pub fn xor(i: Item, j: Item) -> ItemResult {
       match (i, j) {
-          (Item::Int(i), Item::Int(j)) => Ok(Item::Int(i ^ j)),
+          (Item::Number(Number::Int(i)), Item::Number(Number::Int(j))) => {
+              Ok(Item::Number(Number::Int(i ^ j)))
+          }
           (
               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(i))),
               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(j))),
@@ -5567,11 +5448,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }
   }
 
-  pub fn inspect(i: Item) -> ItemResult {
-      let s = format!("{:?}", i);
-      Ok(Item::Dispenser(coll::Dispenser::Sized(
-          coll::Sized::String(s),
-      )))
+  pub fn inspect(i: Item) -> Result<String, Infallible> {
+      Ok(format!("{:?}", i))
   }
 
   pub fn timestamps(mut env: Environment) -> Future<Environment> {
@@ -5586,10 +5464,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           pipes::Tunnel::Standard,
       )));
       env.into()
-  }
-
-  pub fn set(i: Item) -> ItemResult {
-      coll::Set::try_from(i).map(|s| Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Set(s))))
   }
 
   pub fn intersection(i: Item, j: Item) -> ItemResult {
@@ -5622,12 +5496,11 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       Ok((j, k))
   }
 
-  pub fn sort_by_key(i: Item) -> ItemResult {
-      let l = coll::List::try_from(i)?;
+  pub fn sort_by_key(l: coll::List) -> Result<coll::List, Error> {
       let it = l.inner().into_iter().map(as_pair);
       let mut it = it.collect::<Result<Vec<(Item, assoc::KeyItem)>, Error>>()?;
       it.sort_unstable_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Less));
-      Ok(coll::List::from_iter(it.into_iter().map(|(k, _)| k)).into())
+      Ok(coll::List::from_iter(it.into_iter().map(|(k, _)| k)))
   }
 
   fn slice(arr: Item, start: Item, end: Item) -> ItemResult {
@@ -5672,7 +5545,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   .collect();
               Ok(coll::List::from(owned_subset).into())
           }
-          i => Err(Error::expected("ordered", i.into())),
+          i => Err(Error::expected("ordered", i)),
       }
   }
 
@@ -5969,7 +5842,7 @@ We'll also define how to run unit tests.
               vec![Error::create(
                   list!("dictionary", list!(w.clone()), "lookup"),
                   "word is not defined",
-                  None,
+                  None::<Item>,
               )]
           }
       }
@@ -6596,7 +6469,8 @@ How to interact with the network (TCP/IP sockets)
   use crate::list;
   use crate::types::associative as assoc;
   use crate::types::error::Error;
-  use crate::types::{self, Int, Item};
+  use crate::types::number::Int;
+  use crate::types::{self, Item};
   use futures::future::FutureExt;
   use std::future::{self};
   use std::net::{Ipv4Addr, SocketAddrV4};
@@ -6768,7 +6642,9 @@ How to interact with the network (TCP/IP sockets)
 #+begin_src rust :tangle src/pipes/time.rs :mkdirp yes
   use crate::types::associative as assoc;
   use crate::types::error::Error;
+  use crate::types::number::{Int, Number};
   use crate::types::*;
+
   use std::{
       future,
       time::{SystemTime, UNIX_EPOCH},
@@ -6779,7 +6655,7 @@ How to interact with the network (TCP/IP sockets)
           .duration_since(UNIX_EPOCH)
           .unwrap()
           .as_millis() as Int;
-      Box::pin(future::ready(Ok(Some(Item::Int(t)))))
+      Box::pin(future::ready(Ok(Some(Item::Number(Number::Int(t))))))
   }
 
   pub fn representation() -> Item {
@@ -6845,7 +6721,8 @@ Implement the =handoff= type
   use crate::types::collection as coll;
   use crate::types::environment::Environment;
   use crate::types::error;
-  use crate::types::{self, Int, Item};
+  use crate::types::number::Int;
+  use crate::types::{self, Item};
   use flume;
   use std::future;
   use std::ptr;
@@ -6964,7 +6841,7 @@ Implement the =handoff= type
 
   pub fn handoff(mut env: Environment) -> types::Future<Environment> {
       env.pop_expr();
-      env.push(pipes::Tunnel::Handoff(Handoff::new(false)).into());
+      env.push(pipes::Tunnel::Handoff(Handoff::new(false)));
       env.into()
   }
 
@@ -7180,6 +7057,7 @@ Implement the =handoff= type
   use crate::types::associative as assoc;
   use crate::types::collection as coll;
   use crate::types::error::Error;
+  use crate::types::number::Number;
   use crate::types::{self, Item};
   use directories::ProjectDirs;
 
@@ -7256,7 +7134,7 @@ Implement the =handoff= type
                   assoc::KeyItem::Word(w) => {
                       self.insert_attribute(id, Item::Word(w), v)?;
                   }
-                  other => return Err(Error::expected("word", other.into())),
+                  other => return Err(Error::expected("word", other)),
               }
           }
           Ok(Item::default())
@@ -7273,7 +7151,7 @@ Implement the =handoff= type
       for (k, v) in params.into_iter() {
           match k {
               assoc::KeyItem::String(s) => boxed_params.push((s, v)),
-              k => return Err(Error::expected("string", k.into())),
+              k => return Err(Error::expected("string", k)),
           }
       }
 
@@ -7291,8 +7169,8 @@ Implement the =handoff= type
       type Error = Error;
       fn try_from(value: ValueRef) -> Result<Self, Self::Error> {
           match value {
-              ValueRef::Integer(i) => Ok(Item::Int(i)),
-              ValueRef::Real(f) => Ok(Item::Float(f)),
+              ValueRef::Integer(i) => Ok(Item::Number(Number::Int(i))),
+              ValueRef::Real(f) => Ok(Item::Number(Number::Float(f))),
               ValueRef::Text(t) => decode_string(String::from_utf8_lossy(t).into_owned()),
 
               ValueRef::Blob(b) => Ok(Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(
@@ -7317,10 +7195,10 @@ Implement the =handoff= type
           if char_seq.chars().count() == 1 {
               Ok(Item::Char(char_seq.chars().next().unwrap()))
           } else {
-              Err(Error::expected("char", char_seq.into()))
+              Err(Error::expected("char", char_seq))
           }
       } else {
-          Err(Error::expected("string", s.into()))
+          Err(Error::expected("string", s))
       }
   }
 
@@ -7343,8 +7221,8 @@ Implement the =handoff= type
   impl rusqlite::ToSql for Item {
       fn to_sql(&self) -> Result<ToSqlOutput<'_>> {
           match self {
-              Item::Int(i) => i.to_sql(),
-              Item::Float(f) => f.to_sql(),
+              Item::Number(Number::Int(i)) => i.to_sql(),
+              Item::Number(Number::Float(f)) => f.to_sql(),
               Item::Char(c) => Ok(EncodeAs::Char(*c).encode()),
               Item::Word(w) => Ok(EncodeAs::Word(w.clone()).encode()),
               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(s))) => {
