@@ -2181,6 +2181,7 @@ internally, to keep track of things like the stack, program, lists etc.
 #+end_src
 **** Dictionary types
 #+begin_src rust :tangle src/types/dictionary.rs :mkdirp yes
+  use crate::axiom::BUILTIN_FUNCTIONS;
   use crate::list;
   use crate::serialize;
   use crate::types::associative as assoc;
@@ -2389,7 +2390,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
       /// Merges this dictionary with the given new dictionary. The new
       /// entries are added with the given namespace.
-      pub fn merge(&mut self, new: Dictionary, namespace: Namespace) {
+      pub fn merge(&mut self, new: Dictionary, namespace: &Namespace) {
           let (adds, deletes) = self.diff(new);
           // add namepaces to the adds
           let adds: Vec<_> = adds
@@ -2565,6 +2566,28 @@ internally, to keep track of things like the stack, program, lists etc.
           };
           d.insert(alias.clone(), e);
           Ok(alias)
+      }
+
+      /// For stdlib words that are both built-in and part of a module
+      /// that isn't necessarily loaded as part of the standard
+      /// environment, we need to be able to link the word to its rust
+      /// definition. Calling this function on a dictionary (whether
+      /// full or just the partial dictionary created from a module),
+      /// will create those links. In order for the links to be created,
+      /// the current word currently has to have no definition field
+      /// (set to None). Otherwise changes will not be applied.
+      pub fn add_builtins(&mut self) {
+          let dm = self.make_mut();
+          for (bw, bd) in BUILTIN_FUNCTIONS.iter() {
+              dm.entry(bw.clone()).and_modify(|d| match &d.definition {
+                  Definition::Derived(dd) => {
+                      if dd.is_empty() {
+                          d.definition = bd.clone();
+                      }
+                  }
+                  _ => {}
+              });
+          }
       }
   }
 
@@ -2838,7 +2861,7 @@ internally, to keep track of things like the stack, program, lists etc.
           // can lookup values in as words get loaded, and specify
           // they're builtin somehow (maybe [builtin yes], but just not
           // having definition would also do it)
-          axiom::add_builtins(&mut env.dictionary);
+          env.dictionary.add_builtins();
           let env = futures::executor::block_on(async move { axiom::eval(env).await });
           //print!("Env: {:?}", env.dictionary);
           env
@@ -3012,16 +3035,6 @@ internally, to keep track of things like the stack, program, lists etc.
               let lexicon = String::from_utf8_lossy(file_contents).into_owned();
               self.dictionary.insert_core_module(lexicon, None);
           }
-          Ok(())
-      }
-
-      fn bootstrap(&mut self) -> Result<(), Error> {
-          // let module_aliases = coll::List::try_from(self.pop())?;
-          // for item in module_aliases.inner().into_iter() {
-          //     let module_alias = Word::try_from(item)?;
-          //     self.load_builtin_module(module_alias, false)?
-          // }
-
           Ok(())
       }
 
@@ -3783,7 +3796,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   use core::ops::Deref;
   use dynfmt::{Format, SimpleCurlyFormat};
   use futures::future::FutureExt;
+  use lazy_static::lazy_static;
   use sha2::{self, Digest};
+  use std::collections::HashMap;
   use std::collections::VecDeque;
   use std::convert::Infallible;
   use std::default::Default;
@@ -3980,8 +3995,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }
   }
 
-  pub fn add_builtins(d: &mut dict::Dictionary) {
-      #[cfg(not(feature = "database"))]
+  lazy_static! {
+      pub static ref BUILTIN_FUNCTIONS: HashMap<Word, dict::Definition> = {
+  #[cfg(not(feature = "database"))]
       let entries: Vec<(&str, &'static StepFn)>;
       #[cfg(feature = "database")]
       let mut entries: Vec<(&str, &'static StepFn)>;
@@ -4164,13 +4180,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           entries.push(("database", Box::leak(Box::new(f_stack2(db::query)))));
           entries.push(("persist", Box::leak(Box::new(f_stack1(db::insert_object)))));
       }
-
-      d.insert_axiom_fns(
-          entries
-              .into_iter()
-              .map(|(w, f)| (Word::from(w), dict::Definition::Axiom(f)))
-              .collect(),
-      )
+          HashMap::from_iter(entries.into_iter().map(|(s, f)| (Word::from(s), dict::Definition::Axiom(f))))
+      };
   }
 
   fn pair(i: Item, j: Item) -> Item {
@@ -5350,7 +5361,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       //println!("dictmerge: {:?}", env);
       let partialdict = dict::Dictionary::try_from(env.pop())?;
       let namespace = dict::Namespace::try_from(env.pop())?;
-      env.dictionary.merge(partialdict, namespace);
+      env.dictionary.merge(partialdict, &namespace);
+      if namespace.is_none() {
+          env.dictionary.add_builtins();
+      }
       // pop the word dictmerge
       env.pop_expr();
       Ok(())
