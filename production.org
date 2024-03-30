@@ -77,7 +77,7 @@ the location where you installed the kcats binary.
 #+BEGIN_SRC toml :tangle Cargo.toml
   [package]
   name = "kcats"
-  version = "0.6.0"
+  version = "0.7.0"
   edition = "2021"
 
   # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -2822,7 +2822,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
   use super::dict::MODULE_NAMESPACE;
 
-  #[derive(Clone, PartialEq)]
+  #[derive(Clone, PartialEq, Default)]
   pub struct Environment {
       pub stack: Stack,
       pub program: Stack,
@@ -2830,14 +2830,8 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl Environment {
-      pub fn standard(program: Option<coll::List>, stack: Option<coll::List>) -> Environment {
-          let prog_expr = program.unwrap_or_default();
-
-          let mut env = Environment {
-              stack: stack.unwrap_or_default(),
-              program: prog_expr,
-              dictionary: dict::Dictionary::default(),
-          };
+      pub fn standard() -> Environment {
+          let mut env = Environment::default();
           env.load_core_modules()
               .expect("failed to load core modules");
           env.push(list!(
@@ -2847,10 +2841,13 @@ internally, to keep track of things like the stack, program, lists etc.
               "sets-builtins",
               "time",
               "pipes",
-              "generators" // END default namespace
+              "methods",
+              "generators",
+              "template",
+              "environment" // END default namespace
           ));
           env.program.append(list!(
-              list!("decache", coll::List::default(), "swap", "inscribe"),
+              list!("decache", coll::List::default(), "swap", "inscribe", "drop"),
               "step"
           ));
           env.import_stdlib_module_map();
@@ -3186,7 +3183,9 @@ internally, to keep track of things like the stack, program, lists etc.
                   continue;
               }
           }
-          let mut env = Environment::standard(program, stack);
+          let mut env = Environment::standard();
+          env.stack = stack.unwrap_or_default();
+          env.program = program.unwrap_or_default();
           if let Some(d) = dictionary {
               let edmut = env.dictionary.make_mut();
               edmut.extend(d.inner());
@@ -5355,25 +5354,35 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       Ok(())
   }
 
-  /// Takes a new dictionary, diffs it with the existing one, and marks
-  /// all the deleted items as deleted.
+  /// Takes a new dictionary, merges it into the existing one, and marks
+  /// all the deleted items as deleted. Returns the namespace the new
+  /// items were added to, or nothing if added to the default namespace.
   pub fn dictmerge(env: &mut Environment) -> Result<(), Error> {
       //println!("dictmerge: {:?}", env);
       let partialdict = dict::Dictionary::try_from(env.pop())?;
-      let namespace = dict::Namespace::try_from(env.pop())?;
+      let ns = env.pop();
+      let namespace = dict::Namespace::try_from(ns.clone())?;
       env.dictionary.merge(partialdict, &namespace);
       if namespace.is_none() {
           env.dictionary.add_builtins();
       }
       // pop the word dictmerge
       env.pop_expr();
+      env.push(ns);
       Ok(())
   }
 
-  /// Load a new module and gives it an optional alias (either a word or
-  /// nothing). Takes the raw bytes or string or a program (the latter
-  /// two are converted to bytes). Returns either the module alias or
-  /// hash (either of which can be used to refer to the module later)
+  /// Load a new module and gives it an optional alias. The alias is either:
+  ///
+  /// * [Word] - An alias will be created for the module using that word.
+  /// * Nothing (an empty container) - The module will be inserted into the
+  ///   default namespace, such that the module's words will be accesible directly.
+  /// * Any other value - Will not create any alias. The module's hash will be
+  ///   returned and that can be used to refer to the module later.
+  ///
+  /// The module can be raw bytes or string or a program. Returns the
+  /// hash of the module, which can be used to refer to the module
+  /// later.
   pub fn inscribe(env: &mut Environment) -> Result<(), Error> {
       let module_raw = coll::Sized::try_from(env.pop())?;
       let hash: Bytes;
@@ -5399,9 +5408,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
       // the module alias
       let maybe_alias = env.pop();
-      let maybe_word: Result<Word, Error> = maybe_alias.clone().try_into();
-      match maybe_word {
-          Ok(alias) => {
+      //let maybe_word: Result<Word, Error> = maybe_alias.clone().try_into();
+      match maybe_alias {
+          Item::Word(alias) => {
               match env
                   .dictionary
                   .insert_module_alias(alias.clone(), hash.clone())
@@ -5409,7 +5418,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               {
                   Ok(_) => {}
                   Err(_) => {
-                      // The module already exists, ensure what
+                      // The alias already exists, ensure what
                       // we're loading is actually that module:
                       // check the hash matches.
                       let mut alias = alias.clone();
@@ -5431,10 +5440,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   }
               }
           }
-          Err(_) => {
-              if !maybe_alias.is_empty() {
-                  return Err(Error::expected("module-alias", maybe_alias));
-              } else {
+          i => {
+              if i.is_empty() {
                   is_default_namespace = true;
               }
           }
@@ -5745,7 +5752,7 @@ We'll also define how to run unit tests.
   // string, and then evaluates that string as a kcats program. It then
   // prints the length of the result, and then the result itself.
   async fn interactive_mode() {
-      let mut env = Environment::standard(None, None);
+      let mut env = Environment::standard();
 
       loop {
           if let Some(program) = read_input().await {
@@ -5767,7 +5774,7 @@ We'll also define how to run unit tests.
   }
 
   async fn repl() {
-      let mut env = Environment::standard(None, None);
+      let mut env = Environment::standard();
 
       loop {
           // Print the prompt and flush it to stdout immediately
@@ -5799,7 +5806,7 @@ We'll also define how to run unit tests.
 
   async fn read_eval_print(program: String) {
       // otherwise, read from stdin
-      match parse_input(Environment::standard(None, None), program) {
+      match parse_input(Environment::standard(), program) {
           Ok(env) => {
               print_result(axiom::eval(env).await);
           }
@@ -5933,10 +5940,8 @@ We'll also define how to run unit tests.
       #[test_case("bits")]
       #[test_case("both?" ; "is_both")]
       #[test_case("branch")]
-      #[test_case("breaker")]
       #[test_case("butlast")]
       #[test_case("bytes?" ; "is_bytes")]
-      #[test_case("capture")]
       #[test_case("catcher")]
       #[test_case("ceiling")]
       #[test_case("clone")]
@@ -6042,7 +6047,7 @@ We'll also define how to run unit tests.
       #[test_case("set?" ; "is_set")]
       #[test_case("shield")]
       #[test_case("shielddown")]
-      #[test_case("shielddowndown")]
+      #[test_case("shielddeep")]
       #[test_case("sink")]
       #[test_case("siphon")]
       #[test_case("skipper")]
@@ -6078,7 +6083,7 @@ We'll also define how to run unit tests.
       #[test_case("zero?" ; "is_zero")]
       #[test_case("zip")]
       fn test_lexicon(word: &str) {
-          let e = Environment::standard(None, None);
+          let e = Environment::standard();
 
           let r = test_word(e.clone(), word.into());
           assert!(r.is_empty(), "{:?}", r);
@@ -10371,6 +10376,23 @@ latter, it can have words already resolved.
 [[stack ["foo"]]
  [program []]]
 #+end_src
+
+#+begin_src kcats
+
+  [[fiver [5 +]]]
+  [12 fiver]
+   [[0] swap ;; add an alias (0 means don't bother with creating the alias)
+   [entry] map ;; create full entries for each definition
+   wrap [join] join ;; add 'join' to join the entries with the existing dictionary
+   inscribe wrap] dip ;; update dict and then wrap the hash as the module to be used 
+  using ;; execute the program 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+17
+#+end_src
+
 **** TODO convenient 'let'
 We want define a module and use it inline without having to worry about its alias.
 Let's see if we can implement =partition= this way.
