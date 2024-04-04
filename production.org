@@ -2392,12 +2392,19 @@ internally, to keep track of things like the stack, program, lists etc.
       /// entries are added with the given namespace.
       pub fn merge(&mut self, new: Dictionary, namespace: &Namespace) {
           let (adds, deletes) = self.diff(new);
-          // add namepaces to the adds
+          // add namepaces to the adds and deletes
           let adds: Vec<_> = adds
               .into_iter()
               .map(|(mut w, e)| {
                   w.namespace = namespace.clone();
                   (w, e)
+              })
+              .collect();
+          let deletes: Vec<_> = deletes
+              .into_iter()
+              .map(|mut w| {
+                  w.namespace = namespace.clone();
+                  w
               })
               .collect();
           // make a mini dictionary with the adds
@@ -2406,7 +2413,7 @@ internally, to keep track of things like the stack, program, lists etc.
           let d = self.make_mut();
 
           d.extend(dict.inner());
-          d.extend(make_deletes(deletes));
+          d.extend(Self::make_deletes(deletes));
       }
 
       /// Takes a set of additions to the dictionary. Resolves all of the
@@ -2589,13 +2596,29 @@ internally, to keep track of things like the stack, program, lists etc.
               });
           }
       }
-  }
 
-  // Each word should run a program that calls fail (already namespaced
-  // to the stdlib so that the word acts like it isn't in the dictionary
-  // even though it is.)
-  fn make_deletes(_: Vec<Word>) -> Vec<(Word, dict::Entry)> {
-      Vec::new()
+      /// Each word should run a program that calls fail (already namespaced
+      /// to the stdlib so that the word acts like it isn't in the dictionary
+      /// even though it is.)
+      fn make_deletes(words: Vec<Word>) -> Vec<(Word, dict::Entry)> {
+          words
+              .into_iter()
+              .map(|word| {
+                  println!("Shadowing word: {:?}", word);
+                  let err = Error::create(
+                      list!(word.clone()),
+                      "word removed by module",
+                      Some("access-denied"),
+                  );
+                  let entry = dict::Entry {
+                      examples: None,
+                      spec: None,
+                      definition: dict::Definition::Derived(list!(err, "fail")),
+                  };
+                  (word, entry)
+              })
+              .collect()
+      }
   }
 
   /// Returns the differences between two hashmaps, including the keys
@@ -4042,7 +4065,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("dec", Box::leak(Box::new(f_stack1(dec)))),
           ("decache", Box::leak(Box::new(f_result(read_blob)))),
           ("decide", Box::leak(Box::new(decide))),
-          ("define", Box::leak(Box::new(define))),
           ("decodejson", Box::leak(Box::new(f_stack1(decode_json)))),
           ("dip", Box::leak(Box::new(dip))),
           ("dictionary", Box::leak(Box::new(dictionary))),
@@ -4068,7 +4090,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("evert", Box::leak(Box::new(evert))),
           ("execute", Box::leak(Box::new(execute))),
           ("exp", Box::leak(Box::new(f_stack2(exp)))),
-          ("fail", Box::leak(Box::new(f_stack1(fail)))),
+          ("fail", Box::leak(Box::new(f_result(fail)))),
           (
               "file-in",
               Box::leak(Box::new(f_stack1(crate::pipes::fs::file_in))),
@@ -5256,33 +5278,12 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       env.into()
   }
 
-  /// Even though we say the return type is [Infallible] what we really
-  /// mean is "a type that can never happen in this case", because it's
-  /// always returning an error.
-  pub fn fail(mut e: Error) -> Result<Infallible, Error> {
-      e.is_handled = false;
-      Err(e)
-  }
-
-  /// Set the environment's dictionary to the dictionary on ToS.
-  ///
-  /// Note: this word can be used to bypass all attempts as sandboxing,
-  /// so use caution and be sure to understand the mechanisms used to
-  /// prevent this.
-  pub fn define(mut env: Environment) -> Future<Environment> {
-      let d = dict::Dictionary::try_from(env.pop());
-      match d {
-          Ok(d) => {
-              env.dictionary = d;
-              env.pop_expr();
-              env
-          }
-          Err(e) => {
-              env.push(e);
-              env
-          }
-      }
-      .into()
+  pub fn fail(env: &mut Environment) -> Result<(), Error> {
+      let mut err = Error::try_from(env.pop())?;
+      err.is_handled = false;
+      env.pop_expr();
+      env.push(err);
+      Ok(())
   }
 
   fn resolve(mut env: Environment) -> Future<Environment> {
@@ -5992,7 +5993,6 @@ We'll also define how to run unit tests.
       #[test_case("floor")]
       #[test_case("fold")]
       #[test_case("format")]
-      #[test_case("functional")]
       #[test_case("future")]
       #[test_case("get")]
       #[test_case("generate")]
@@ -6010,7 +6010,6 @@ We'll also define how to run unit tests.
       #[test_case("keep")]
       #[test_case("label")]
       #[test_case("let")]
-      #[test_case("lingo")]
       #[test_case("list?" ; "is_list")]
       #[test_case("lookup")]
       #[test_case("loop")]
@@ -10194,7 +10193,8 @@ If a program refers to a word, and at the time that program is put on
 the stack, that word means something, it should still carry the same
 meaning if that program is later run with =execute=. That means that
 module changes must be permanent.
-**** TODO Sandboxing support
+**** INPROGRESS Sandboxing support
+- State "INPROGRESS" from "TODO"       [2024-04-03 Wed 20:41]
 It must be possible for a module to *deny* access to a given word. Given
 that dictionary changes are permanent, we can't just delete words from
 the dictionary (once the given program is done, that word needs to be
@@ -10211,6 +10211,79 @@ may be others.
   modification)
 + The word should be accessible again after the program using the
   module has completed.
+
+  #+begin_src kcats
+    [functional] unwrap clone decache inscribe
+    wrap ["hi" print] using
+    
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  Warning: empty local module
+  Shadowing word: Word { data: 0x5615a9e3bc20 : "timestamps", namespace: Some([135, 33, 67, 200, 122, 176, 100, 49, 34, 129, 137, 223, 216, 237, 201, 45, 224, 127, 173, 14, 204, 149, 59, 92, 210, 59, 141, 148, 175, 190, 228, 97]) }
+  Shadowing word: Word { data: 0x5615a9e5a7f0 : "database", namespace: Some([135, 33, 67, 200, 122, 176, 100, 49, 34, 129, 137, 223, 216, 237, 201, 45, 224, 127, 173, 14, 204, 149, 59, 92, 210, 59, 141, 148, 175, 190, 228, 97]) }
+  Shadowing word: Word { data: 0x5615a9e4c0d0 : "animate", namespace: Some([135, 33, 67, 200, 122, 176, 100, 49, 34, 129, 137, 223, 216, 237, 201, 45, 224, 127, 173, 14, 204, 149, 59, 92, 210, 59, 141, 148, 175, 190, 228, 97]) }
+  Shadowing word: Word { data: 0x5615a9e2fc50 : "file-in", namespace: Some([135, 33, 67, 200, 122, 176, 100, 49, 34, 129, 137, 223, 216, 237, 201, 45, 224, 127, 173, 14, 204, 149, 59, 92, 210, 59, 141, 148, 175, 190, 228, 97]) }
+  Shadowing word: Word { data: 0x5615a9e5a660 : "serversocket", namespace: Some([135, 33, 67, 200, 122, 176, 100, 49, 34, 129, 137, 223, 216, 237, 201, 45, 224, 127, 173, 14, 204, 149, 59, 92, 210, 59, 141, 148, 175, 190, 228, 97]) }
+  Shadowing word: Word { data: 0x5615a9e2fc30 : "handoff", namespace: Some([135, 33, 67, 200, 122, 176, 100, 49, 34, 129, 137, 223, 216, 237, 201, 45, 224, 127, 173, 14, 204, 149, 59, 92, 210, 59, 141, 148, 175, 190, 228, 97]) }
+  Shadowing word: Word { data: 0x5615a9efb3d0 : "spit", namespace: Some([135, 33, 67, 200, 122, 176, 100, 49, 34, 129, 137, 223, 216, 237, 201, 45, 224, 127, 173, 14, 204, 149, 59, 92, 210, 59, 141, 148, 175, 190, 228, 97]) }
+  Shadowing word: Word { data: 0x5615a9f26680 : "tunnel", namespace: Some([135, 33, 67, 200, 122, 176, 100, 49, 34, 129, 137, 223, 216, 237, 201, 45, 224, 127, 173, 14, 204, 149, 59, 92, 210, 59, 141, 148, 175, 190, 228, 97]) }
+  Shadowing word: Word { data: 0x5615a9e445b0 : "pipe-in", namespace: Some([135, 33, 67, 200, 122, 176, 100, 49, 34, 129, 137, 223, 216, 237, 201, 45, 224, 127, 173, 14, 204, 149, 59, 92, 210, 59, 141, 148, 175, 190, 228, 97]) }
+  Shadowing word: Word { data: 0x5615a9e5a4f0 : "file-out", namespace: Some([135, 33, 67, 200, 122, 176, 100, 49, 34, 129, 137, 223, 216, 237, 201, 45, 224, 127, 173, 14, 204, 149, 59, 92, 210, 59, 141, 148, 175, 190, 228, 97]) }
+  Shadowing word: Word { data: 0x5615a9f4b9d0 : "future", namespace: Some([135, 33, 67, 200, 122, 176, 100, 49, 34, 129, 137, 223, 216, 237, 201, 45, 224, 127, 173, 14, 204, 149, 59, 92, 210, 59, 141, 148, 175, 190, 228, 97]) }
+  Shadowing word: Word { data: 0x5615a9efb390 : "pipe-out", namespace: Some([135, 33, 67, 200, 122, 176, 100, 49, 34, 129, 137, 223, 216, 237, 201, 45, 224, 127, 173, 14, 204, 149, 59, 92, 210, 59, 141, 148, 175, 190, 228, 97]) }
+  Shadowing word: Word { data: 0x5615a9e531c0 : "standard", namespace: Some([135, 33, 67, 200, 122, 176, 100, 49, 34, 129, 137, 223, 216, 237, 201, 45, 224, 127, 173, 14, 204, 149, 59, 92, 210, 59, 141, 148, 175, 190, 228, 97]) }
+  hi
+
+  #+end_src
+
+  Oh ... so this is a problem. We said that we can't change the
+  meaning of words for anyone else so sandboxing with just the low
+  level words isn't going to work with this design. We can only block
+  words that a caller might directly refer to, not deeper ones. In
+  other words, we have to block =print= as well as =standard=.
+
+  But there's another problem here, the shadowing isn't working
+  properly, we seem to be overwriting the original. ok this is fixed.
+
+  Now we can modify the module to search out all the words that use sensitive words.
+
+  #+begin_src kcats
+    [pipe-in pipe-out channel timeout
+     handoff file-in file-out timestamps
+     standard serversocket animate future
+     spit tunnel database] set
+
+    dictionary [[1 definition] lookup intersection] filter ;; words def  
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  [[actual builtin]
+   [asked [sized]]
+   [handled yes]
+   [reason "type mismatch"]
+   [type error]
+   [unwound [intersection [[[hashbytes [[definition builtin-function]
+                                        [examples [[[["foo" encode hashbytes] 2 times =] [yes]]
+                                                   [["foo" encode hashbytes "fop" encode hashbytes =]
+                                                    [[]]]]]
+                                        [spec [[bytes] [bytes]]]]]
+                            [animate channel database file-in file-out future handoff pipe-in pipe-out serversocket
+                             spit standard timeout timestamps tunnel]]] unwrap evert first [[]] unwrap swap []
+             [drop swap put] [drop dropdown]
+             if dictionary_redacted [swap [[[1 definition]
+                                            lookup intersection]
+                                           shield]
+                                     dip swap [] [drop swap put] [drop dropdown]
+                                     if]
+             step]]]
+  builtin [animate channel database file-in file-out future handoff pipe-in pipe-out
+           serversocket spit standard timeout timestamps tunnel]
+  #+end_src
+
+  
 **** TODO Access control
 Take the word =define= which allows the caller to make arbitrary and
 permanent changes to the dictionary. What if we wanted to restrict
