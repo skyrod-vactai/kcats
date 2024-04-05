@@ -122,8 +122,10 @@ the location where you installed the kcats binary.
   ## Figure out best place to store the db and stdlib files
   directories = "5.0"
 
-  #cozo = { version = "0.7", default-features = false, features = ["minimal", "rayon"], optional=true }
   rusqlite = { version = "0.30", optional = true, features = ["uuid"] }
+
+  # memoized functions
+  once_cell = "1"
 
   [dependencies.uuid]
   version = "1.6.1"
@@ -2840,12 +2842,13 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::types::*;
   use crate::types::{associative as assoc, collection as coll, dictionary as dict};
   use directories::ProjectDirs;
+  use once_cell::sync::Lazy;
   use std::future;
   use std::ops::Range;
 
   use super::dict::MODULE_NAMESPACE;
 
-  #[derive(Clone, PartialEq, Default)]
+  #[derive(Clone, PartialEq)]
   pub struct Environment {
       pub stack: Stack,
       pub program: Stack,
@@ -2853,40 +2856,6 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl Environment {
-      pub fn standard() -> Environment {
-          let mut env = Environment::default();
-          env.load_core_modules()
-              .expect("failed to load core modules");
-          env.push(list!(
-              "errors",
-              "environment-builtins",
-              "encode",
-              "sets-builtins",
-              "time",
-              "pipes",
-              "methods",
-              "generators",
-              "template",
-              "environment" // END default namespace
-          ));
-          env.program.append(list!(
-              list!("decache", coll::List::default(), "swap", "inscribe", "drop"),
-              "step"
-          ));
-          env.import_stdlib_module_map();
-
-          // There's a problem here: the builtins need to be added in a
-          // way that they don't get overwritten. They may need to get
-          // added piece by piece, somehow. Perhaps a hashmap that we
-          // can lookup values in as words get loaded, and specify
-          // they're builtin somehow (maybe [builtin yes], but just not
-          // having definition would also do it)
-          env.dictionary.add_builtins();
-          let env = futures::executor::block_on(async move { axiom::eval(env).await });
-          //print!("Env: {:?}", env.dictionary);
-          env
-      }
-
       pub fn push<T: Into<Item>>(&mut self, i: T) {
           coll::Arc::make_mut(&mut self.stack).push_front(i.into());
       }
@@ -3082,6 +3051,49 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  impl Default for Environment {
+      fn default() -> Self {
+          static INST: Lazy<Environment> = Lazy::new(|| {
+              let mut env = Environment {
+                  dictionary: coll::Arc::wrap(HashMap::new()),
+                  stack: Default::default(),
+                  program: Default::default(),
+              };
+              env.load_core_modules()
+                  .expect("failed to load core modules");
+              env.push(list!(
+                  "errors",
+                  "environment-builtins",
+                  "encode",
+                  "sets-builtins",
+                  "time",
+                  "pipes",
+                  "methods",
+                  "generators",
+                  "template",
+                  "environment" // END default namespace
+              ));
+              env.program.append(list!(
+                  list!("decache", coll::List::default(), "swap", "inscribe", "drop"),
+                  "step"
+              ));
+              env.import_stdlib_module_map();
+
+              // There's a problem here: the builtins need to be added in a
+              // way that they don't get overwritten. They may need to get
+              // added piece by piece, somehow. Perhaps a hashmap that we
+              // can lookup values in as words get loaded, and specify
+              // they're builtin somehow (maybe [builtin yes], but just not
+              // having definition would also do it)
+              env.dictionary.add_builtins();
+              let env = futures::executor::block_on(async move { axiom::eval(env).await });
+              //print!("Env: {:?}", env.dictionary);
+              env
+          });
+          INST.clone()
+      }
+  }
+
   fn check_type(i: &Item, w: &Word) -> Result<(), Error> {
       match (w, i) {
           (w, _) if *w == *S_ITEM => Ok(()),
@@ -3206,13 +3218,10 @@ internally, to keep track of things like the stack, program, lists etc.
                   continue;
               }
           }
-          let mut env = Environment::standard();
+          let mut env = Environment::default();
           env.stack = stack.unwrap_or_default();
           env.program = program.unwrap_or_default();
-          if let Some(d) = dictionary {
-              let edmut = env.dictionary.make_mut();
-              edmut.extend(d.inner());
-          }
+          env.dictionary = dictionary.unwrap_or_else(|| Environment::default().dictionary);
           Ok(env)
       }
   }
@@ -5753,7 +5762,7 @@ We'll also define how to run unit tests.
   // string, and then evaluates that string as a kcats program. It then
   // prints the length of the result, and then the result itself.
   async fn interactive_mode() {
-      let mut env = Environment::standard();
+      let mut env = Environment::default();
 
       loop {
           if let Some(program) = read_input().await {
@@ -5775,7 +5784,7 @@ We'll also define how to run unit tests.
   }
 
   async fn repl() {
-      let mut env = Environment::standard();
+      let mut env = Environment::default();
 
       loop {
           // Print the prompt and flush it to stdout immediately
@@ -5807,7 +5816,7 @@ We'll also define how to run unit tests.
 
   async fn read_eval_print(program: String) {
       // otherwise, read from stdin
-      match parse_input(Environment::standard(), program) {
+      match parse_input(Environment::default(), program) {
           Ok(env) => {
               print_result(axiom::eval(env).await);
           }
@@ -6082,7 +6091,7 @@ We'll also define how to run unit tests.
       #[test_case("zero?" ; "is_zero")]
       #[test_case("zip")]
       fn test_lexicon(word: &str) {
-          let e = Environment::standard();
+          let e = Environment::default();
 
           let r = test_word(e.clone(), word.into());
           assert!(r.is_empty(), "{:?}", r);
@@ -10211,79 +10220,83 @@ may be others.
   modification)
 + The word should be accessible again after the program using the
   module has completed.
+***** TODO experiment with nested envs as module loading mechanism
+First let's see if a nested env allows sandboxing
+#+begin_src kcats
+  ;; make an env with no access to io
 
-  #+begin_src kcats
-    [functional] unwrap clone decache inscribe
-    wrap ["hi" print] using
-    
-  #+end_src
+  ;; load the functional module code
+  [functional] unwrap decache string read
 
-  #+RESULTS:
-  #+begin_src kcats
-  Warning: empty local module
-  Shadowing word: Word { data: 0x5615a9e3bc20 : "timestamps", namespace: Some([135, 33, 67, 200, 122, 176, 100, 49, 34, 129, 137, 223, 216, 237, 201, 45, 224, 127, 173, 14, 204, 149, 59, 92, 210, 59, 141, 148, 175, 190, 228, 97]) }
-  Shadowing word: Word { data: 0x5615a9e5a7f0 : "database", namespace: Some([135, 33, 67, 200, 122, 176, 100, 49, 34, 129, 137, 223, 216, 237, 201, 45, 224, 127, 173, 14, 204, 149, 59, 92, 210, 59, 141, 148, 175, 190, 228, 97]) }
-  Shadowing word: Word { data: 0x5615a9e4c0d0 : "animate", namespace: Some([135, 33, 67, 200, 122, 176, 100, 49, 34, 129, 137, 223, 216, 237, 201, 45, 224, 127, 173, 14, 204, 149, 59, 92, 210, 59, 141, 148, 175, 190, 228, 97]) }
-  Shadowing word: Word { data: 0x5615a9e2fc50 : "file-in", namespace: Some([135, 33, 67, 200, 122, 176, 100, 49, 34, 129, 137, 223, 216, 237, 201, 45, 224, 127, 173, 14, 204, 149, 59, 92, 210, 59, 141, 148, 175, 190, 228, 97]) }
-  Shadowing word: Word { data: 0x5615a9e5a660 : "serversocket", namespace: Some([135, 33, 67, 200, 122, 176, 100, 49, 34, 129, 137, 223, 216, 237, 201, 45, 224, 127, 173, 14, 204, 149, 59, 92, 210, 59, 141, 148, 175, 190, 228, 97]) }
-  Shadowing word: Word { data: 0x5615a9e2fc30 : "handoff", namespace: Some([135, 33, 67, 200, 122, 176, 100, 49, 34, 129, 137, 223, 216, 237, 201, 45, 224, 127, 173, 14, 204, 149, 59, 92, 210, 59, 141, 148, 175, 190, 228, 97]) }
-  Shadowing word: Word { data: 0x5615a9efb3d0 : "spit", namespace: Some([135, 33, 67, 200, 122, 176, 100, 49, 34, 129, 137, 223, 216, 237, 201, 45, 224, 127, 173, 14, 204, 149, 59, 92, 210, 59, 141, 148, 175, 190, 228, 97]) }
-  Shadowing word: Word { data: 0x5615a9f26680 : "tunnel", namespace: Some([135, 33, 67, 200, 122, 176, 100, 49, 34, 129, 137, 223, 216, 237, 201, 45, 224, 127, 173, 14, 204, 149, 59, 92, 210, 59, 141, 148, 175, 190, 228, 97]) }
-  Shadowing word: Word { data: 0x5615a9e445b0 : "pipe-in", namespace: Some([135, 33, 67, 200, 122, 176, 100, 49, 34, 129, 137, 223, 216, 237, 201, 45, 224, 127, 173, 14, 204, 149, 59, 92, 210, 59, 141, 148, 175, 190, 228, 97]) }
-  Shadowing word: Word { data: 0x5615a9e5a4f0 : "file-out", namespace: Some([135, 33, 67, 200, 122, 176, 100, 49, 34, 129, 137, 223, 216, 237, 201, 45, 224, 127, 173, 14, 204, 149, 59, 92, 210, 59, 141, 148, 175, 190, 228, 97]) }
-  Shadowing word: Word { data: 0x5615a9f4b9d0 : "future", namespace: Some([135, 33, 67, 200, 122, 176, 100, 49, 34, 129, 137, 223, 216, 237, 201, 45, 224, 127, 173, 14, 204, 149, 59, 92, 210, 59, 141, 148, 175, 190, 228, 97]) }
-  Shadowing word: Word { data: 0x5615a9efb390 : "pipe-out", namespace: Some([135, 33, 67, 200, 122, 176, 100, 49, 34, 129, 137, 223, 216, 237, 201, 45, 224, 127, 173, 14, 204, 149, 59, 92, 210, 59, 141, 148, 175, 190, 228, 97]) }
-  Shadowing word: Word { data: 0x5615a9e531c0 : "standard", namespace: Some([135, 33, 67, 200, 122, 176, 100, 49, 34, 129, 137, 223, 216, 237, 201, 45, 224, 127, 173, 14, 204, 149, 59, 92, 210, 59, 141, 148, 175, 190, 228, 97]) }
-  hi
+  ;; get the current dictionary and modify it
+  [dictionary] dip execute
 
-  #+end_src
+  ;; Now create a new env with this dictionary and execute it
+  ["hi" print] [program dictionary] label environment evaluate
+#+end_src
 
-  Oh ... so this is a problem. We said that we can't change the
-  meaning of words for anyone else so sandboxing with just the low
-  level words isn't going to work with this design. We can only block
-  words that a caller might directly refer to, not deeper ones. In
-  other words, we have to block =print= as well as =standard=.
+#+RESULTS:
+#+begin_src kcats
+[[program []]
+ [stack [[[asked [standard]]
+          [handled yes]
+          [reason "word is not defined"]
+          [type error]
+          [unwound [standard ["hi"] unwrap "\n" join encode put drop]]]]]]
+#+end_src
 
-  But there's another problem here, the shadowing isn't working
-  properly, we seem to be overwriting the original. ok this is fixed.
+Yes!
 
-  Now we can modify the module to search out all the words that use sensitive words.
+Ok now let's make a word that takes a module and a program, builds a
+new env.
 
-  #+begin_src kcats
-    [pipe-in pipe-out channel timeout
-     handoff file-in file-out timestamps
-     standard serversocket animate future
-     spit tunnel database] set
+#+begin_src kcats
+   "foo" [bar]
+   [[plus2 [2 +]]] [entry] map
+   wrap [join] join
+   [5 plus2]
+   spawn
+   ;dictionary
+   ;float shielddown [dictionary program] label environment
+   evaluate [stack] lookup restore
+#+end_src
 
-    dictionary [[1 definition] lookup intersection] filter ;; words def  
-  #+end_src
+#+RESULTS:
+#+begin_src kcats
+7 [bar] "foo"
+#+end_src
 
-  #+RESULTS:
-  #+begin_src kcats
-  [[actual builtin]
-   [asked [sized]]
-   [handled yes]
-   [reason "type mismatch"]
-   [type error]
-   [unwound [intersection [[[hashbytes [[definition builtin-function]
-                                        [examples [[[["foo" encode hashbytes] 2 times =] [yes]]
-                                                   [["foo" encode hashbytes "fop" encode hashbytes =]
-                                                    [[]]]]]
-                                        [spec [[bytes] [bytes]]]]]
-                            [animate channel database file-in file-out future handoff pipe-in pipe-out serversocket
-                             spit standard timeout timestamps tunnel]]] unwrap evert first [[]] unwrap swap []
-             [drop swap put] [drop dropdown]
-             if dictionary_redacted [swap [[[1 definition]
-                                            lookup intersection]
-                                           shield]
-                                     dip swap [] [drop swap put] [drop dropdown]
-                                     if]
-             step]]]
-  builtin [animate channel database file-in file-out future handoff pipe-in pipe-out
-           serversocket spit standard timeout timestamps tunnel]
-  #+end_src
+Also, for debugging purposes it would seem we need a way of running
+eval-step (outer) in a loop - perhaps an axiom that checks if the
+program is empty, if not eval-step it and place eval-step back in the
+program? Slightly better than a =loop= impl. Maybe it's ok for now.
 
-  
+#+begin_src kcats
+[[program [1 2 3 +]]] environment eval-step
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[program [2 3 +]]
+ [stack [1]]]
+#+end_src
+
+Let's see if it's possible to use an inner-env module and still debug it.
+#+begin_src kcats
+  ;; the program we want to debug in the top level
+  [2 3
+   [[plus2 [2 +]]] [entry] map
+   wrap [join] join
+   [plus2] boomerang]
+  [program] label environment 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[program [2 3 [[plus2 [2 +]]] [entry] map wrap [join] join [plus2] boomerang]]
+ [stack []]]
+#+end_src
+
 **** TODO Access control
 Take the word =define= which allows the caller to make arbitrary and
 permanent changes to the dictionary. What if we wanted to restrict
