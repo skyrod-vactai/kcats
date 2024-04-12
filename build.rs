@@ -4,6 +4,7 @@ use std::error::Error;
 use std::fs::{self};
 use std::path::Path;
 
+use base64;
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::Write;
@@ -51,15 +52,13 @@ fn vec_to_byte_literal(vec: Vec<u8>) -> String {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    //panic!("oh noes");
-    println!("Starting build.rs!");
-
+    //copy source files to the interpreter's cache, and hardcode the hashes
     if let Some(proj_dirs) = ProjectDirs::from("org", "skyrod", "kcats") {
         let data_dir = proj_dirs.data_dir();
         fs::create_dir_all(data_dir).expect("Failed to create data directory");
 
-        let std_path = data_dir.join("stdlib");
-        fs::create_dir_all(&std_path).expect("Failed to create standard library directory");
+        let std_path = data_dir.join("cache");
+        fs::create_dir_all(&std_path).expect("Failed to create cache directory");
         // Specify the path to your project's stdlib folder
         let src = "src/kcats/stdlib";
         let src_stdlib_path = Path::new(src);
@@ -81,23 +80,30 @@ fn main() -> Result<(), Box<dyn Error>> {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_file() {
-                    if let Some(filename) = path.file_name() {
-                        let dest_path = std_path.join(filename);
-                        fs::copy(&path, &dest_path)
-                            .expect(&format!("Failed to copy file {:?}", filename));
+                    if path.file_name().is_some() {
+                        //let hash = sha2::Sha256::digest(bytes);
+                        let hash = hash_file(&path).unwrap();
+                        let dest_path =
+                            std_path.join(base64::encode_config(&hash, base64::URL_SAFE));
+                        fs::copy(&path, &dest_path).expect(&format!(
+                            "Failed to copy file {:?} to {:?}, {:?}",
+                            path,
+                            dest_path,
+                            path.canonicalize()
+                        ));
+                        let module_name = <PathBuf as AsRef<Path>>::as_ref(&path)
+                            .file_stem()
+                            .unwrap()
+                            .to_str()
+                            .unwrap();
+
+                        writeln!(
+                            f,
+                            "    map.insert(\"{}\", {});",
+                            module_name,
+                            vec_to_byte_literal(hash)
+                        )?;
                     }
-                    let module_name = <PathBuf as AsRef<Path>>::as_ref(&path)
-                        .file_stem()
-                        .unwrap()
-                        .to_str()
-                        .unwrap();
-                    let hash = hash_file(path.clone()).unwrap();
-                    writeln!(
-                        f,
-                        "    map.insert(\"{}\", {});",
-                        module_name,
-                        vec_to_byte_literal(hash)
-                    )?;
                 }
             }
             writeln!(f, "    map")?;
@@ -105,8 +111,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             Ok(())
         } else {
             Err(Box::new(MyError::CustomError(
-                "Source standard library directory does not exist or is not a directory"
-                    .to_string(),
+                "Cache directory does not exist or is not a directory".to_string(),
             )))
         }
     } else {

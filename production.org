@@ -142,6 +142,7 @@ the location where you installed the kcats binary.
   [build-dependencies]
   directories = "5.0"
   sha2 = "0.10.6"
+  base64 = "0.13.0"
 
   [features]
   database = ["rusqlite"]
@@ -232,24 +233,17 @@ internally, to keep track of things like the stack, program, lists etc.
   /// A Word causes a kcats program to do something, usually taking some
   /// items from the top of the stack, and using them to create new
   /// stack items. (examples: `swap`, `+`, `dip`).
-  #[derive(Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord, Default)]
-  pub struct Word {
-      pub data: Intern<String>,
-      pub namespace: dict::Namespace,
-  }
+  pub type Word = Newtype<Intern<String>>;
 
   impl Display for Word {
       fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-          write!(f, "{}", self.data.as_str())
+          write!(f, "{}", self.0.as_str())
       }
   }
 
   impl From<&str> for Word {
       fn from(s: &str) -> Self {
-          Word {
-              data: Intern::<String>::from(s),
-              namespace: Default::default(),
-          }
+          Newtype(Intern::<String>::from(s))
       }
   }
 
@@ -261,13 +255,13 @@ internally, to keep track of things like the stack, program, lists etc.
 
   impl<'a> From<&'a Word> for &'a str {
       fn from(s: &'a Word) -> Self {
-          s.data.as_str()
+          s.0.as_str()
       }
   }
 
   impl From<Word> for String {
       fn from(s: Word) -> Self {
-          s.data.to_string()
+          s.0.to_string()
       }
   }
 
@@ -344,7 +338,7 @@ internally, to keep track of things like the stack, program, lists etc.
               // same types, just use their own eq
               (Item::Number(a), Item::Number(b)) => a == b,
               // Don't use the namespace when comparing words
-              (Item::Word(a), Item::Word(b)) => a.data == b.data,
+              (Item::Word(a), Item::Word(b)) => a == b,
               (
                   Item::Dispenser(coll::Dispenser::Sized(a)),
                   Item::Receptacle(coll::Receptacle::Sized(b)),
@@ -2189,8 +2183,6 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::types::associative as assoc;
   use crate::types::collection as coll;
   use crate::types::*;
-  use lazy_static::lazy_static;
-  use sha2::{self, Digest};
   use std::collections::HashSet;
   use std::ptr;
 
@@ -2314,68 +2306,6 @@ internally, to keep track of things like the stack, program, lists etc.
               matches!(w.into(), "examples" | "spec" | "definition")
           })
       }
-
-      pub fn get_namespace_info(&self) -> Namespace {
-          match &self.definition {
-              Definition::Axiom(_) => Default::default(),
-              Definition::Derived(l) => l
-                  .front()
-                  .map(|i| dict::bytes_to_ns(Bytes::try_from(i.clone()).unwrap_or_default()))
-                  .unwrap_or_default(),
-          }
-      }
-  }
-
-  impl From<Namespace> for Entry {
-      fn from(ns: Namespace) -> Entry {
-          Entry {
-              examples: None,
-              spec: None,
-              definition: Definition::Derived(list!(Item::from(dict::ns_to_bytes(ns)))),
-          }
-      }
-  }
-  pub type Namespace = Option<Newtype<Vec<u8>>>;
-
-  lazy_static! {
-      pub static ref MODULE_NAMESPACE: Namespace =
-          Some(Newtype(sha2::Sha256::digest(b"modules").deref().to_vec()));
-      pub static ref SHADOW_NAMESPACE: Namespace =
-          Some(Newtype(sha2::Sha256::digest(b"shadow").deref().to_vec()));
-  }
-
-  pub fn bytes_to_ns(b: Bytes) -> Namespace {
-      if b.is_empty() {
-          Default::default()
-      } else {
-          Some(Newtype(b))
-      }
-  }
-
-  pub fn ns_to_bytes(ns: Namespace) -> Bytes {
-      if let Some(ns) = ns {
-          ns.0
-      } else {
-          Default::default()
-      }
-  }
-
-  impl TryFrom<Item> for Namespace {
-      type Error = Error;
-      fn try_from(i: Item) -> Result<Namespace, Error> {
-          match i {
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(b))) => Ok(bytes_to_ns(b)),
-              Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(b))) => Ok(bytes_to_ns(b)),
-              i => {
-                  let s = coll::Sized::try_from(i)?;
-                  if s.is_empty() {
-                      Ok(Default::default())
-                  } else {
-                      Err(Error::expected("namespace", s))
-                  }
-              }
-          }
-      }
   }
 
   /// One of the main components of an
@@ -2390,140 +2320,16 @@ internally, to keep track of things like the stack, program, lists etc.
           diff_hashmaps(&self.inner(), &newer.inner())
       }
 
-      /// Merges this dictionary with the given new dictionary. The new
-      /// entries are added with the given namespace.
-      pub fn merge(&mut self, new: Dictionary, namespace: &Namespace) {
-          let (adds, deletes) = self.diff(new);
-          // add namepaces to the adds and deletes
-          let adds: Vec<_> = adds
-              .into_iter()
-              .map(|(mut w, e)| {
-                  w.namespace = namespace.clone();
-                  (w, e)
-              })
-              .collect();
-          let deletes: Vec<_> = deletes
-              .into_iter()
-              .map(|mut w| {
-                  w.namespace = namespace.clone();
-                  w
-              })
-              .collect();
-          // make a mini dictionary with the adds
-          let mut dict: Dictionary = coll::Arc::wrap(HashMap::from_iter(adds));
-          dict.resolve_local();
-          let d = self.make_mut();
-
-          d.extend(dict.inner());
-          d.extend(Self::make_deletes(deletes));
-      }
-
-      /// Takes a set of additions to the dictionary. Resolves all of the
-      /// references to the words added, in any of the other words, to the
-      /// words being added. This allows modules to call other words in the
-      /// same module. The additions should have the word keys already set
-      /// to the proper namespace. So for example, if you're adding the
-      /// words `foo` and `bar` and `foo` calls `bar`, the `bar` that `foo`
-      /// refers to will be the one from this module.
-      pub fn resolve_local(&mut self) {
-          // grab the first namespace (they should all be the same)
-          if !self.is_empty() {
-              let adds_ro = self.clone();
-              let ns = &vec![adds_ro.inner().keys().next().unwrap().namespace.clone()];
-              let adds_m = self.make_mut();
-              for entry in adds_m.values_mut() {
-                  match &mut entry.definition {
-                      dict::Definition::Axiom(_) => {}
-                      dict::Definition::Derived(ref mut d) => {
-                          adds_ro.resolve_all(d, ns);
-                      }
-                  }
-                  if let Some(e) = entry.examples.as_mut() {
-                      adds_ro.resolve_all(e, ns);
-                  }
-              }
-          } else {
-              println!("Warning: empty local module")
-          }
-      }
-
-      /// Find the word in the dictionary in one of the given
-      /// namespaces. The first match is returned, or None if no matches.
-      fn resolve_word(&self, w: &mut Word, namespaces: &[dict::Namespace]) {
-          // if the word is already namespaced we're done
-          if w.namespace.is_none() {
-              for namespace in namespaces.iter().cloned() {
-                  w.namespace = namespace;
-                  if self.contains_key(w) {
-                      return;
-                  }
-              }
-              // no match found, clear the namespace
-              w.namespace = Default::default();
-          }
-      }
-
-      /// Resolves all the words in the given program
-      /// (recursively). Uses the given namespaces as possible
-      /// resolution targets.
-      pub fn resolve_all(&self, p: &mut coll::List, namespaces: &Vec<Namespace>) {
-          let p = p.make_mut();
-          for item in p.iter_mut() {
-              match item {
-                  Item::Word(w) => {
-                      self.resolve_word(w, namespaces);
-                  }
-                  Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(ref mut l))) => {
-                      self.resolve_all(l, namespaces);
-                  }
-                  Item::Receptacle(coll::Receptacle::Sized(coll::Sized::List(ref mut l))) => {
-                      self.resolve_all(l, namespaces);
-                  }
-                  Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
-                      assoc::Associative::Assoc(_),
-                  ))) => {}
-                  _ => {}
-              }
-          }
-      }
-
-      /// Given an [Item] and a Dictionary, resolve what [Namespace] it is
-      /// referring to - it's either a hash already, or it's a [Word] (an
-      /// alias), otherwise an error is returned. If it's a [Word], we
-      /// look it up in the dictionary to see if it's an existing alias,
-      /// if so, we return the value of that alias. If it's a hash, we
-      /// don't check to see if it's valid, we just return it in
-      /// [Namespace] form.
-      pub fn resolve_ns(&self, i: Item) -> Result<Namespace, Error> {
-          match i {
-              Item::Word(mut w) => {
-                  w.namespace = MODULE_NAMESPACE.clone();
-                  match self.get(&w) {
-                      Some(e) => Ok(e.get_namespace_info()),
-                      None => Err(Error::create(
-                          list!("resolve"),
-                          "module not found",
-                          Some(Item::Word(w)),
-                      )),
-                  }
-              }
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(b))) => Ok(bytes_to_ns(b)),
-              Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(b))) => Ok(bytes_to_ns(b)),
-              i => Err(Error::expected("module", i)),
-          }
-      }
-
       /// Takes a core module (in string form - should contain a series
       /// of word definitions, not wrapped in a single list), and
       /// inserts all the definitions into the dictionary, with an
       /// optional namespace.
-      pub fn insert_core_module(&mut self, lexicon: String, namespace: Namespace) {
+      pub fn insert_core_module(&mut self, lexicon: String) {
           let items = serialize::parse(lexicon).unwrap();
           for r in Box::new(items.inner().into_iter()) {
               let (k, def): (assoc::KeyItem, Item) = r.try_into().unwrap();
-              let mut word: Word = k.try_into().unwrap();
+              let word: Word = k.try_into().unwrap();
 
-              word.namespace = namespace.clone();
               let iter: Box<dyn Iterator<Item = Item>> = def.try_into().unwrap();
               let new_entry: dict::Entry = iter.try_into().unwrap();
               let new_entry2 = new_entry.clone();
@@ -2551,32 +2357,6 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
-      /// Creates a module alias in the dictionary, under the "module"
-      /// namespace. The value is inserted as a specially formed word
-      /// "definition". If there is already a value for the given key,
-      /// it cannot be overwritten with a new value, for security
-      /// reasons.
-      pub fn insert_module_alias(
-          &mut self,
-          mut alias: Word,
-          module_hash: Bytes,
-      ) -> Result<Word, Error> {
-          alias.namespace = dict::MODULE_NAMESPACE.clone();
-          let d = self.make_mut();
-          let e = Entry::from(dict::bytes_to_ns(module_hash.clone()));
-          //println!("Adding alias {:?} -> {:?}", alias, e);
-          let existing = d.get(&alias);
-          if existing.is_some() && existing != Some(&e) {
-              return Err(Error::create(
-                  list!("module-alias"),
-                  "Module alias already exists, overwriting is not allowed",
-                  Some(list!(alias, existing.unwrap().clone())),
-              ));
-          };
-          d.insert(alias.clone(), e);
-          Ok(alias)
-      }
-
       /// For stdlib words that are both built-in and part of a module
       /// that isn't necessarily loaded as part of the standard
       /// environment, we need to be able to link the word to its rust
@@ -2597,29 +2377,6 @@ internally, to keep track of things like the stack, program, lists etc.
                   _ => {}
               });
           }
-      }
-
-      /// Each word should run a program that calls fail (already namespaced
-      /// to the stdlib so that the word acts like it isn't in the dictionary
-      /// even though it is.)
-      fn make_deletes(words: Vec<Word>) -> Vec<(Word, dict::Entry)> {
-          words
-              .into_iter()
-              .map(|word| {
-                  println!("Shadowing word: {:?}", word);
-                  let err = Error::create(
-                      list!(word.clone()),
-                      "word removed by module",
-                      Some("access-denied"),
-                  );
-                  let entry = dict::Entry {
-                      examples: None,
-                      spec: None,
-                      definition: dict::Definition::Derived(list!(err, "fail")),
-                  };
-                  (word, entry)
-              })
-              .collect()
       }
   }
 
@@ -2834,19 +2591,14 @@ internally, to keep track of things like the stack, program, lists etc.
 **** Environment types
 #+begin_src rust :tangle src/types/environment.rs :mkdirp yes
   use crate::axiom;
-  use crate::crypto;
   use crate::list;
-  use crate::module_map;
   use crate::serialize;
   use crate::types::number::Number;
   use crate::types::*;
   use crate::types::{associative as assoc, collection as coll, dictionary as dict};
-  use directories::ProjectDirs;
   use once_cell::sync::Lazy;
   use std::future;
   use std::ops::Range;
-
-  use super::dict::MODULE_NAMESPACE;
 
   #[derive(Clone, PartialEq)]
   pub struct Environment {
@@ -2962,35 +2714,10 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
-      fn import_stdlib_module_map(&mut self) {
-          let modmap = module_map::module_hashes();
-          let d = self.dictionary.make_mut();
-
-          for (alias, hash) in modmap.into_iter() {
-              //namespace the alias
-              let mut alias_word: Word = alias.into();
-              alias_word.namespace = MODULE_NAMESPACE.clone();
-              d.insert(alias_word, dict::Entry::from(dict::bytes_to_ns(hash)));
-          }
-      }
-
       /// Reads a stdlib module and updates the dictionary.
-      pub fn load_builtin_module(
-          &mut self,
-          module_alias: Word,
-          is_namespaced: bool,
-      ) -> Result<(), Error> {
-          let module_hash = self.dictionary.resolve_ns(module_alias.clone().into())?;
-          let module_content = read_module(module_alias, dict::ns_to_bytes(module_hash.clone()))?;
-          self.dictionary
-              .insert_core_module(String::from_utf8(module_content)?, {
-                  if is_namespaced {
-                      module_hash
-                  } else {
-                      None
-                  }
-              });
-          Ok(())
+      pub fn load_builtin_module(&mut self, module_alias: Word) -> Result<(), Error> {
+          self.push(module_alias);
+          axiom::read_blob(self)
       }
 
       fn load_core_modules(&mut self) -> Result<(), Error> {
@@ -3022,7 +2749,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
           for &file_contents in &files {
               let lexicon = String::from_utf8_lossy(file_contents).into_owned();
-              self.dictionary.insert_core_module(lexicon, None);
+              self.dictionary.insert_core_module(lexicon);
           }
           Ok(())
       }
@@ -3070,15 +2797,21 @@ internally, to keep track of things like the stack, program, lists etc.
                   "pipes",
                   "methods",
                   "generators",
-                  "template",
+                  //"template",
                   "environment",
                   "debug" // END default namespace
               ));
+
+              // Here we can no longer modify our own dictionary, so
+              // here's what we do instead, we build a new dictionary
+              // and leave it on the stack. Then when finished we grab
+              // it at the end of this function.
               env.program.append(list!(
-                  list!("decache", coll::List::default(), "swap", "inscribe", "drop"),
+                  "dictionary",
+                  "swap",
+                  list!("decache", "string", "read", "shielddown"),
                   "step"
               ));
-              env.import_stdlib_module_map();
 
               // There's a problem here: the builtins need to be added in a
               // way that they don't get overwritten. They may need to get
@@ -3087,8 +2820,11 @@ internally, to keep track of things like the stack, program, lists etc.
               // they're builtin somehow (maybe [builtin yes], but just not
               // having definition would also do it)
               env.dictionary.add_builtins();
-              let env = futures::executor::block_on(async move { axiom::eval(env).await });
-              //print!("Env: {:?}", env.dictionary);
+              let mut env = futures::executor::block_on(async move { axiom::eval(env).await });
+              print!("Env: {:?}", env);
+              let mut dict: dict::Dictionary = env.pop().try_into().unwrap();
+              dict.add_builtins();
+              env.dictionary = dict;
               env
           });
           INST.clone()
@@ -3165,39 +2901,6 @@ internally, to keep track of things like the stack, program, lists etc.
               //println!("Type check failed! wanted {} got {:?}", w, i);
               Err(Error::expected(w.into(), i.clone()))
           }
-      }
-  }
-
-  pub fn read_blob(alias: &Word) -> Result<Bytes, Error> {
-      if let Some(proj_dirs) = ProjectDirs::from("org", "skyrod", "kcats") {
-          let data_dir = proj_dirs.data_dir();
-
-          let std_path = data_dir.join("stdlib");
-
-          // Look up the file
-          if std_path.exists() && std_path.is_dir() {
-              let file = std_path.join(format!("{}.kcats", alias));
-              Ok(std::fs::read(file)?)
-          } else {
-              Err(Error::expected("stdlibdir", None::<Item>))
-          }
-      } else {
-          Err(Error::expected("stdlibdir", None::<Item>))
-      }
-  }
-
-  /// Reads the module from the data cache and verifies its hash matches
-  pub fn read_module(alias: Word, expected_hash: Bytes) -> Result<Bytes, Error> {
-      let contents = read_blob(&alias)?;
-      let actual_hash = crypto::hash_bytes(contents.clone())?;
-      if actual_hash == expected_hash {
-          Ok(contents)
-      } else {
-          Err(Error::create(
-              list!(expected_hash, "="),
-              format!("{} module integrity check failed", alias).as_str(),
-              Some(actual_hash),
-          ))
       }
   }
 
@@ -3329,13 +3032,13 @@ words for them (hashing, encryption, signing)
       }
   }
 
-  pub fn hash_bytes(contents: Vec<u8>) -> io::Result<Vec<u8>> {
+  pub fn hash_bytes(contents: &Vec<u8>) -> Vec<u8> {
       let mut hasher = sha2::Sha256::new();
       //let mut buffer = [0; 1024]; // Read in chunks of 1024 bytes
       let count = contents.len();
       hasher.update(&contents[..count]);
 
-      Ok(hasher.finalize().to_vec())
+      hasher.finalize().to_vec()
   }
 
   impl CryptoRng for SeededRNG {}
@@ -3813,7 +3516,10 @@ example, in order to read/write to/from disk).
 *** Builtin words
 We'll define some words as axioms (not in terms of other words, only defined in Rust). 
 #+begin_src rust :tangle src/axiom.rs :mkdirp yes
+  use crate::cache;
+  use crate::crypto;
   use crate::list;
+  use crate::module_map;
   use crate::pipes;
   #[cfg(feature = "database")]
   use crate::pipes::db;
@@ -3825,11 +3531,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   use crate::types::error::Error;
   use crate::types::number::{Float, Int, Number};
   use crate::types::*;
-  use core::ops::Deref;
   use dynfmt::{Format, SimpleCurlyFormat};
   use futures::future::FutureExt;
   use lazy_static::lazy_static;
-  use sha2::{self, Digest};
   use std::collections::HashMap;
   use std::collections::VecDeque;
   use std::convert::Infallible;
@@ -4046,7 +3750,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           (">", Box::leak(Box::new(f_stack2(gt)))),
           (">=", Box::leak(Box::new(f_stack2(gte)))),
           ("abs", Box::leak(Box::new(f_stack1(abs)))),
-          ("alias", Box::leak(Box::new(f_result(alias_module)))),
           ("and", Box::leak(Box::new(f_stack2(and)))),
           ("animate", Box::leak(Box::new(animate))),
           ("assign", Box::leak(Box::new(f_stack3(assign)))),
@@ -4078,7 +3781,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("decodejson", Box::leak(Box::new(f_stack1(decode_json)))),
           ("dip", Box::leak(Box::new(dip))),
           ("dictionary", Box::leak(Box::new(dictionary))),
-          ("dictmerge", Box::leak(Box::new(f_result(dictmerge)))),
           ("dipdown", Box::leak(Box::new(dipdown))),
           ("drop", Box::leak(Box::new(drop))),
           ("emit", Box::leak(Box::new(f_stack1(emit)))),
@@ -4123,7 +3825,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               Box::leak(Box::new(f_stack1(crate::crypto::hash))),
           ),
           ("inc", Box::leak(Box::new(f_stack1(inc)))),
-          ("inscribe", Box::leak(Box::new(f_result(inscribe)))),
           ("intersection", Box::leak(Box::new(f_stack2(intersection)))),
           ("inspect", Box::leak(Box::new(f_stack1(inspect)))),
           ("join", Box::leak(Box::new(f_stack2(join)))),
@@ -4133,7 +3834,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("log", Box::leak(Box::new(f_stack2(log)))),
           ("loop", Box::leak(Box::new(loop_))),
           ("mod", Box::leak(Box::new(f_stack2(mod_)))),
-          ("namespaced", Box::leak(Box::new(f_stack2(namespaced)))),
           ("not", Box::leak(Box::new(f_stack1(not)))),
           ("number?", Box::leak(Box::new(f_stack1(is_number)))),
           ("odd?", Box::leak(Box::new(f_stack1(is_odd)))),
@@ -4152,7 +3852,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               Box::leak(Box::new(f_stack1(crate::pipes::channel::receiver))),
           ),
           ("recur", Box::leak(Box::new(recur))),
-          ("resolve", Box::leak(Box::new(resolve))),
           ("resume", Box::leak(Box::new(identity))),
           ("reverse", Box::leak(Box::new(f_stack1(reverse)))),
           ("round", Box::leak(Box::new(f_stack1(round)))),
@@ -5296,192 +4995,35 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       Ok(())
   }
 
-  fn resolve(mut env: Environment) -> Future<Environment> {
-      let program = coll::List::try_from(env.pop());
-      let namespaces = coll::List::try_from(env.pop());
-
-      match (program, namespaces) {
-          (Ok(mut program), Ok(mut namespaces)) => {
-              {
-                  // Prepend the Dictionary's namespace so that
-                  // deletions are respected (via shadowing the existing
-                  // word with one that throws an error.)
-                  let namespaces = namespaces.make_mut();
-                  namespaces.push_front(dict::ns_to_bytes(dict::SHADOW_NAMESPACE.clone()).into());
-              }
-
-              let ns: Result<Vec<dict::Namespace>, Error> = namespaces
-                  .inner()
-                  .into_iter()
-                  .map(|ns| {
-                      env.dictionary.resolve_ns(ns.clone()).or_else(|e| {
-                          // try to load the missing module and try again
-                          let ns2 = ns.clone();
-                          match ns2 {
-                              Item::Word(w) => env
-                                  .load_builtin_module(w, true)
-                                  .and_then(|_| env.dictionary.resolve_ns(ns)),
-                              _ => Err(e),
-                          }
-                      })
-                  })
-                  .collect();
-              match ns {
-                  Ok(ns) => {
-                      env.dictionary.resolve_all(&mut program, &ns);
-                      env.push(program);
-                      // pop the word 'using'
-                      env.pop_expr();
-                  }
-                  Err(e) => {
-                      env.push(e);
-                  }
-              }
-          }
-          (Err(e), _) => {
-              env.push(e);
-          }
-          (_, Err(e)) => {
-              env.push(e);
-          }
-      }
-      env.into()
-  }
-
-  /// Takes a word, and gives it a namespace. The namespace should be
-  /// [Bytes]. Overwrites any previous namespace the word had.
-  pub fn namespaced(namespace: Bytes, mut word: Word) -> Result<Word, Infallible> {
-      word.namespace = Some(Newtype(namespace));
-      Ok(word)
-  }
-
-  /// Creates an alias for a module. Takes a word and bytes and creates
-  /// a module alias from it in the dictionary.
-  pub fn alias_module(env: &mut Environment) -> Result<(), Error> {
-      let b = Bytes::try_from(env.pop())?;
-      let w = Word::try_from(env.pop())?;
-      let r: Result<Word, Error> = env.dictionary.insert_module_alias(w, b);
-      env.push(r);
-      Ok(())
-  }
-
-  /// Takes a new dictionary, merges it into the existing one, and marks
-  /// all the deleted items as deleted. Returns the namespace the new
-  /// items were added to, or nothing if added to the default namespace.
-  pub fn dictmerge(env: &mut Environment) -> Result<(), Error> {
-      //println!("dictmerge: {:?}", env);
-      let partialdict = dict::Dictionary::try_from(env.pop())?;
-      let ns = env.pop();
-      let namespace = dict::Namespace::try_from(ns.clone())?;
-      env.dictionary.merge(partialdict, &namespace);
-      if namespace.is_none() {
-          env.dictionary.add_builtins();
-      }
-      // pop the word dictmerge
-      env.pop_expr();
-      env.push(ns);
-      Ok(())
-  }
-
-  /// Load a new module and gives it an optional alias. The alias is either:
-  ///
-  /// * [Word] - An alias will be created for the module using that word.
-  /// * Nothing (an empty container) - The module will be inserted into the
-  ///   default namespace, such that the module's words will be accesible directly.
-  /// * Any other value - Will not create any alias. The module's hash will be
-  ///   returned and that can be used to refer to the module later.
-  ///
-  /// The module can be raw bytes or string or a program. Returns the
-  /// hash of the module, which can be used to refer to the module
-  /// later.
-  pub fn inscribe(env: &mut Environment) -> Result<(), Error> {
-      let module_raw = coll::Sized::try_from(env.pop())?;
-      let hash: Bytes;
-      let mut is_default_namespace = false;
-      let (module_program, hash) = match module_raw {
-          coll::Sized::Bytes(b) => {
-              // first see if we can parse the module
-              let module_string = String::from_utf8(b.clone())?;
-              let program: coll::List =
-                  coll::List::try_from(serialize::parse(module_string)?.inner())?;
-              hash = sha2::Sha256::digest(b.as_slice()).deref().to_vec();
-              (program, hash)
-          }
-          coll::Sized::List(l) => {
-              let bytes = serialize::emit(&l.clone().into()).as_bytes().to_vec();
-              hash = sha2::Sha256::digest(bytes.as_slice()).deref().to_vec();
-              (l, hash)
-          }
-          i => Err(Error::expected("program", i))?,
-      };
-
-      let dict = env.dictionary.clone();
-
-      // the module alias
-      let maybe_alias = env.pop();
-      //let maybe_word: Result<Word, Error> = maybe_alias.clone().try_into();
-      match maybe_alias {
+  pub fn read_blob(env: &mut Environment) -> Result<(), Error> {
+      //println!("Env: {:?}", env);
+      let (alias, expected_hash, contents) = match env.pop() {
           Item::Word(alias) => {
-              match env
-                  .dictionary
-                  .insert_module_alias(alias.clone(), hash.clone())
-                  .map(Item::from)
-              {
-                  Ok(_) => {}
-                  Err(_) => {
-                      // The alias already exists, ensure what
-                      // we're loading is actually that module:
-                      // check the hash matches.
-                      let mut alias = alias.clone();
-                      alias.namespace = dict::MODULE_NAMESPACE.clone();
-                      let exp_hash = env
-                          .dictionary
-                          .get(&alias)
-                          .unwrap()
-                          .get_namespace_info()
-                          .unwrap_or_default()
-                          .0;
-                      if exp_hash != hash {
-                          return Err(Error::create(
-                              list!(list!("hash"), "both", "="),
-                              "module integrity check failed",
-                              Some(alias),
-                          ));
-                      }
-                  }
-              }
+              let hashes = module_map::module_hashes();
+              let hash = hashes
+                  .get::<&str>(&(&alias).into())
+                  .ok_or_else(|| Error::expected("known-alias", alias.clone()))?;
+              (alias.to_string(), hash.clone(), cache::get(hash)?)
           }
           i => {
-              if i.is_empty() {
-                  is_default_namespace = true;
-              }
+              let hash = Bytes::try_from(i)?;
+              (
+                  base64::encode_config(hash.clone(), base64::URL_SAFE),
+                  hash.clone(),
+                  cache::get(&hash)?,
+              )
           }
+      };
+      let actual_hash = crypto::hash_bytes(&contents);
+      if actual_hash != expected_hash {
+          return Err(Error::create(
+              list!(expected_hash, "="),
+              format!("{} cache integrity check failed", alias).as_str(),
+              Some(actual_hash),
+          ));
       }
-      // The module program should not be able to smash the stack, so run it within
-      // shielddown to let it only consume the copy of the original dictionary
-      let module_program = list!(module_program, "shielddown");
-
-      env.push({
-          if is_default_namespace {
-              Item::default()
-          } else {
-              hash.into()
-          }
-      });
-      env.push(dict);
-      env.pop_expr(); //pop off the inscribe word
-
-      env.push_expr("dictmerge".into());
-      env.program.append(module_program);
-      //println!("inscribe: {:?}", env);
-      Ok(())
-  }
-
-  pub fn read_blob(env: &mut Environment) -> Result<(), Error> {
-      let alias = Word::try_from(env.pop())?;
-      let blob = environment::read_blob(&alias)?;
-      env.push(blob);
       env.pop_expr();
+      env.push(contents);
       Ok(())
   }
 
@@ -5673,6 +5215,7 @@ interpreter process, and prints output.
 We'll also define how to run unit tests.
 #+begin_src rust :tangle src/main.rs :mkdirp yes
   mod axiom;
+  mod cache;
   mod crypto;
   mod module_map;
   mod pipes;
@@ -9756,63 +9299,206 @@ map now doesn't require you to bind values (the map function has access to the r
  [2 4]
  5
  #+end_src
-*** INPROGRESS inscribe currently re-defines words repeatedly at runtime
-- State "INPROGRESS" from "TODO"       [2024-02-08 Thu 17:17]
+
+*** TODO Modules
 **** Problem statement
-The way it works now, it does the dictionary update and then runs the
-program. It should instead alter a program.
-
-Even with this functionality, the problem is the code will be
-difficult to read: instead of defining programs as inline literals,
-we'd have to "inscribe" the program so that its component words refer
-to the right definitions, and then bring that new program into an
-inscribe call by pulling it from the stack into a nested update structure. 
-
-
-#+begin_src kcats
-  [[pt [+ *]]]
-  vocab
-  -> partial dictionary with math = [[pt [+ *]]]
-
-  [9 3 pt] lingo
-  ;; iterate through the partial dict, for each word update the version
-  ;; in the program (to avoid having inner functions' meaning changed)
-  ;; 
-#+end_src
-
-Problems that need to be avoided:
-
-+ When code is defining new vocabulary, and it gets called in a tight
+***** TODO Efficient use
+ When code is defining new vocabulary, and it gets called in a tight
   loop, it should not be modifying the dictionary each
   time. Dictionary shoud be append only (to avoid having to swap back
   and forth between a modified and unmodified version)
-+ Dictionary modification should not happen at "runtime" (when the
+***** TODO Modification happens once per program
+  Dictionary modification should not happen at "runtime" (when the
   program is actually being executed) - it should be modified when the
   program is *built*. However the consequence of this is pretty dire,
   because much of the standard library is currently just programs that
   are literals and don't need "building".
-+ Nested library calls need to work - I should be able to call =af= that
-  loads (or depends on  =b= and calls =bf= that loads =c= and calls =cf=, and those loads
-  should only happen once even if i call =af= in a tight loop.
-+ Building vocabulary and the programs that use that vocabulary need
-  to be separable (that's the whole point of a library). In practice
-  there will be some "mini-libs" that mostly just make code easier to
-  read and stay with the program that uses them. However we need to be
-  able to modify the dictionary, and then refer to that modification
-  later (by name? hash?), to support the typical library use
-  case. That maps to a use/require when a program starts, and then
-  later, in some arbitrary place in the code, you refer to the
-  library's functions via its namespace.
-  
-  This is starting to sound a lot like namespaces: It's an impl where
-  there's only a 'use' without aliasing that overrides any existing
-  definitions. Currently we avoid the whole issue of referring to
-  namespaces by name by insisting you pair the library to a program at
-  definition time. But that is a 1:1 relationship and it should be
-  1:many. I should be able to bind a 2nd program such that it uses the
-  library's vocab. There's no way to do that with the current impl of
-  =inscribe=.
-**** INPROGRESS Current design
+***** TODO Nested library calls need to work
+  I should be able to call =af= that loads (or depends on =b= and calls =bf=
+  that loads =c= and calls =cf=, and those loads should only happen once
+  even if i call =af= in a tight loop.
+***** TODO Building vocabulary and the programs that use that vocabulary need to be separable
+  (that's the whole point of a library). In practice there will be
+  some "mini-libs" that mostly just make code easier to read and stay
+  with the program that uses them. However we need to be able to
+  modify the dictionary, and then refer to that modification later (by
+  name? hash?), to support the typical library use case. That maps to
+  a use/require when a program starts, and then later, in some
+  arbitrary place in the code, you refer to the library's functions
+  via its namespace.
+***** TODO Sandboxing
+****** TODO Preservation of meaning
+We execute untrusted code, then our own code, our code should mean the
+same thing as it would have before executing the untrusted code.
+****** TODO Access control
+We should be able to execute untrusted code in a limited environment
+(where, for example, it does not have access to the filesystem
+etc). 
+******* TODO [#C] Fine grained access control
+We could for example, limit filesystem access to a particular
+directory, or network access to a particular host. One way this could
+be done: have all such primitives run some other word as a predicate
+lock, and respect the outcome of that predicate. However, some care
+would need to be taken that the untrusted code couldn't just bootstrap
+a new env without that lock in place. I'm not sure this is possible
+within the overall language design.cause
+
+#+begin_quote
+Integrating an authentication scripting language directly into the
+core of your stack-based language and leveraging it for controlling
+access to sensitive operations could indeed be a powerful and flexible
+solution. This approach aligns well with your goal of making
+authentication programmable while addressing the specific challenges
+of providing fine-grained access control in a sandboxed
+environment. Here's how to address potential concerns and make the
+most out of this integration: Design Principles
+
+    Efficiency by Design: Since performance is a concern, designing
+    the authentication script execution to be as lightweight as
+    possible is crucial. Optimize the most common authentication paths
+    to reduce overhead. Consider caching results of authentication
+    checks where safe and applicable, especially in scenarios where
+    the same authentication decision is repeated.
+
+    Conditional Authentication Checks: Implement the authentication
+    scripts to run conditionally, i.e., only in contexts where
+    sandboxing is required. This minimizes the performance impact on
+    the overall system while still providing robust security measures
+    where they're most needed.
+
+    Customizable Script Complexity: Allow the complexity of the
+    authentication scripts to be tailored according to the security
+    needs of the sandbox environment. For less sensitive operations or
+    more trusted sandboxed environments, simpler scripts could be
+    used, reducing resource consumption.
+
+Practical Implementation
+
+    Authentication Context: Provide a rich context to the
+    authentication scripts, including details about the requested
+    operation (e.g., file path for file access, URL for network
+    requests), the environment's security status, and any relevant
+    user or process identifiers. This enables writing precise and
+    effective authentication logic.
+
+    Digital Signatures and Proof Checking: As part of the
+    authentication scripts, leverage digital signatures for verifying
+    the integrity and authenticity of the scripts themselves or any
+    other supplied credentials. Although checking digital signatures
+    can be resource-intensive, optimizing the cryptographic operations
+    and selectively applying them can help manage the performance
+    impact.
+
+    Expandable Security Model: By integrating authentication scripting
+    into the core, you lay a foundation that's not only useful for
+    sandboxed environment control but can also be expanded for broader
+    security features in the future, such as secure inter-process
+    communication or encrypted data storage, using the same flexible
+    scripting approach.
+
+Security and Performance Balance
+
+    Asynchronous Operations: When possible, make the authentication
+    checks asynchronous, especially for I/O bound tasks like network
+    requests or disk access. This can help mitigate the performance
+    impact on the rest of the system.
+
+    Resource Limits and Quotas: Introduce limits on the resources that
+    authentication scripts can consume, such as CPU time or memory
+    usage. This prevents potential abuse where overly complex scripts
+    could degrade system performance.
+
+In sum, your approach to incorporate an authentication scripting layer
+directly into the core of the language introduces a novel mechanism
+for fine-grained access control, effectively turning authentication
+checks into programmable gatekeepers for sensitive operations. While
+it introduces challenges in terms of complexity and resource
+management, careful design and optimizations can mitigate these
+issues, offering a powerful and flexible tool for secure sandboxing.
+I guess the question is, can the lock be unalterable? I can definitely
+hardcode some aspects of these locks so that they are alterable from
+the outside but not the inside. For example, if my trusted env wants
+to create an untrusted one, it could insert a lock into a field of the
+inner env, that is not accessible to the untrusted program. However,
+the inner env can still construct a new env itself with a very
+permissive lock and still use it to read the filesystem however it
+wants. So somehow, the construct needs to force new envs to inherit
+the locks of the current one. That's possible to implement. It could
+be a series of locks (append only), and the key has to unlock all of
+them.
+
+> I think the locks don't really even need cryptography in that case:
+the lock would say "can only read/write to /tmp" and the key would
+just be the file that the environment is trying to access. If it
+starts with /tmp then it is allowed.
+
+Yes, designing a lock mechanism that is both unalterable from inside
+the untrusted environment and inheritable for any subsequently created
+environments is indeed possible and can effectively secure the system
+according to your requirements. The append-only series of locks, where
+each new environment inherits the restrictions (locks) of its creator,
+ensures that no matter how deeply nested an environment is, it cannot
+escape the boundaries set by its original, trusted creator. Here's how
+such a mechanism could be structured:
+Lock Mechanism Design
+
+    Immutable Locks: Implement locks as immutable structures within
+    each environment. Once a lock is set, it cannot be modified from
+    within that environment. New environments inherit the lock state
+    of their parent environment upon creation.
+
+    Lock Inheritance and Aggregation: Ensure that when an environment
+    creates a new environment (even an untrusted one wants to create
+    another environment), the new environment inherits all the locks
+    of its parent environment, potentially adding its own restrictions
+    but never relaxing any existing ones. This could be done in an
+    append-only manner, where new locks add to the restrictions but do
+    not overwrite them.
+
+    Path-Based Access Control: Your description of using locks to
+    control file access based on paths (e.g., "can only read/write to
+    /tmp") is an example of path-based access control. This control is
+    straightforward yet effective and does not necessarily require
+    cryptographic keys for enforcement, simplifying implementation and
+    reducing overhead.
+
+Implementation Considerations
+
+    System-Enforced Lock Checks: The core system that mediates access
+    to resources (file system, network, etc.) must enforce the lock
+    checks before granting any operation. This ensures that no
+    environment, regardless of its programming, can bypass the
+    restrictions placed upon it by its defined locks.
+
+    Auditing and Monitoring: Although the lock mechanism provides a
+    strong control mechanism, implementing auditing and monitoring on
+    the enforcement points can help identify potential attempts to
+    bypass restrictions or exploit weaknesses in the lock design.
+
+    Error Handling and Feedback: Define clear behavior and feedback
+    mechanisms for when an environment attempts to perform an
+    operation that is denied by its locks. Good error handling is
+    crucial for developers working within these environments to
+    understand the boundaries and work effectively within them.
+
+    Documentation and Transparency: Providing clear documentation on
+    how locks work, how they are inherited, and how they restrict
+    operations will aid in the adoption and correct usage of the
+    environment creation and management functionalities you are
+    designing.
+
+In conclusion, your approach to using immutable, inheritable locks
+that enforce path-based access control offers a robust method to
+secure environments in a stack-based programming language, without
+necessitating the complexity and overhead associated with
+cryptographic solutions. This method provides a fine-grained control
+mechanism that's both practical and efficient, aligning well with the
+needs of a secure, sandboxed execution environment.
+#+end_quote
+
+**** INPROGRESS inscribe currently re-defines words repeatedly at runtime
+- State "INPROGRESS" from "TODO"       [2024-02-08 Thu 17:17]
+***** INPROGRESS Current design
 - State "INPROGRESS" from "TODO"       [2024-02-12 Mon 08:22]
 Have two separate words: one for loading new modules =loadlib=, and
 other =using= for activating them in a given program.
@@ -9858,127 +9544,17 @@ cache. We can check the mapping of alias->hash and if it exists,
 verify a match, and if it doesn't exist, create the mapping. Since the
 mapping will exist before calling =inscribe=, =inscribe= needs a way of
 not creating the alias - we could do that by allowing =[]= as an alias.
-**** INPROGRESS Library loading
+***** INPROGRESS Library loading
 - State "INPROGRESS" from "TODO"       [2024-02-17 Sat 14:51]
-***** INPROGRESS Hash-based namespace identification
-- State "INPROGRESS" from "TODO"       [2024-02-14 Wed 19:22]
-We identify which module a word's definition came from, by its
-hash. However it's not clear what exactly we hash or when.
-
-There are several ways to implement
-
-+ Take a hash from the user of what module he wants (mapping hashes to
-  documentation and version numbers is done elsewhere)
-+ Contact peers to retrieve the bytes corresponding to that hash
-+ Check the retrieved bytes in fact match the hash
-+ call =read= on those bytes to get a program datastructure
-+ Call =loadlib= and pass it a hash to execute that program on the
-  dictionary to add that hash's namespace.
-
-However that makes =loadlib= unsafe because malicious code would be able
-to masquerade as a trusted lib. We could do this
-
-+ Call loadlib and pass it the raw bytes, loadlib calculates the hash
-  itself and then calls =read=.
-
-This is not ideal either, since then defining modules inline would
-involve a round trip of serialization (you'd have to =emit= to get the
-bytes, and then loadlib would re-read). I don't really see any way
-around this though, as there's no other way to hash a program other
-than through =emit=. Note we need a deterministic =emit=. Add an issue for
-that.
-
-Should inscribe be responsible for hash checking? Options:
-+ First impl, inscribe takes bytes, hashes it itself, and calls
-  read. The problem is this causes a serialization round trip before
-  the library is interpreted, even when the library is "local" (inside
-  the main program or another lib). That erases word namespaces which
-  can be inconvenient.
-+ Inscribe takes list already parsed, and trusts the hash it is
-  given. Then the calling code has to be secure.
-+ Inscribe takes a list already parsed, but emits it itself, just to
-  calculate the hash. Then it could potentially do a serialize round
-  trip and a half (if it was read from disk) - serialized to disk,
-  parsed into program, and then serialized again to get the hash.
-+ Inscribe has two different modes, 1) bytes where it operates in the
-  first mode, and 2) program where it operates in the 3rd mode
-So what would an inline library use look like?
-#+begin_src kcats
-  [[clone *] [square] assign] [emit hash] shield loadlib
-  wrap
-  [9 square] using
-
-  ;; we could define `draft` to allow this:
-  [[clone *] [square] assign]
-  [9 square] draft
-
-  ;; but you can't nest, you'd have to do this:
-  [[clone *] [square] assign] [math] loadlib
-  [[[math]
-    [clone square *] resolve]
-
-   [cube] update]
-  [math2] loadlib
-  [[math2] [9 cube] using]
-
-#+end_src
-
-Test basic functionality: can define a new word in a scope and call it, but not outside the scope.
-#+begin_src kcats
-  [[cubez]
-   [[clone clone * *]
-    [[number] [number]]
-    [spec definition] label]
-   update] encode
-  [math] unwrap inscribe
-
-  [math] [9 cubez] using  ;; in scope
-  2 cubez ;; out of scope
-#+end_src
-
-#+RESULTS:
-#+begin_src kcats
-[[type error]
- [asked [cubez]]
- [reason "word is not defined"]
- [unwound [cubez]]
- [handled yes]]
-2 729
-#+end_src
-
-Words in a library can call each other
-#+begin_src kcats
-  [[square]
-   [[clone *]
-    [[number] [number]]
-    [spec definition] label]
-   update
-   [cube]
-   [[clone square *]
-    [[number] [number]]
-    [spec definition] label]
-   update]
-
-  encode [math] unwrap inscribe
-  [math] [9 cube] using 
-  ; tracer collect 
-  ;  [math] [9 cube] using execute ;; in scope
-
-#+end_src
-
-#+RESULTS:
-#+begin_src kcats
-729
-#+end_src
-***** TODO Make library loading primitives
-****** DONE Move hash to earlier loading module
+****** TODO Make library loading primitives
+******* DONE Move hash to earlier loading module
 - State "DONE"       from "INPROGRESS" [2024-03-19 Tue 11:39]
 - State "INPROGRESS" from "TODO"       [2024-03-19 Tue 11:14]
 We need it for library loading, can't stay as part of crypto lib.
-****** DONE Primitive for namespacing a word
+******* DONE Primitive for namespacing a word
 - State "DONE"       from "INPROGRESS" [2024-03-19 Tue 16:50]
 - State "INPROGRESS" from "TODO"       [2024-03-19 Tue 11:44]
-****** DONE Primitive for loading a blob from cache via hash or alias
+******* DONE Primitive for loading a blob from cache via hash or alias
 - State "DONE"       from "INPROGRESS" [2024-03-19 Tue 16:50]
 - State "INPROGRESS" from "TODO"       [2024-03-19 Tue 16:34]
 
@@ -10062,9 +9638,50 @@ We need it for library loading, can't stay as part of crypto lib.
   #+end_src
 
 
-****** TODO Primitive for aliasing a module
+******* CANCELED Primitive for aliasing a module
+- State "CANCELED"   from "TODO"       [2024-04-08 Mon 16:40] \\
+  Not going to use aliases.
 Needs to respect the "no overwrite" rule.
-**** INPROGRESS Nesting scopes
+
+******* TODO Test out saving modules as dict entries
+We can think of a module as a dictionary modification program. We can
+store those programs in the dictionary as definitions and use them
+later? No not really, because we can't modify the current
+dictionary. So there's no way to just install an alias to a module.
+
+#+begin_src kcats
+  "123" encode
+  [crypto] stdmod
+  [hash] boomerang
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+#b64 "pmWkWSBCL51Bfkhn79xPuKBKHz//H6B+mY6G9/eieuM="
+#+end_src
+
+Ok so this is straight forward enough but what if we want to use a
+module later? Do we need to reload it? We could save dictionaries but
+that's not the same as saving the modules that comprise it so that
+they can be combined in different ways.
+
+In most languages, a module continues to be addressable by an alias
+after you've loaded it (and doesn't result in loading it again).
+
+A couple ways to deal with that - can store a diff instead of the
+module program and just apply it. Can just reload the module every
+time. Can keep the resulting dictionary somewhere (on the stack?).
+
+Kcats is just function composition, I don't think there's any case
+where more than one function needs to be available at a time. Dividing
+the dictionary seems to be more of a security feature - you're saying
+"this program should only need these functions but I don't know what
+the lower levels try to do". In theory you could give different
+dictionaries to every word of the program that consisted of all the
+words that word calls, etc. So this whole system is more of a
+"matching my expectations to the actual behavior" type of feature.
+
+***** INPROGRESS Nesting scopes
 - State "INPROGRESS" from "TODO"       [2024-02-14 Wed 20:07]
 We should be able to chain calls to =using= without repeating any
 expensive calls.
@@ -10198,12 +9815,12 @@ then resolving the module once. Something like this:
 
 #+end_src
 
-**** TODO Stack escape protection
+***** TODO Stack escape protection
 If a program refers to a word, and at the time that program is put on
 the stack, that word means something, it should still carry the same
 meaning if that program is later run with =execute=. That means that
 module changes must be permanent.
-**** INPROGRESS Sandboxing support
+***** INPROGRESS Sandboxing support
 - State "INPROGRESS" from "TODO"       [2024-04-03 Wed 20:41]
 It must be possible for a module to *deny* access to a given word. Given
 that dictionary changes are permanent, we can't just delete words from
@@ -10221,7 +9838,7 @@ may be others.
   modification)
 + The word should be accessible again after the program using the
   module has completed.
-***** TODO experiment with nested envs as module loading mechanism
+****** TODO experiment with nested envs as module loading mechanism
 First let's see if a nested env allows sandboxing
 #+begin_src kcats
   ;; make an env with no access to io
@@ -10300,14 +9917,16 @@ Let's see if it's possible to use an inner-env module and still debug it.
  [stack [3 2]]]
 #+end_src
 
-**** TODO Access control
+
+***** INPROGRESS Access control
+- State "INPROGRESS" from "TODO"       [2024-04-07 Sun 13:53]
 Take the word =define= which allows the caller to make arbitrary and
 permanent changes to the dictionary. What if we wanted to restrict
 access to that word such that authorized programs can call it but
 others can't?
-**** INPROGRESS Words can refer to other words in the same library
+***** INPROGRESS Words can refer to other words in the same library
 - State "INPROGRESS" from "TODO"       [2024-02-17 Sat 14:51]
-**** TODO Convenient module definition
+***** TODO Convenient module definition
 We need a word that takes care of the common case: we want to define a
 set of vocabulary, it's all additive, and some of the words refer to
 each other. Previously we called that =draft=. Here's what the new =draft=
@@ -10482,7 +10101,7 @@ latter, it can have words already resolved.
 17
 #+end_src
 
-**** TODO convenient 'let'
+***** TODO convenient 'let'
 We want define a module and use it inline without having to worry about its alias.
 Let's see if we can implement =partition= this way.
 #+begin_src kcats
@@ -10520,7 +10139,7 @@ Let's see if we can implement =partition= this way.
 [[foo [[1]]]] []
 #+end_src
 
-**** INPROGRESS Break up the standard library
+***** INPROGRESS Break up the standard library
 - State "INPROGRESS" from "TODO"       [2024-03-04 Mon 20:22]
 Question: how do we break it up? For example, does =io= refer to all I/O
 operations or just the base stuff that they all depend on?
@@ -10549,7 +10168,7 @@ There seem to be 3 types of modules:
 The 2nd type, we can now use "inscribe" and make them normal modules,
 but then they won't be in the default namespace. We can at least leave
 them out of the binary. 
-***** INPROGRESS Figure out where to put modules on disk
+****** INPROGRESS Figure out where to put modules on disk
 - State "INPROGRESS" from "TODO"       [2024-03-04 Mon 20:22]
 This will make the build and packaging more complex as it will have to
 include other files besides the binary and deal with platform-specific
@@ -10745,31 +10364,53 @@ Warning: empty local module
  [type error]
  [unwound [resolve]]]
 #+end_src
-***** INPROGRESS Move core libs back to using include_bytes
+****** INPROGRESS Move core libs back to using include_bytes
 - State "INPROGRESS" from "TODO"       [2024-03-14 Thu 17:11]
-***** INPROGRESS Figure out what to do about builtins
+****** INPROGRESS Figure out what to do about builtins
 - State "INPROGRESS" from "TODO"       [2024-03-04 Mon 20:22]
-***** INPROGRESS Group functions
+****** INPROGRESS Group functions
 - State "INPROGRESS" from "TODO"       [2024-02-27 Tue 11:58]
-***** INPROGRESS Determine module loading order
+****** INPROGRESS Determine module loading order
 - State "INPROGRESS" from "TODO"       [2024-03-04 Mon 20:22]
 + stack ops builtins [drop clone evert]
 + stack motion builtins [swap swapdown float sink]
 + stack motion [flip] (only depends on own builtins)
 + collection builtins [join put count first step take wrap unwrap ...]
 + execution builtins [dip execute branch recur loop decide] 
-**** TODO Disallow module alias overwriting
+***** CANCELED Disallow module alias overwriting
+- State "CANCELED"   from "TODO"       [2024-04-07 Sun 13:53] \\
+  We're not going to be using aliases in this branch
 It is a security problem to allow code to overwrite some other code's
 alias for a module. Throw an error in this case. We should call insert
 on the aliases, and if it returns something, it better be equal to
 what we inserted.
-**** TODO Store data sources
+***** TODO Store data sources
 When we load modules we will eventually be getting them from the
 network but for now the stdlib needs to be loaded from disk.  So we
 could just always look there by default, i guess. But if we need to
 allow custom sources, we could add that alongside the aliases
-**** TODO Find stdlib by alias
-***** TODO hardcode the aliases in the source
+***** TODO Find stdlib by alias
+****** TODO hardcode the aliases in the source
+***** TODO LIbrary loading should be in order of decreasing trust
+We shouldn't start with a standard env with access to the
+filesystem. Instead the standard env should lack IO capability, and
+force that to be loaded in an inner env.
+
+So instead of dropping back to a functional env, we start with one and
+load io capability when needed.
+
+Questions:
++ How do we decide what "less trusted" means?
++ Does decreasing trust make sense?
++ Does that mean we should never need to delete words? Seems like
+  sometimes we might.
+
+Decreasing trust seems to make sense, since you can't make a
+trustworthy construct out of an untrusted, only vice versa.
+
+What makes an env less trusted than its parent? Is it the additional
+words? Is it just that any additional code requires more trust, since
+it needs to be vetted?
 *** INPROGRESS Database
 - State "INPROGRESS" from "TODO"       [2023-12-31 Sun 10:17]
 **** Books db
