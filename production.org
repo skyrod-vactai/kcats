@@ -298,14 +298,19 @@ internally, to keep track of things like the stack, program, lists etc.
       pub static ref S_WORD: Word = Word::from("word");
   }
 
-  /// A kcats data value.
+  /// A kcats data value. There are two container types, `Dispenser` and
+  /// `Receptacle`, that represent containers you can take things out
+  /// of, or put things into. Items can only be one of these things at a
+  /// time, but conversion between the two is automatic and done when
+  /// needed.
   #[derive(Debug, Clone)]
   pub enum Item {
-      /// An integer number value
+      /// A number value
       Number(number::Number),
-      /// A word value
+      /// A word value. Words are atomic, they can't be broken down into
+      /// characters like Strings.
       Word(Word),
-      /// A character value
+      /// A character value, like 'a', or '\n'.
       Char(Char),
       /// A container value (that [Item]s can be taken from)
       Dispenser(coll::Dispenser),
@@ -337,7 +342,6 @@ internally, to keep track of things like the stack, program, lists etc.
           match (self, other) {
               // same types, just use their own eq
               (Item::Number(a), Item::Number(b)) => a == b,
-              // Don't use the namespace when comparing words
               (Item::Word(a), Item::Word(b)) => a == b,
               (
                   Item::Dispenser(coll::Dispenser::Sized(a)),
@@ -348,6 +352,8 @@ internally, to keep track of things like the stack, program, lists etc.
                   Item::Dispenser(coll::Dispenser::Sized(b)),
               ) => a == b,
               (Item::Dispenser(a), Item::Dispenser(b)) => a == b,
+              (Item::Receptacle(a), Item::Receptacle(b)) => a == b,
+
               (Item::Char(a), Item::Char(b)) => a == b,
               _ => false,
           }
@@ -412,7 +418,8 @@ internally, to keep track of things like the stack, program, lists etc.
   /// As there are no real booleans, we use the word 'yes' but literally
   /// any value except empty containers is truthy. If we read a value
   /// 'false', that's not actually a boolean, it's just the [Word]
-  /// false.
+  /// false. The fact that the word 'yes' is used in the language but
+  /// 'no' is not, is a known tradeoff.
   impl From<bool> for Item {
       fn from(b: bool) -> Item {
           if b {
@@ -737,8 +744,11 @@ internally, to keep track of things like the stack, program, lists etc.
   /// can be taken out.
   #[derive(Debug, Clone, PartialEq)]
   pub enum Dispenser {
+      /// A container with a known number of items inside
       Sized(Sized),
+      /// A pipe that dispenses an unknown number of items
       Out(pipe::Out),
+      /// Similar to Out but also convertible to [Receptacle]
       Tunnel(pipe::Tunnel),
   }
 
@@ -747,8 +757,11 @@ internally, to keep track of things like the stack, program, lists etc.
   /// can be put in.
   #[derive(Debug, Clone, PartialEq)]
   pub enum Receptacle {
+      /// A container with a known number of items inside
       Sized(Sized),
+      /// A pipe that can receive an arbitrary number of items
       In(pipe::In),
+      /// Similar to In but also convertible to [Dispenser]
       Tunnel(pipe::Tunnel),
   }
 
@@ -756,10 +769,19 @@ internally, to keep track of things like the stack, program, lists etc.
   /// that it can also be appended to.
   #[derive(Debug, Clone)]
   pub enum Sized {
+      /// Associative containers associate Items in pairs, like Map or
+      /// Dict in other languages.
       Associative(assoc::Associative),
+      /// List containers have multiple Items in a specific order.
       List(List),
+      /// Set containers have multiple Items in no particular order, and
+      /// each Item can only appear once.
       Set(Set),
+      /// A String is a chunk of text, like a list of individual
+      /// characters.
       String(String),
+      /// Bytes is the lowest common denominator form of data, useful
+      /// for when no other type applies.
       Bytes(Bytes),
   }
 
@@ -1382,6 +1404,10 @@ internally, to keep track of things like the stack, program, lists etc.
   pub type AssociationContent = Associationy<KeyItem, Item>;
   pub type Association = coll::Arc<AssociationContent>;
 
+  /// A KeyItem is all the Item types that can be used as a key in an
+  /// Associative structure. In order to be a key, the type has to be
+  /// hashable and have an ordering, so types like floating point
+  /// numbers or sets can't be used.
   #[derive(Debug, Clone, Eq, PartialEq, Hash, PartialOrd, Ord)]
   pub enum KeyItem {
       // Order matters here, for comparison purposes - changing the
@@ -1394,6 +1420,12 @@ internally, to keep track of things like the stack, program, lists etc.
       List(KeyList),
   }
 
+  /// An Entry is a single pairing in an Associative type
+  pub type Entry = (KeyItem, Item);
+
+  pub type KeyListContent = coll::Listy<KeyItem>;
+  pub type KeyList = coll::Arc<KeyListContent>;
+
   impl KeyList {
       pub fn try_from_iter<I>(l: I) -> Result<Self, Error>
       where
@@ -1405,6 +1437,29 @@ internally, to keep track of things like the stack, program, lists etc.
                   .collect::<Result<VecDeque<KeyItem>, Error>>()?,
           )))
       }
+  }
+
+  /// An Associative is a container type that associates one Item (the
+  /// key) with another (the value). It has the property where you can
+  /// look up a value using the key, and you can update the value that a
+  /// key points to. Some Item types cannot be used as keys, only
+  /// [KeyItem] is accepted as an Associative key.
+  #[derive(Debug, Clone)]
+  pub enum Associative {
+      /// A generic associative structure where you can associate any
+      /// [KeyItem] with any [Item].
+      Assoc(Association),
+      /// Represents an [dict::Dictionary] entry structure with
+      /// specific keys.
+      DictEntry(dict::Entry),
+      /// Represents an execution environment, with specific keys
+      Env(env::Environment),
+      /// Represents a runtime Error value, with specific keys
+      Error(Error),
+      /// Represents a dictionary for an execution environment, with
+      /// more specific key and value types.
+      Dictionary(dict::Dictionary),
+      Nothing,
   }
 
   impl From<KeyItem> for Item {
@@ -1468,21 +1523,6 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  pub type Entry = (KeyItem, Item);
-
-  pub type KeyListContent = coll::Listy<KeyItem>;
-  pub type KeyList = coll::Arc<KeyListContent>;
-
-  #[derive(Debug, Clone)]
-  pub enum Associative {
-      Assoc(Association),
-      DictEntry(dict::Entry),
-      Env(env::Environment),
-      Error(Error),
-      Dictionary(dict::Dictionary),
-      Nothing,
-  }
-
   impl PartialEq for Associative {
       fn eq(&self, other: &Self) -> bool {
           match (self, other) {
@@ -1500,6 +1540,7 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl Associative {
+      /// Retuns the number of associations in the container
       pub fn len(&self) -> usize {
           match self {
               Associative::Assoc(a) => a.len(),
@@ -1511,10 +1552,23 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
+      /// Returns true if the container is empty
       pub fn is_empty(&self) -> bool {
           self.len() == 0
       }
 
+      /// Inserts a new association of a [KeyItem] to [Item]. If the key
+      /// already exists, the value is replaced and the old value is
+      /// returned. If the key doesn't exist, a new one is created with
+      /// the new value and no old value is returned. The overall return
+      /// value is tuple of an updated Associative, and an optional old
+      /// value.
+      ///
+      /// The Associative returned is not necessarily the same type as
+      /// self, as sometimes there is auto-demotion, eg from Error to
+      /// Association. Demotion typically happens when you insert a key
+      /// into a type that doesn't support that key, you'll get a more
+      /// generic type back instead.
       pub fn insert(self, k: KeyItem, v: Item) -> (Associative, Option<Item>) {
           match self {
               Associative::Assoc(mut a) => {
@@ -1578,11 +1632,28 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
+      /// The put operation is for generic containers, adding a new Item
+      /// to the container. In the case of Associative, we can still do
+      /// this if the Item is the right type: a key/value pair. If it's
+      /// the right type, we [self.insert] the value using the key,
+      /// otherwise return an error.
       pub fn put(self, other: Item) -> Result<Associative, Error> {
           let entry: (KeyItem, Item) = other.try_into()?;
           Ok(self.insert(entry.0, entry.1).0)
       }
 
+      /// The join operation is for generic containers, but we can join
+      /// two Associatives by merging them together. If both
+      /// Associatives are the same specific type, the type is
+      /// preserved. If `other` can be converted to the same specific
+      /// type as `self`, that conversion will be done and the specific
+      /// type of `self` is preserved. If they are different types and we
+      /// can't convert `other` to `self`s type, the result will be
+      /// demoted to a more generic form.
+      ///
+      /// Keys in `other` have priority over those in `self` - if a key
+      /// is in both containers, the result will have only the value
+      /// from `other`.
       pub fn join(self, other: Associative) -> Associative {
           match (self, other) {
               // same type means 2nd one wins.
@@ -1622,6 +1693,8 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
+      /// Retrieves a value from the container using the key
+      /// `k`. Returns [None] if the key is not present.
       pub fn get(&self, k: &KeyItem) -> Option<Item> {
           match self {
               Associative::Assoc(a) => a.get(k).cloned(),
@@ -1642,6 +1715,7 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
+      /// Returns true if the key `k` is present in the container.
       pub fn contains_key(&self, k: &KeyItem) -> bool {
           match self {
               Associative::Assoc(a) => a.contains_key(k),
@@ -1656,7 +1730,9 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
-      //TODO remove
+      /// Removes the key `k` from the container, returning a tuple of a
+      /// new [Associative] and an optional value if the key was
+      /// present.
       pub fn remove(self, k: &KeyItem) -> (Associative, Option<Item>) {
           match self {
               Associative::Assoc(mut a) => {
@@ -1678,6 +1754,9 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
+      /// The take operation is for generic containers but we can
+      /// perform it on an Associative by removing an arbitrary pair and
+      /// returning it.
       pub fn take(self) -> (Self, Option<Item>) {
           match self {
               Associative::Assoc(mut a) => {
@@ -1710,6 +1789,8 @@ internally, to keep track of things like the stack, program, lists etc.
                       }),
                   )
               }
+              // The remaining impls may require auto-demotion (eg,
+              // removing a required field from say, Error)
               _ => todo!("taking from assoc Requires insert/remove impl"),
           }
       }
@@ -1988,6 +2069,12 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::types::{Item, Word};
   use std::convert::Infallible;
 
+  /// Represents a runtime error type. Contains generic fields to hold
+  /// things like what type of error, the actual vs expected conditions,
+  /// etc. Also holds whether the error has been handled or not, which
+  /// the runtime uses to decide whether to keep unwinding the program
+  /// looking for something to handle the error. An error that has been
+  /// handled is inert, it is just another data value.
   #[derive(Clone, PartialEq)]
   pub struct Error {
       pub data: assoc::Association,
@@ -1995,6 +2082,7 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl Error {
+      /// Creates a new error.
       pub fn create<T: Into<Item>>(asked: coll::List, reason: &str, actual: Option<T>) -> Error {
           // let bt = backtrace::Backtrace::new();
           let mut data: Vec<(assoc::KeyItem, Item)> = vec![
@@ -2013,6 +2101,8 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
+      /// Creates a stack underflow error for when the current word
+      /// needs more items than there are on the stack.
       pub fn stack_underflow() -> Error {
           Error::create(
               list!("consume"),
@@ -2196,6 +2286,8 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   // TODO: move specs to their own module
+  /// An element of a [Spec], either an input or an output. Holds the
+  /// type and optional name of the input/output.
   #[derive(Debug, Clone, PartialEq)]
   pub struct SpecElement {
       pub elemtype: Word,
@@ -2203,6 +2295,10 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   pub type StackSpec = Vec<SpecElement>;
+
+  /// The spec of a [Word] consists of the input spec and the output
+  /// spec, that shows what the stack should look like before and after
+  /// the [Word] is invoked.
   pub type Spec = (StackSpec, StackSpec);
 
   impl TryFrom<Item> for SpecElement {
@@ -2821,7 +2917,7 @@ internally, to keep track of things like the stack, program, lists etc.
               // having definition would also do it)
               env.dictionary.add_builtins();
               let mut env = futures::executor::block_on(async move { axiom::eval(env).await });
-              print!("Env: {:?}", env);
+              //print!("Env: {:?}", env);
               let mut dict: dict::Dictionary = env.pop().try_into().unwrap();
               dict.add_builtins();
               env.dictionary = dict;
@@ -2990,7 +3086,7 @@ words for them (hashing, encryption, signing)
   use rand::RngCore as RandRngCore;
   use rand_core::{CryptoRng, RngCore};
   use sha2::{self, Digest}; // Import RngCore for the fill_bytes method
-  use std::io;
+
   pub fn hash(i: Item) -> ItemResult {
       let b = Bytes::try_from(i).unwrap();
       Ok(sha2::Sha256::digest(b).deref().to_vec().into())
@@ -9307,6 +9403,29 @@ map now doesn't require you to bind values (the map function has access to the r
   loop, it should not be modifying the dictionary each
   time. Dictionary shoud be append only (to avoid having to swap back
   and forth between a modified and unmodified version)
+
+ #+begin_src kcats
+   ;; save a modified env or dictionary and use it
+   ;; again.
+   [crypto] stdmod ;; make the module
+   ;; apply it to the dictionary
+ #+end_src
+
+ #+RESULTS:
+ #+begin_src kcats
+ [[[delegated [[spec [[[association pubkey]] [program]]]
+               [definition [[[sink [[hash] [shield dip]
+                                    decorated float [verify] dip [[]] branch]
+                              [drop drop sink verify] [clone] dipdown branch]
+                             [[]] recover]
+                            swap prepend]]]]
+   [hash [[spec [[item] [bytes]]]
+          [definition [[[[bytes?] [hashbytes]]
+                        [[yes] [encode hash]]]
+                       decide]]]]]
+  join]
+ #+end_src
+
 ***** TODO Modification happens once per program
   Dictionary modification should not happen at "runtime" (when the
   program is actually being executed) - it should be modified when the
@@ -9495,7 +9614,35 @@ cryptographic solutions. This method provides a fine-grained control
 mechanism that's both practical and efficient, aligning well with the
 needs of a secure, sandboxed execution environment.
 #+end_quote
+**** Discussion
+Let's consider pairs of program/dictionary.
 
+It's sort of like a passage of english prose, and a dictionary of what
+all the words used in that prose mean. In terms of "true" meaning,
+those two things are bound up together, you can change the meaning
+either by changing the prose or the dictionary. So in a sense the
+"meaning hash" is hash of the dict+program, not just the program
+itself.
+
+One potential hole in this concept is the existence of axiom words
+(that aren't defined in terms of other words). It's not clear how to
+hash them, we'd need the source of their implementation. Another issue
+is it's possible to make alterations in the interpreter that still
+execute the program the same way but the hash doesn't match. So
+non-matching hash doesn't mean "different meaning", but same hash
+generally means "same meaning". That's the way hashes work most places
+though.
+
+Can we do anything with this? Maybe not.
+
+
+Let's consider what we do about not having to recalculate the whole
+dictionary each time we want to use a module. There's several possible mitigations:
+
++ Leave the modified dictionary on the stack so it can be reused
++ Make 2 levels of env nesting per library
+   + One where the modified dict is in the dict (but words are not available)
+   + One where we actually apply that dict so the words can be used
 **** INPROGRESS inscribe currently re-defines words repeatedly at runtime
 - State "INPROGRESS" from "TODO"       [2024-02-08 Thu 17:17]
 ***** INPROGRESS Current design
@@ -9680,6 +9827,38 @@ the lower levels try to do". In theory you could give different
 dictionaries to every word of the program that consisted of all the
 words that word calls, etc. So this whole system is more of a
 "matching my expectations to the actual behavior" type of feature.
+
+******* TODO Test out nested envs as library mechanism
+#+begin_src kcats
+  ;; load a module
+  [crypto] unwrap decache string read
+  [["foo" "bar" "baz"] [hash] map] spawn clone evaluate
+
+  ;;boomerang
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[program []]
+ [stack [[#b64 "LCa0a2j/xo/5m0U8HTBBNBNCLXBkg7+g+YpeiGJm564=" #b64 "/N4rLtula/QIYB+3If6bXDONEO5CnqBPrlURto+/j7k="
+          #b64 "uqWglk0zIPvAxqkiFARTyFE+okq4/QV3A0gEqWckgJY="]]]]
+[[program [["foo" "bar" "baz"] [hash] map]]
+ [stack []]]
+#+end_src
+
+So what is =let= in this model?
+
+#+begin_src kcats 
+  [[plus2 [2 +]]]
+  [5 plus2]
+  [draft] dip
+  boomerang
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+7
+#+end_src
 
 ***** INPROGRESS Nesting scopes
 - State "INPROGRESS" from "TODO"       [2024-02-14 Wed 20:07]
