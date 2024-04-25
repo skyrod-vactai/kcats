@@ -1393,6 +1393,8 @@ internally, to keep track of things like the stack, program, lists etc.
 #+end_src
 **** Associative types
 #+begin_src rust :tangle src/types/associative.rs :mkdirp yes
+  /// A module to support Associative data types (similar contract to
+  /// Rust's HashMap)
   use crate::types::collection as coll;
   use crate::types::dictionary as dict;
   use crate::types::environment as env;
@@ -1635,7 +1637,7 @@ internally, to keep track of things like the stack, program, lists etc.
       /// The put operation is for generic containers, adding a new Item
       /// to the container. In the case of Associative, we can still do
       /// this if the Item is the right type: a key/value pair. If it's
-      /// the right type, we [self.insert] the value using the key,
+      /// the right type, we [Self::insert] the value using the key,
       /// otherwise return an error.
       pub fn put(self, other: Item) -> Result<Associative, Error> {
           let entry: (KeyItem, Item) = other.try_into()?;
@@ -2686,6 +2688,8 @@ internally, to keep track of things like the stack, program, lists etc.
 #+end_src
 **** Environment types
 #+begin_src rust :tangle src/types/environment.rs :mkdirp yes
+  /// A module that outlines functionality of a kcats execution
+  /// environment.
   use crate::axiom;
   use crate::list;
   use crate::serialize;
@@ -2696,6 +2700,10 @@ internally, to keep track of things like the stack, program, lists etc.
   use std::future;
   use std::ops::Range;
 
+  /// A struct to hold the state of an executing kcats program. The
+  /// `stack` is the data being manipulated, the `program` is program
+  /// remaining to be executed, and the `dictionary` is the set of
+  /// functions available to the program.
   #[derive(Clone, PartialEq)]
   pub struct Environment {
       pub stack: Stack,
@@ -2704,32 +2712,42 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl Environment {
+      /// Push the [Item] onto the top of the stack.
       pub fn push<T: Into<Item>>(&mut self, i: T) {
           coll::Arc::make_mut(&mut self.stack).push_front(i.into());
       }
 
+      /// Pop the top [Item] from the stack, panicking if the stack is
+      /// empty.
       pub fn pop(&mut self) -> Item {
           coll::Arc::make_mut(&mut self.stack).pop_front().unwrap()
       }
 
-      /// Pushes one item onto the front of the expression (so that it
-      /// executes first)
-      pub fn push_expr(&mut self, i: Item) {
+      /// Pushes one item onto the front of the program (so that it
+      /// executes first).
+      pub fn push_prog(&mut self, i: Item) {
           coll::Arc::make_mut(&mut self.program).push_front(i);
       }
 
-      pub fn pop_expr(&mut self) -> Item {
+      /// Pops an [Item] from the front of the program.
+      pub fn pop_prog(&mut self) -> Item {
           coll::Arc::make_mut(&mut self.program).pop_front().unwrap()
       }
 
+      /// Returns a reference to the top stack [Item], or [None] if it's
+      /// empty.
       pub fn tos(&self) -> Option<&Item> {
           self.stack.front()
       }
 
+      /// Returns the length of this struct (as an associative
+      /// structure), which is constant.
       pub fn len(&self) -> usize {
           3 // 3 fields
       }
 
+      /// Treats the [Environment] as an associative structure,
+      /// returning one of its fields, or [None].
       pub fn get(&self, key: &str) -> Option<Item> {
           match key {
               "stack" => Some(self.stack.clone().into()),
@@ -2739,12 +2757,19 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
+      /// Returns true if the [Environment] contains the given key,
+      /// which is only true for its fixed fields.
       pub fn contains_key(&self, key: &assoc::KeyItem) -> bool {
           Word::try_from(key.clone()).map_or(false, |ref w| {
               matches!(w.into(), "stack" | "program" | "dictionary")
           })
       }
 
+      /// Inserts the key/value into the [Environment]. If the key is
+      /// not one of its fixed fields, return a demoted
+      /// [assoc::Associative] value that's more generic and supports
+      /// any key. Also optionally return any old value that might get
+      /// overwritten.
       pub fn insert(mut self, k: assoc::KeyItem, v: Item) -> (assoc::Associative, Option<Item>) {
           match k {
               assoc::KeyItem::Word(ref w) => {
@@ -2816,6 +2841,8 @@ internally, to keep track of things like the stack, program, lists etc.
           axiom::read_blob(self)
       }
 
+      /// Loads the core modules as part of preparing a standard
+      /// environment.
       fn load_core_modules(&mut self) -> Result<(), Error> {
           // Assuming /project/core/ is in your project's root directory and part of the source
           let files: Vec<&[u8]> = vec![
@@ -2850,6 +2877,7 @@ internally, to keep track of things like the stack, program, lists etc.
           Ok(())
       }
 
+      /// Returns an error if the stack isn't at least `min_depth` deep.
       fn check_stack_depth(&self, min_depth: usize) -> Result<(), Error> {
           //println!("Checking stack has at least {} items", min_depth);
           if self.stack.len() < min_depth {
@@ -2859,6 +2887,7 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
+      /// Returns an error if the stack doesn't match the given input spec.
       pub fn check_input_spec(&self, specs: &dict::StackSpec) -> Result<(), Error> {
           self.check_stack_depth(specs.len())?;
           let indexes = Range {
@@ -2875,6 +2904,9 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl Default for Environment {
+      /// Returns the default environment, which is the "standard"
+      /// environment. It loads some standard libraries and core
+      /// functions. The environment is only built once and memoized.
       fn default() -> Self {
           static INST: Lazy<Environment> = Lazy::new(|| {
               let mut env = Environment {
@@ -2927,6 +2959,9 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  /// Returns an error if the [Item] is not of the type specified by
+  /// [Word] `w`. This allows specs to have their own little type
+  /// hierarchy, eg, `integer` is a `number`, `list` is a `sized` etc.
   fn check_type(i: &Item, w: &Word) -> Result<(), Error> {
       match (w, i) {
           (w, _) if *w == *S_ITEM => Ok(()),
@@ -3612,6 +3647,8 @@ example, in order to read/write to/from disk).
 *** Builtin words
 We'll define some words as axioms (not in terms of other words, only defined in Rust). 
 #+begin_src rust :tangle src/axiom.rs :mkdirp yes
+  /// All the core functions of kcats, the words that are implemented in
+  /// rust, instead of in terms of other kcats words.
   use crate::cache;
   use crate::crypto;
   use crate::list;
@@ -3670,7 +3707,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   let res = f(x);
                   match res {
                       Ok(r) => {
-                          env.pop_expr();
+                          env.pop_prog();
                           env.pop();
                           env.push(r.into());
                       }
@@ -3713,7 +3750,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   let res = f(y, x);
                   match res {
                       Ok(r) => {
-                          env.pop_expr();
+                          env.pop_prog();
                           env.pop();
                           env.pop();
                           env.push(r.into());
@@ -3767,7 +3804,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   let res = f(z, y, x);
                   match res {
                       Ok(r) => {
-                          env.pop_expr();
+                          env.pop_prog();
                           env.pop();
                           env.pop();
                           env.pop();
@@ -3800,7 +3837,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           let y = env.pop();
           Box::pin(f(x, y).map(|r| {
               if r.is_ok() {
-                  env.pop_expr();
+                  env.pop_prog();
               }
               env.push(Item::from(r));
               env
@@ -4128,7 +4165,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           Ok(p) => Box::pin(p.put(j).map(|f| {
               match f {
                   Ok(p) => {
-                      env.pop_expr();
+                      env.pop_prog();
                       env.push(Item::Receptacle(p))
                   }
                   Err(e) => {
@@ -4148,7 +4185,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn clone(mut env: Environment) -> Future<Environment> {
       let clone = env.stack.front().unwrap().clone();
-      env.pop_expr();
+      env.pop_prog();
       env.push(clone);
       env.into()
   }
@@ -4159,12 +4196,12 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn swap(mut env: Environment) -> Future<Environment> {
-      env.pop_expr();
+      env.pop_prog();
       swap2(env, 0)
   }
 
   pub fn swapdown(mut env: Environment) -> Future<Environment> {
-      env.pop_expr();
+      env.pop_prog();
       swap2(env, 1)
   }
 
@@ -4172,7 +4209,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let s = coll::Arc::make_mut(&mut env.stack);
       s.swap(0, 2);
       s.swap(0, 1);
-      env.pop_expr();
+      env.pop_prog();
       env.into()
   }
 
@@ -4180,20 +4217,20 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let s = coll::Arc::make_mut(&mut env.stack);
       s.swap(0, 2);
       s.swap(1, 2);
-      env.pop_expr();
+      env.pop_prog();
       env.into()
   }
 
   pub fn drop(mut env: Environment) -> Future<Environment> {
       env.pop();
-      env.pop_expr();
+      env.pop_prog();
       env.into()
   }
 
   pub fn eq(mut env: Environment) -> Future<Environment> {
       let i = env.pop();
       let j = env.pop();
-      env.pop_expr();
+      env.pop_prog();
       env.push(i == j);
       env.into()
   }
@@ -4267,7 +4304,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let p = coll::List::try_from(env.pop());
       match p {
           Ok(mut p) => {
-              env.pop_expr();
+              env.pop_prog();
               let f = env.pop();
               if is_truthy(f) {
                   let p2 = p.clone();
@@ -4286,7 +4323,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let i = env.pop();
       match coll::List::try_from(i) {
           Ok(program) => {
-              env.pop_expr();
+              env.pop_prog();
               env.program.append(program);
           }
           Err(e) => {
@@ -4298,7 +4335,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn wrap(mut env: Environment) -> Future<Environment> {
       let item = env.pop();
-      env.pop_expr();
+      env.pop_prog();
       env.push(list!(item));
       env.into()
   }
@@ -4306,7 +4343,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   pub fn unwrap(mut env: Environment) -> Future<Environment> {
       match coll::List::try_from(env.pop()) {
           Ok(l) => {
-              env.pop_expr();
+              env.pop_prog();
               env.stack.extend(l.inner().into_iter().rev());
               env
           }
@@ -4364,7 +4401,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       let f = it.take();
                       Box::pin(async move {
                           let (c, i) = f.await;
-                          env.pop_expr();
+                          env.pop_prog();
                           let stack = env.stack.make_mut();
                           stack.push_front(c.into());
                           stack.push_front(i.unwrap_or_default());
@@ -4400,7 +4437,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               match s {
                   Ok(it) => {
                       let (c, i) = it.pop();
-                      env.pop_expr();
+                      env.pop_prog();
                       env.push(c);
                       env.push(i.unwrap_or_default());
                   }
@@ -4431,7 +4468,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           coll::List::try_from(env.pop()),
       ) {
           (Ok(false_branch), Ok(true_branch)) => {
-              env.pop_expr();
+              env.pop_prog();
               let b = env.pop();
 
               env.program.append(if is_truthy(b) {
@@ -4462,7 +4499,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               env.push(litem);
           } else {
               // if the container is empty, just pop off 'step' and we're done
-              env.pop_expr();
+              env.pop_prog();
           }
           env
       })
@@ -4485,8 +4522,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let mut rec1 = coll::List::try_from(env.pop()).unwrap();
       let then = coll::List::try_from(env.pop()).unwrap();
       let pred = coll::List::try_from(env.pop()).unwrap();
-      env.pop_expr();
-      env.push_expr("if".into());
+      env.pop_prog();
+      env.push_prog("if".into());
       let r = list!(
           pred.clone(),
           then.clone(),
@@ -4515,7 +4552,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   pub fn evert(mut env: Environment) -> Future<Environment> {
       let mut l = coll::List::try_from(env.pop()).unwrap();
       mem::swap(&mut env.stack, &mut l);
-      env.pop_expr();
+      env.pop_prog();
       env.push(l);
       env.into()
   }
@@ -4814,7 +4851,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                                   // end 'dipdown'
                                   "branch"
                               );
-                              env.pop_expr();
+                              env.pop_prog();
                               env.program.append(newexpr);
                           }
                           (Err(test), _) => {
@@ -4832,7 +4869,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           }
       } else {
           // clauses empty, return nothing
-          env.pop_expr();
+          env.pop_prog();
           env.push(Item::default());
       }
       env.into()
@@ -4872,7 +4909,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                               dict::Definition::Axiom(a) => (*a)(env),
                               dict::Definition::Derived(d) => {
                                   let items = d.clone();
-                                  env.pop_expr();
+                                  env.pop_prog();
                                   env.program.append(items);
                                   env.into()
                               }
@@ -4886,7 +4923,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               }
               _ => {
                   // not a word, just push onto stack
-                  let i = env.pop_expr();
+                  let i = env.pop_prog();
                   env.push(i);
                   env.into()
               }
@@ -4966,12 +5003,12 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               let mut next = env.program.front();
               let mut unwound = Vec::<Item>::new();
               while next.is_some() && next.unwrap() != w {
-                  let i = env.pop_expr();
+                  let i = env.pop_prog();
                   unwound.push(i);
                   next = env.program.front();
               }
               if next.is_some() {
-                  env.pop_expr();
+                  env.pop_prog();
               }
               // set the is_handled bit
               e.is_handled = true;
@@ -5007,7 +5044,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
       match inner_env {
           Ok(inner) => {
-              env.pop_expr();
+              env.pop_prog();
               if inner.program.is_empty() {
                   Box::pin(async move {
                       env.push(Item::default());
@@ -5032,7 +5069,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let inner_env = Environment::try_from(tos);
       match inner_env {
           Ok(inner) => Box::pin(eval(inner).map(|inner_done| {
-              env.pop_expr();
+              env.pop_prog();
               env.push(inner_done);
               env
           })),
@@ -5044,13 +5081,13 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn identity(mut env: Environment) -> Future<Environment> {
-      env.pop_expr();
+      env.pop_prog();
       env.into()
   }
 
   pub fn dictionary(mut env: Environment) -> Future<Environment> {
       let d = env.dictionary.clone();
-      env.pop_expr();
+      env.pop_prog();
       env.push(d);
       env.into()
   }
@@ -5078,7 +5115,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   /// Makes 'yes' a word that doesn't have to be quoted, just pushes
   /// itself onto the stack.
   pub fn yes(mut env: Environment) -> Future<Environment> {
-      let t = env.pop_expr();
+      let t = env.pop_prog();
       env.push(t);
       env.into()
   }
@@ -5086,7 +5123,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   pub fn fail(env: &mut Environment) -> Result<(), Error> {
       let mut err = Error::try_from(env.pop())?;
       err.is_handled = false;
-      env.pop_expr();
+      env.pop_prog();
       env.push(err);
       Ok(())
   }
@@ -5118,7 +5155,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               Some(actual_hash),
           ));
       }
-      env.pop_expr();
+      env.pop_prog();
       env.push(contents);
       Ok(())
   }
@@ -5130,7 +5167,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let inner_env = Environment::try_from(tos);
       match inner_env {
           Ok(inner) => {
-              env.pop_expr();
+              env.pop_prog();
               tokio::spawn(async move { eval(inner).await });
               env.into()
           }
@@ -5174,13 +5211,13 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn timestamps(mut env: Environment) -> Future<Environment> {
-      env.pop_expr();
+      env.pop_prog();
       env.push(Item::Dispenser(coll::Dispenser::Out(pipes::Out::Time)));
       env.into()
   }
 
   pub fn standard(mut env: Environment) -> Future<Environment> {
-      env.pop_expr();
+      env.pop_prog();
       env.push(Item::Dispenser(coll::Dispenser::Tunnel(
           pipes::Tunnel::Standard,
       )));
@@ -5776,11 +5813,17 @@ The basic pipe contracts.
   pub mod standard;
   pub mod time;
 
+  /// A pipe that accepts items.
   #[derive(Debug, Clone)]
   pub enum In {
+      /// A pipe that takes bytes to write to a file on disk
       StaticFile(Arc<RwLock<fs::StaticFile>>),
+      /// A pipe that takes bytes to write to a TCP/IP socket
       Socket(Arc<RwLock<net::Socket>>),
+      /// A pipe that takes items to send through a channel to another
+      /// part of the running program
       Handoff(channel::Handoff<Item>),
+      /// A pipe that takes bytes to write to standard out
       Standard,
   }
 
@@ -5794,15 +5837,25 @@ The basic pipe contracts.
           }
       }
   }
-
+  /// A pipe that produces items.
   #[derive(Debug, Clone)]
   pub enum Out {
+      /// A pipe that produces bytes from a file on disk
       StaticFile(Arc<RwLock<fs::StaticFile>>),
+      /// A pipe that produces bytes from a TCP/IP socket
       Socket(Arc<RwLock<net::Socket>>),
+      /// A pipe that produces sockets from a TCP/IP server socket
       ServerSocket(Arc<RwLock<net::ServerSocket>>),
+      /// A pipe that produces items from a channel that comes from
+      /// another part of the program
       Handoff(channel::Handoff<Item>),
+      /// A pipe that produces a dummy value after a given amount of
+      /// time. Can be used as a timeout mechanism when waiting on
+      /// multiple pipes at once.
       Timer(channel::Timer<Item>),
+      /// A pipe that produces timestamps of the current UNIX time
       Time,
+      /// A pipe that produces bytes from standard in.
       Standard,
   }
 
@@ -5820,11 +5873,18 @@ The basic pipe contracts.
       }
   }
 
+  /// A bi-directional pipe that can accept and produce Items.
   #[derive(Debug, Clone)]
   pub enum Tunnel {
+      /// A pipe that can both produce and accept bytes to read/write from a file.
       StaticFile(Arc<RwLock<fs::StaticFile>>),
+      /// A pipe that can both produce and accept bytes to read/write
+      /// from a TCP/IP socket.
       Socket(Arc<RwLock<net::Socket>>),
+      /// A pipe that produces or accepts values to/from a channel that
+      /// connects to another part of the program.
       Handoff(channel::Handoff<Item>),
+      /// A pipe to standard in/out that produces/accepts bytes.
       Standard,
   }
 
@@ -5863,6 +5923,7 @@ The basic pipe contracts.
   }
 
   impl In {
+      /// Puts the [Item] into the pipe. Blocks if the pipe is full.
       pub fn put(&mut self, i: Item) -> types::Future<Result<(), Error>> {
           match self {
               In::StaticFile(f) => {
@@ -5880,6 +5941,8 @@ The basic pipe contracts.
   }
 
   impl Tunnel {
+      /// Puts the [Item] into the tunnel, blocks if the send side of
+      /// the tunnel is full.
       pub fn put(&mut self, i: Item) -> types::Future<Result<(), Error>> {
           match self {
               Tunnel::StaticFile(f) => {
@@ -5895,6 +5958,8 @@ The basic pipe contracts.
           }
       }
 
+      /// Takes an [Item] from the tunnel, blocks if the receive side of
+      /// the tunnel is empty.
       pub fn take(&mut self) -> types::Future<Result<Option<Item>, Error>> {
           match self {
               Tunnel::StaticFile(f) => {
@@ -5912,6 +5977,7 @@ The basic pipe contracts.
   }
 
   impl Out {
+      /// Takes an [Item] from the pipe, blocks if the pipe is empty.
       pub fn take(&mut self) -> types::Future<Result<Option<Item>, Error>> {
           match self {
               Out::StaticFile(f) => {
@@ -6558,7 +6624,7 @@ Implement the =handoff= type
   }
 
   pub fn handoff(mut env: Environment) -> types::Future<Environment> {
-      env.pop_expr();
+      env.pop_prog();
       env.push(pipes::Tunnel::Handoff(Handoff::new(false)));
       env.into()
   }
@@ -6967,25 +7033,25 @@ Implement the =handoff= type
       }
   }
 #+end_src
-** Issues
-*** INPROGRESS Interactive mode :tools:
+* Issues
+** INPROGRESS Interactive mode                                       :tools:
 run with =kcats -i= for interactive, where you get a repl-like
 prompt. Each prompt accepts kcats items as input, and updates the
 state accordingly. There are special commands to print the current
 state, clear it, write to file, etc.
-**** TODO Only print the changed part of the stack
-**** TODO Emacs keybindings to send common stack ops
+*** TODO Only print the changed part of the stack
+*** TODO Emacs keybindings to send common stack ops
 + swap / swapdown
 + clear ([] evert drop)
 + clone
 + snapshot?
 + drop
 + sink / float
-*** TODO Source mapping :debugging:errorHandling:
+** TODO Source mapping                             :debugging:errorHandling:
 It would be nice if we could tell which file any given word was read
 from. We could do this at read time, but i don't think our edn parser
 remembers byte positions, so that might need modification.
-*** TODO Call stack in errors :debugging:errorHandling:
+** TODO Call stack in errors                       :debugging:errorHandling:
 It would be nice to see the call stack, if possible. For example if
 foo calls bar, and bar fails, it'd be nice to know we're in the middle
 of executing foo also. I have no idea how to implement this at the
@@ -6997,8 +7063,8 @@ puts itself back in the program.
 
 So maybe a "call stack" isn't exactly what we want, I'm not even sure
 it's possible to get what we want here.
-*** INPROGRESS Implement pipes :stdlib:
-**** DONE Write to a file
+** INPROGRESS Implement pipes                                       :stdlib:
+*** DONE Write to a file
 #+begin_src kcats
   [[file "/tmp/bar4"]] pipe-in
 
@@ -7038,7 +7104,7 @@ it's possible to get what we want here.
 #+RESULTS:
 : "hello world!" [[type pipe] [file "/tmp/bar101r7"]]
 
-**** DONE Read from a file
+*** DONE Read from a file
 #+begin_src kcats :results code
 "" [string join] [[file "/tmp/bar2"]] pipe-out
 
@@ -7065,7 +7131,7 @@ dictionary [collect spec] lookup
  [[definition [swap [take swap] swap put [dip] join [[closed? not]] dip while drop]]
   [spec [[pipe program] [item]]]]]
 #+end_src
-**** DONE Close a pipe
+*** DONE Close a pipe
 #+begin_src kcats :results code
 [[file "/tmp/foopytoop"]] pipe-in "foo" bytes put close "bar" bytes put
 #+end_src
@@ -7074,12 +7140,12 @@ dictionary [collect spec] lookup
 #+begin_src kcats
 [[type pipe] [file "/tmp/foopytoop"]]
 #+end_src
-**** DONE Serialize pipes with something sane
+*** DONE Serialize pipes with something sane
 Maybe they can't be easily round-tripped, but at least we can print
 something reasonable that will tell human eyes what it is.
 something like[[type pipe-in] [file "/tmp/foo"]]
-**** DONE Sockets
-***** DONE Server Sockets
+*** DONE Sockets
+**** DONE Server Sockets
 #+begin_src kcats :results code
 [[type ip-host] [address "127.0.0.1"] [port 11211]] pipe-out 
 #+end_src
@@ -7115,9 +7181,9 @@ dip
 [[asked [string]] [unwound [take "foo\n" bytes put take string [drop drop] dip]] [type error] [reason "type mismatch"]]
 #+end_src
 
-***** DONE Sockets
+**** DONE Sockets
 
-***** CANCELED Assemble is broken when reading files
+**** CANCELED Assemble is broken when reading files
 - State "CANCELED"   from "INPROGRESS" [2023-10-22 Sun 07:55]
 I think it's because =closed?= is broken.
 
@@ -7144,14 +7210,14 @@ I see the problem. When we clone the pipe, we also clone the =closed=
 boolean and we shouldn't be doing that. There should only be one copy
 of that. The entire struct should be in an Arc<Mutex> and not just the
 file field. And when we modify the boolean, we shouldn't 
-**** DONE Convert In/Out traits to enums in pipes modules
+*** DONE Convert In/Out traits to enums in pipes modules
 Enums seem to work well elsewhere, and since pipes are also a closed
 set, we can use them here too.
 
 I don't think there will ever be user-created pipe types as it would
 have to be done in rust and not in kcats.
 
-**** DONE Composable transforms
+*** DONE Composable transforms
 There should be some way to compose transforms in a pipe. For example,
 we can have a pipe that when you put bytes in it, it gets written to a
 certain file on disk. But what we really want is that we put bytes
@@ -7164,7 +7230,7 @@ aren't going to be i/o, it's pure computation. Actually I guess any
 pipe could take an optional transform. Clojure.core.async channels do this.
 
 Maybe the first thing to do is implement transducers?
-***** DONE Siphon from one pipe to another
+**** DONE Siphon from one pipe to another
 A nice primitive would be a word that takes a program (the program
 should expect an item on ToS and it should leave a transformed item)
 and two pipes, and takes from one pipe, runs the program, and puts the
@@ -7220,7 +7286,7 @@ integers 5 taker [] siphon
 #+end_src
 
 And since pipes can have generator layers put on top of them, I think we're done. 
-**** CANCELED Filled pipes
+*** CANCELED Filled pipes
 Mostly for testing purposes, takes a list and creates a buffered pipe
 that offers list items until the list is exhausted and then returns pipe closed errors.
 
@@ -7231,7 +7297,7 @@ that offers list items until the list is exhausted and then returns pipe closed 
 #+RESULTS:
 : 1 [[type pipe] [filled todo: id-or-hash here]]
 
-**** INPROGRESS Object pipes
+*** INPROGRESS Object pipes
 - State "INPROGRESS" from "TODO"       [2023-10-19 Thu 21:10]
 These pipes should send serialized kcats objects and each put/take
 should transfer 1 object. Maybe use protocol buffers or similar
@@ -7426,7 +7492,7 @@ otherwise generate and repeat.
   collect
 #+end_src
 
-**** DONE Time pipe
+*** DONE Time pipe
 Each take from the pipe return the current unix time in ms.  Should be
 a "singleton" - probably using Box::leak, so that we can insert a copy
 of this pipe whenever we want and it's always a reference to the same
@@ -7440,7 +7506,7 @@ timestamps take
 #+RESULTS:
 : 1687273991929 [[from systemtime] [values [[type integer] [units milliseconds]]] [type out]]
 
-**** DONE stdin/stdout pipes
+*** DONE stdin/stdout pipes
 Should also be singleton. Should it always be a tunnel or should we
 allow separate access to in or out?
 
@@ -7454,7 +7520,7 @@ standard "foo" bytes put
 Stdin is not tested, since currently the interpreter reads the program
 from stdin. May need to change that (read the program from filesystem
 and let the program itself access stdin).
-**** CANCELED Pipe take outcome
+*** CANCELED Pipe take outcome
 - State "CANCELED"   from "TODO"       [2023-09-22 Fri 09:14] \\
   I don't think there's any glaring inconsistency here - indefinite (or
   i guess I might call them 'unsized') dispensers will dispense =nothing=
@@ -7481,7 +7547,7 @@ return an error. May need to resolve this inconsistency.
 | take Items    | Item    | Item    | Bytes   | Bytes      |
 | take Past EOF | Nothing | Nothing | Nothing | Nothing    |
 | step Past EOF | Exit    | Exit    | Exit    | Exit       |
-*** INPROGRESS Use a single word for all derivation/conversion :stdlib:
+** INPROGRESS Use a single word for all derivation/conversion       :stdlib:
 Right now there's different words for converting bytes to string
 (string) or string to bytes (bytes). Proposing a more composable
 mechanism here, where there's a single action word that derives one
@@ -7677,13 +7743,13 @@ dispatch on both =to= and =from= types for =derive=.
 #+begin_src 
 
 #+end_src
-*** TODO Error should have actual struct fields :optimization:
+** TODO Error should have actual struct fields                :optimization:
 It's still implemented as generic Hashmap data field. 
 
-*** INPROGRESS Script
+** INPROGRESS Script
 - State "INPROGRESS" from "TODO"       [2024-02-23 Fri 15:12]
-**** DONE Cryptographic primitives
-***** DONE SHA256
+*** DONE Cryptographic primitives
+**** DONE SHA256
 #+begin_src kcats
 "foo" bytes hash "fop" bytes hash =
 #+end_src
@@ -7705,7 +7771,7 @@ It's still implemented as generic Hashmap data field.
 #+RESULTS:
 : [[public #b64 "NNJledu0Vmk+VAZyz5IvUt3g1lMuNb8GvgE6fFMvIOA="] [type elliptic-curve-key] [secret #b64 "LCa0a2j/xo/5m0U8HTBBNBNCLXBkg7+g+YpeiGJm564="]]
 
-***** DONE Signing
+**** DONE Signing
 #+begin_src kcats :results code
   "foo" bytes key "we attack at dawn" bytes [sign] shield verify
 #+end_src
@@ -7870,7 +7936,7 @@ try a dummy script that really does always validate
 [] #b64 "M+LwVX3X2/aNUvQNUQxkH9+m5dpgq8cN+sB9K2tsvM8="
 #+end_src
 
-***** DONE Make verify return the message
+**** DONE Make verify return the message
 - State "DONE"       from "INPROGRESS" [2023-09-28 Thu 10:43]
 one thing I hadn't considered before. We receive this package of
 "proof" - proof of what? That this message is from the party
@@ -7888,17 +7954,17 @@ the message is a perfectly good truthy value. I suppose signing an
 empty byte array could cause confusion (if that were considered
 "nothing" which I suppose it should, but currently isn't). But I can't
 think of any valid reason to sign 'nothing'.
-***** TODO [#A] AES Encryption
-***** TODO [#B] Random
+**** TODO [#A] AES Encryption
+**** TODO [#B] Random
 
-**** DONE Pure functional env
+*** DONE Pure functional env
 #+begin_src kcats
   [[pipe-in pipe-out channel timeout handoff file-in file-out timestamps standard serversocket animate future spit tunnel ] [wrap unassign] step] [1 2 swap] lingo
 #+end_src
 
 #+RESULTS:
 : 1 2
-**** TODO Infinite loop protection
+*** TODO Infinite loop protection
 We need to prevent an attacker presenting =true [clone] loop= as their
 identity proof, which would never halt. It may be easiest to just
 remove all the looping words from the dictionary, but that seems
@@ -7908,16 +7974,16 @@ attacker can consume, and we already have a direct solution for that:
 #+begin_src kcats
 [[program [true [clone] loop]]] environment
 #+end_src
-*** TODO retry should have opposite argument order :stdlib:consistency:
+** TODO retry should have opposite argument order       :stdlib:consistency:
 Currently it expects an error on ToS and then a program beneath. But
 it seems like we'd nearly always have to =dip= the program beneath the
 error. I think it would be better if =retry= expected the program to fix
 the issue on top, and the error beneath.
-*** INPROGRESS Support Kademlia DHT
-**** DONE XOR
+** INPROGRESS Support Kademlia DHT
+*** DONE XOR
 We have a node id (maybe just the i2p destination address?) and we
 want to calculate the distance to another node as the XOR
-**** INPROGRESS Simple API server
+*** INPROGRESS Simple API server
 Construct a socket listener, and serve something from a trivial local
 database. Disable exploitable words. Catch errors and return to the user.
 
@@ -7995,7 +8061,7 @@ This works ok for a read-only database, but for the purposes of a DHT
 we can't do it this way - we'd have to expose the database and there's
 no way to prevent the api user from making arbitrary (and malicious)
 changes.
-**** INPROGRESS Simple API client
+*** INPROGRESS Simple API client
 #+begin_src kcats
   "localhost" 12121 socket
   [[[title] lookup count 10 <] filter]
@@ -8017,8 +8083,8 @@ changes.
     [subjects [love morality society class womanhood independence]]]]]]
 #+end_src
 
-**** TODO Kademlia functions
-***** TODO COMMENT Distance
+*** TODO Kademlia functions
+**** TODO COMMENT Distance
 takes two hashes, returns the xor distance between them
 
 helper function that takes an int 0-255 and returns the most
@@ -8066,25 +8132,25 @@ significant bit position, eg 33 is 5
 #+RESULTS:
 : 253 #b64 "9xFLZf2AmWe7DRojlnYwLsBsq1Iz7mfo8BYH33X3FQ=="
 
-*** TODO read and emit don't have quite the same semantics :consistency:
+** TODO read and emit don't have quite the same semantics      :consistency:
 read will read all the bytes and return however many objects were read.
 emit will take an object and return its serialization.
 
 There should be some way of round tripping here, maybe a word =read1= or
 something that just reads one object. 
-*** INPROGRESS [#A] Inconsistent stack handling when encountering error :consistency:
+** INPROGRESS [#A] Inconsistent stack handling when encountering error :consistency:
 - State "INPROGRESS" from "TODO"       [2023-12-30 Sat 14:17]
 Some words pop the arguments off the stack, then if an error is
 encountered, throws the error without the args on the stack. Others
 leave the args intact. This needs to be consistent.
 
 I would lean towards leaving the args intact so that =retry= is easily applied.
-**** TODO 'read' on invalid edn consumes the string argument
+*** TODO 'read' on invalid edn consumes the string argument
 It should attempt to parse before popping the item off the stack.
-**** TODO Division by zero consumes stack items
+*** TODO Division by zero consumes stack items
 =5 0 /= shouldn't consume the =5= and =0= - compare to =1 "2" += behavior
 (which leaves items on stack).
-*** DONE Inconsistent expression handling when encountering error
+** DONE Inconsistent expression handling when encountering error
 - State "DONE"       from "INPROGRESS" [2023-10-15 Sun 15:24]
 - State "INPROGRESS" from "TODO"       [2023-10-15 Sun 15:20]
 Some errors lose the word on which they occurred. They should be in
@@ -8143,8 +8209,8 @@ function throws the error.
 The question then is how to fix this? Hopefully this can be fixed
 inside =eval_step=. After the function completes, we can check if there
 was an error on top (if there wasn't before), and if so, we can replace the 
-*** TODO Performance optimizations :optimization:
-**** TODO Compile programs
+** TODO Performance optimizations                             :optimization:
+*** TODO Compile programs
 Here is how it could maybe be done. We already have a type StepFn
 (which takes an env and returns a new one, in a future).
 
@@ -8184,7 +8250,7 @@ debugger we can go step by step, but if the function composition is
 bundled up, we can only "step over" that function and not "into" it. I
 am not sure if it's possible to build this such that we preserve
 stepping ability and increase performance substantially.
-**** TODO Programs as their own immutable type
+*** TODO Programs as their own immutable type
 Programs executing in a loop are generally not modified (exception -
 the =recur= word, which can modify but usually just calls =execute=)- so
 when we execute a program with =loop= we don't want to have to clone it
@@ -8218,8 +8284,8 @@ example program:
 So when printing out the program, we could cheat and only show the
 remaining program (instead of a stack of partially executed programs).
 
-*** INPROGRESS Generators                                          :stdlib:
-**** DONE Basic functionality and generators
+** INPROGRESS Generators                                            :stdlib:
+*** DONE Basic functionality and generators
 There's the concept of "lazy sequence" that I think maps nicely to
 pipes - you can keep calling 'take' and it keeps calculating new
 values. Everything it needs is contained in the object, it's not like
@@ -8408,17 +8474,17 @@ integers 10 taker collect drop generate
 #+RESULTS:
 : [] [[positive?] [dec [generate] dive] [[]] if] 0 [inc clone] 9
 
-**** DONE map
-**** DONE filter
-**** DONE take
-**** DONE drop
+*** DONE map
+*** DONE filter
+*** DONE take
+*** DONE drop
 #+begin_src kcats
 integers 15 taker 10 dropper [+] reduce
 #+end_src
 
 #+RESULTS:
 : 60 [[[positive?] [[generate drop] dip dec] while [generate swap] dip float] bail] 0 [[positive?] [dec [generate] dive] [[]] if] 0 [inc clone] 14
-**** DONE drop-while (skipper)
+*** DONE drop-while (skipper)
 
 - State "DONE"       from "INPROGRESS" [2023-11-30 Thu 18:01]
 - State "INPROGRESS" from "TODO"       [2023-11-30 Thu 17:28]
@@ -8438,7 +8504,7 @@ integers 15 taker 10 dropper [+] reduce
    if]
   collect
 #+end_src
-**** DONE take-while (catcher)
+*** DONE take-while (catcher)
 
 - State "DONE"       from "INPROGRESS" [2023-11-30 Thu 18:02]
 - State "INPROGRESS" from "TODO"       [2023-11-30 Thu 17:30]
@@ -8465,8 +8531,8 @@ integers 15 taker 10 dropper [+] reduce
 [positive?] [take] []
 #+end_src
 
-**** CANCELED last
-**** TODO distinct
+*** CANCELED last
+*** TODO distinct
 depends on sets
 
 The difference between this and just calling =set= is that the result is
@@ -8488,7 +8554,7 @@ duplicates. Should be a similar impl to =keep=.
 #+RESULTS:
 : [1 1 3] [[generate] dive [contains?] [put [generate] dive] while] [] [take] []
 
-**** DONE partition
+*** DONE partition
 - State "DONE"       from "TODO"       [2023-12-07 Thu 17:39]
 #+begin_src kcats
   [1 2 3 4 5 6] [take]
@@ -8506,7 +8572,7 @@ duplicates. Should be a similar impl to =keep=.
 [] 2 [take] [1 2 3 4 5 6]
 #+end_src
 
-**** DONE joiner (aka catenate)
+*** DONE joiner (aka catenate)
 #+begin_src kcats
   [[1 2 3] [4 5 6] [7 8 9]]
   liberate
@@ -8521,7 +8587,7 @@ duplicates. Should be a similar impl to =keep=.
 #+RESULTS:
 : [1 2 3 4 5 6 7 8 9] [generate [] swap [] [join [generate] dip swap] while drop] [take] []
 
-**** TODO groupby
+*** TODO groupby
 #+begin_src kcats :results code
    ["foo" "bar" "baaz" "quux"]
    liberate ;; (the next word foo)
@@ -8561,8 +8627,8 @@ specifying it inline.
 [take] []
 #+end_src
 
-**** CANCELED Map/filter can't access lower stack items
-***** Problem
+*** CANCELED Map/filter can't access lower stack items
+**** Problem
 this doesn't work:
 
 #+begin_src kcats :results code
@@ -8595,7 +8661,7 @@ Perhaps we can split each stage into several parts:
 + dip underneath the layers to calculate the next value using lower stack items
 + swap the new value to the top of stack
 +
-***** Debug session
+**** Debug session
 #+begin_src kcats :results code
 [[program [10 [1 2 3] liberate [+] each generate]]] environment
 advance advance advance advance eval-step [advance] 5 times eval-step
@@ -8618,7 +8684,7 @@ advance advance advance advance eval-step [advance] 5 times eval-step
 #+begin_src kcats
 [[program [[[program] lookup count] shield swap [[program] lookup count [[positive?] [<=]] [execute] every?] [eval-step] while swap drop]] [stack [[[stack []] [program [+]]]]]]
 #+end_src
-***** Resolution
+**** Resolution
 After thinking about this some more, my conclusion:
 
 This is supporting multi-arity mapping functions, which did work in
@@ -8667,7 +8733,7 @@ In theory we could write a helper function called =capture1= or something that d
 
 #+RESULTS:
 : [6 7 5]
-***** DONE Add functions to help capture environment for map/filter fns
+**** DONE Add functions to help capture environment for map/filter fns
 It's too difficult to do this manually.
 
 #+begin_src kcats
@@ -8705,7 +8771,7 @@ and the generator equivalent
 109 5
 #+end_src
 
-**** DONE Reduce
+*** DONE Reduce
 #+begin_src kcats :results code
   0 [inc clone] 30 taker [+]
   [generate] dive clone ;; acc acc f
@@ -8788,7 +8854,7 @@ let's make an equivalent to =map= (that doesn't require a generator) for ease of
 
 ...wait a minute, isn't that just =step=?
 
-**** CANCELED Generator combinators?
+*** CANCELED Generator combinators?
 - State "CANCELED"   from "TODO"       [2024-01-16 Tue 17:10] \\
   Not sure there's anything to do here.
 When writing =partition=, it would be nice if we could use generators
@@ -8849,7 +8915,7 @@ Maybe we can even implement the window shifting version?
 1 3 [take] []
 #+end_src
 
-**** DONE Applying generator to an existing container
+*** DONE Applying generator to an existing container
 - State "DONE"       from "INPROGRESS" [2023-12-07 Thu 17:40]
 - State "INPROGRESS" from "TODO"       [2023-11-10 Fri 16:36]
 we commonly have this construct: =[[1 2 3] ... collect] shield=, where
@@ -8867,7 +8933,7 @@ we're transducing a list and we want to just get the result.
 [1 3 5]
 #+end_src
 
-**** INPROGRESS Combinations
+*** INPROGRESS Combinations
 - State "INPROGRESS" from "TODO"       [2024-01-17 Wed 09:13]
 #+begin_src kcats
   [1 2 3 4 5] [[count] shield -1 ;; l idx i
@@ -9013,9 +9079,9 @@ enumerate generator
 [a b c d e] [] 3 1 [a b c d e]
 #+end_src
 
-*** INPROGRESS Implement sorting                                   :stdlib:
+** INPROGRESS Implement sorting                                     :stdlib:
 
-**** TODO Implement partialord
+*** TODO Implement partialord
 Each type needs to be comparable to another.
 
 #+begin_src kcats
@@ -9077,7 +9143,7 @@ UHOH
 #+RESULTS:
 : [[reason "word is not defined"] [unwound [both]] [type error] [asked [both]] [handled true]] [inc] 2 1
 
-**** TODO Make floats hashable
+*** TODO Make floats hashable
 This will allow floats to be added to the =KeyItem= enum. Floats are not
 normally hashable, because mathematically identical numbers are not
 always represented the same way in memory and wouldn't hash the
@@ -9088,7 +9154,7 @@ be the same map key.
 This will then allow a list that contains floats, to be sorted, or be
 able to use float values as a sort-by key.
 
-**** TODO Implement compare
+*** TODO Implement compare
 Should expose Rust's comparison function. That will allow a native
 sort function, for max flexibility (but not performance).
 
@@ -9128,7 +9194,7 @@ This should work - the empty set and map maybe can't be compared but Nothing sho
 #+RESULTS:
 : less
 
-*** TODO Stream transformation
+** TODO Stream transformation
 Problem: kcats doesn't speak http or https or various other protocols
 and formats, but rust does. We want to be able to use the complicated
 bits of rust, but let kcats decide how to combine them.
@@ -9143,19 +9209,19 @@ iterate. All such transforms would probably have the same program.
 
 I think what I am getting at here is that Items should implement Rust
 traits where possible, eg Read/Write for file and network pipes.
-*** INPROGRESS Select from multiple pipes
+** INPROGRESS Select from multiple pipes
 A basic select (which I call =attend=) is in place. 
 
-**** TODO Attend should leave the pipe list argument
+*** TODO Attend should leave the pipe list argument
 A lot of callers would want to re-use that argument so it shouldn't
 need to be shielded by default.
 
-**** TODO Better error handling
+*** TODO Better error handling
 There's lots of places where flume could throw an error and we don't
 do anything about it.
 
-*** TODO Monitoring tools
-**** TODO Reporting back to the mothership
+** TODO Monitoring tools
+*** TODO Reporting back to the mothership
 When we spawn/animate, the environment is in its own universe and the
 main environment has no way to get any information about it, except by
 whatever means are baked into the spawned env's program. Users can
@@ -9183,7 +9249,7 @@ that leads back to the master env). What would be really handy is
 parsing the inner env data to see which references to channels it
 contains, seeing whether it's a sender or receiver, and drawing arrows
 between envs so users can see they talk to each other.
-**** TODO Monitoring UI
+*** TODO Monitoring UI
 We could show not only all the envs and ther recent state (perhaps
 dumped every few seconds), we could show arrows between environments
 that represent pipes (if two envs have a copy of the same pipe
@@ -9194,10 +9260,10 @@ direction of data flow along with the pipe id.
 We could also allow views into a particular pipe where we copy the
 last handful of values to pass through (this is doable for channels
 but probably not file/network pipes).
-*** INPROGRESS Native REPL
-**** DONE Main mode of reading program from cmdline or file
+** INPROGRESS Native REPL
+*** DONE Main mode of reading program from cmdline or file
 - State "DONE"       from "TODO"       [2023-10-19 Thu 21:08]
-**** INPROGRESS REPL as a kcats program
+*** INPROGRESS REPL as a kcats program
 - State "INPROGRESS" from "TODO"       [2023-10-19 Thu 21:08]
 Read inputs from stdin, eval in a nested env, write to stdout.
 
@@ -9234,7 +9300,7 @@ Read inputs from stdin, eval in a nested env, write to stdout.
         [type tunnel]]
 #+end_src
 
-*** TODO Words that quote programs instead of executing them
+** TODO Words that quote programs instead of executing them
 eg =liberate= - it is just =[take]=, so it doesn't actually do anything by
 itself. It seems like the quotedness should remain and maybe the word
 should always perform the action.
@@ -9264,7 +9330,7 @@ makes sense when you dive into it.
 
 Isn't this just an implementation detail? In theory =each= could be a
 separate generator and honestly it probably should be.
-**** TODO Get rid of self-inserting programs (esp with generators)
+*** TODO Get rid of self-inserting programs (esp with generators)
 Problem: words like =joiner= and =taker= don't do anything except insert a
 program. That, i think, should be an anti-pattern in kcats. If you
 want to put a program on the stack succintly,then define a word that
@@ -9289,13 +9355,13 @@ create it (since the state is always a list and otherwise it would see
 a number). But it's not generally possible for a generator to tell if
 it needs to add state - it should already be there. So if we're just
 quoting the generator, then what will add it?
-*** TODO Data compression
+** TODO Data compression
 Data streams that we intend to produce later are going to need
 compression - the streams should be as small as possible (they'll be
 encrypted later so it's too late to compress them after that). lz4 maybe?
-*** TODO Multimethod improvements
-**** TODO Convert to multi
-**** DONE Refactor addmethod
+** TODO Multimethod improvements
+*** TODO Convert to multi
+*** DONE Refactor addmethod
 - State "DONE"       from "INPROGRESS" [2023-12-04 Mon 16:24]
 - State "INPROGRESS" from "TODO"       [2023-12-04 Mon 16:13]
 #+begin_src kcats
@@ -9335,9 +9401,9 @@ encrypted later so it's too late to compress them after that). lz4 maybe?
 foo
 #+end_src
 
-**** DONE ismulti?
+*** DONE ismulti?
 - State "DONE"       from "TODO"       [2023-12-04 Mon 16:25]
-*** TODO run multiple programs on same argument to get list
+** TODO run multiple programs on same argument to get list
 #+begin_src kcats
   5 2 [[+] [*]] [execute] map
 #+end_src
@@ -9348,7 +9414,7 @@ foo
 2 5
 #+end_src
 
-*** INPROGRESS pairwise operations
+** INPROGRESS pairwise operations
 - State "INPROGRESS" from "TODO"       [2024-02-03 Sat 11:28]
 #+begin_src kcats
   1 2 3 4 5 [] both] [[] evert [2 2 partition] assemble] dip
@@ -9376,7 +9442,7 @@ this generator based impl doesn't support nil values on the stack:
 [4 3]
 #+end_src
 
-*** INPROGRESS Non-generator filter
+** INPROGRESS Non-generator filter
 - State "INPROGRESS" from "TODO"       [2024-02-04 Sun 13:50]
 map now doesn't require you to bind values (the map function has access to the rest of the stack).
  Do the same for =filter=.
@@ -9396,9 +9462,9 @@ map now doesn't require you to bind values (the map function has access to the r
  5
  #+end_src
 
-*** TODO Modules
-**** Problem statement
-***** TODO Efficient use
+** TODO Modules
+*** Problem statement
+**** TODO Efficient use
  When code is defining new vocabulary, and it gets called in a tight
   loop, it should not be modifying the dictionary each
   time. Dictionary shoud be append only (to avoid having to swap back
@@ -9426,17 +9492,17 @@ map now doesn't require you to bind values (the map function has access to the r
   join]
  #+end_src
 
-***** TODO Modification happens once per program
+**** TODO Modification happens once per program
   Dictionary modification should not happen at "runtime" (when the
   program is actually being executed) - it should be modified when the
   program is *built*. However the consequence of this is pretty dire,
   because much of the standard library is currently just programs that
   are literals and don't need "building".
-***** TODO Nested library calls need to work
+**** TODO Nested library calls need to work
   I should be able to call =af= that loads (or depends on =b= and calls =bf=
   that loads =c= and calls =cf=, and those loads should only happen once
   even if i call =af= in a tight loop.
-***** TODO Building vocabulary and the programs that use that vocabulary need to be separable
+**** TODO Building vocabulary and the programs that use that vocabulary need to be separable
   (that's the whole point of a library). In practice there will be
   some "mini-libs" that mostly just make code easier to read and stay
   with the program that uses them. However we need to be able to
@@ -9445,15 +9511,15 @@ map now doesn't require you to bind values (the map function has access to the r
   a use/require when a program starts, and then later, in some
   arbitrary place in the code, you refer to the library's functions
   via its namespace.
-***** TODO Sandboxing
-****** TODO Preservation of meaning
+**** TODO Sandboxing
+***** TODO Preservation of meaning
 We execute untrusted code, then our own code, our code should mean the
 same thing as it would have before executing the untrusted code.
-****** TODO Access control
+***** TODO Access control
 We should be able to execute untrusted code in a limited environment
 (where, for example, it does not have access to the filesystem
 etc). 
-******* TODO [#C] Fine grained access control
+****** TODO [#C] Fine grained access control
 We could for example, limit filesystem access to a particular
 directory, or network access to a particular host. One way this could
 be done: have all such primitives run some other word as a predicate
@@ -9614,8 +9680,8 @@ cryptographic solutions. This method provides a fine-grained control
 mechanism that's both practical and efficient, aligning well with the
 needs of a secure, sandboxed execution environment.
 #+end_quote
-**** Discussion
-Let's consider pairs of program/dictionary.
+*** Discussion
+**** pairs of program/dictionary.
 
 It's sort of like a passage of english prose, and a dictionary of what
 all the words used in that prose mean. In terms of "true" meaning,
@@ -9636,16 +9702,26 @@ though.
 Can we do anything with this? Maybe not.
 
 
-Let's consider what we do about not having to recalculate the whole
-dictionary each time we want to use a module. There's several possible mitigations:
+**** not having to recalculate the whole dictionary each time we want to use a module.
+There's several possible mitigations:
 
 + Leave the modified dictionary on the stack so it can be reused
 + Make 2 levels of env nesting per library
    + One where the modified dict is in the dict (but words are not available)
    + One where we actually apply that dict so the words can be used
-**** INPROGRESS inscribe currently re-defines words repeatedly at runtime
+
+**** Builtin libs have names but nothing else does
+It seems weird we'd have a few named libs (like =crypto=) but not allow
+users to name theirs. We can either get rid of names entirely, or add
+a naming mechanism.
+
+I don't see how we could avoid some kind of naming, how else can we
+specify what we're loading?
+
+
+*** INPROGRESS inscribe currently re-defines words repeatedly at runtime
 - State "INPROGRESS" from "TODO"       [2024-02-08 Thu 17:17]
-***** INPROGRESS Current design
+**** INPROGRESS Current design
 - State "INPROGRESS" from "TODO"       [2024-02-12 Mon 08:22]
 Have two separate words: one for loading new modules =loadlib=, and
 other =using= for activating them in a given program.
@@ -9691,17 +9767,17 @@ cache. We can check the mapping of alias->hash and if it exists,
 verify a match, and if it doesn't exist, create the mapping. Since the
 mapping will exist before calling =inscribe=, =inscribe= needs a way of
 not creating the alias - we could do that by allowing =[]= as an alias.
-***** INPROGRESS Library loading
+**** INPROGRESS Library loading
 - State "INPROGRESS" from "TODO"       [2024-02-17 Sat 14:51]
-****** TODO Make library loading primitives
-******* DONE Move hash to earlier loading module
+***** TODO Make library loading primitives
+****** DONE Move hash to earlier loading module
 - State "DONE"       from "INPROGRESS" [2024-03-19 Tue 11:39]
 - State "INPROGRESS" from "TODO"       [2024-03-19 Tue 11:14]
 We need it for library loading, can't stay as part of crypto lib.
-******* DONE Primitive for namespacing a word
+****** DONE Primitive for namespacing a word
 - State "DONE"       from "INPROGRESS" [2024-03-19 Tue 16:50]
 - State "INPROGRESS" from "TODO"       [2024-03-19 Tue 11:44]
-******* DONE Primitive for loading a blob from cache via hash or alias
+****** DONE Primitive for loading a blob from cache via hash or alias
 - State "DONE"       from "INPROGRESS" [2024-03-19 Tue 16:50]
 - State "INPROGRESS" from "TODO"       [2024-03-19 Tue 16:34]
 
@@ -9785,12 +9861,12 @@ We need it for library loading, can't stay as part of crypto lib.
   #+end_src
 
 
-******* CANCELED Primitive for aliasing a module
+****** CANCELED Primitive for aliasing a module
 - State "CANCELED"   from "TODO"       [2024-04-08 Mon 16:40] \\
   Not going to use aliases.
 Needs to respect the "no overwrite" rule.
 
-******* TODO Test out saving modules as dict entries
+****** TODO Test out saving modules as dict entries
 We can think of a module as a dictionary modification program. We can
 store those programs in the dictionary as definitions and use them
 later? No not really, because we can't modify the current
@@ -9828,7 +9904,7 @@ dictionaries to every word of the program that consisted of all the
 words that word calls, etc. So this whole system is more of a
 "matching my expectations to the actual behavior" type of feature.
 
-******* TODO Test out nested envs as library mechanism
+****** TODO Test out nested envs as library mechanism
 #+begin_src kcats
   ;; load a module
   [crypto] unwrap decache string read
@@ -9860,7 +9936,7 @@ So what is =let= in this model?
 7
 #+end_src
 
-***** INPROGRESS Nesting scopes
+**** INPROGRESS Nesting scopes
 - State "INPROGRESS" from "TODO"       [2024-02-14 Wed 20:07]
 We should be able to chain calls to =using= without repeating any
 expensive calls.
@@ -9994,12 +10070,12 @@ then resolving the module once. Something like this:
 
 #+end_src
 
-***** TODO Stack escape protection
+**** TODO Stack escape protection
 If a program refers to a word, and at the time that program is put on
 the stack, that word means something, it should still carry the same
 meaning if that program is later run with =execute=. That means that
 module changes must be permanent.
-***** INPROGRESS Sandboxing support
+**** INPROGRESS Sandboxing support
 - State "INPROGRESS" from "TODO"       [2024-04-03 Wed 20:41]
 It must be possible for a module to *deny* access to a given word. Given
 that dictionary changes are permanent, we can't just delete words from
@@ -10017,7 +10093,7 @@ may be others.
   modification)
 + The word should be accessible again after the program using the
   module has completed.
-****** TODO experiment with nested envs as module loading mechanism
+***** TODO experiment with nested envs as module loading mechanism
 First let's see if a nested env allows sandboxing
 #+begin_src kcats
   ;; make an env with no access to io
@@ -10097,15 +10173,15 @@ Let's see if it's possible to use an inner-env module and still debug it.
 #+end_src
 
 
-***** INPROGRESS Access control
+**** INPROGRESS Access control
 - State "INPROGRESS" from "TODO"       [2024-04-07 Sun 13:53]
 Take the word =define= which allows the caller to make arbitrary and
 permanent changes to the dictionary. What if we wanted to restrict
 access to that word such that authorized programs can call it but
 others can't?
-***** INPROGRESS Words can refer to other words in the same library
+**** INPROGRESS Words can refer to other words in the same library
 - State "INPROGRESS" from "TODO"       [2024-02-17 Sat 14:51]
-***** TODO Convenient module definition
+**** TODO Convenient module definition
 We need a word that takes care of the common case: we want to define a
 set of vocabulary, it's all additive, and some of the words refer to
 each other. Previously we called that =draft=. Here's what the new =draft=
@@ -10280,7 +10356,7 @@ latter, it can have words already resolved.
 17
 #+end_src
 
-***** TODO convenient 'let'
+**** TODO convenient 'let'
 We want define a module and use it inline without having to worry about its alias.
 Let's see if we can implement =partition= this way.
 #+begin_src kcats
@@ -10318,7 +10394,7 @@ Let's see if we can implement =partition= this way.
 [[foo [[1]]]] []
 #+end_src
 
-***** INPROGRESS Break up the standard library
+**** INPROGRESS Break up the standard library
 - State "INPROGRESS" from "TODO"       [2024-03-04 Mon 20:22]
 Question: how do we break it up? For example, does =io= refer to all I/O
 operations or just the base stuff that they all depend on?
@@ -10347,7 +10423,7 @@ There seem to be 3 types of modules:
 The 2nd type, we can now use "inscribe" and make them normal modules,
 but then they won't be in the default namespace. We can at least leave
 them out of the binary. 
-****** INPROGRESS Figure out where to put modules on disk
+***** INPROGRESS Figure out where to put modules on disk
 - State "INPROGRESS" from "TODO"       [2024-03-04 Mon 20:22]
 This will make the build and packaging more complex as it will have to
 include other files besides the binary and deal with platform-specific
@@ -10543,34 +10619,34 @@ Warning: empty local module
  [type error]
  [unwound [resolve]]]
 #+end_src
-****** INPROGRESS Move core libs back to using include_bytes
+***** INPROGRESS Move core libs back to using include_bytes
 - State "INPROGRESS" from "TODO"       [2024-03-14 Thu 17:11]
-****** INPROGRESS Figure out what to do about builtins
+***** INPROGRESS Figure out what to do about builtins
 - State "INPROGRESS" from "TODO"       [2024-03-04 Mon 20:22]
-****** INPROGRESS Group functions
+***** INPROGRESS Group functions
 - State "INPROGRESS" from "TODO"       [2024-02-27 Tue 11:58]
-****** INPROGRESS Determine module loading order
+***** INPROGRESS Determine module loading order
 - State "INPROGRESS" from "TODO"       [2024-03-04 Mon 20:22]
 + stack ops builtins [drop clone evert]
 + stack motion builtins [swap swapdown float sink]
 + stack motion [flip] (only depends on own builtins)
 + collection builtins [join put count first step take wrap unwrap ...]
 + execution builtins [dip execute branch recur loop decide] 
-***** CANCELED Disallow module alias overwriting
+**** CANCELED Disallow module alias overwriting
 - State "CANCELED"   from "TODO"       [2024-04-07 Sun 13:53] \\
   We're not going to be using aliases in this branch
 It is a security problem to allow code to overwrite some other code's
 alias for a module. Throw an error in this case. We should call insert
 on the aliases, and if it returns something, it better be equal to
 what we inserted.
-***** TODO Store data sources
+**** TODO Store data sources
 When we load modules we will eventually be getting them from the
 network but for now the stdlib needs to be loaded from disk.  So we
 could just always look there by default, i guess. But if we need to
 allow custom sources, we could add that alongside the aliases
-***** TODO Find stdlib by alias
-****** TODO hardcode the aliases in the source
-***** TODO LIbrary loading should be in order of decreasing trust
+**** TODO Find stdlib by alias
+***** TODO hardcode the aliases in the source
+**** TODO LIbrary loading should be in order of decreasing trust
 We shouldn't start with a standard env with access to the
 filesystem. Instead the standard env should lack IO capability, and
 force that to be loaded in an inner env.
@@ -10590,9 +10666,9 @@ trustworthy construct out of an untrusted, only vice versa.
 What makes an env less trusted than its parent? Is it the additional
 words? Is it just that any additional code requires more trust, since
 it needs to be vetted?
-*** INPROGRESS Database
+** INPROGRESS Database
 - State "INPROGRESS" from "TODO"       [2023-12-31 Sun 10:17]
-**** Books db
+*** Books db
 #+begin_src kcats
   [[author-first "George"] [author-last "Orwell"] [title "1984"] [year 1949] [subjects [government dystopia surveillance totalitarianism freedom]]]
   [[author-first "Aldous"] [author-last "Huxley"] [title "Brave New World"] [year 1932] [subjects [society technology dystopia happiness drugs]]]
@@ -10624,7 +10700,7 @@ it needs to be vetted?
    [execute] every?]
   keep
 #+end_src
-**** EAVTO (entity, attribute, value, time, observer)
+*** EAVTO (entity, attribute, value, time, observer)
 Here's a database of the most basic and abstract observations
 (ignoring time and observer for now - those are all "now" and "me").
 
@@ -11141,7 +11217,7 @@ it? (May need to add some set-based words here).
 [[title? [value 2]]
  [author? [value 3]]]
 #+end_src
-*** TODO Reduce CPU cost of `shield`
+** TODO Reduce CPU cost of `shield`
 #+begin_src kcats
 [[program [1 2 3 [+] shield]]] environment stepper 0 [drop inc] cram
 #+end_src
@@ -11199,7 +11275,7 @@ it? (May need to add some set-based words here).
 [eval-step clone]
 []
 #+end_src
-*** TODO Sort out feature dependencies
+** TODO Sort out feature dependencies
 #+begin_src dot 
   digraph G {
       // Define nodes
