@@ -127,6 +127,9 @@ the location where you installed the kcats binary.
   # memoized functions
   once_cell = "1"
 
+  # The blob cache
+  cache = {path = "./cache"}
+
   [dependencies.uuid]
   version = "1.6.1"
   features = [
@@ -143,6 +146,7 @@ the location where you installed the kcats binary.
   directories = "5.0"
   sha2 = "0.10.6"
   base64 = "0.13.0"
+  cache = {path = "./cache"}
 
   [features]
   database = ["rusqlite"]
@@ -3119,23 +3123,87 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 #+end_src
 **** Hash-based object cache
-We will need to be able to fetch binary data via its hash, or a local name.
-#+begin_src rust :tangle src/cache.rs :mkdirp yes
-  use crate::types::container::error::Error;
-  use crate::types::{Bytes, Item, Word};
-  use directories::ProjectDirs;
-  use sha2::{self, Digest};
-  use std::fs::{self, File};
-  use std::io::{self, Read, Write};
-  use std::path::{Path, PathBuf};
+We will need to be able to fetch binary data via its hash, or a local
+name. This will supplement the database, by storing larger objects
+directly in the filesystem, which is more efficient. But it can also
+be used by the kcats module system even if the optional database
+feature is disabled. When the database is enabled, hashes or local
+aliases can be stored in the db as values and then once those are
+retrieved, the actual contents can be retrieved via the
+cache. Currently there is no disk space management, so the cache grows
+unbounded. 
 
-  pub enum Key {
-      Hash(Bytes),
-      Alias(Word),
-  }
+We also want to pre-populate some cache items at build time
+(some of the standard libraries), so we make the cache a separate
+crate so we can use it at both build time and runtime.
 
-  impl Key {
-      pub fn get(&self) -> Result<Bytes, Error> {
+#+begin_src toml :tangle cache/Cargo.toml :mkdirp yes
+  [package]
+  name = "cache"
+  version = "0.1.0"
+  edition = "2021"
+
+  [dependencies]
+  base64 = "0.13.0"
+  sha2 = "0.10.6"
+  directories = "5.0"
+
+  [dependencies.uuid]
+  version = "1.6.1"
+  features = [
+      "v4",                # Lets you generate random UUIDs
+      "v7",
+      "fast-rng",          # Use a faster (but still sufficiently random) RNG
+  ]
+#+end_src
+
+#+begin_src rust :tangle cache/src/lib.rs :mkdirp yes
+  pub mod cache {
+      //use crate::types::container::error::Error;
+      //use crate::types::{Bytes, Item, Word};
+      use directories::ProjectDirs;
+      use io::Error;
+      use sha2::{self, Digest};
+      use std::fs::{self, File};
+      use std::io::{self, Read, Write};
+      use std::path::{Path, PathBuf};
+
+      type Bytes = Vec<u8>;
+
+      pub enum Key {
+          Hash(Bytes),
+          Alias(String),
+      }
+
+      impl Key {
+          pub fn get(&self) -> Result<Bytes, Error> {
+              if let Some(proj_dirs) = ProjectDirs::from("org", "skyrod", "kcats") {
+                  let data_dir = proj_dirs.data_dir();
+
+                  let cache_path = data_dir.join("cache");
+
+                  // Look up the file
+                  if cache_path.exists() && cache_path.is_dir() {
+                      let filename = match self {
+                          Key::Hash(hash) => base64::encode_config(hash, base64::URL_SAFE),
+                          Key::Alias(word) => word.to_string(),
+                      };
+
+                      let file = cache_path.join(filename);
+                      //println!("Reading cache file {:?}", file);
+                      let mut content = Bytes::new();
+                      fetch_link(file.as_path())?.read_to_end(&mut content)?;
+                      Ok(content)
+                  } else {
+                      Err(Error::new(io::ErrorKind::Other, "Cache dir not found"))
+                  }
+              } else {
+                  Err(Error::new(io::ErrorKind::Other, "Cache data dir not found"))
+              }
+          }
+      }
+
+      pub fn put(content: &Bytes, alias: Option<String>) -> Result<(), Error> {
           if let Some(proj_dirs) = ProjectDirs::from("org", "skyrod", "kcats") {
               let data_dir = proj_dirs.data_dir();
 
@@ -3143,134 +3211,171 @@ We will need to be able to fetch binary data via its hash, or a local name.
 
               // Look up the file
               if cache_path.exists() && cache_path.is_dir() {
-                  let filename = match self {
-                      Key::Hash(hash) => base64::encode_config(hash, base64::URL_SAFE),
-                      Key::Alias(word) => word.to_string(),
-                  };
+                  let hash = sha2::Sha256::digest(&content);
+                  let file = cache_path.join(base64::encode_config(hash, base64::URL_SAFE));
+                  // only write the file if it doesn't exist
+                  if !file.exists() {
+                      std::fs::write(file.clone(), content)?;
+                  }
 
-                  let file = cache_path.join(filename);
-                  //println!("Reading cache file {:?}", file);
-                  let mut content = Bytes::new();
-                  fetch_link(file.as_path())?.read_to_end(&mut content)?;
-                  Ok(content)
+                  // Create the alias if necessary
+                  if let Some(alias) = alias {
+                      let alias_path = PathBuf::from(alias.to_string());
+                      create_link(file.as_path(), alias_path.as_path())?;
+                  }
+                  Ok(())
               } else {
-                  Err(Error::expected("cachedir", None::<Item>))
+                  Err(Error::new(io::ErrorKind::Other, "Cache dir not found"))
               }
           } else {
-              Err(Error::expected("cachedir", None::<Item>))
+              Err(Error::new(io::ErrorKind::Other, "Cache data dir not found"))
           }
       }
-  }
 
-  pub fn put(content: &Bytes, alias: Option<Word>) -> Result<(), Error> {
-      if let Some(proj_dirs) = ProjectDirs::from("org", "skyrod", "kcats") {
-          let data_dir = proj_dirs.data_dir();
+      enum Link {
+          Manual,
+          Symlink,
+      }
 
-          let cache_path = data_dir.join("cache");
+      use base64::URL_SAFE_NO_PAD;
+      //use project_dirs::ProjectDirs;
+      use sha2::Sha256;
+      //use std::fs::OpenOptions;
+      use std::io::{BufReader, BufWriter};
+      use uuid::Uuid; // You need to add `uuid` crate to your dependencies
 
-          // Look up the file
-          if cache_path.exists() && cache_path.is_dir() {
-              let hash = sha2::Sha256::digest(&content);
-              let file = cache_path.join(base64::encode_config(hash, base64::URL_SAFE));
-              // only write the file if it doesn't exist
-              if !file.exists() {
-                  std::fs::write(file.clone(), content)?;
+      pub fn put_from_path(path: &Path, alias: Option<String>) -> Result<(), Error> {
+          if let Some(proj_dirs) = ProjectDirs::from("org", "skyrod", "kcats") {
+              println!("Caching {:?}", alias.clone());
+              let data_dir = proj_dirs.data_dir();
+              let cache_path = data_dir.join("cache");
+
+              // Ensure the cache directory exists
+              if !cache_path.exists() {
+                  fs::create_dir_all(&cache_path)?;
               }
 
+              let unique_temp_file = format!("temp_{}", Uuid::new_v4()); // Generate a unique temporary filename
+              let temp_file_path = cache_path.join(unique_temp_file);
+              let file = File::open(path)?;
+              let mut reader = BufReader::new(file);
+              let mut hasher = Sha256::new();
+              let mut buffer = [0u8; 4096]; // 4 KiB buffer
+              let mut writer = BufWriter::new(File::create(&temp_file_path)?);
+
+              // Read, hash, and write in chunks
+              loop {
+                  let count = reader.read(&mut buffer)?;
+                  if count == 0 {
+                      break;
+                  }
+                  hasher.update(&buffer[..count]);
+                  writer.write_all(&buffer[..count])?;
+              }
+              writer.flush()?;
+
+              // Compute the final hash and rename the file according to the hash
+              let hash = hasher.finalize();
+              let file_name = base64::encode_config(&hash, URL_SAFE_NO_PAD);
+              let final_path = cache_path.join(file_name);
+
+              // Move to final destination, overwriting anything there
+              println!("Renaming");
+              fs::rename(temp_file_path.clone(), final_path.clone())?;
+              println!("Renamed");
               // Create the alias if necessary
               if let Some(alias) = alias {
-                  let alias_path = PathBuf::from(alias.to_string());
-                  create_link(file.as_path(), alias_path.as_path())?;
+                  let alias_path = cache_path.join(alias);
+                  create_link(&final_path, &alias_path)?;
               }
+              println!("Cached");
               Ok(())
           } else {
-              Err(Error::expected("cachedir", None::<Item>))
+              Err(io::Error::new(
+                  io::ErrorKind::NotFound,
+                  "Failed to locate project directory.",
+              ))
           }
-      } else {
-          Err(Error::expected("cachedir", None::<Item>))
       }
-  }
 
-  enum Link {
-      Manual,
-      Symlink,
-  }
-
-  /// Determines the appropriate link type based on the operating system.
-  fn get_link_type() -> Link {
-      if cfg!(target_os = "linux") || cfg!(target_os = "macos") || cfg!(target_os = "windows") {
-          Link::Symlink
-      } else if cfg!(target_os = "android") || cfg!(target_os = "ios") {
-          Link::Manual
-      } else {
-          panic!("Unsupported operating system for linking");
+      /// Determines the appropriate link type based on the operating system.
+      fn get_link_type() -> Link {
+          if cfg!(target_os = "linux") || cfg!(target_os = "macos") || cfg!(target_os = "windows") {
+              Link::Symlink
+          } else if cfg!(target_os = "android") || cfg!(target_os = "ios") {
+              Link::Manual
+          } else {
+              panic!("Unsupported operating system for linking");
+          }
       }
-  }
 
-  /// Creates a link based on the specified link type.
-  ///
-  /// # Arguments
-  /// * `target` - The target file or directory to link to.
-  /// * `link_name` - The name of the symlink or link file to create.
-  ///
-  /// # Returns
-  /// A `Result` indicating success or failure.
-  fn create_link(target: &Path, link_name: &Path) -> io::Result<()> {
-      match get_link_type() {
-          Link::Symlink => {
-              #[cfg(unix)]
-              std::os::unix::fs::symlink(target, link_name)?;
+      /// Creates a link based on the specified link type.
+      ///
+      /// # Arguments
+      /// * `target` - The target file or directory to link to.
+      /// * `link_name` - The name of the symlink or link file to create.
+      ///
+      /// # Returns
+      /// A `Result` indicating success or failure.
+      fn create_link(target: &Path, link_name: &Path) -> io::Result<()> {
+          if !target.exists() {
+              match get_link_type() {
+                  Link::Symlink => {
+                      #[cfg(unix)]
+                      std::os::unix::fs::symlink(target, link_name)?;
 
-              #[cfg(windows)]
-              {
-                  if target.is_dir() {
-                      fs::os::windows::fs::symlink_dir(target, link_name)?
-                  } else {
-                      fs::os::windows::fs::symlink_file(target, link_name)?
+                      #[cfg(windows)]
+                      {
+                          if target.is_dir() {
+                              fs::os::windows::fs::symlink_dir(target, link_name)?
+                          } else {
+                              fs::os::windows::fs::symlink_file(target, link_name)?
+                          }
+                      }
+                  }
+                  Link::Manual => {
+                      let mut link_file = File::create(link_name)?;
+                      let path = target.canonicalize()?;
+                      let target_path = path.to_str().ok_or(Error::new(
+                          io::ErrorKind::Other,
+                          "Failed to convert path to string",
+                      ))?;
+                      writeln!(link_file, "{}", target_path)?;
                   }
               }
-              Ok(())
           }
-          Link::Manual => {
-              let mut link_file = File::create(link_name)?;
-              let path = target.canonicalize()?;
-              let target_path = path.to_str().ok_or(io::Error::new(
-                  io::ErrorKind::Other,
-                  "Failed to convert path to string",
-              ))?;
-              writeln!(link_file, "{}", target_path)
+          Ok(())
+      }
+
+      /// Fetches the target of a link.
+      ///
+      /// # Arguments
+      /// * `link_name` - The link file or symlink to fetch.
+      ///
+      /// # Returns
+      /// A `Result` containing the target `File`.
+      fn fetch_link(link_name: &Path) -> io::Result<File> {
+          match get_link_type() {
+              Link::Symlink => File::open(link_name),
+              Link::Manual => {
+                  let mut link_file = File::open(link_name)?;
+                  let mut target_path = String::new();
+                  link_file.read_to_string(&mut target_path)?;
+                  File::open(target_path)
+              }
           }
       }
-  }
 
-  /// Fetches the target of a link.
-  ///
-  /// # Arguments
-  /// * `link_name` - The link file or symlink to fetch.
-  ///
-  /// # Returns
-  /// A `Result` containing the target `File`.
-  fn fetch_link(link_name: &Path) -> io::Result<File> {
-      match get_link_type() {
-          Link::Symlink => File::open(link_name),
-          Link::Manual => {
-              let mut link_file = File::open(link_name)?;
-              let mut target_path = String::new();
-              link_file.read_to_string(&mut target_path)?;
-              File::open(target_path)
-          }
+      /// Deletes a link.
+      ///
+      /// # Arguments
+      /// * `link_name` - The link file or symlink to delete.
+      ///
+      /// # Returns
+      /// A `Result` indicating success or failure.
+      fn delete_link(link_name: &Path) -> io::Result<()> {
+          fs::remove_file(link_name)
       }
-  }
-
-  /// Deletes a link.
-  ///
-  /// # Arguments
-  /// * `link_name` - The link file or symlink to delete.
-  ///
-  /// # Returns
-  /// A `Result` indicating success or failure.
-  fn delete_link(link_name: &Path) -> io::Result<()> {
-      fs::remove_file(link_name)
   }
 #+end_src
 **** Cryptographic primitives
@@ -3823,10 +3928,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 #+begin_src rust :tangle src/axiom.rs :mkdirp yes
   //! All the core functions of kcats: Words that are implemented in
   //! rust, instead of in terms of other kcats words.
-  use crate::cache;
-  use crate::crypto;
   use crate::list;
-  use crate::module_map;
   use crate::serialize;
   #[cfg(feature = "database")]
   use crate::types::container::pipe::db;
@@ -3836,6 +3938,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   };
   use crate::types::number::{Float, Int, Number};
   use crate::types::*;
+  use cache::cache;
   use dynfmt::{Format, SimpleCurlyFormat};
   use futures::future::FutureExt;
   use lazy_static::lazy_static;
@@ -5313,35 +5416,14 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn read_blob(env: &mut Environment) -> Result<(), Error> {
       //println!("Env: {:?}", env);
-      let (alias, expected_hash, contents) = match env.pop() {
-          Item::Word(alias) => {
-              let hashes = module_map::module_hashes();
-              let hash = hashes
-                  .get::<&str>(&(&alias).into())
-                  .ok_or_else(|| Error::expected("known-alias", alias.clone()))?;
-              (
-                  alias.to_string(),
-                  hash.clone(),
-                  cache::Key::Hash(hash.clone()).get()?,
-              )
-          }
+      let contents = match env.pop() {
+          Item::Word(alias) => cache::Key::Alias(alias.to_string()).get()?,
           i => {
               let hash = Bytes::try_from(i)?;
-              (
-                  base64::encode_config(hash.clone(), base64::URL_SAFE),
-                  hash.clone(),
-                  cache::Key::Hash(hash).get()?,
-              )
+
+              cache::Key::Hash(hash).get()?
           }
       };
-      let actual_hash = crypto::hash_bytes(&contents);
-      if actual_hash != expected_hash {
-          return Err(Error::create(
-              list!(expected_hash, "="),
-              format!("{} cache integrity check failed", alias).as_str(),
-              Some(actual_hash),
-          ));
-      }
       env.pop_prog();
       env.push(contents);
       Ok(())
@@ -5536,7 +5618,6 @@ We'll also define how to run unit tests.
 #+begin_src rust :tangle src/main.rs :mkdirp yes
   //! The main kcats module, that executes the kcats interpreter. See [main]
   mod axiom;
-  mod cache;
   mod crypto;
   mod module_map;
   mod serialize;

@@ -1,14 +1,8 @@
+use cache::cache;
 use directories::ProjectDirs;
-use sha2::{self};
 use std::error::Error;
 use std::fs::{self};
 use std::path::Path;
-
-use base64;
-use sha2::{Digest, Sha256};
-use std::fs::File;
-use std::io::Write;
-use std::io::{self, Read};
 use std::path::PathBuf;
 
 #[derive(Debug)]
@@ -26,31 +20,6 @@ impl std::fmt::Display for MyError {
 
 impl std::error::Error for MyError {}
 
-fn hash_file<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
-    let mut file = File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0; 1024]; // Read in chunks of 1024 bytes
-
-    loop {
-        let count = file.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        hasher.update(&buffer[..count]);
-    }
-
-    Ok(hasher.finalize().to_vec())
-}
-
-fn vec_to_byte_literal(vec: Vec<u8>) -> String {
-    let mut literal = String::from("vec![");
-    for byte in vec.iter() {
-        literal.push_str(&format!("0x{:02X}, ", byte));
-    }
-    literal.push(']');
-    literal
-}
-
 fn main() -> Result<(), Box<dyn Error>> {
     //copy source files to the interpreter's cache, and hardcode the hashes
     if let Some(proj_dirs) = ProjectDirs::from("org", "skyrod", "kcats") {
@@ -66,48 +35,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         // Iterate over the contents of the source stdlib directory
         if src_stdlib_path.exists() && src_stdlib_path.is_dir() {
             let entries = fs::read_dir(src_stdlib_path)?;
-            // Write a source file hardcoding the hashes of the stdlib files
-            let out_dir = Path::new("src");
-            let dest_path = Path::new(&out_dir).join("module_map.rs");
-            let mut f = File::create(dest_path)?;
 
-            writeln!(f, "use std::collections::HashMap;\n")?;
-            writeln!(
-                f,
-                "pub fn module_hashes() -> HashMap<&'static str, Vec<u8>> {{"
-            )?;
-            writeln!(f, "    let mut map = HashMap::new();")?;
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_file() {
                     if path.file_name().is_some() {
-                        //let hash = sha2::Sha256::digest(bytes);
-                        let hash = hash_file(&path).unwrap();
-                        let dest_path =
-                            std_path.join(base64::encode_config(&hash, base64::URL_SAFE));
-                        fs::copy(&path, &dest_path).expect(&format!(
-                            "Failed to copy file {:?} to {:?}, {:?}",
-                            path,
-                            dest_path,
-                            path.canonicalize()
-                        ));
                         let module_name = <PathBuf as AsRef<Path>>::as_ref(&path)
                             .file_stem()
                             .unwrap()
                             .to_str()
                             .unwrap();
-
-                        writeln!(
-                            f,
-                            "    map.insert(\"{}\", {});",
-                            module_name,
-                            vec_to_byte_literal(hash)
-                        )?;
+                        cache::put_from_path(&path, Some(module_name.to_string()))?;
                     }
                 }
             }
-            writeln!(f, "    map")?;
-            writeln!(f, "}}")?;
             Ok(())
         } else {
             Err(Box::new(MyError::CustomError(
