@@ -3118,6 +3118,161 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 #+end_src
+**** Hash-based object cache
+We will need to be able to fetch binary data via its hash, or a local name.
+#+begin_src rust :tangle src/cache.rs :mkdirp yes
+  use crate::types::container::error::Error;
+  use crate::types::{Bytes, Item, Word};
+  use directories::ProjectDirs;
+  use sha2::{self, Digest};
+  use std::fs::{self, File};
+  use std::io::{self, Read, Write};
+  use std::path::{Path, PathBuf};
+
+  pub enum Key {
+      Hash(Bytes),
+      Alias(Word),
+  }
+
+  impl Key {
+      pub fn get(&self) -> Result<Bytes, Error> {
+          if let Some(proj_dirs) = ProjectDirs::from("org", "skyrod", "kcats") {
+              let data_dir = proj_dirs.data_dir();
+
+              let cache_path = data_dir.join("cache");
+
+              // Look up the file
+              if cache_path.exists() && cache_path.is_dir() {
+                  let filename = match self {
+                      Key::Hash(hash) => base64::encode_config(hash, base64::URL_SAFE),
+                      Key::Alias(word) => word.to_string(),
+                  };
+
+                  let file = cache_path.join(filename);
+                  //println!("Reading cache file {:?}", file);
+                  let mut content = Bytes::new();
+                  fetch_link(file.as_path())?.read_to_end(&mut content)?;
+                  Ok(content)
+              } else {
+                  Err(Error::expected("cachedir", None::<Item>))
+              }
+          } else {
+              Err(Error::expected("cachedir", None::<Item>))
+          }
+      }
+  }
+
+  pub fn put(content: &Bytes, alias: Option<Word>) -> Result<(), Error> {
+      if let Some(proj_dirs) = ProjectDirs::from("org", "skyrod", "kcats") {
+          let data_dir = proj_dirs.data_dir();
+
+          let cache_path = data_dir.join("cache");
+
+          // Look up the file
+          if cache_path.exists() && cache_path.is_dir() {
+              let hash = sha2::Sha256::digest(&content);
+              let file = cache_path.join(base64::encode_config(hash, base64::URL_SAFE));
+              // only write the file if it doesn't exist
+              if !file.exists() {
+                  std::fs::write(file.clone(), content)?;
+              }
+
+              // Create the alias if necessary
+              if let Some(alias) = alias {
+                  let alias_path = PathBuf::from(alias.to_string());
+                  create_link(file.as_path(), alias_path.as_path())?;
+              }
+              Ok(())
+          } else {
+              Err(Error::expected("cachedir", None::<Item>))
+          }
+      } else {
+          Err(Error::expected("cachedir", None::<Item>))
+      }
+  }
+
+  enum Link {
+      Manual,
+      Symlink,
+  }
+
+  /// Determines the appropriate link type based on the operating system.
+  fn get_link_type() -> Link {
+      if cfg!(target_os = "linux") || cfg!(target_os = "macos") || cfg!(target_os = "windows") {
+          Link::Symlink
+      } else if cfg!(target_os = "android") || cfg!(target_os = "ios") {
+          Link::Manual
+      } else {
+          panic!("Unsupported operating system for linking");
+      }
+  }
+
+  /// Creates a link based on the specified link type.
+  ///
+  /// # Arguments
+  /// * `target` - The target file or directory to link to.
+  /// * `link_name` - The name of the symlink or link file to create.
+  ///
+  /// # Returns
+  /// A `Result` indicating success or failure.
+  fn create_link(target: &Path, link_name: &Path) -> io::Result<()> {
+      match get_link_type() {
+          Link::Symlink => {
+              #[cfg(unix)]
+              std::os::unix::fs::symlink(target, link_name)?;
+
+              #[cfg(windows)]
+              {
+                  if target.is_dir() {
+                      fs::os::windows::fs::symlink_dir(target, link_name)?
+                  } else {
+                      fs::os::windows::fs::symlink_file(target, link_name)?
+                  }
+              }
+              Ok(())
+          }
+          Link::Manual => {
+              let mut link_file = File::create(link_name)?;
+              let path = target.canonicalize()?;
+              let target_path = path.to_str().ok_or(io::Error::new(
+                  io::ErrorKind::Other,
+                  "Failed to convert path to string",
+              ))?;
+              writeln!(link_file, "{}", target_path)
+          }
+      }
+  }
+
+  /// Fetches the target of a link.
+  ///
+  /// # Arguments
+  /// * `link_name` - The link file or symlink to fetch.
+  ///
+  /// # Returns
+  /// A `Result` containing the target `File`.
+  fn fetch_link(link_name: &Path) -> io::Result<File> {
+      match get_link_type() {
+          Link::Symlink => File::open(link_name),
+          Link::Manual => {
+              let mut link_file = File::open(link_name)?;
+              let mut target_path = String::new();
+              link_file.read_to_string(&mut target_path)?;
+              File::open(target_path)
+          }
+      }
+  }
+
+  /// Deletes a link.
+  ///
+  /// # Arguments
+  /// * `link_name` - The link file or symlink to delete.
+  ///
+  /// # Returns
+  /// A `Result` indicating success or failure.
+  fn delete_link(link_name: &Path) -> io::Result<()> {
+      fs::remove_file(link_name)
+  }
+#+end_src
 **** Cryptographic primitives
 We'll implement certain cryptography functions in rust and make kcats
 words for them (hashing, encryption, signing)
@@ -3288,7 +3443,6 @@ example, in order to read/write to/from disk).
   //! containers from edn are used, no lists, maps or sets). Currently
   //! one custom tag is used for encoding byte arrays, but this is
   //! subject to change.
-  extern crate edn_format;
   use crate::types::container::{
       self as coll, associative as assoc, environment::Environment, error::Error,
   };
@@ -5165,14 +5319,18 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               let hash = hashes
                   .get::<&str>(&(&alias).into())
                   .ok_or_else(|| Error::expected("known-alias", alias.clone()))?;
-              (alias.to_string(), hash.clone(), cache::get(hash)?)
+              (
+                  alias.to_string(),
+                  hash.clone(),
+                  cache::Key::Hash(hash.clone()).get()?,
+              )
           }
           i => {
               let hash = Bytes::try_from(i)?;
               (
                   base64::encode_config(hash.clone(), base64::URL_SAFE),
                   hash.clone(),
-                  cache::get(&hash)?,
+                  cache::Key::Hash(hash).get()?,
               )
           }
       };
