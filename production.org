@@ -103,7 +103,7 @@ the location where you installed the kcats binary.
 
   # crypto stuff
   ed25519-dalek = {version="1", features=["batch_deterministic", "std", "rand"]}
-  sha2 = "0.10.6"
+  sha2 = {version="0.10.6", features=["std"]}
   rand_core = "0.5.1" # careful here, having 2 versions present will make weird compile errors
   rand = "0.8"
 
@@ -283,6 +283,7 @@ internally, to keep track of things like the stack, program, lists etc.
       pub static ref S_BOOLEAN: Word = Word::from("boolean");
       pub static ref S_BYTES: Word = Word::from("bytes");
       pub static ref S_CHAR: Word = Word::from("character");
+      pub static ref S_DICTIONARY: Word = Word::from("dictionary");
       pub static ref S_DISPENSER: Word = Word::from("dispenser");
       pub static ref S_ENVIRONMENT: Word = Word::from("environment");
       pub static ref S_ERROR: Word = Word::from("error");
@@ -2438,6 +2439,7 @@ internally, to keep track of things like the stack, program, lists etc.
       /// inserts all the definitions into the dictionary, with an
       /// optional namespace.
       pub fn insert_core_module(&mut self, lexicon: String) {
+          //println!("Parsing: {}", lexicon);
           let items = serialize::parse(lexicon).unwrap();
           for r in Box::new(items.inner().into_iter()) {
               let (k, def): (assoc::KeyItem, Item) = r.try_into().unwrap();
@@ -2882,7 +2884,9 @@ internally, to keep track of things like the stack, program, lists etc.
               include_bytes!("../../kcats/core/collections.kcats"),
               include_bytes!("../../kcats/core/associations-builtins.kcats"),
               include_bytes!("../../kcats/core/associations.kcats"),
-              include_bytes!("../../kcats/core/dictionary.kcats"), // END core libs
+              include_bytes!("../../kcats/core/dictionary.kcats"),
+              include_bytes!("../../kcats/core/environment-builtins.kcats"),
+              include_bytes!("../../kcats/core/environment.kcats"),
           ];
 
           for &file_contents in &files {
@@ -2941,8 +2945,8 @@ internally, to keep track of things like the stack, program, lists etc.
                   "methods",
                   "generators",
                   "template",
-                  "environment",
-                  "debug" // END default namespace
+                  //"environment",
+                  //"debug" // END default namespace
               ));
 
               // Here we can no longer modify our own dictionary, so
@@ -2978,6 +2982,7 @@ internally, to keep track of things like the stack, program, lists etc.
   /// [Word] `w`. This allows specs to have their own little type
   /// hierarchy, eg, `integer` is a `number`, `list` is a `sized` etc.
   fn check_type(i: &Item, w: &Word) -> Result<(), Error> {
+      //println!("Check {:?} is {:?}", w, i);
       match (w, i) {
           (w, _) if *w == *S_ITEM => Ok(()),
           (w, Item::Dispenser(_) | Item::Receptacle(_)) if *w == *S_DISPENSER => Ok(()),
@@ -3027,6 +3032,16 @@ internally, to keep track of things like the stack, program, lists etc.
                   assoc::Associative::Error(_),
               ))),
           ) if *w == *S_ERROR => Ok(()),
+
+          (
+              w,
+              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
+                  assoc::Associative::Dictionary(_),
+              )))
+              | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(
+                  assoc::Associative::Dictionary(_),
+              ))),
+          ) if *w == *S_DICTIONARY => Ok(()),
 
           (
               w,
@@ -3145,7 +3160,7 @@ crate so we can use it at both build time and runtime.
 
   [dependencies]
   base64 = "0.13.0"
-  sha2 = "0.10.6"
+  sha2 = {version="0.10.6", features=["std"]}
   directories = "5.0"
 
   [dependencies.uuid]
@@ -3159,14 +3174,16 @@ crate so we can use it at both build time and runtime.
 
 #+begin_src rust :tangle cache/src/lib.rs :mkdirp yes
   pub mod cache {
-      //use crate::types::container::error::Error;
-      //use crate::types::{Bytes, Item, Word};
+      use base64::URL_SAFE_NO_PAD;
       use directories::ProjectDirs;
       use io::Error;
+      use sha2::Sha256;
       use sha2::{self, Digest};
       use std::fs::{self, File};
       use std::io::{self, Read, Write};
+      use std::io::{BufReader, BufWriter};
       use std::path::{Path, PathBuf};
+      use uuid::Uuid;
 
       type Bytes = Vec<u8>;
 
@@ -3185,7 +3202,7 @@ crate so we can use it at both build time and runtime.
                   // Look up the file
                   if cache_path.exists() && cache_path.is_dir() {
                       let filename = match self {
-                          Key::Hash(hash) => base64::encode_config(hash, base64::URL_SAFE),
+                          Key::Hash(hash) => base64::encode_config(hash, base64::URL_SAFE_NO_PAD),
                           Key::Alias(word) => word.to_string(),
                       };
 
@@ -3203,7 +3220,7 @@ crate so we can use it at both build time and runtime.
           }
       }
 
-      pub fn put(content: &Bytes, alias: Option<String>) -> Result<(), Error> {
+      pub fn put(content: &Bytes, alias: Option<String>) -> Result<Bytes, Error> {
           if let Some(proj_dirs) = ProjectDirs::from("org", "skyrod", "kcats") {
               let data_dir = proj_dirs.data_dir();
 
@@ -3212,18 +3229,19 @@ crate so we can use it at both build time and runtime.
               // Look up the file
               if cache_path.exists() && cache_path.is_dir() {
                   let hash = sha2::Sha256::digest(&content);
-                  let file = cache_path.join(base64::encode_config(hash, base64::URL_SAFE));
+                  let hashfilename = base64::encode_config(hash, base64::URL_SAFE_NO_PAD);
+                  let target = cache_path.join(hashfilename.clone());
                   // only write the file if it doesn't exist
-                  if !file.exists() {
-                      std::fs::write(file.clone(), content)?;
+                  if !target.exists() {
+                      std::fs::write(target.clone(), content)?;
                   }
 
                   // Create the alias if necessary
                   if let Some(alias) = alias {
-                      let alias_path = PathBuf::from(alias.to_string());
-                      create_link(file.as_path(), alias_path.as_path())?;
+                      let alias_path = cache_path.join(PathBuf::from(alias.to_string()));
+                      create_link(Path::new(&hashfilename), alias_path.as_path())?;
                   }
-                  Ok(())
+                  Ok(hash.to_vec())
               } else {
                   Err(Error::new(io::ErrorKind::Other, "Cache dir not found"))
               }
@@ -3237,16 +3255,8 @@ crate so we can use it at both build time and runtime.
           Symlink,
       }
 
-      use base64::URL_SAFE_NO_PAD;
-      //use project_dirs::ProjectDirs;
-      use sha2::Sha256;
-      //use std::fs::OpenOptions;
-      use std::io::{BufReader, BufWriter};
-      use uuid::Uuid; // You need to add `uuid` crate to your dependencies
-
-      pub fn put_from_path(path: &Path, alias: Option<String>) -> Result<(), Error> {
+      pub fn put_from_path(path: &Path, alias: Option<String>) -> Result<Bytes, Error> {
           if let Some(proj_dirs) = ProjectDirs::from("org", "skyrod", "kcats") {
-              println!("Caching {:?}", alias.clone());
               let data_dir = proj_dirs.data_dir();
               let cache_path = data_dir.join("cache");
 
@@ -3277,19 +3287,18 @@ crate so we can use it at both build time and runtime.
               // Compute the final hash and rename the file according to the hash
               let hash = hasher.finalize();
               let file_name = base64::encode_config(&hash, URL_SAFE_NO_PAD);
-              let final_path = cache_path.join(file_name);
+              let final_path = cache_path.join(file_name.clone());
 
               // Move to final destination, overwriting anything there
-              println!("Renaming");
               fs::rename(temp_file_path.clone(), final_path.clone())?;
-              println!("Renamed");
               // Create the alias if necessary
+
               if let Some(alias) = alias {
                   let alias_path = cache_path.join(alias);
-                  create_link(&final_path, &alias_path)?;
+                  let target_path = Path::new(".").join(file_name);
+                  create_link(&target_path, &alias_path)?;
               }
-              println!("Cached");
-              Ok(())
+              Ok(hash.to_vec())
           } else {
               Err(io::Error::new(
                   io::ErrorKind::NotFound,
@@ -3318,30 +3327,35 @@ crate so we can use it at both build time and runtime.
       /// # Returns
       /// A `Result` indicating success or failure.
       fn create_link(target: &Path, link_name: &Path) -> io::Result<()> {
-          if !target.exists() {
-              match get_link_type() {
-                  Link::Symlink => {
-                      #[cfg(unix)]
-                      std::os::unix::fs::symlink(target, link_name)?;
+          println!("Creating link from {:?} to {:?}", link_name, target);
 
-                      #[cfg(windows)]
-                      {
-                          if target.is_dir() {
-                              fs::os::windows::fs::symlink_dir(target, link_name)?
-                          } else {
-                              fs::os::windows::fs::symlink_file(target, link_name)?
-                          }
+          if link_name.exists() {
+              fs::remove_file(link_name)?;
+          }
+
+          match get_link_type() {
+              Link::Symlink => {
+                  #[cfg(unix)]
+                  std::os::unix::fs::symlink(target, link_name)?;
+
+                  #[cfg(windows)]
+                  {
+                      if target.is_dir() {
+                          fs::os::windows::fs::symlink_dir(target, link_name)?
+                      } else {
+                          fs::os::windows::fs::symlink_file(target, link_name)?
                       }
                   }
-                  Link::Manual => {
-                      let mut link_file = File::create(link_name)?;
-                      let path = target.canonicalize()?;
-                      let target_path = path.to_str().ok_or(Error::new(
-                          io::ErrorKind::Other,
-                          "Failed to convert path to string",
-                      ))?;
-                      writeln!(link_file, "{}", target_path)?;
-                  }
+              }
+
+              Link::Manual => {
+                  let mut link_file = File::create(link_name)?;
+                  let path = target.canonicalize()?;
+                  let target_path = path.to_str().ok_or(Error::new(
+                      io::ErrorKind::Other,
+                      "Failed to convert path to string",
+                  ))?;
+                  writeln!(link_file, "{}", target_path)?;
               }
           }
           Ok(())
@@ -3373,6 +3387,7 @@ crate so we can use it at both build time and runtime.
       ///
       /// # Returns
       /// A `Result` indicating success or failure.
+      #[allow(dead_code)]
       fn delete_link(link_name: &Path) -> io::Result<()> {
           fs::remove_file(link_name)
       }
@@ -3435,6 +3450,7 @@ words for them (hashing, encryption, signing)
       }
   }
 
+  #[allow(dead_code)]
   pub fn hash_bytes(contents: &Vec<u8>) -> Vec<u8> {
       let mut hasher = sha2::Sha256::new();
       //let mut buffer = [0; 1024]; // Read in chunks of 1024 bytes
@@ -4189,6 +4205,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("autoformat", Box::leak(Box::new(f_stack1(autoformat)))),
           ("branch", Box::leak(Box::new(branch))),
           ("bytes?", Box::leak(Box::new(f_stack1(is_bytes)))),
+          ("cache", Box::leak(Box::new(f_result(write_blob)))),
           ("clone", Box::leak(Box::new(clone))),
           ("contains?", Box::leak(Box::new(f_stack2(contains)))),
           ("ceiling", Box::leak(Box::new(f_stack1(ceiling)))),
@@ -5184,6 +5201,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   if let Some(dfn) = env.dictionary.get(word) {
                       {
                           if let Some(spec) = &dfn.spec {
+                              //println!("Checking spec for {:?}: {:?}", word, spec.0);
                               if let Err(e) = env.check_input_spec(&spec.0) {
                                   env.push(e);
                                   return env.into();
@@ -5414,13 +5432,14 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       Ok(())
   }
 
+  /// Fetches a binary blob from the cache. The top of stack should be
+  /// either the hash of the content or its alias (a [Word]).
   pub fn read_blob(env: &mut Environment) -> Result<(), Error> {
       //println!("Env: {:?}", env);
       let contents = match env.pop() {
           Item::Word(alias) => cache::Key::Alias(alias.to_string()).get()?,
           i => {
               let hash = Bytes::try_from(i)?;
-
               cache::Key::Hash(hash).get()?
           }
       };
@@ -5429,8 +5448,29 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       Ok(())
   }
 
-  // Takes an inner environment from the top of the stack, and spawns a
-  // tokio task to evaluate that environment.
+  /// Writes a given binary object to the cache. Supports [Bytes], and
+  /// certain kinds of pipes. The top of stack should be the alias to
+  /// store the contents under, which should be either a [Word] or
+  /// nothing. If nothing, the object will only be available via its
+  /// hash. Returns the hash.
+  pub fn write_blob(env: &mut Environment) -> Result<(), Error> {
+      let alias = match env.pop() {
+          Item::Word(w) => Some(w.to_string()),
+          _ => None,
+      };
+      match env.pop() {
+          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(b))) => {
+              let hash = cache::put(&b, alias)?;
+              env.push(hash);
+              env.pop_prog();
+              Ok(())
+          }
+          i => Err(Error::expected("bytes", i)),
+      }
+  }
+
+  /// Takes an inner environment from the top of the stack, and spawns a
+  /// tokio task to evaluate that environment.
   pub fn animate(mut env: Environment) -> Future<Environment> {
       let tos = env.pop();
       let inner_env = Environment::try_from(tos);
@@ -9741,22 +9781,34 @@ map now doesn't require you to bind values (the map function has access to the r
    ;; again.
    [crypto] stdmod ;; make the module
    ;; apply it to the dictionary
+   ["foo" encode hash] confine
  #+end_src
 
  #+RESULTS:
  #+begin_src kcats
- [[[delegated [[spec [[[association pubkey]] [program]]]
-               [definition [[[sink [[hash] [shield dip]
-                                    decorated float [verify] dip [[]] branch]
-                              [drop drop sink verify] [clone] dipdown branch]
-                             [[]] recover]
-                            swap prepend]]]]
-   [hash [[spec [[item] [bytes]]]
-          [definition [[[[bytes?] [hashbytes]]
-                        [[yes] [encode hash]]]
-                       decide]]]]]
-  join]
+ #b64 "LCa0a2j/xo/5m0U8HTBBNBNCLXBkg7+g+YpeiGJm564="
  #+end_src
+
+ Let's make a word to load multiple modules
+
+ #+begin_src kcats
+   [crypto time]
+   ;; apply the changes in order
+   dictionary swap [decache string read shielddown] step
+   ;; now execute
+   
+ #+end_src
+
+ #+RESULTS:
+ #+begin_src kcats
+ dictionary_redacted
+ #+end_src
+
+ Let's divide up the functionality:
+ + reading from cache and parsing (module)
+ + apply module to dictionary (inscribe)
+ + spawn env with new dict and program (spawn)
+ + capture result as our stack 
 
 **** TODO Modification happens once per program
   Dictionary modification should not happen at "runtime" (when the
@@ -9768,6 +9820,9 @@ map now doesn't require you to bind values (the map function has access to the r
   I should be able to call =af= that loads (or depends on =b= and calls =bf=
   that loads =c= and calls =cf=, and those loads should only happen once
   even if i call =af= in a tight loop.
+**** TODO Code should be shareable
+That means, local names should generarlly not appear in code, as they
+change meaning.
 **** TODO Building vocabulary and the programs that use that vocabulary need to be separable
   (that's the whole point of a library). In practice there will be
   some "mini-libs" that mostly just make code easier to read and stay
@@ -9976,24 +10031,34 @@ There's several possible mitigations:
    + One where the modified dict is in the dict (but words are not available)
    + One where we actually apply that dict so the words can be used
 
-**** Builtin libs have names but nothing else does
-It seems weird we'd have a few named libs (like =crypto=) but not allow
-users to name theirs. We can either get rid of names entirely, or add
-a naming mechanism.
+**** Use of names
+It occurred to me that we don't have to use names at all when it comes
+to libaries or modules. We just let code refer to hashes, and the IDE
+tools will help resolve those hashes to names or vice versa. But the
+canonical form (in the actual code) will be hashes only.
 
-I don't see how we could avoid some kind of naming, how else can we
-specify what we're loading?
+This solves a lot of issues:
 
-let's experiment what we can do without any additional mechanism
-#+begin_src  kcats
-  [[square [clone *]]] draft 
-  dictionary swap shielddown
-  [math] label
++ There is no chicken and egg problem. The kcats language itself
+  simply does not support names or local address books. It refers to
+  content by hash and that's it. That's how libraries are loaded,
+  etc. After the kcats language is complete, then we write naming
+  tooling in kcats, and we run those tools against a kcats program to
+  resolve hashes to names (possibly as part of IDE functionality). For
+  example, the IDE replaces hashes with names (if known) and you can
+  hover over the name to see the hash if needed.
++ Code is sharable because there are no local names present
+
+#+begin_src kcats
+  ;; define a module
+  [[square [clone *]]] draft inscribe
+  ;; now the dictionary is on the stack
+  [9 square] confine
 #+end_src
 
 #+RESULTS:
 #+begin_src kcats
-[[math dictionary_redacted]]
+81
 #+end_src
 
 *** INPROGRESS inscribe currently re-defines words repeatedly at runtime
