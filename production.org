@@ -77,7 +77,7 @@ the location where you installed the kcats binary.
 #+BEGIN_SRC toml :tangle Cargo.toml
   [package]
   name = "kcats"
-  version = "0.7.0"
+  version = "0.8.0"
   edition = "2021"
 
   # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -103,7 +103,7 @@ the location where you installed the kcats binary.
 
   # crypto stuff
   ed25519-dalek = {version="1", features=["batch_deterministic", "std", "rand"]}
-  sha2 = "0.10.6"
+  sha2 = {version="0.10.6", features=["std"]}
   rand_core = "0.5.1" # careful here, having 2 versions present will make weird compile errors
   rand = "0.8"
 
@@ -122,8 +122,13 @@ the location where you installed the kcats binary.
   ## Figure out best place to store the db and stdlib files
   directories = "5.0"
 
-  #cozo = { version = "0.7", default-features = false, features = ["minimal", "rayon"], optional=true }
   rusqlite = { version = "0.30", optional = true, features = ["uuid"] }
+
+  # memoized functions
+  once_cell = "1"
+
+  # The blob cache
+  cache = {path = "./cache"}
 
   [dependencies.uuid]
   version = "1.6.1"
@@ -140,6 +145,8 @@ the location where you installed the kcats binary.
   [build-dependencies]
   directories = "5.0"
   sha2 = "0.10.6"
+  base64 = "0.13.0"
+  cache = {path = "./cache"}
 
   [features]
   database = ["rusqlite"]
@@ -149,11 +156,13 @@ the location where you installed the kcats binary.
 We'll start by defining the basic data structures that kcats will use
 internally, to keep track of things like the stack, program, lists etc.
 #+begin_src rust :tangle src/types.rs :mkdirp yes
+  //! Defines kcats internal data types.
+
   use crate::list;
-  use crate::types::collection as coll;
-  use crate::types::dictionary as dict;
-  use crate::types::environment as env;
-  use crate::types::error::Error;
+  use crate::types::container as coll;
+  use crate::types::container::dictionary as dict;
+  use crate::types::container::environment as env;
+  use crate::types::container::error::Error;
 
   use core::default::Default;
   use internment::Intern;
@@ -166,11 +175,7 @@ internally, to keep track of things like the stack, program, lists etc.
   use std::ops::{Deref, DerefMut};
   use std::pin::Pin;
 
-  pub mod associative;
-  pub mod collection;
-  pub mod dictionary;
-  pub mod environment;
-  pub mod error;
+  pub mod container;
   pub mod number;
 
   /// A generic newtype to contain various types, so that we can
@@ -230,24 +235,17 @@ internally, to keep track of things like the stack, program, lists etc.
   /// A Word causes a kcats program to do something, usually taking some
   /// items from the top of the stack, and using them to create new
   /// stack items. (examples: `swap`, `+`, `dip`).
-  #[derive(Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord, Default)]
-  pub struct Word {
-      pub data: Intern<String>,
-      pub namespace: dict::Namespace,
-  }
+  pub type Word = Newtype<Intern<String>>;
 
   impl Display for Word {
       fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-          write!(f, "{}", self.data.as_str())
+          write!(f, "{}", self.0.as_str())
       }
   }
 
   impl From<&str> for Word {
       fn from(s: &str) -> Self {
-          Word {
-              data: Intern::<String>::from(s),
-              namespace: Default::default(),
-          }
+          Newtype(Intern::<String>::from(s))
       }
   }
 
@@ -259,20 +257,20 @@ internally, to keep track of things like the stack, program, lists etc.
 
   impl<'a> From<&'a Word> for &'a str {
       fn from(s: &'a Word) -> Self {
-          s.data.as_str()
+          s.0.as_str()
       }
   }
 
   impl From<Word> for String {
       fn from(s: Word) -> Self {
-          s.data.to_string()
+          s.0.to_string()
       }
   }
 
   /// Represents a stack (the part of an
-  /// [crate::types::environment::Environment] that holds the data
+  /// [crate::types::container::environment::Environment] that holds the data
   /// values being manipulated by the program).
-  pub type Stack = collection::List;
+  pub type Stack = container::List;
 
   /// A byte array type
   pub type Bytes = Vec<u8>;
@@ -285,6 +283,7 @@ internally, to keep track of things like the stack, program, lists etc.
       pub static ref S_BOOLEAN: Word = Word::from("boolean");
       pub static ref S_BYTES: Word = Word::from("bytes");
       pub static ref S_CHAR: Word = Word::from("character");
+      pub static ref S_DICTIONARY: Word = Word::from("dictionary");
       pub static ref S_DISPENSER: Word = Word::from("dispenser");
       pub static ref S_ENVIRONMENT: Word = Word::from("environment");
       pub static ref S_ERROR: Word = Word::from("error");
@@ -305,11 +304,12 @@ internally, to keep track of things like the stack, program, lists etc.
   /// A kcats data value.
   #[derive(Debug, Clone)]
   pub enum Item {
-      /// An integer number value
+      /// A number value
       Number(number::Number),
-      /// A word value
+      /// A word value. Words are atomic, they can't be broken down into
+      /// characters like Strings.
       Word(Word),
-      /// A character value
+      /// A character value, like 'a', or '\n'.
       Char(Char),
       /// A container value (that [Item]s can be taken from)
       Dispenser(coll::Dispenser),
@@ -341,8 +341,7 @@ internally, to keep track of things like the stack, program, lists etc.
           match (self, other) {
               // same types, just use their own eq
               (Item::Number(a), Item::Number(b)) => a == b,
-              // Don't use the namespace when comparing words
-              (Item::Word(a), Item::Word(b)) => a.data == b.data,
+              (Item::Word(a), Item::Word(b)) => a == b,
               (
                   Item::Dispenser(coll::Dispenser::Sized(a)),
                   Item::Receptacle(coll::Receptacle::Sized(b)),
@@ -352,6 +351,8 @@ internally, to keep track of things like the stack, program, lists etc.
                   Item::Dispenser(coll::Dispenser::Sized(b)),
               ) => a == b,
               (Item::Dispenser(a), Item::Dispenser(b)) => a == b,
+              (Item::Receptacle(a), Item::Receptacle(b)) => a == b,
+
               (Item::Char(a), Item::Char(b)) => a == b,
               _ => false,
           }
@@ -416,7 +417,8 @@ internally, to keep track of things like the stack, program, lists etc.
   /// As there are no real booleans, we use the word 'yes' but literally
   /// any value except empty containers is truthy. If we read a value
   /// 'false', that's not actually a boolean, it's just the [Word]
-  /// false.
+  /// false. The fact that the word 'yes' is used in the language but
+  /// 'no' is not, is a known tradeoff.
   impl From<bool> for Item {
       fn from(b: bool) -> Item {
           if b {
@@ -484,16 +486,16 @@ internally, to keep track of things like the stack, program, lists etc.
               let v: Vec<Item> = vec![
                   $( $x.into(), )*
               ];
-              $crate::types::collection::List::from_iter(v.into_iter())
+              $crate::types::container::List::from_iter(v.into_iter())
           }
       };
   }
 
-  /// A module to support json serialization
   mod serde {
+      //! Support for json serialization of kcats objects
       use super::Item;
-      use crate::types::associative as assoc;
-      use crate::types::collection as coll;
+      use crate::types::container as coll;
+      use crate::types::container::associative as assoc;
       use crate::types::number;
       use crate::types::Error;
       use serde::de::{self, Deserialize, Deserializer, Visitor};
@@ -621,12 +623,27 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 #+end_src
-**** Collection types
-#+begin_src rust :tangle src/types/collection.rs :mkdirp yes
+**** Container types
+#+begin_src rust :tangle src/types/container.rs :mkdirp yes
+  //! Support for containers in kcats. Includes types like
+  //! [List], [Set],
+  //! [associative::Association], String,
+  //! [pipe::In],
+  //! [pipe::Out], and Byte arrays. The
+  //! container contract is you can put things into, or take things out
+  //! of them. [Receptacle]s are for putting into, and [Dispenser]s are
+  //! for taking out of. For underlying types that support both
+  //! operations (like [List]), we can easily convert between
+  //! [Receptacle] and [Dispenser] as needed.
+  pub mod associative;
+  pub mod dictionary;
+  pub mod environment;
+  pub mod error;
+  pub mod pipe;
+
   use futures::FutureExt;
 
-  use crate::pipes as pipe;
-  use crate::types::associative as assoc;
+  use self::associative as assoc;
   use crate::types::number::{Int, Number};
   use crate::types::*;
   use std::{collections::HashSet, future, sync};
@@ -741,8 +758,11 @@ internally, to keep track of things like the stack, program, lists etc.
   /// can be taken out.
   #[derive(Debug, Clone, PartialEq)]
   pub enum Dispenser {
+      /// A container with a known number of items inside
       Sized(Sized),
+      /// A pipe that dispenses an unknown number of items
       Out(pipe::Out),
+      /// Similar to Out but also convertible to [Receptacle]
       Tunnel(pipe::Tunnel),
   }
 
@@ -751,8 +771,11 @@ internally, to keep track of things like the stack, program, lists etc.
   /// can be put in.
   #[derive(Debug, Clone, PartialEq)]
   pub enum Receptacle {
+      /// A container with a known number of items inside
       Sized(Sized),
+      /// A pipe that can receive an arbitrary number of items
       In(pipe::In),
+      /// Similar to In but also convertible to [Dispenser]
       Tunnel(pipe::Tunnel),
   }
 
@@ -760,10 +783,19 @@ internally, to keep track of things like the stack, program, lists etc.
   /// that it can also be appended to.
   #[derive(Debug, Clone)]
   pub enum Sized {
+      /// Associative containers associate Items in pairs, like Map or
+      /// Dict in other languages.
       Associative(assoc::Associative),
+      /// List containers have multiple Items in a specific order.
       List(List),
+      /// Set containers have multiple Items in no particular order, and
+      /// each Item can only appear once.
       Set(Set),
+      /// A String is a chunk of text, like a list of individual
+      /// characters.
       String(String),
+      /// Bytes is the lowest common denominator form of data, useful
+      /// for when no other type applies.
       Bytes(Bytes),
   }
 
@@ -1303,7 +1335,7 @@ internally, to keep track of things like the stack, program, lists etc.
   mod serde {
       use super::{Dispenser, Receptacle, Sized};
       use crate::serialize::Display;
-      use crate::types::associative as assoc;
+      use crate::types::container::associative as assoc;
       use serde::ser::{Serialize, SerializeMap, SerializeSeq};
 
       impl Serialize for Dispenser {
@@ -1374,18 +1406,26 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 #+end_src
 **** Associative types
-#+begin_src rust :tangle src/types/associative.rs :mkdirp yes
-  use crate::types::collection as coll;
-  use crate::types::dictionary as dict;
-  use crate::types::environment as env;
+#+begin_src rust :tangle src/types/container/associative.rs :mkdirp yes
+  //! Support for Associative data types (similar contract to Rust's
+  //! HashMap). Includes specific runtime data types like Errors,
+  //! Dictionaries, Environments, as well as generic maps (which are
+  //! called "associations" in kcats)
+  use super::{dictionary as dict, environment as env};
+  use crate::types::container as coll;
   use crate::types::number::{Int, Number};
   use crate::types::*;
   use std::iter::FromIterator;
   use std::sync;
+
   pub type Associationy<K, V> = Newtype<HashMap<K, V>>;
   pub type AssociationContent = Associationy<KeyItem, Item>;
   pub type Association = coll::Arc<AssociationContent>;
 
+  /// A KeyItem is all the Item types that can be used as a key in an
+  /// Associative structure. In order to be a key, the type has to be
+  /// hashable and have an ordering, so types like floating point
+  /// numbers or sets can't be used.
   #[derive(Debug, Clone, Eq, PartialEq, Hash, PartialOrd, Ord)]
   pub enum KeyItem {
       // Order matters here, for comparison purposes - changing the
@@ -1398,6 +1438,12 @@ internally, to keep track of things like the stack, program, lists etc.
       List(KeyList),
   }
 
+  /// An Entry is a single pairing in an Associative type
+  pub type Entry = (KeyItem, Item);
+
+  pub type KeyListContent = coll::Listy<KeyItem>;
+  pub type KeyList = coll::Arc<KeyListContent>;
+
   impl KeyList {
       pub fn try_from_iter<I>(l: I) -> Result<Self, Error>
       where
@@ -1409,6 +1455,29 @@ internally, to keep track of things like the stack, program, lists etc.
                   .collect::<Result<VecDeque<KeyItem>, Error>>()?,
           )))
       }
+  }
+
+  /// An Associative is a container type that associates one Item (the
+  /// key) with another (the value). It has the property where you can
+  /// look up a value using the key, and you can update the value that a
+  /// key points to. Some Item types cannot be used as keys, only
+  /// [KeyItem] is accepted as an Associative key.
+  #[derive(Debug, Clone)]
+  pub enum Associative {
+      /// A generic associative structure where you can associate any
+      /// [KeyItem] with any [Item].
+      Assoc(Association),
+      /// Represents an [dict::Dictionary] entry structure with
+      /// specific keys.
+      DictEntry(dict::Entry),
+      /// Represents an execution environment, with specific keys
+      Env(env::Environment),
+      /// Represents a runtime Error value, with specific keys
+      Error(Error),
+      /// Represents a dictionary for an execution environment, with
+      /// more specific key and value types.
+      Dictionary(dict::Dictionary),
+      Nothing,
   }
 
   impl From<KeyItem> for Item {
@@ -1472,21 +1541,6 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  pub type Entry = (KeyItem, Item);
-
-  pub type KeyListContent = coll::Listy<KeyItem>;
-  pub type KeyList = coll::Arc<KeyListContent>;
-
-  #[derive(Debug, Clone)]
-  pub enum Associative {
-      Assoc(Association),
-      DictEntry(dict::Entry),
-      Env(env::Environment),
-      Error(Error),
-      Dictionary(dict::Dictionary),
-      Nothing,
-  }
-
   impl PartialEq for Associative {
       fn eq(&self, other: &Self) -> bool {
           match (self, other) {
@@ -1504,6 +1558,7 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl Associative {
+      /// Retuns the number of associations in the container
       pub fn len(&self) -> usize {
           match self {
               Associative::Assoc(a) => a.len(),
@@ -1515,10 +1570,23 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
+      /// Returns true if the container is empty
       pub fn is_empty(&self) -> bool {
           self.len() == 0
       }
 
+      /// Inserts a new association of a [KeyItem] to [Item]. If the key
+      /// already exists, the value is replaced and the old value is
+      /// returned. If the key doesn't exist, a new one is created with
+      /// the new value and no old value is returned. The overall return
+      /// value is tuple of an updated Associative, and an optional old
+      /// value.
+      ///
+      /// The Associative returned is not necessarily the same type as
+      /// self, as sometimes there is auto-demotion, eg from Error to
+      /// Association. Demotion typically happens when you insert a key
+      /// into a type that doesn't support that key, you'll get a more
+      /// generic type back instead.
       pub fn insert(self, k: KeyItem, v: Item) -> (Associative, Option<Item>) {
           match self {
               Associative::Assoc(mut a) => {
@@ -1582,11 +1650,38 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
+      /// The put operation is for generic containers, adding a new Item
+      /// to the container. In the case of Associative, we can still do
+      /// this if the Item is the right type: a key/value pair. If it's
+      /// the right type, we [Self::insert] the value using the key,
+      /// otherwise return an error.
       pub fn put(self, other: Item) -> Result<Associative, Error> {
-          let entry: (KeyItem, Item) = other.try_into()?;
-          Ok(self.insert(entry.0, entry.1).0)
+          match (self, other) {
+              (Associative::Dictionary(mut this), other) => {
+                  let (word, entry) = <(Word, dict::Entry)>::try_from(other)?;
+                  let thismut = this.make_mut();
+                  thismut.insert(word.into(), entry.into());
+                  Ok(Associative::Dictionary(this))
+              }
+              (this, other) => {
+                  let entry: (KeyItem, Item) = other.try_into()?;
+                  Ok(this.insert(entry.0, entry.1).0)
+              }
+          }
       }
 
+      /// The join operation is for generic containers, but we can join
+      /// two Associatives by merging them together. If both
+      /// Associatives are the same specific type, the type is
+      /// preserved. If `other` can be converted to the same specific
+      /// type as `self`, that conversion will be done and the specific
+      /// type of `self` is preserved. If they are different types and we
+      /// can't convert `other` to `self`s type, the result will be
+      /// demoted to a more generic form.
+      ///
+      /// Keys in `other` have priority over those in `self` - if a key
+      /// is in both containers, the result will have only the value
+      /// from `other`.
       pub fn join(self, other: Associative) -> Associative {
           match (self, other) {
               // same type means 2nd one wins.
@@ -1626,6 +1721,8 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
+      /// Retrieves a value from the container using the key
+      /// `k`. Returns [None] if the key is not present.
       pub fn get(&self, k: &KeyItem) -> Option<Item> {
           match self {
               Associative::Assoc(a) => a.get(k).cloned(),
@@ -1646,6 +1743,7 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
+      /// Returns true if the key `k` is present in the container.
       pub fn contains_key(&self, k: &KeyItem) -> bool {
           match self {
               Associative::Assoc(a) => a.contains_key(k),
@@ -1660,7 +1758,9 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
-      //TODO remove
+      /// Removes the key `k` from the container, returning a tuple of a
+      /// new [Associative] and an optional value if the key was
+      /// present.
       pub fn remove(self, k: &KeyItem) -> (Associative, Option<Item>) {
           match self {
               Associative::Assoc(mut a) => {
@@ -1682,6 +1782,9 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
+      /// The take operation is for generic containers but we can
+      /// perform it on an Associative by removing an arbitrary pair and
+      /// returning it.
       pub fn take(self) -> (Self, Option<Item>) {
           match self {
               Associative::Assoc(mut a) => {
@@ -1714,6 +1817,8 @@ internally, to keep track of things like the stack, program, lists etc.
                       }),
                   )
               }
+              // The remaining impls may require auto-demotion (eg,
+              // removing a required field from say, Error)
               _ => todo!("taking from assoc Requires insert/remove impl"),
           }
       }
@@ -1984,14 +2089,20 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 #+end_src
 **** Error types
-#+begin_src rust :tangle src/types/error.rs :mkdirp yes
+#+begin_src rust :tangle src/types/container/error.rs :mkdirp yes
+  use super::associative as assoc;
   use crate::list;
-  use crate::types::associative as assoc;
-  use crate::types::collection as coll;
+  use crate::types::container as coll;
   use crate::types::number::Int;
   use crate::types::{Item, Word};
   use std::convert::Infallible;
 
+  /// Represents a runtime error type. Contains generic fields to hold
+  /// things like what type of error, the actual vs expected conditions,
+  /// etc. Also holds whether the error has been handled or not, which
+  /// the runtime uses to decide whether to keep unwinding the program
+  /// looking for something to handle the error. An error that has been
+  /// handled is inert, it is just another data value.
   #[derive(Clone, PartialEq)]
   pub struct Error {
       pub data: assoc::Association,
@@ -1999,6 +2110,7 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl Error {
+      /// Creates a new error.
       pub fn create<T: Into<Item>>(asked: coll::List, reason: &str, actual: Option<T>) -> Error {
           // let bt = backtrace::Backtrace::new();
           let mut data: Vec<(assoc::KeyItem, Item)> = vec![
@@ -2017,6 +2129,8 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
+      /// Creates a stack underflow error for when the current word
+      /// needs more items than there are on the stack.
       pub fn stack_underflow() -> Error {
           Error::create(
               list!("consume"),
@@ -2180,15 +2294,13 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 #+end_src
 **** Dictionary types
-#+begin_src rust :tangle src/types/dictionary.rs :mkdirp yes
+#+begin_src rust :tangle src/types/container/dictionary.rs :mkdirp yes
+  use super::associative as assoc;
   use crate::axiom::BUILTIN_FUNCTIONS;
   use crate::list;
   use crate::serialize;
-  use crate::types::associative as assoc;
-  use crate::types::collection as coll;
+  use crate::types::container as coll;
   use crate::types::*;
-  use lazy_static::lazy_static;
-  use sha2::{self, Digest};
   use std::collections::HashSet;
   use std::ptr;
 
@@ -2202,6 +2314,8 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   // TODO: move specs to their own module
+  /// An element of a [Spec], either an input or an output. Holds the
+  /// type and optional name of the input/output.
   #[derive(Debug, Clone, PartialEq)]
   pub struct SpecElement {
       pub elemtype: Word,
@@ -2209,6 +2323,10 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   pub type StackSpec = Vec<SpecElement>;
+
+  /// The spec of a [Word] consists of the input spec and the output
+  /// spec, that shows what the stack should look like before and after
+  /// the [Word] is invoked.
   pub type Spec = (StackSpec, StackSpec);
 
   impl TryFrom<Item> for SpecElement {
@@ -2312,72 +2430,10 @@ internally, to keep track of things like the stack, program, lists etc.
               matches!(w.into(), "examples" | "spec" | "definition")
           })
       }
-
-      pub fn get_namespace_info(&self) -> Namespace {
-          match &self.definition {
-              Definition::Axiom(_) => Default::default(),
-              Definition::Derived(l) => l
-                  .front()
-                  .map(|i| dict::bytes_to_ns(Bytes::try_from(i.clone()).unwrap_or_default()))
-                  .unwrap_or_default(),
-          }
-      }
-  }
-
-  impl From<Namespace> for Entry {
-      fn from(ns: Namespace) -> Entry {
-          Entry {
-              examples: None,
-              spec: None,
-              definition: Definition::Derived(list!(Item::from(dict::ns_to_bytes(ns)))),
-          }
-      }
-  }
-  pub type Namespace = Option<Newtype<Vec<u8>>>;
-
-  lazy_static! {
-      pub static ref MODULE_NAMESPACE: Namespace =
-          Some(Newtype(sha2::Sha256::digest(b"modules").deref().to_vec()));
-      pub static ref SHADOW_NAMESPACE: Namespace =
-          Some(Newtype(sha2::Sha256::digest(b"shadow").deref().to_vec()));
-  }
-
-  pub fn bytes_to_ns(b: Bytes) -> Namespace {
-      if b.is_empty() {
-          Default::default()
-      } else {
-          Some(Newtype(b))
-      }
-  }
-
-  pub fn ns_to_bytes(ns: Namespace) -> Bytes {
-      if let Some(ns) = ns {
-          ns.0
-      } else {
-          Default::default()
-      }
-  }
-
-  impl TryFrom<Item> for Namespace {
-      type Error = Error;
-      fn try_from(i: Item) -> Result<Namespace, Error> {
-          match i {
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(b))) => Ok(bytes_to_ns(b)),
-              Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(b))) => Ok(bytes_to_ns(b)),
-              i => {
-                  let s = coll::Sized::try_from(i)?;
-                  if s.is_empty() {
-                      Ok(Default::default())
-                  } else {
-                      Err(Error::expected("namespace", s))
-                  }
-              }
-          }
-      }
   }
 
   /// One of the main components of an
-  /// [crate::types::environment::Environment], holds [Word]s and their
+  /// [crate::types::container::environment::Environment], holds [Word]s and their
   /// definitions.
   pub type Dictionary = coll::Arc<HashMap<Word, Entry>>;
 
@@ -2388,133 +2444,17 @@ internally, to keep track of things like the stack, program, lists etc.
           diff_hashmaps(&self.inner(), &newer.inner())
       }
 
-      /// Merges this dictionary with the given new dictionary. The new
-      /// entries are added with the given namespace.
-      pub fn merge(&mut self, new: Dictionary, namespace: &Namespace) {
-          let (adds, deletes) = self.diff(new);
-          // add namepaces to the adds
-          let adds: Vec<_> = adds
-              .into_iter()
-              .map(|(mut w, e)| {
-                  w.namespace = namespace.clone();
-                  (w, e)
-              })
-              .collect();
-          // make a mini dictionary with the adds
-          let mut dict: Dictionary = coll::Arc::wrap(HashMap::from_iter(adds));
-          dict.resolve_local();
-          let d = self.make_mut();
-
-          d.extend(dict.inner());
-          d.extend(make_deletes(deletes));
-      }
-
-      /// Takes a set of additions to the dictionary. Resolves all of the
-      /// references to the words added, in any of the other words, to the
-      /// words being added. This allows modules to call other words in the
-      /// same module. The additions should have the word keys already set
-      /// to the proper namespace. So for example, if you're adding the
-      /// words `foo` and `bar` and `foo` calls `bar`, the `bar` that `foo`
-      /// refers to will be the one from this module.
-      pub fn resolve_local(&mut self) {
-          // grab the first namespace (they should all be the same)
-          if !self.is_empty() {
-              let adds_ro = self.clone();
-              let ns = &vec![adds_ro.inner().keys().next().unwrap().namespace.clone()];
-              let adds_m = self.make_mut();
-              for entry in adds_m.values_mut() {
-                  match &mut entry.definition {
-                      dict::Definition::Axiom(_) => {}
-                      dict::Definition::Derived(ref mut d) => {
-                          adds_ro.resolve_all(d, ns);
-                      }
-                  }
-                  if let Some(e) = entry.examples.as_mut() {
-                      adds_ro.resolve_all(e, ns);
-                  }
-              }
-          } else {
-              println!("Warning: empty local module")
-          }
-      }
-
-      /// Find the word in the dictionary in one of the given
-      /// namespaces. The first match is returned, or None if no matches.
-      fn resolve_word(&self, w: &mut Word, namespaces: &[dict::Namespace]) {
-          // if the word is already namespaced we're done
-          if w.namespace.is_none() {
-              for namespace in namespaces.iter().cloned() {
-                  w.namespace = namespace;
-                  if self.contains_key(w) {
-                      return;
-                  }
-              }
-              // no match found, clear the namespace
-              w.namespace = Default::default();
-          }
-      }
-
-      /// Resolves all the words in the given program
-      /// (recursively). Uses the given namespaces as possible
-      /// resolution targets.
-      pub fn resolve_all(&self, p: &mut coll::List, namespaces: &Vec<Namespace>) {
-          let p = p.make_mut();
-          for item in p.iter_mut() {
-              match item {
-                  Item::Word(w) => {
-                      self.resolve_word(w, namespaces);
-                  }
-                  Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(ref mut l))) => {
-                      self.resolve_all(l, namespaces);
-                  }
-                  Item::Receptacle(coll::Receptacle::Sized(coll::Sized::List(ref mut l))) => {
-                      self.resolve_all(l, namespaces);
-                  }
-                  Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
-                      assoc::Associative::Assoc(_),
-                  ))) => {}
-                  _ => {}
-              }
-          }
-      }
-
-      /// Given an [Item] and a Dictionary, resolve what [Namespace] it is
-      /// referring to - it's either a hash already, or it's a [Word] (an
-      /// alias), otherwise an error is returned. If it's a [Word], we
-      /// look it up in the dictionary to see if it's an existing alias,
-      /// if so, we return the value of that alias. If it's a hash, we
-      /// don't check to see if it's valid, we just return it in
-      /// [Namespace] form.
-      pub fn resolve_ns(&self, i: Item) -> Result<Namespace, Error> {
-          match i {
-              Item::Word(mut w) => {
-                  w.namespace = MODULE_NAMESPACE.clone();
-                  match self.get(&w) {
-                      Some(e) => Ok(e.get_namespace_info()),
-                      None => Err(Error::create(
-                          list!("resolve"),
-                          "module not found",
-                          Some(Item::Word(w)),
-                      )),
-                  }
-              }
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(b))) => Ok(bytes_to_ns(b)),
-              Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(b))) => Ok(bytes_to_ns(b)),
-              i => Err(Error::expected("module", i)),
-          }
-      }
-
       /// Takes a core module (in string form - should contain a series
       /// of word definitions, not wrapped in a single list), and
       /// inserts all the definitions into the dictionary, with an
       /// optional namespace.
-      pub fn insert_core_module(&mut self, lexicon: String, namespace: Namespace) {
+      pub fn insert_core_module(&mut self, lexicon: String) {
+          //println!("Parsing: {}", lexicon);
           let items = serialize::parse(lexicon).unwrap();
           for r in Box::new(items.inner().into_iter()) {
               let (k, def): (assoc::KeyItem, Item) = r.try_into().unwrap();
-              let mut word: Word = k.try_into().unwrap();
+              let word: Word = k.try_into().unwrap();
 
-              word.namespace = namespace.clone();
               let iter: Box<dyn Iterator<Item = Item>> = def.try_into().unwrap();
               let new_entry: dict::Entry = iter.try_into().unwrap();
               let new_entry2 = new_entry.clone();
@@ -2542,32 +2482,6 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
-      /// Creates a module alias in the dictionary, under the "module"
-      /// namespace. The value is inserted as a specially formed word
-      /// "definition". If there is already a value for the given key,
-      /// it cannot be overwritten with a new value, for security
-      /// reasons.
-      pub fn insert_module_alias(
-          &mut self,
-          mut alias: Word,
-          module_hash: Bytes,
-      ) -> Result<Word, Error> {
-          alias.namespace = dict::MODULE_NAMESPACE.clone();
-          let d = self.make_mut();
-          let e = Entry::from(dict::bytes_to_ns(module_hash.clone()));
-          //println!("Adding alias {:?} -> {:?}", alias, e);
-          let existing = d.get(&alias);
-          if existing.is_some() && existing != Some(&e) {
-              return Err(Error::create(
-                  list!("module-alias"),
-                  "Module alias already exists, overwriting is not allowed",
-                  Some(list!(alias, existing.unwrap().clone())),
-              ));
-          };
-          d.insert(alias.clone(), e);
-          Ok(alias)
-      }
-
       /// For stdlib words that are both built-in and part of a module
       /// that isn't necessarily loaded as part of the standard
       /// environment, we need to be able to link the word to its rust
@@ -2589,13 +2503,6 @@ internally, to keep track of things like the stack, program, lists etc.
               });
           }
       }
-  }
-
-  // Each word should run a program that calls fail (already namespaced
-  // to the stdlib so that the word acts like it isn't in the dictionary
-  // even though it is.)
-  fn make_deletes(_: Vec<Word>) -> Vec<(Word, dict::Entry)> {
-      Vec::new()
   }
 
   /// Returns the differences between two hashmaps, including the keys
@@ -2807,22 +2714,24 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 #+end_src
 **** Environment types
-#+begin_src rust :tangle src/types/environment.rs :mkdirp yes
+#+begin_src rust :tangle src/types/container/environment.rs :mkdirp yes
+  //! Functionality of a kcats execution environment.
+  use super::{associative as assoc, dictionary as dict};
   use crate::axiom;
-  use crate::crypto;
   use crate::list;
-  use crate::module_map;
   use crate::serialize;
+  use crate::types::container as coll;
   use crate::types::number::Number;
   use crate::types::*;
-  use crate::types::{associative as assoc, collection as coll, dictionary as dict};
-  use directories::ProjectDirs;
+  use once_cell::sync::Lazy;
   use std::future;
   use std::ops::Range;
 
-  use super::dict::MODULE_NAMESPACE;
-
-  #[derive(Clone, PartialEq, Default)]
+  /// A struct to hold the state of an executing kcats program. The
+  /// `stack` is the data being manipulated, the `program` is program
+  /// remaining to be executed, and the `dictionary` is the set of
+  /// functions available to the program.
+  #[derive(Clone, PartialEq)]
   pub struct Environment {
       pub stack: Stack,
       pub program: Stack,
@@ -2830,66 +2739,42 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl Environment {
-      pub fn standard() -> Environment {
-          let mut env = Environment::default();
-          env.load_core_modules()
-              .expect("failed to load core modules");
-          env.push(list!(
-              "errors",
-              "environment-builtins",
-              "encode",
-              "sets-builtins",
-              "time",
-              "pipes",
-              "methods",
-              "generators",
-              "template",
-              "environment" // END default namespace
-          ));
-          env.program.append(list!(
-              list!("decache", coll::List::default(), "swap", "inscribe", "drop"),
-              "step"
-          ));
-          env.import_stdlib_module_map();
-
-          // There's a problem here: the builtins need to be added in a
-          // way that they don't get overwritten. They may need to get
-          // added piece by piece, somehow. Perhaps a hashmap that we
-          // can lookup values in as words get loaded, and specify
-          // they're builtin somehow (maybe [builtin yes], but just not
-          // having definition would also do it)
-          env.dictionary.add_builtins();
-          let env = futures::executor::block_on(async move { axiom::eval(env).await });
-          //print!("Env: {:?}", env.dictionary);
-          env
-      }
-
+      /// Push the [Item] onto the top of the stack.
       pub fn push<T: Into<Item>>(&mut self, i: T) {
           coll::Arc::make_mut(&mut self.stack).push_front(i.into());
       }
 
+      /// Pop the top [Item] from the stack, panicking if the stack is
+      /// empty.
       pub fn pop(&mut self) -> Item {
           coll::Arc::make_mut(&mut self.stack).pop_front().unwrap()
       }
 
-      /// Pushes one item onto the front of the expression (so that it
-      /// executes first)
-      pub fn push_expr(&mut self, i: Item) {
+      /// Pushes one item onto the front of the program (so that it
+      /// executes first).
+      pub fn push_prog(&mut self, i: Item) {
           coll::Arc::make_mut(&mut self.program).push_front(i);
       }
 
-      pub fn pop_expr(&mut self) -> Item {
+      /// Pops an [Item] from the front of the program.
+      pub fn pop_prog(&mut self) -> Item {
           coll::Arc::make_mut(&mut self.program).pop_front().unwrap()
       }
 
+      /// Returns a reference to the top stack [Item], or [None] if it's
+      /// empty.
       pub fn tos(&self) -> Option<&Item> {
           self.stack.front()
       }
 
+      /// Returns the length of this struct (as an associative
+      /// structure), which is constant.
       pub fn len(&self) -> usize {
           3 // 3 fields
       }
 
+      /// Treats the [Environment] as an associative structure,
+      /// returning one of its fields, or [None].
       pub fn get(&self, key: &str) -> Option<Item> {
           match key {
               "stack" => Some(self.stack.clone().into()),
@@ -2899,12 +2784,19 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
+      /// Returns true if the [Environment] contains the given key,
+      /// which is only true for its fixed fields.
       pub fn contains_key(&self, key: &assoc::KeyItem) -> bool {
           Word::try_from(key.clone()).map_or(false, |ref w| {
               matches!(w.into(), "stack" | "program" | "dictionary")
           })
       }
 
+      /// Inserts the key/value into the [Environment]. If the key is
+      /// not one of its fixed fields, return a demoted
+      /// [assoc::Associative] value that's more generic and supports
+      /// any key. Also optionally return any old value that might get
+      /// overwritten.
       pub fn insert(mut self, k: assoc::KeyItem, v: Item) -> (assoc::Associative, Option<Item>) {
           match k {
               assoc::KeyItem::Word(ref w) => {
@@ -2970,71 +2862,51 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
-      fn import_stdlib_module_map(&mut self) {
-          let modmap = module_map::module_hashes();
-          let d = self.dictionary.make_mut();
-
-          for (alias, hash) in modmap.into_iter() {
-              //namespace the alias
-              let mut alias_word: Word = alias.into();
-              alias_word.namespace = MODULE_NAMESPACE.clone();
-              d.insert(alias_word, dict::Entry::from(dict::bytes_to_ns(hash)));
-          }
-      }
-
       /// Reads a stdlib module and updates the dictionary.
-      pub fn load_builtin_module(
-          &mut self,
-          module_alias: Word,
-          is_namespaced: bool,
-      ) -> Result<(), Error> {
-          let module_hash = self.dictionary.resolve_ns(module_alias.clone().into())?;
-          let module_content = read_module(module_alias, dict::ns_to_bytes(module_hash.clone()))?;
-          self.dictionary
-              .insert_core_module(String::from_utf8(module_content)?, {
-                  if is_namespaced {
-                      module_hash
-                  } else {
-                      None
-                  }
-              });
-          Ok(())
+      pub fn load_builtin_module(&mut self, module_alias: Word) -> Result<(), Error> {
+          self.push(module_alias);
+          axiom::read_blob(self)
       }
 
+      /// Loads the core modules as part of preparing a standard
+      /// environment.
       fn load_core_modules(&mut self) -> Result<(), Error> {
           // Assuming /project/core/ is in your project's root directory and part of the source
           let files: Vec<&[u8]> = vec![
-              include_bytes!("../kcats/core/stack-builtins.kcats"),
-              include_bytes!("../kcats/core/motion-builtins.kcats"),
-              include_bytes!("../kcats/core/compare-builtins.kcats"),
-              include_bytes!("../kcats/core/math-builtins.kcats"),
-              include_bytes!("../kcats/core/boolean-builtins.kcats"),
-              include_bytes!("../kcats/core/serialize-builtins.kcats"),
-              include_bytes!("../kcats/core/encode-builtins.kcats"),
-              include_bytes!("../kcats/core/strings-builtins.kcats"),
-              include_bytes!("../kcats/core/errors-builtins.kcats"),
-              include_bytes!("../kcats/core/pipes-builtins.kcats"),
-              include_bytes!("../kcats/core/stack.kcats"),
-              include_bytes!("../kcats/core/motion.kcats"),
-              include_bytes!("../kcats/core/collections-builtins.kcats"),
-              include_bytes!("../kcats/core/execute-builtins.kcats"),
-              include_bytes!("../kcats/core/execute.kcats"),
-              include_bytes!("../kcats/core/dictionary-builtins.kcats"),
-              include_bytes!("../kcats/core/math.kcats"),
-              include_bytes!("../kcats/core/compare.kcats"),
-              include_bytes!("../kcats/core/collections.kcats"),
-              include_bytes!("../kcats/core/associations-builtins.kcats"),
-              include_bytes!("../kcats/core/associations.kcats"),
-              include_bytes!("../kcats/core/dictionary.kcats"), // END core libs
+              include_bytes!("../../kcats/core/stack-builtins.kcats"),
+              include_bytes!("../../kcats/core/motion-builtins.kcats"),
+              include_bytes!("../../kcats/core/compare-builtins.kcats"),
+              include_bytes!("../../kcats/core/math-builtins.kcats"),
+              include_bytes!("../../kcats/core/boolean-builtins.kcats"),
+              include_bytes!("../../kcats/core/serialize-builtins.kcats"),
+              include_bytes!("../../kcats/core/encode-builtins.kcats"),
+              include_bytes!("../../kcats/core/strings-builtins.kcats"),
+              include_bytes!("../../kcats/core/errors-builtins.kcats"),
+              include_bytes!("../../kcats/core/pipes-builtins.kcats"),
+              include_bytes!("../../kcats/core/stack.kcats"),
+              include_bytes!("../../kcats/core/motion.kcats"),
+              include_bytes!("../../kcats/core/collections-builtins.kcats"),
+              include_bytes!("../../kcats/core/execute-builtins.kcats"),
+              include_bytes!("../../kcats/core/execute.kcats"),
+              include_bytes!("../../kcats/core/dictionary-builtins.kcats"),
+              include_bytes!("../../kcats/core/math.kcats"),
+              include_bytes!("../../kcats/core/compare.kcats"),
+              include_bytes!("../../kcats/core/collections.kcats"),
+              include_bytes!("../../kcats/core/associations-builtins.kcats"),
+              include_bytes!("../../kcats/core/associations.kcats"),
+              include_bytes!("../../kcats/core/dictionary.kcats"),
+              include_bytes!("../../kcats/core/environment-builtins.kcats"),
+              include_bytes!("../../kcats/core/environment.kcats"),
           ];
 
           for &file_contents in &files {
               let lexicon = String::from_utf8_lossy(file_contents).into_owned();
-              self.dictionary.insert_core_module(lexicon, None);
+              self.dictionary.insert_core_module(lexicon);
           }
           Ok(())
       }
 
+      /// Returns an error if the stack isn't at least `min_depth` deep.
       fn check_stack_depth(&self, min_depth: usize) -> Result<(), Error> {
           //println!("Checking stack has at least {} items", min_depth);
           if self.stack.len() < min_depth {
@@ -3044,6 +2916,7 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
+      /// Returns an error if the stack doesn't match the given input spec.
       pub fn check_input_spec(&self, specs: &dict::StackSpec) -> Result<(), Error> {
           self.check_stack_depth(specs.len())?;
           let indexes = Range {
@@ -3059,7 +2932,66 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  impl Default for Environment {
+      /// Returns the default environment, which is the "standard"
+      /// environment. It loads some standard libraries and core
+      /// functions. The environment is only built once and memoized.
+      fn default() -> Self {
+          static INST: Lazy<Environment> = Lazy::new(|| {
+              let mut env = Environment {
+                  dictionary: coll::Arc::wrap(HashMap::new()),
+                  stack: Default::default(),
+                  program: Default::default(),
+              };
+              env.load_core_modules()
+                  .expect("failed to load core modules");
+              env.push(list!(
+                  "errors",
+                  "environment-builtins",
+                  "encode",
+                  "sets-builtins",
+                  "time",
+                  "pipes",
+                  "methods",
+                  "generators",
+                  "template",
+                  "debug" // END default namespace
+              ));
+
+              // Here we can no longer modify our own dictionary, so
+              // here's what we do instead, we build a new dictionary
+              // and leave it on the stack. Then when finished we grab
+              // it at the end of this function.
+              env.program.append(list!(
+                  "dictionary",
+                  "swap",
+                  list!("decache", "string", "read", "shielddown"),
+                  "step"
+              ));
+
+              // There's a problem here: the builtins need to be added in a
+              // way that they don't get overwritten. They may need to get
+              // added piece by piece, somehow. Perhaps a hashmap that we
+              // can lookup values in as words get loaded, and specify
+              // they're builtin somehow (maybe [builtin yes], but just not
+              // having definition would also do it)
+              env.dictionary.add_builtins();
+              let mut env = futures::executor::block_on(async move { axiom::eval(env).await });
+              //print!("Env: {:?}", env);
+              let mut dict: dict::Dictionary = env.pop().try_into().unwrap();
+              dict.add_builtins();
+              env.dictionary = dict;
+              env
+          });
+          INST.clone()
+      }
+  }
+
+  /// Returns an error if the [Item] is not of the type specified by
+  /// [Word] `w`. This allows specs to have their own little type
+  /// hierarchy, eg, `integer` is a `number`, `list` is a `sized` etc.
   fn check_type(i: &Item, w: &Word) -> Result<(), Error> {
+      //println!("Check {:?} is {:?}", w, i);
       match (w, i) {
           (w, _) if *w == *S_ITEM => Ok(()),
           (w, Item::Dispenser(_) | Item::Receptacle(_)) if *w == *S_DISPENSER => Ok(()),
@@ -3112,6 +3044,16 @@ internally, to keep track of things like the stack, program, lists etc.
 
           (
               w,
+              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
+                  assoc::Associative::Dictionary(_),
+              )))
+              | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(
+                  assoc::Associative::Dictionary(_),
+              ))),
+          ) if *w == *S_DICTIONARY => Ok(()),
+
+          (
+              w,
               Item::Dispenser(coll::Dispenser::Sized(_))
               | Item::Receptacle(coll::Receptacle::Sized(_)),
           ) if *w == *S_SIZED || *w == *S_ORDERED => Ok(()),
@@ -3129,39 +3071,6 @@ internally, to keep track of things like the stack, program, lists etc.
               //println!("Type check failed! wanted {} got {:?}", w, i);
               Err(Error::expected(w.into(), i.clone()))
           }
-      }
-  }
-
-  pub fn read_blob(alias: &Word) -> Result<Bytes, Error> {
-      if let Some(proj_dirs) = ProjectDirs::from("org", "skyrod", "kcats") {
-          let data_dir = proj_dirs.data_dir();
-
-          let std_path = data_dir.join("stdlib");
-
-          // Look up the file
-          if std_path.exists() && std_path.is_dir() {
-              let file = std_path.join(format!("{}.kcats", alias));
-              Ok(std::fs::read(file)?)
-          } else {
-              Err(Error::expected("stdlibdir", None::<Item>))
-          }
-      } else {
-          Err(Error::expected("stdlibdir", None::<Item>))
-      }
-  }
-
-  /// Reads the module from the data cache and verifies its hash matches
-  pub fn read_module(alias: Word, expected_hash: Bytes) -> Result<Bytes, Error> {
-      let contents = read_blob(&alias)?;
-      let actual_hash = crypto::hash_bytes(contents.clone())?;
-      if actual_hash == expected_hash {
-          Ok(contents)
-      } else {
-          Err(Error::create(
-              list!(expected_hash, "="),
-              format!("{} module integrity check failed", alias).as_str(),
-              Some(actual_hash),
-          ))
       }
   }
 
@@ -3183,13 +3092,10 @@ internally, to keep track of things like the stack, program, lists etc.
                   continue;
               }
           }
-          let mut env = Environment::standard();
+          let mut env = Environment::default();
           env.stack = stack.unwrap_or_default();
           env.program = program.unwrap_or_default();
-          if let Some(d) = dictionary {
-              let edmut = env.dictionary.make_mut();
-              edmut.extend(d.inner());
-          }
+          env.dictionary = dictionary.unwrap_or_else(|| Environment::default().dictionary);
           Ok(env)
       }
   }
@@ -3240,13 +3146,270 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 #+end_src
+**** Hash-based object cache
+We will need to be able to fetch binary data via its hash, or a local
+name. This will supplement the database, by storing larger objects
+directly in the filesystem, which is more efficient. But it can also
+be used by the kcats module system even if the optional database
+feature is disabled. When the database is enabled, hashes or local
+aliases can be stored in the db as values and then once those are
+retrieved, the actual contents can be retrieved via the
+cache. Currently there is no disk space management, so the cache grows
+unbounded. 
+
+We also want to pre-populate some cache items at build time
+(some of the standard libraries), so we make the cache a separate
+crate so we can use it at both build time and runtime.
+
+#+begin_src toml :tangle cache/Cargo.toml :mkdirp yes
+  [package]
+  name = "cache"
+  version = "0.1.0"
+  edition = "2021"
+
+  [dependencies]
+  base64 = "0.13.0"
+  sha2 = {version="0.10.6", features=["std"]}
+  directories = "5.0"
+
+  [dependencies.uuid]
+  version = "1.6.1"
+  features = [
+      "v4",                # Lets you generate random UUIDs
+      "v7",
+      "fast-rng",          # Use a faster (but still sufficiently random) RNG
+  ]
+#+end_src
+
+#+begin_src rust :tangle cache/src/lib.rs :mkdirp yes
+  pub mod cache {
+      use base64::URL_SAFE_NO_PAD;
+      use directories::ProjectDirs;
+      use io::Error;
+      use sha2::Sha256;
+      use sha2::{self, Digest};
+      use std::fs::{self, File};
+      use std::io::{self, Read, Write};
+      use std::io::{BufReader, BufWriter};
+      use std::path::{Path, PathBuf};
+      use uuid::Uuid;
+
+      type Bytes = Vec<u8>;
+
+      pub enum Key {
+          Hash(Bytes),
+          Alias(String),
+      }
+
+      impl Key {
+          pub fn get(&self) -> Result<Bytes, Error> {
+              if let Some(proj_dirs) = ProjectDirs::from("org", "skyrod", "kcats") {
+                  let data_dir = proj_dirs.data_dir();
+
+                  let cache_path = data_dir.join("cache");
+
+                  // Look up the file
+                  if cache_path.exists() && cache_path.is_dir() {
+                      let filename = match self {
+                          Key::Hash(hash) => base64::encode_config(hash, base64::URL_SAFE_NO_PAD),
+                          Key::Alias(word) => word.to_string(),
+                      };
+
+                      let file = cache_path.join(filename);
+                      //println!("Reading cache file {:?}", file);
+                      let mut content = Bytes::new();
+                      fetch_link(file.as_path())?.read_to_end(&mut content)?;
+                      Ok(content)
+                  } else {
+                      Err(Error::new(io::ErrorKind::Other, "Cache dir not found"))
+                  }
+              } else {
+                  Err(Error::new(io::ErrorKind::Other, "Cache data dir not found"))
+              }
+          }
+      }
+
+      pub fn put(content: &Bytes, alias: Option<String>) -> Result<Bytes, Error> {
+          if let Some(proj_dirs) = ProjectDirs::from("org", "skyrod", "kcats") {
+              let data_dir = proj_dirs.data_dir();
+
+              let cache_path = data_dir.join("cache");
+
+              // Look up the file
+              if cache_path.exists() && cache_path.is_dir() {
+                  let hash = sha2::Sha256::digest(&content);
+                  let hashfilename = base64::encode_config(hash, base64::URL_SAFE_NO_PAD);
+                  let target = cache_path.join(hashfilename.clone());
+                  // only write the file if it doesn't exist
+                  if !target.exists() {
+                      std::fs::write(target.clone(), content)?;
+                  }
+
+                  // Create the alias if necessary
+                  if let Some(alias) = alias {
+                      let alias_path = cache_path.join(PathBuf::from(alias.to_string()));
+                      create_link(Path::new(&hashfilename), alias_path.as_path())?;
+                  }
+                  Ok(hash.to_vec())
+              } else {
+                  Err(Error::new(io::ErrorKind::Other, "Cache dir not found"))
+              }
+          } else {
+              Err(Error::new(io::ErrorKind::Other, "Cache data dir not found"))
+          }
+      }
+
+      enum Link {
+          Manual,
+          Symlink,
+      }
+
+      pub fn put_from_path(path: &Path, alias: Option<String>) -> Result<Bytes, Error> {
+          if let Some(proj_dirs) = ProjectDirs::from("org", "skyrod", "kcats") {
+              let data_dir = proj_dirs.data_dir();
+              let cache_path = data_dir.join("cache");
+
+              // Ensure the cache directory exists
+              if !cache_path.exists() {
+                  fs::create_dir_all(&cache_path)?;
+              }
+
+              let unique_temp_file = format!("temp_{}", Uuid::new_v4()); // Generate a unique temporary filename
+              let temp_file_path = cache_path.join(unique_temp_file);
+              let file = File::open(path)?;
+              let mut reader = BufReader::new(file);
+              let mut hasher = Sha256::new();
+              let mut buffer = [0u8; 4096]; // 4 KiB buffer
+              let mut writer = BufWriter::new(File::create(&temp_file_path)?);
+
+              // Read, hash, and write in chunks
+              loop {
+                  let count = reader.read(&mut buffer)?;
+                  if count == 0 {
+                      break;
+                  }
+                  hasher.update(&buffer[..count]);
+                  writer.write_all(&buffer[..count])?;
+              }
+              writer.flush()?;
+
+              // Compute the final hash and rename the file according to the hash
+              let hash = hasher.finalize();
+              let file_name = base64::encode_config(&hash, URL_SAFE_NO_PAD);
+              let final_path = cache_path.join(file_name.clone());
+
+              // Move to final destination, overwriting anything there
+              fs::rename(temp_file_path.clone(), final_path.clone())?;
+              // Create the alias if necessary
+
+              if let Some(alias) = alias {
+                  let alias_path = cache_path.join(alias);
+                  let target_path = Path::new(".").join(file_name);
+                  create_link(&target_path, &alias_path)?;
+              }
+              Ok(hash.to_vec())
+          } else {
+              Err(io::Error::new(
+                  io::ErrorKind::NotFound,
+                  "Failed to locate project directory.",
+              ))
+          }
+      }
+
+      /// Determines the appropriate link type based on the operating system.
+      fn get_link_type() -> Link {
+          if cfg!(target_os = "linux") || cfg!(target_os = "macos") || cfg!(target_os = "windows") {
+              Link::Symlink
+          } else if cfg!(target_os = "android") || cfg!(target_os = "ios") {
+              Link::Manual
+          } else {
+              panic!("Unsupported operating system for linking");
+          }
+      }
+
+      /// Creates a link based on the specified link type.
+      ///
+      /// # Arguments
+      /// * `target` - The target file or directory to link to.
+      /// * `link_name` - The name of the symlink or link file to create.
+      ///
+      /// # Returns
+      /// A `Result` indicating success or failure.
+      fn create_link(target: &Path, link_name: &Path) -> io::Result<()> {
+          println!("Creating link from {:?} to {:?}", link_name, target);
+
+          if link_name.exists() {
+              fs::remove_file(link_name)?;
+          }
+
+          match get_link_type() {
+              Link::Symlink => {
+                  #[cfg(unix)]
+                  std::os::unix::fs::symlink(target, link_name)?;
+
+                  #[cfg(windows)]
+                  {
+                      if target.is_dir() {
+                          fs::os::windows::fs::symlink_dir(target, link_name)?
+                      } else {
+                          fs::os::windows::fs::symlink_file(target, link_name)?
+                      }
+                  }
+              }
+
+              Link::Manual => {
+                  let mut link_file = File::create(link_name)?;
+                  let path = target.canonicalize()?;
+                  let target_path = path.to_str().ok_or(Error::new(
+                      io::ErrorKind::Other,
+                      "Failed to convert path to string",
+                  ))?;
+                  writeln!(link_file, "{}", target_path)?;
+              }
+          }
+          Ok(())
+      }
+
+      /// Fetches the target of a link.
+      ///
+      /// # Arguments
+      /// * `link_name` - The link file or symlink to fetch.
+      ///
+      /// # Returns
+      /// A `Result` containing the target `File`.
+      fn fetch_link(link_name: &Path) -> io::Result<File> {
+          match get_link_type() {
+              Link::Symlink => File::open(link_name),
+              Link::Manual => {
+                  let mut link_file = File::open(link_name)?;
+                  let mut target_path = String::new();
+                  link_file.read_to_string(&mut target_path)?;
+                  File::open(target_path)
+              }
+          }
+      }
+
+      /// Deletes a link.
+      ///
+      /// # Arguments
+      /// * `link_name` - The link file or symlink to delete.
+      ///
+      /// # Returns
+      /// A `Result` indicating success or failure.
+      #[allow(dead_code)]
+      fn delete_link(link_name: &Path) -> io::Result<()> {
+          fs::remove_file(link_name)
+      }
+  }
+#+end_src
 **** Cryptographic primitives
 We'll implement certain cryptography functions in rust and make kcats
 words for them (hashing, encryption, signing)
 #+begin_src rust :tangle src/crypto.rs :mkdirp yes
   use crate::axiom::ItemResult;
+  use crate::types::container::{associative as assoc, error::Error};
   use crate::types::number::Int;
-  use crate::types::{associative as assoc, error::Error, Bytes, Item};
+  use crate::types::{Bytes, Item};
   use core::ops::Deref;
   use ed25519_dalek as signing;
   use ed25519_dalek::{Signer, Verifier};
@@ -3254,7 +3417,7 @@ words for them (hashing, encryption, signing)
   use rand::RngCore as RandRngCore;
   use rand_core::{CryptoRng, RngCore};
   use sha2::{self, Digest}; // Import RngCore for the fill_bytes method
-  use std::io;
+
   pub fn hash(i: Item) -> ItemResult {
       let b = Bytes::try_from(i).unwrap();
       Ok(sha2::Sha256::digest(b).deref().to_vec().into())
@@ -3296,13 +3459,14 @@ words for them (hashing, encryption, signing)
       }
   }
 
-  pub fn hash_bytes(contents: Vec<u8>) -> io::Result<Vec<u8>> {
+  #[allow(dead_code)]
+  pub fn hash_bytes(contents: &Vec<u8>) -> Vec<u8> {
       let mut hasher = sha2::Sha256::new();
       //let mut buffer = [0; 1024]; // Read in chunks of 1024 bytes
       let count = contents.len();
       hasher.update(&contents[..count]);
 
-      Ok(hasher.finalize().to_vec())
+      hasher.finalize().to_vec()
   }
 
   impl CryptoRng for SeededRNG {}
@@ -3404,19 +3568,27 @@ words for them (hashing, encryption, signing)
 We'll define how kcats data structure are parsed and written (for
 example, in order to read/write to/from disk).
 #+begin_src rust :tangle src/serialize.rs :mkdirp yes
-  extern crate edn_format;
-  use crate::types::environment::Environment;
+  //! Serializes and parses kcats data. kcats serialization is inspired
+  //! by Joy, and implemented as a subset of edn (where only vector
+  //! containers from edn are used, no lists, maps or sets). Currently
+  //! one custom tag is used for encoding byte arrays, but this is
+  //! subject to change.
+  use crate::types::container::{
+      self as coll, associative as assoc, environment::Environment, error::Error,
+  };
   use crate::types::number::Number;
-  use crate::types::{associative as assoc, collection as coll, error::Error, *};
+  use crate::types::*;
   use std::collections::VecDeque;
   use std::fmt;
   use std::string;
+
   pub trait Display {
       fn representation(&self) -> Item;
   }
 
   const BYTE_TAG: &str = "b64";
 
+  /// Parses a serialized value into an [Item].
   fn to_item(item: &edn_format::Value) -> Result<Item, Error> {
       //println!("to item {:?}", item);
       match item {
@@ -3452,33 +3624,18 @@ example, in order to read/write to/from disk).
       }
   }
 
-  /// Serializes the item deterministically. Certain data is lost in
-  /// serialization: The type of container (sets/maps/lists all are
-  /// serialized as vectors), namespaced words (the namespace is not
-  /// kept)
-  pub fn from_item(item: &Item) -> edn_format::Value {
-      match item {
-          // dictionaries are big and it's ugly to print them for
-          // environments.
-          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
-              assoc::Associative::Dictionary(_),
-          ))) => edn_format::Value::Symbol(edn_format::Symbol::from_name("dictionary_redacted")),
-          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
-              assoc::Associative::Env(e),
-          ))) => from_item(&e.representation()),
-          Item::Number(Number::Int(i)) => edn_format::Value::Integer(*i),
-          Item::Number(Number::Float(f)) => edn_format::Value::from(*f),
-          Item::Char(c) => edn_format::Value::Character(*c),
-          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(s))) => {
-              edn_format::Value::String(s.to_string())
+  fn from_sized(s: &coll::Sized) -> edn_format::Value {
+      match s {
+          coll::Sized::Associative(assoc::Associative::Dictionary(_)) => {
+              edn_format::Value::Symbol(edn_format::Symbol::from_name("dictionary_redacted"))
           }
-          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(bs))) => {
-              edn_format::Value::TaggedElement(
-                  edn_format::Symbol::from_name("b64"),
-                  Box::new(edn_format::Value::String(base64::encode(bs))),
-              )
-          }
-          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(a))) => {
+          coll::Sized::Associative(assoc::Associative::Env(e)) => from_item(&e.representation()),
+          coll::Sized::String(s) => edn_format::Value::String(s.to_string()),
+          coll::Sized::Bytes(bs) => edn_format::Value::TaggedElement(
+              edn_format::Symbol::from_name("b64"),
+              Box::new(edn_format::Value::String(base64::encode(bs))),
+          ),
+          coll::Sized::Associative(a) => {
               let mut av = a
                   .clone()
                   .into_iter()
@@ -3490,54 +3647,38 @@ example, in order to read/write to/from disk).
                       .collect::<Vec<edn_format::Value>>(),
               )
           }
-          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Set(s))) => {
+          coll::Sized::Set(s) => {
               let mut v = s.inner().into_iter().collect::<Vec<assoc::KeyItem>>();
               v.sort();
               edn_format::Value::Vector(v.into_iter().map(|ki| from_item(&Item::from(ki))).collect())
           }
-          Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Set(s))) => {
-              let mut v = s.inner().into_iter().collect::<Vec<assoc::KeyItem>>();
-              v.sort();
-              edn_format::Value::Vector(v.into_iter().map(|ki| from_item(&Item::from(ki))).collect())
-          }
-          Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(a))) => {
-              let mut av = a
-                  .clone()
-                  .into_iter()
-                  .collect::<Vec<(assoc::KeyItem, Item)>>();
-              av.sort_by(|(ka, _), (kb, _)| ka.cmp(kb));
-              edn_format::Value::Vector(
-                  av.into_iter()
-                      .map(|i| from_item(&i.into()))
-                      .collect::<Vec<edn_format::Value>>(),
-              )
-          }
-
-          Item::Receptacle(coll::Receptacle::Sized(coll::Sized::String(s))) => {
-              edn_format::Value::String(s.to_string())
-          }
-          Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(bs))) => {
-              edn_format::Value::TaggedElement(
-                  edn_format::Symbol::from_name("b64"),
-                  Box::new(edn_format::Value::String(base64::encode(bs))),
-              )
-          }
-
-          Item::Dispenser(coll::Dispenser::Sized(v)) => edn_format::Value::Vector(
+          v => edn_format::Value::Vector(
               v.clone()
                   .into_iter()
                   .map(|i| from_item(&i))
                   .collect::<Vec<edn_format::Value>>(),
           ),
-          Item::Receptacle(coll::Receptacle::Sized(v)) => {
-              from_item(&Item::Dispenser(coll::Dispenser::Sized(v.clone())))
-          }
+      }
+  }
+
+  /// Serializes the item deterministically. Certain data is lost in
+  /// serialization, including the type of container (sets/maps/lists
+  /// all are serialized as vectors)
+  pub fn from_item(item: &Item) -> edn_format::Value {
+      match item {
+          // dictionaries are big and it's ugly to print them for
+          // environments.
+          Item::Number(Number::Int(i)) => edn_format::Value::Integer(*i),
+          Item::Number(Number::Float(f)) => edn_format::Value::from(*f),
+          Item::Char(c) => edn_format::Value::Character(*c),
           Item::Word(w) => edn_format::Value::Symbol(edn_format::Symbol::from_name(w.into())),
           //Item::Entry(w) => edn_format::Value::Symbol(edn_format::Symbol::from_name(&w.word)),
           Item::Dispenser(coll::Dispenser::Out(o)) => from_item(&o.representation()),
           Item::Dispenser(coll::Dispenser::Tunnel(t)) => from_item(&t.representation()),
           Item::Receptacle(coll::Receptacle::In(i)) => from_item(&i.representation()),
           Item::Receptacle(coll::Receptacle::Tunnel(t)) => from_item(&t.representation()),
+          Item::Dispenser(coll::Dispenser::Sized(s)) => from_sized(s),
+          Item::Receptacle(coll::Receptacle::Sized(s)) => from_sized(s),
       }
   }
 
@@ -3780,23 +3921,22 @@ example, in order to read/write to/from disk).
 *** Builtin words
 We'll define some words as axioms (not in terms of other words, only defined in Rust). 
 #+begin_src rust :tangle src/axiom.rs :mkdirp yes
+  //! All the core functions of kcats: Words that are implemented in
+  //! rust, instead of in terms of other kcats words.
   use crate::list;
-  use crate::pipes;
-  #[cfg(feature = "database")]
-  use crate::pipes::db;
   use crate::serialize;
-  use crate::types::associative as assoc;
-  use crate::types::collection as coll;
-  use crate::types::dictionary as dict;
-  use crate::types::environment::Environment;
-  use crate::types::error::Error;
+  #[cfg(feature = "database")]
+  use crate::types::container::pipe::db;
+  use crate::types::container::{
+      self as coll, associative as assoc, dictionary as dict, environment::Environment, error::Error,
+      pipe,
+  };
   use crate::types::number::{Float, Int, Number};
   use crate::types::*;
-  use core::ops::Deref;
+  use cache::cache;
   use dynfmt::{Format, SimpleCurlyFormat};
   use futures::future::FutureExt;
   use lazy_static::lazy_static;
-  use sha2::{self, Digest};
   use std::collections::HashMap;
   use std::collections::VecDeque;
   use std::convert::Infallible;
@@ -3820,6 +3960,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }
   }
 
+  /// A higher order function that executes a simpler function `f`,
+  /// where `f` takes a stack item and returns a [Result] of another
+  /// stack item.
   fn f_stack1<T, U, R>(f: fn(U) -> Result<T, R>) -> impl Fn(Environment) -> Future<Environment>
   where
       T: Into<Item>,
@@ -3837,7 +3980,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   let res = f(x);
                   match res {
                       Ok(r) => {
-                          env.pop_expr();
+                          env.pop_prog();
                           env.pop();
                           env.push(r.into());
                       }
@@ -3855,6 +3998,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }
   }
 
+  /// A higher order function that executes a simpler function `f`,
+  /// where `f` takes two stack items and returns a [Result] of another
+  /// stack item.
   fn f_stack2<T, U, V, R>(f: fn(U, V) -> Result<T, R>) -> impl Fn(Environment) -> Future<Environment>
   where
       T: Into<Item>,
@@ -3880,7 +4026,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   let res = f(y, x);
                   match res {
                       Ok(r) => {
-                          env.pop_expr();
+                          env.pop_prog();
                           env.pop();
                           env.pop();
                           env.push(r.into());
@@ -3901,6 +4047,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }
   }
 
+  /// A higher order function that executes a simpler function `f`,
+  /// where `f` takes 3 stack items and returns a [Result] of another
+  /// stack item.
   fn f_stack3<T, U, V, W, R>(
       f: fn(U, V, W) -> Result<T, R>,
   ) -> impl Fn(Environment) -> Future<Environment>
@@ -3934,7 +4083,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   let res = f(z, y, x);
                   match res {
                       Ok(r) => {
-                          env.pop_expr();
+                          env.pop_prog();
                           env.pop();
                           env.pop();
                           env.pop();
@@ -3967,7 +4116,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           let y = env.pop();
           Box::pin(f(x, y).map(|r| {
               if r.is_ok() {
-                  env.pop_expr();
+                  env.pop_prog();
               }
               env.push(Item::from(r));
               env
@@ -3977,7 +4126,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   /// Wrapper function that allows you to use the ? operator in your own
   /// functions. If that function returns an error result, it will
-  /// append that error to the env.
+  /// append that error to the env. The function `f` should return
+  /// either unit or an Error. If it returns an [Error] it will be
+  /// pushed onto the stack.
   fn f_result<F>(f: F) -> impl Fn(Environment) -> Future<Environment>
   where
       F: Fn(&mut Environment) -> Result<(), Error>,
@@ -4013,7 +4164,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           (">", Box::leak(Box::new(f_stack2(gt)))),
           (">=", Box::leak(Box::new(f_stack2(gte)))),
           ("abs", Box::leak(Box::new(f_stack1(abs)))),
-          ("alias", Box::leak(Box::new(f_result(alias_module)))),
           ("and", Box::leak(Box::new(f_stack2(and)))),
           ("animate", Box::leak(Box::new(animate))),
           ("assign", Box::leak(Box::new(f_stack3(assign)))),
@@ -4029,11 +4179,12 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ),
           (
               "attend",
-              Box::leak(Box::new(f_stack1(crate::pipes::channel::select))),
+              Box::leak(Box::new(f_stack1(crate::types::container::pipe::channel::select))),
           ),
           ("autoformat", Box::leak(Box::new(f_stack1(autoformat)))),
           ("branch", Box::leak(Box::new(branch))),
           ("bytes?", Box::leak(Box::new(f_stack1(is_bytes)))),
+          ("cache", Box::leak(Box::new(f_result(write_blob)))),
           ("clone", Box::leak(Box::new(clone))),
           ("contains?", Box::leak(Box::new(f_stack2(contains)))),
           ("ceiling", Box::leak(Box::new(f_stack1(ceiling)))),
@@ -4042,11 +4193,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("dec", Box::leak(Box::new(f_stack1(dec)))),
           ("decache", Box::leak(Box::new(f_result(read_blob)))),
           ("decide", Box::leak(Box::new(decide))),
-          ("define", Box::leak(Box::new(define))),
           ("decodejson", Box::leak(Box::new(f_stack1(decode_json)))),
           ("dip", Box::leak(Box::new(dip))),
           ("dictionary", Box::leak(Box::new(dictionary))),
-          ("dictmerge", Box::leak(Box::new(f_result(dictmerge)))),
           ("dipdown", Box::leak(Box::new(dipdown))),
           ("drop", Box::leak(Box::new(drop))),
           ("emit", Box::leak(Box::new(f_stack1(emit)))),
@@ -4068,14 +4217,14 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("evert", Box::leak(Box::new(evert))),
           ("execute", Box::leak(Box::new(execute))),
           ("exp", Box::leak(Box::new(f_stack2(exp)))),
-          ("fail", Box::leak(Box::new(f_stack1(fail)))),
+          ("fail", Box::leak(Box::new(f_result(fail)))),
           (
               "file-in",
-              Box::leak(Box::new(f_stack1(crate::pipes::fs::file_in))),
+              Box::leak(Box::new(f_stack1(crate::types::container::pipe::fs::file_in))),
           ),
           (
               "file-out",
-              Box::leak(Box::new(f_stack1(crate::pipes::fs::file_out))),
+              Box::leak(Box::new(f_stack1(crate::types::container::pipe::fs::file_out))),
           ),
           ("first", Box::leak(Box::new(f_stack1(first)))),
           ("float", Box::leak(Box::new(float))),
@@ -4084,14 +4233,13 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("handle", Box::leak(Box::new(f_stack1(handle)))),
           (
               "handoff",
-              Box::leak(Box::new(crate::pipes::channel::handoff)),
+              Box::leak(Box::new(crate::types::container::pipe::channel::handoff)),
           ),
           (
               "hashbytes",
               Box::leak(Box::new(f_stack1(crate::crypto::hash))),
           ),
           ("inc", Box::leak(Box::new(f_stack1(inc)))),
-          ("inscribe", Box::leak(Box::new(f_result(inscribe)))),
           ("intersection", Box::leak(Box::new(f_stack2(intersection)))),
           ("inspect", Box::leak(Box::new(f_stack1(inspect)))),
           ("join", Box::leak(Box::new(f_stack2(join)))),
@@ -4101,7 +4249,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("log", Box::leak(Box::new(f_stack2(log)))),
           ("loop", Box::leak(Box::new(loop_))),
           ("mod", Box::leak(Box::new(f_stack2(mod_)))),
-          ("namespaced", Box::leak(Box::new(f_stack2(namespaced)))),
           ("not", Box::leak(Box::new(f_stack1(not)))),
           ("number?", Box::leak(Box::new(f_stack1(is_number)))),
           ("odd?", Box::leak(Box::new(f_stack1(is_odd)))),
@@ -4117,21 +4264,20 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("read", Box::leak(Box::new(f_stack1(serialize::parse)))),
           (
               "receiver",
-              Box::leak(Box::new(f_stack1(crate::pipes::channel::receiver))),
+              Box::leak(Box::new(f_stack1(crate::types::container::pipe::channel::receiver))),
           ),
           ("recur", Box::leak(Box::new(recur))),
-          ("resolve", Box::leak(Box::new(resolve))),
           ("resume", Box::leak(Box::new(identity))),
           ("reverse", Box::leak(Box::new(f_stack1(reverse)))),
           ("round", Box::leak(Box::new(f_stack1(round)))),
           ("second", Box::leak(Box::new(f_stack1(second)))),
           (
               "sender",
-              Box::leak(Box::new(f_stack1(crate::pipes::channel::sender))),
+              Box::leak(Box::new(f_stack1(crate::types::container::pipe::channel::sender))),
           ),
           (
               "serversocket",
-              Box::leak(Box::new(f_stack2_async(crate::pipes::net::server_socket))),
+              Box::leak(Box::new(f_stack2_async(crate::types::container::pipe::net::server_socket))),
           ),
           (
               "set",
@@ -4145,7 +4291,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("slice", Box::leak(Box::new(f_stack3(slice)))),
           (
               "socket",
-              Box::leak(Box::new(f_stack2_async(crate::pipes::net::socket))),
+              Box::leak(Box::new(f_stack2_async(crate::types::container::pipe::net::socket))),
           ),
           ("sqrt", Box::leak(Box::new(f_stack1(sqrt)))),
           ("standard", Box::leak(Box::new(standard))),
@@ -4156,7 +4302,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("swapdown", Box::leak(Box::new(swapdown))),
           (
               "timer",
-              Box::leak(Box::new(f_stack1(crate::pipes::channel::timer))),
+              Box::leak(Box::new(f_stack1(crate::types::container::pipe::channel::timer))),
           ),
           ("timestamps", Box::leak(Box::new(timestamps))),
           ("unassign", Box::leak(Box::new(f_stack2(unassign)))),
@@ -4301,7 +4447,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           Ok(p) => Box::pin(p.put(j).map(|f| {
               match f {
                   Ok(p) => {
-                      env.pop_expr();
+                      env.pop_prog();
                       env.push(Item::Receptacle(p))
                   }
                   Err(e) => {
@@ -4321,7 +4467,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn clone(mut env: Environment) -> Future<Environment> {
       let clone = env.stack.front().unwrap().clone();
-      env.pop_expr();
+      env.pop_prog();
       env.push(clone);
       env.into()
   }
@@ -4332,12 +4478,12 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn swap(mut env: Environment) -> Future<Environment> {
-      env.pop_expr();
+      env.pop_prog();
       swap2(env, 0)
   }
 
   pub fn swapdown(mut env: Environment) -> Future<Environment> {
-      env.pop_expr();
+      env.pop_prog();
       swap2(env, 1)
   }
 
@@ -4345,7 +4491,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let s = coll::Arc::make_mut(&mut env.stack);
       s.swap(0, 2);
       s.swap(0, 1);
-      env.pop_expr();
+      env.pop_prog();
       env.into()
   }
 
@@ -4353,20 +4499,20 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let s = coll::Arc::make_mut(&mut env.stack);
       s.swap(0, 2);
       s.swap(1, 2);
-      env.pop_expr();
+      env.pop_prog();
       env.into()
   }
 
   pub fn drop(mut env: Environment) -> Future<Environment> {
       env.pop();
-      env.pop_expr();
+      env.pop_prog();
       env.into()
   }
 
   pub fn eq(mut env: Environment) -> Future<Environment> {
       let i = env.pop();
       let j = env.pop();
-      env.pop_expr();
+      env.pop_prog();
       env.push(i == j);
       env.into()
   }
@@ -4440,7 +4586,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let p = coll::List::try_from(env.pop());
       match p {
           Ok(mut p) => {
-              env.pop_expr();
+              env.pop_prog();
               let f = env.pop();
               if is_truthy(f) {
                   let p2 = p.clone();
@@ -4459,7 +4605,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let i = env.pop();
       match coll::List::try_from(i) {
           Ok(program) => {
-              env.pop_expr();
+              env.pop_prog();
               env.program.append(program);
           }
           Err(e) => {
@@ -4471,7 +4617,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn wrap(mut env: Environment) -> Future<Environment> {
       let item = env.pop();
-      env.pop_expr();
+      env.pop_prog();
       env.push(list!(item));
       env.into()
   }
@@ -4479,7 +4625,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   pub fn unwrap(mut env: Environment) -> Future<Environment> {
       match coll::List::try_from(env.pop()) {
           Ok(l) => {
-              env.pop_expr();
+              env.pop_prog();
               env.stack.extend(l.inner().into_iter().rev());
               env
           }
@@ -4537,7 +4683,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       let f = it.take();
                       Box::pin(async move {
                           let (c, i) = f.await;
-                          env.pop_expr();
+                          env.pop_prog();
                           let stack = env.stack.make_mut();
                           stack.push_front(c.into());
                           stack.push_front(i.unwrap_or_default());
@@ -4573,7 +4719,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               match s {
                   Ok(it) => {
                       let (c, i) = it.pop();
-                      env.pop_expr();
+                      env.pop_prog();
                       env.push(c);
                       env.push(i.unwrap_or_default());
                   }
@@ -4604,7 +4750,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           coll::List::try_from(env.pop()),
       ) {
           (Ok(false_branch), Ok(true_branch)) => {
-              env.pop_expr();
+              env.pop_prog();
               let b = env.pop();
 
               env.program.append(if is_truthy(b) {
@@ -4635,7 +4781,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               env.push(litem);
           } else {
               // if the container is empty, just pop off 'step' and we're done
-              env.pop_expr();
+              env.pop_prog();
           }
           env
       })
@@ -4658,8 +4804,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let mut rec1 = coll::List::try_from(env.pop()).unwrap();
       let then = coll::List::try_from(env.pop()).unwrap();
       let pred = coll::List::try_from(env.pop()).unwrap();
-      env.pop_expr();
-      env.push_expr("if".into());
+      env.pop_prog();
+      env.push_prog("if".into());
       let r = list!(
           pred.clone(),
           then.clone(),
@@ -4688,7 +4834,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   pub fn evert(mut env: Environment) -> Future<Environment> {
       let mut l = coll::List::try_from(env.pop()).unwrap();
       mem::swap(&mut env.stack, &mut l);
-      env.pop_expr();
+      env.pop_prog();
       env.push(l);
       env.into()
   }
@@ -4987,7 +5133,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                                   // end 'dipdown'
                                   "branch"
                               );
-                              env.pop_expr();
+                              env.pop_prog();
                               env.program.append(newexpr);
                           }
                           (Err(test), _) => {
@@ -5005,7 +5151,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           }
       } else {
           // clauses empty, return nothing
-          env.pop_expr();
+          env.pop_prog();
           env.push(Item::default());
       }
       env.into()
@@ -5034,6 +5180,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   if let Some(dfn) = env.dictionary.get(word) {
                       {
                           if let Some(spec) = &dfn.spec {
+                              //println!("Checking spec for {:?}: {:?}", word, spec.0);
                               if let Err(e) = env.check_input_spec(&spec.0) {
                                   env.push(e);
                                   return env.into();
@@ -5045,7 +5192,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                               dict::Definition::Axiom(a) => (*a)(env),
                               dict::Definition::Derived(d) => {
                                   let items = d.clone();
-                                  env.pop_expr();
+                                  env.pop_prog();
                                   env.program.append(items);
                                   env.into()
                               }
@@ -5059,7 +5206,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               }
               _ => {
                   // not a word, just push onto stack
-                  let i = env.pop_expr();
+                  let i = env.pop_prog();
                   env.push(i);
                   env.into()
               }
@@ -5139,12 +5286,12 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               let mut next = env.program.front();
               let mut unwound = Vec::<Item>::new();
               while next.is_some() && next.unwrap() != w {
-                  let i = env.pop_expr();
+                  let i = env.pop_prog();
                   unwound.push(i);
                   next = env.program.front();
               }
               if next.is_some() {
-                  env.pop_expr();
+                  env.pop_prog();
               }
               // set the is_handled bit
               e.is_handled = true;
@@ -5180,7 +5327,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
       match inner_env {
           Ok(inner) => {
-              env.pop_expr();
+              env.pop_prog();
               if inner.program.is_empty() {
                   Box::pin(async move {
                       env.push(Item::default());
@@ -5205,7 +5352,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let inner_env = Environment::try_from(tos);
       match inner_env {
           Ok(inner) => Box::pin(eval(inner).map(|inner_done| {
-              env.pop_expr();
+              env.pop_prog();
               env.push(inner_done);
               env
           })),
@@ -5217,13 +5364,13 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn identity(mut env: Environment) -> Future<Environment> {
-      env.pop_expr();
+      env.pop_prog();
       env.into()
   }
 
   pub fn dictionary(mut env: Environment) -> Future<Environment> {
       let d = env.dictionary.clone();
-      env.pop_expr();
+      env.pop_prog();
       env.push(d);
       env.into()
   }
@@ -5251,237 +5398,64 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   /// Makes 'yes' a word that doesn't have to be quoted, just pushes
   /// itself onto the stack.
   pub fn yes(mut env: Environment) -> Future<Environment> {
-      let t = env.pop_expr();
+      let t = env.pop_prog();
       env.push(t);
       env.into()
   }
 
-  /// Even though we say the return type is [Infallible] what we really
-  /// mean is "a type that can never happen in this case", because it's
-  /// always returning an error.
-  pub fn fail(mut e: Error) -> Result<Infallible, Error> {
-      e.is_handled = false;
-      Err(e)
-  }
-
-  /// Set the environment's dictionary to the dictionary on ToS.
-  ///
-  /// Note: this word can be used to bypass all attempts as sandboxing,
-  /// so use caution and be sure to understand the mechanisms used to
-  /// prevent this.
-  pub fn define(mut env: Environment) -> Future<Environment> {
-      let d = dict::Dictionary::try_from(env.pop());
-      match d {
-          Ok(d) => {
-              env.dictionary = d;
-              env.pop_expr();
-              env
-          }
-          Err(e) => {
-              env.push(e);
-              env
-          }
-      }
-      .into()
-  }
-
-  fn resolve(mut env: Environment) -> Future<Environment> {
-      let program = coll::List::try_from(env.pop());
-      let namespaces = coll::List::try_from(env.pop());
-
-      match (program, namespaces) {
-          (Ok(mut program), Ok(mut namespaces)) => {
-              {
-                  // Prepend the Dictionary's namespace so that
-                  // deletions are respected (via shadowing the existing
-                  // word with one that throws an error.)
-                  let namespaces = namespaces.make_mut();
-                  namespaces.push_front(dict::ns_to_bytes(dict::SHADOW_NAMESPACE.clone()).into());
-              }
-
-              let ns: Result<Vec<dict::Namespace>, Error> = namespaces
-                  .inner()
-                  .into_iter()
-                  .map(|ns| {
-                      env.dictionary.resolve_ns(ns.clone()).or_else(|e| {
-                          // try to load the missing module and try again
-                          let ns2 = ns.clone();
-                          match ns2 {
-                              Item::Word(w) => env
-                                  .load_builtin_module(w, true)
-                                  .and_then(|_| env.dictionary.resolve_ns(ns)),
-                              _ => Err(e),
-                          }
-                      })
-                  })
-                  .collect();
-              match ns {
-                  Ok(ns) => {
-                      env.dictionary.resolve_all(&mut program, &ns);
-                      env.push(program);
-                      // pop the word 'using'
-                      env.pop_expr();
-                  }
-                  Err(e) => {
-                      env.push(e);
-                  }
-              }
-          }
-          (Err(e), _) => {
-              env.push(e);
-          }
-          (_, Err(e)) => {
-              env.push(e);
-          }
-      }
-      env.into()
-  }
-
-  /// Takes a word, and gives it a namespace. The namespace should be
-  /// [Bytes]. Overwrites any previous namespace the word had.
-  pub fn namespaced(namespace: Bytes, mut word: Word) -> Result<Word, Infallible> {
-      word.namespace = Some(Newtype(namespace));
-      Ok(word)
-  }
-
-  /// Creates an alias for a module. Takes a word and bytes and creates
-  /// a module alias from it in the dictionary.
-  pub fn alias_module(env: &mut Environment) -> Result<(), Error> {
-      let b = Bytes::try_from(env.pop())?;
-      let w = Word::try_from(env.pop())?;
-      let r: Result<Word, Error> = env.dictionary.insert_module_alias(w, b);
-      env.push(r);
+  pub fn fail(env: &mut Environment) -> Result<(), Error> {
+      let mut err = Error::try_from(env.pop())?;
+      err.is_handled = false;
+      env.pop_prog();
+      env.push(err);
       Ok(())
   }
 
-  /// Takes a new dictionary, merges it into the existing one, and marks
-  /// all the deleted items as deleted. Returns the namespace the new
-  /// items were added to, or nothing if added to the default namespace.
-  pub fn dictmerge(env: &mut Environment) -> Result<(), Error> {
-      //println!("dictmerge: {:?}", env);
-      let partialdict = dict::Dictionary::try_from(env.pop())?;
-      let ns = env.pop();
-      let namespace = dict::Namespace::try_from(ns.clone())?;
-      env.dictionary.merge(partialdict, &namespace);
-      if namespace.is_none() {
-          env.dictionary.add_builtins();
-      }
-      // pop the word dictmerge
-      env.pop_expr();
-      env.push(ns);
-      Ok(())
-  }
-
-  /// Load a new module and gives it an optional alias. The alias is either:
-  ///
-  /// * [Word] - An alias will be created for the module using that word.
-  /// * Nothing (an empty container) - The module will be inserted into the
-  ///   default namespace, such that the module's words will be accesible directly.
-  /// * Any other value - Will not create any alias. The module's hash will be
-  ///   returned and that can be used to refer to the module later.
-  ///
-  /// The module can be raw bytes or string or a program. Returns the
-  /// hash of the module, which can be used to refer to the module
-  /// later.
-  pub fn inscribe(env: &mut Environment) -> Result<(), Error> {
-      let module_raw = coll::Sized::try_from(env.pop())?;
-      let hash: Bytes;
-      let mut is_default_namespace = false;
-      let (module_program, hash) = match module_raw {
-          coll::Sized::Bytes(b) => {
-              // first see if we can parse the module
-              let module_string = String::from_utf8(b.clone())?;
-              let program: coll::List =
-                  coll::List::try_from(serialize::parse(module_string)?.inner())?;
-              hash = sha2::Sha256::digest(b.as_slice()).deref().to_vec();
-              (program, hash)
-          }
-          coll::Sized::List(l) => {
-              let bytes = serialize::emit(&l.clone().into()).as_bytes().to_vec();
-              hash = sha2::Sha256::digest(bytes.as_slice()).deref().to_vec();
-              (l, hash)
-          }
-          i => Err(Error::expected("program", i))?,
-      };
-
-      let dict = env.dictionary.clone();
-
-      // the module alias
-      let maybe_alias = env.pop();
-      //let maybe_word: Result<Word, Error> = maybe_alias.clone().try_into();
-      match maybe_alias {
-          Item::Word(alias) => {
-              match env
-                  .dictionary
-                  .insert_module_alias(alias.clone(), hash.clone())
-                  .map(Item::from)
-              {
-                  Ok(_) => {}
-                  Err(_) => {
-                      // The alias already exists, ensure what
-                      // we're loading is actually that module:
-                      // check the hash matches.
-                      let mut alias = alias.clone();
-                      alias.namespace = dict::MODULE_NAMESPACE.clone();
-                      let exp_hash = env
-                          .dictionary
-                          .get(&alias)
-                          .unwrap()
-                          .get_namespace_info()
-                          .unwrap_or_default()
-                          .0;
-                      if exp_hash != hash {
-                          return Err(Error::create(
-                              list!(list!("hash"), "both", "="),
-                              "module integrity check failed",
-                              Some(alias),
-                          ));
-                      }
-                  }
-              }
-          }
-          i => {
-              if i.is_empty() {
-                  is_default_namespace = true;
-              }
-          }
-      }
-      // The module program should not be able to smash the stack, so run it within
-      // shielddown to let it only consume the copy of the original dictionary
-      let module_program = list!(module_program, "shielddown");
-
-      env.push({
-          if is_default_namespace {
-              Item::default()
-          } else {
-              hash.into()
-          }
-      });
-      env.push(dict);
-      env.pop_expr(); //pop off the inscribe word
-
-      env.push_expr("dictmerge".into());
-      env.program.append(module_program);
-      //println!("inscribe: {:?}", env);
-      Ok(())
-  }
-
+  /// Fetches a binary blob from the cache. The top of stack should be
+  /// either the hash of the content or its alias (a [Word]).
   pub fn read_blob(env: &mut Environment) -> Result<(), Error> {
-      let alias = Word::try_from(env.pop())?;
-      let blob = environment::read_blob(&alias)?;
-      env.push(blob);
-      env.pop_expr();
+      //println!("Env: {:?}", env);
+      let contents = match env.pop() {
+          Item::Word(alias) => cache::Key::Alias(alias.to_string()).get()?,
+          i => {
+              let hash = Bytes::try_from(i)?;
+              cache::Key::Hash(hash).get()?
+          }
+      };
+      env.pop_prog();
+      env.push(contents);
       Ok(())
   }
 
-  // Takes an inner environment from the top of the stack, and spawns a
-  // tokio task to evaluate that environment.
+  /// Writes a given binary object to the cache. Supports [Bytes], and
+  /// certain kinds of pipes. The top of stack should be the alias to
+  /// store the contents under, which should be either a [Word] or
+  /// nothing. If nothing, the object will only be available via its
+  /// hash. Returns the hash.
+  pub fn write_blob(env: &mut Environment) -> Result<(), Error> {
+      let alias = match env.pop() {
+          Item::Word(w) => Some(w.to_string()),
+          _ => None,
+      };
+      match env.pop() {
+          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(b))) => {
+              let hash = cache::put(&b, alias)?;
+              env.push(hash);
+              env.pop_prog();
+              Ok(())
+          }
+          i => Err(Error::expected("bytes", i)),
+      }
+  }
+
+  /// Takes an inner environment from the top of the stack, and spawns a
+  /// tokio task to evaluate that environment.
   pub fn animate(mut env: Environment) -> Future<Environment> {
       let tos = env.pop();
       let inner_env = Environment::try_from(tos);
       match inner_env {
           Ok(inner) => {
-              env.pop_expr();
+              env.pop_prog();
               tokio::spawn(async move { eval(inner).await });
               env.into()
           }
@@ -5525,15 +5499,15 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn timestamps(mut env: Environment) -> Future<Environment> {
-      env.pop_expr();
-      env.push(Item::Dispenser(coll::Dispenser::Out(pipes::Out::Time)));
+      env.pop_prog();
+      env.push(Item::Dispenser(coll::Dispenser::Out(pipe::Out::Time)));
       env.into()
   }
 
   pub fn standard(mut env: Environment) -> Future<Environment> {
-      env.pop_expr();
+      env.pop_prog();
       env.push(Item::Dispenser(coll::Dispenser::Tunnel(
-          pipes::Tunnel::Standard,
+          pipe::Tunnel::Standard,
       )));
       env.into()
   }
@@ -5661,16 +5635,16 @@ interpreter process, and prints output.
 
 We'll also define how to run unit tests.
 #+begin_src rust :tangle src/main.rs :mkdirp yes
+  //! The main kcats module, that executes the kcats interpreter. See [main]
   mod axiom;
   mod crypto;
   mod module_map;
-  mod pipes;
   mod serialize;
   mod types;
 
-  use crate::types::{environment::Environment, error};
   use std::io::{self, BufRead, Read, Write};
   use std::sync::Arc;
+  use types::container::{environment::Environment, error};
 
   fn print_result(env: Environment) {
       if env.program.is_empty() {
@@ -5752,7 +5726,7 @@ We'll also define how to run unit tests.
   // string, and then evaluates that string as a kcats program. It then
   // prints the length of the result, and then the result itself.
   async fn interactive_mode() {
-      let mut env = Environment::standard();
+      let mut env = Environment::default();
 
       loop {
           if let Some(program) = read_input().await {
@@ -5774,7 +5748,7 @@ We'll also define how to run unit tests.
   }
 
   async fn repl() {
-      let mut env = Environment::standard();
+      let mut env = Environment::default();
 
       loop {
           // Print the prompt and flush it to stdout immediately
@@ -5806,7 +5780,7 @@ We'll also define how to run unit tests.
 
   async fn read_eval_print(program: String) {
       // otherwise, read from stdin
-      match parse_input(Environment::standard(), program) {
+      match parse_input(Environment::default(), program) {
           Ok(env) => {
               print_result(axiom::eval(env).await);
           }
@@ -5816,6 +5790,8 @@ We'll also define how to run unit tests.
       }
   }
 
+  /// The main intepreter entry function that can start the interpreter
+  /// in several different modes.
   #[tokio::main]
   async fn main() {
       // read command line options, to look for -i switch
@@ -5842,10 +5818,15 @@ We'll also define how to run unit tests.
 
   #[cfg(test)]
   mod tests {
+      //! Unit tests, in the form of all the examples of usage of the
+      //! different lexicon words. Examples are all in the form of two
+      //! programs that should be equivalent, something like `2 3 +` and
+      //! `5`. Runs both programs in separate environments, compares the
+      //! resulting stack to ensure they are equal.
       // Note this useful idiom: importing names from outer (for mod tests) scope.
       use super::error::Error;
       use super::*;
-      use crate::types::collection as coll;
+      use crate::types::container as coll;
       use crate::types::{Item, Word};
       use std::borrow::Borrow;
       use test_case::test_case;
@@ -5992,7 +5973,6 @@ We'll also define how to run unit tests.
       #[test_case("floor")]
       #[test_case("fold")]
       #[test_case("format")]
-      #[test_case("functional")]
       #[test_case("future")]
       #[test_case("get")]
       #[test_case("generate")]
@@ -6010,7 +5990,6 @@ We'll also define how to run unit tests.
       #[test_case("keep")]
       #[test_case("label")]
       #[test_case("let")]
-      #[test_case("lingo")]
       #[test_case("list?" ; "is_list")]
       #[test_case("lookup")]
       #[test_case("loop")]
@@ -6083,7 +6062,7 @@ We'll also define how to run unit tests.
       #[test_case("zero?" ; "is_zero")]
       #[test_case("zip")]
       fn test_lexicon(word: &str) {
-          let e = Environment::standard();
+          let e = Environment::default();
 
           let r = test_word(e.clone(), word.into());
           assert!(r.is_empty(), "{:?}", r);
@@ -6110,9 +6089,9 @@ they emerge elsewhere. Words that act on pipes are the only ones that
 can be impure. Everything else is a value.
 ***** Basic Types
 The basic pipe contracts.
-#+begin_src rust :tangle src/pipes.rs :mkdirp yes
-  use crate::types::collection as coll;
-  use crate::types::error::Error;
+#+begin_src rust :tangle src/types/container/pipe.rs :mkdirp yes
+  use super::error::Error;
+  use crate::types::container as coll;
   use crate::types::{self, Item};
   use std::sync::Arc;
   use tokio::sync::RwLock;
@@ -6128,11 +6107,17 @@ The basic pipe contracts.
   pub mod standard;
   pub mod time;
 
+  /// A pipe that accepts items.
   #[derive(Debug, Clone)]
   pub enum In {
+      /// A pipe that takes bytes to write to a file on disk
       StaticFile(Arc<RwLock<fs::StaticFile>>),
+      /// A pipe that takes bytes to write to a TCP/IP socket
       Socket(Arc<RwLock<net::Socket>>),
+      /// A pipe that takes items to send through a channel to another
+      /// part of the running program
       Handoff(channel::Handoff<Item>),
+      /// A pipe that takes bytes to write to standard out
       Standard,
   }
 
@@ -6146,15 +6131,25 @@ The basic pipe contracts.
           }
       }
   }
-
+  /// A pipe that produces items.
   #[derive(Debug, Clone)]
   pub enum Out {
+      /// A pipe that produces bytes from a file on disk
       StaticFile(Arc<RwLock<fs::StaticFile>>),
+      /// A pipe that produces bytes from a TCP/IP socket
       Socket(Arc<RwLock<net::Socket>>),
+      /// A pipe that produces sockets from a TCP/IP server socket
       ServerSocket(Arc<RwLock<net::ServerSocket>>),
+      /// A pipe that produces items from a channel that comes from
+      /// another part of the program
       Handoff(channel::Handoff<Item>),
+      /// A pipe that produces a dummy value after a given amount of
+      /// time. Can be used as a timeout mechanism when waiting on
+      /// multiple pipes at once.
       Timer(channel::Timer<Item>),
+      /// A pipe that produces timestamps of the current UNIX time
       Time,
+      /// A pipe that produces bytes from standard in.
       Standard,
   }
 
@@ -6172,11 +6167,18 @@ The basic pipe contracts.
       }
   }
 
+  /// A bi-directional pipe that can accept and produce Items.
   #[derive(Debug, Clone)]
   pub enum Tunnel {
+      /// A pipe that can both produce and accept bytes to read/write from a file.
       StaticFile(Arc<RwLock<fs::StaticFile>>),
+      /// A pipe that can both produce and accept bytes to read/write
+      /// from a TCP/IP socket.
       Socket(Arc<RwLock<net::Socket>>),
+      /// A pipe that produces or accepts values to/from a channel that
+      /// connects to another part of the program.
       Handoff(channel::Handoff<Item>),
+      /// A pipe to standard in/out that produces/accepts bytes.
       Standard,
   }
 
@@ -6215,6 +6217,7 @@ The basic pipe contracts.
   }
 
   impl In {
+      /// Puts the [Item] into the pipe. Blocks if the pipe is full.
       pub fn put(&mut self, i: Item) -> types::Future<Result<(), Error>> {
           match self {
               In::StaticFile(f) => {
@@ -6232,6 +6235,8 @@ The basic pipe contracts.
   }
 
   impl Tunnel {
+      /// Puts the [Item] into the tunnel, blocks if the send side of
+      /// the tunnel is full.
       pub fn put(&mut self, i: Item) -> types::Future<Result<(), Error>> {
           match self {
               Tunnel::StaticFile(f) => {
@@ -6247,6 +6252,8 @@ The basic pipe contracts.
           }
       }
 
+      /// Takes an [Item] from the tunnel, blocks if the receive side of
+      /// the tunnel is empty.
       pub fn take(&mut self) -> types::Future<Result<Option<Item>, Error>> {
           match self {
               Tunnel::StaticFile(f) => {
@@ -6264,6 +6271,7 @@ The basic pipe contracts.
   }
 
   impl Out {
+      /// Takes an [Item] from the pipe, blocks if the pipe is empty.
       pub fn take(&mut self) -> types::Future<Result<Option<Item>, Error>> {
           match self {
               Out::StaticFile(f) => {
@@ -6418,10 +6426,10 @@ The basic pipe contracts.
 #+end_src
 ***** Files
 How to interact with files on disk
-#+begin_src rust :tangle src/pipes/fs.rs :mkdirp yes
+#+begin_src rust :tangle src/types/container/pipe/fs.rs :mkdirp yes
   use crate::axiom::ItemResult;
-  use crate::types::associative as assoc;
-  use crate::types::error::Error;
+  use crate::types::container::associative as assoc;
+  use crate::types::container::error::Error;
   use crate::types::*;
   use std::future;
   use std::pin::Pin;
@@ -6534,11 +6542,11 @@ How to interact with files on disk
 #+end_src
 ***** Network
 How to interact with the network (TCP/IP sockets)
-#+begin_src rust :tangle src/pipes/net.rs :mkdirp yes
+#+begin_src rust :tangle src/types/container/pipe/net.rs :mkdirp yes
   use crate::axiom::ItemResult;
   use crate::list;
-  use crate::types::associative as assoc;
-  use crate::types::error::Error;
+  use crate::types::container::associative as assoc;
+  use crate::types::container::error::Error;
   use crate::types::number::Int;
   use crate::types::{self, Item};
   use futures::future::FutureExt;
@@ -6709,9 +6717,9 @@ How to interact with the network (TCP/IP sockets)
   }
 #+end_src
 ***** Time
-#+begin_src rust :tangle src/pipes/time.rs :mkdirp yes
-  use crate::types::associative as assoc;
-  use crate::types::error::Error;
+#+begin_src rust :tangle src/types/container/pipe/time.rs :mkdirp yes
+  use crate::types::container::associative as assoc;
+  use crate::types::container::error::Error;
   use crate::types::number::{Int, Number};
   use crate::types::*;
 
@@ -6745,9 +6753,9 @@ How to interact with the network (TCP/IP sockets)
   }
 #+end_src
 ***** Standard in/out
-#+begin_src rust :tangle src/pipes/standard.rs :mkdirp yes
-  use crate::types::associative as assoc;
-  use crate::types::error::Error;
+#+begin_src rust :tangle src/types/container/pipe/standard.rs :mkdirp yes
+  use crate::types::container::associative as assoc;
+  use crate::types::container::error::Error;
   use crate::types::{self, *};
   use std::future;
   use std::io::{self, Read, Write};
@@ -6784,13 +6792,10 @@ How to interact with the network (TCP/IP sockets)
 #+end_src
 ***** Channels
 Implement the =handoff= type
-#+begin_src rust :tangle src/pipes/channel.rs :mkdirp yes
+#+begin_src rust :tangle src/types/container/pipe/channel.rs :mkdirp yes
   use crate::axiom;
-  use crate::pipes;
-  use crate::types::associative as assoc;
-  use crate::types::collection as coll;
-  use crate::types::environment::Environment;
-  use crate::types::error;
+  use crate::types::container as coll;
+  use crate::types::container::{associative as assoc, environment::Environment, error, pipe};
   use crate::types::number::Int;
   use crate::types::{self, Item};
   use flume;
@@ -6849,7 +6854,7 @@ Implement the =handoff= type
                   Box::pin(async move {
                       ch.send_async(i)
                           .await
-                          .map_err(|_| pipes::closed_error(false))
+                          .map_err(|_| pipe::closed_error(false))
                   })
               } else {
                   // If we're putting 'nothing', that indicates end of
@@ -6858,7 +6863,7 @@ Implement the =handoff= type
                   Box::pin(future::ready(Ok(())))
               }
           } else {
-              Box::pin(future::ready(Err(pipes::closed_error(false))))
+              Box::pin(future::ready(Err(pipe::closed_error(false))))
           }
       }
 
@@ -6910,20 +6915,20 @@ Implement the =handoff= type
   }
 
   pub fn handoff(mut env: Environment) -> types::Future<Environment> {
-      env.pop_expr();
-      env.push(pipes::Tunnel::Handoff(Handoff::new(false)));
+      env.pop_prog();
+      env.push(pipe::Tunnel::Handoff(Handoff::new(false)));
       env.into()
   }
 
   impl From<flume::RecvError> for error::Error {
       fn from(_: flume::RecvError) -> Self {
-          pipes::closed_error(false) // todo fix this
+          pipe::closed_error(false) // todo fix this
       }
   }
 
   impl From<flume::SendError<Item>> for error::Error {
       fn from(_: flume::SendError<Item>) -> Self {
-          pipes::closed_error(false)
+          pipe::closed_error(false)
       }
   }
 
@@ -6944,14 +6949,14 @@ Implement the =handoff= type
           .into_iter()
           .enumerate()
           .map(move |(idx, i)| match i {
-              Item::Dispenser(coll::Dispenser::Out(pipes::Out::Handoff(p))) => {
+              Item::Dispenser(coll::Dispenser::Out(pipe::Out::Handoff(p))) => {
                   Ok(ChannelOp::Receive(Arc::new(p.receiver.unwrap()), idx))
               }
-              Item::Dispenser(coll::Dispenser::Tunnel(pipes::Tunnel::Handoff(p))) => {
+              Item::Dispenser(coll::Dispenser::Tunnel(pipe::Tunnel::Handoff(p))) => {
                   Ok(ChannelOp::Receive(Arc::new(p.receiver.unwrap()), idx))
               }
               // Handle timeout channels - start the timer and add receive op
-              Item::Dispenser(coll::Dispenser::Out(pipes::Out::Timer(t))) => {
+              Item::Dispenser(coll::Dispenser::Out(pipe::Out::Timer(t))) => {
                   let mut t = t.clone();
                   t.start();
                   Ok(ChannelOp::Receive(Arc::new(t.receiver.unwrap()), idx))
@@ -6962,11 +6967,11 @@ Implement the =handoff= type
                   let i = l.get(1);
                   match (p, i) {
                       (Some(p), Some(i)) => match (p, i) {
-                          (Item::Receptacle(coll::Receptacle::In(pipes::In::Handoff(p))), i) => Ok(
+                          (Item::Receptacle(coll::Receptacle::In(pipe::In::Handoff(p))), i) => Ok(
                               ChannelOp::Send(Arc::new(p.sender.clone().unwrap()), idx, i.clone()),
                           ),
                           (
-                              Item::Receptacle(coll::Receptacle::Tunnel(pipes::Tunnel::Handoff(p))),
+                              Item::Receptacle(coll::Receptacle::Tunnel(pipe::Tunnel::Handoff(p))),
                               i,
                           ) => Ok(ChannelOp::Send(
                               Arc::new(p.sender.clone().unwrap()),
@@ -7021,10 +7026,10 @@ Implement the =handoff= type
 
       fn try_from(i: Item) -> Result<Self, Self::Error> {
           match i {
-              Item::Dispenser(coll::Dispenser::Out(pipes::Out::Handoff(p))) => Ok(p),
-              Item::Receptacle(coll::Receptacle::In(pipes::In::Handoff(p))) => Ok(p),
-              Item::Receptacle(coll::Receptacle::Tunnel(pipes::Tunnel::Handoff(p))) => Ok(p),
-              Item::Dispenser(coll::Dispenser::Tunnel(pipes::Tunnel::Handoff(p))) => Ok(p),
+              Item::Dispenser(coll::Dispenser::Out(pipe::Out::Handoff(p))) => Ok(p),
+              Item::Receptacle(coll::Receptacle::In(pipe::In::Handoff(p))) => Ok(p),
+              Item::Receptacle(coll::Receptacle::Tunnel(pipe::Tunnel::Handoff(p))) => Ok(p),
+              Item::Dispenser(coll::Dispenser::Tunnel(pipe::Tunnel::Handoff(p))) => Ok(p),
               i => Err(error::Error::expected("handoff", i)),
           }
       }
@@ -7034,18 +7039,14 @@ Implement the =handoff= type
   pub fn sender(i: Item) -> axiom::ItemResult {
       let mut h = Handoff::try_from(i)?;
       h.close_take();
-      Ok(Item::Receptacle(coll::Receptacle::In(pipes::In::Handoff(
-          h,
-      ))))
+      Ok(Item::Receptacle(coll::Receptacle::In(pipe::In::Handoff(h))))
   }
 
   // drop the sender side of the handoff and return the handoff item
   pub fn receiver(i: Item) -> axiom::ItemResult {
       let mut h = Handoff::try_from(i)?;
       h.close_put();
-      Ok(Item::Dispenser(coll::Dispenser::Out(pipes::Out::Handoff(
-          h,
-      ))))
+      Ok(Item::Dispenser(coll::Dispenser::Out(pipe::Out::Handoff(h))))
   }
 
   #[derive(Debug)]
@@ -7100,7 +7101,7 @@ Implement the =handoff= type
 
   impl From<Timer<Item>> for Item {
       fn from(t: Timer<Item>) -> Self {
-          Item::Dispenser(coll::Dispenser::Out(pipes::Out::Timer(t)))
+          Item::Dispenser(coll::Dispenser::Out(pipe::Out::Timer(t)))
       }
   }
 
@@ -7121,12 +7122,10 @@ Implement the =handoff= type
   }
 #+end_src
 ***** Database
-#+begin_src rust :tangle src/pipes/db.rs :mkdirp yes
+#+begin_src rust :tangle src/types/container/pipe/db.rs :mkdirp yes
   use crate::axiom;
   use crate::list;
-  use crate::types::associative as assoc;
-  use crate::types::collection as coll;
-  use crate::types::error::Error;
+  use crate::types::container::{self as coll, associative as assoc, error::Error};
   use crate::types::number::Number;
   use crate::types::{self, Item};
   use directories::ProjectDirs;
@@ -7319,25 +7318,25 @@ Implement the =handoff= type
       }
   }
 #+end_src
-** Issues
-*** INPROGRESS Interactive mode :tools:
+* Issues
+** INPROGRESS Interactive mode                                       :tools:
 run with =kcats -i= for interactive, where you get a repl-like
 prompt. Each prompt accepts kcats items as input, and updates the
 state accordingly. There are special commands to print the current
 state, clear it, write to file, etc.
-**** TODO Only print the changed part of the stack
-**** TODO Emacs keybindings to send common stack ops
+*** TODO Only print the changed part of the stack
+*** TODO Emacs keybindings to send common stack ops
 + swap / swapdown
 + clear ([] evert drop)
 + clone
 + snapshot?
 + drop
 + sink / float
-*** TODO Source mapping :debugging:errorHandling:
+** TODO Source mapping                             :debugging:errorHandling:
 It would be nice if we could tell which file any given word was read
 from. We could do this at read time, but i don't think our edn parser
 remembers byte positions, so that might need modification.
-*** TODO Call stack in errors :debugging:errorHandling:
+** TODO Call stack in errors                       :debugging:errorHandling:
 It would be nice to see the call stack, if possible. For example if
 foo calls bar, and bar fails, it'd be nice to know we're in the middle
 of executing foo also. I have no idea how to implement this at the
@@ -7349,8 +7348,8 @@ puts itself back in the program.
 
 So maybe a "call stack" isn't exactly what we want, I'm not even sure
 it's possible to get what we want here.
-*** INPROGRESS Implement pipes :stdlib:
-**** DONE Write to a file
+** INPROGRESS Implement pipes                                       :stdlib:
+*** DONE Write to a file
 #+begin_src kcats
   [[file "/tmp/bar4"]] pipe-in
 
@@ -7390,7 +7389,7 @@ it's possible to get what we want here.
 #+RESULTS:
 : "hello world!" [[type pipe] [file "/tmp/bar101r7"]]
 
-**** DONE Read from a file
+*** DONE Read from a file
 #+begin_src kcats :results code
 "" [string join] [[file "/tmp/bar2"]] pipe-out
 
@@ -7417,7 +7416,7 @@ dictionary [collect spec] lookup
  [[definition [swap [take swap] swap put [dip] join [[closed? not]] dip while drop]]
   [spec [[pipe program] [item]]]]]
 #+end_src
-**** DONE Close a pipe
+*** DONE Close a pipe
 #+begin_src kcats :results code
 [[file "/tmp/foopytoop"]] pipe-in "foo" bytes put close "bar" bytes put
 #+end_src
@@ -7426,12 +7425,12 @@ dictionary [collect spec] lookup
 #+begin_src kcats
 [[type pipe] [file "/tmp/foopytoop"]]
 #+end_src
-**** DONE Serialize pipes with something sane
+*** DONE Serialize pipes with something sane
 Maybe they can't be easily round-tripped, but at least we can print
 something reasonable that will tell human eyes what it is.
 something like[[type pipe-in] [file "/tmp/foo"]]
-**** DONE Sockets
-***** DONE Server Sockets
+*** DONE Sockets
+**** DONE Server Sockets
 #+begin_src kcats :results code
 [[type ip-host] [address "127.0.0.1"] [port 11211]] pipe-out 
 #+end_src
@@ -7467,9 +7466,9 @@ dip
 [[asked [string]] [unwound [take "foo\n" bytes put take string [drop drop] dip]] [type error] [reason "type mismatch"]]
 #+end_src
 
-***** DONE Sockets
+**** DONE Sockets
 
-***** CANCELED Assemble is broken when reading files
+**** CANCELED Assemble is broken when reading files
 - State "CANCELED"   from "INPROGRESS" [2023-10-22 Sun 07:55]
 I think it's because =closed?= is broken.
 
@@ -7496,14 +7495,14 @@ I see the problem. When we clone the pipe, we also clone the =closed=
 boolean and we shouldn't be doing that. There should only be one copy
 of that. The entire struct should be in an Arc<Mutex> and not just the
 file field. And when we modify the boolean, we shouldn't 
-**** DONE Convert In/Out traits to enums in pipes modules
+*** DONE Convert In/Out traits to enums in pipes modules
 Enums seem to work well elsewhere, and since pipes are also a closed
 set, we can use them here too.
 
 I don't think there will ever be user-created pipe types as it would
 have to be done in rust and not in kcats.
 
-**** DONE Composable transforms
+*** DONE Composable transforms
 There should be some way to compose transforms in a pipe. For example,
 we can have a pipe that when you put bytes in it, it gets written to a
 certain file on disk. But what we really want is that we put bytes
@@ -7516,7 +7515,7 @@ aren't going to be i/o, it's pure computation. Actually I guess any
 pipe could take an optional transform. Clojure.core.async channels do this.
 
 Maybe the first thing to do is implement transducers?
-***** DONE Siphon from one pipe to another
+**** DONE Siphon from one pipe to another
 A nice primitive would be a word that takes a program (the program
 should expect an item on ToS and it should leave a transformed item)
 and two pipes, and takes from one pipe, runs the program, and puts the
@@ -7572,7 +7571,7 @@ integers 5 taker [] siphon
 #+end_src
 
 And since pipes can have generator layers put on top of them, I think we're done. 
-**** CANCELED Filled pipes
+*** CANCELED Filled pipes
 Mostly for testing purposes, takes a list and creates a buffered pipe
 that offers list items until the list is exhausted and then returns pipe closed errors.
 
@@ -7583,7 +7582,7 @@ that offers list items until the list is exhausted and then returns pipe closed 
 #+RESULTS:
 : 1 [[type pipe] [filled todo: id-or-hash here]]
 
-**** INPROGRESS Object pipes
+*** INPROGRESS Object pipes
 - State "INPROGRESS" from "TODO"       [2023-10-19 Thu 21:10]
 These pipes should send serialized kcats objects and each put/take
 should transfer 1 object. Maybe use protocol buffers or similar
@@ -7778,7 +7777,7 @@ otherwise generate and repeat.
   collect
 #+end_src
 
-**** DONE Time pipe
+*** DONE Time pipe
 Each take from the pipe return the current unix time in ms.  Should be
 a "singleton" - probably using Box::leak, so that we can insert a copy
 of this pipe whenever we want and it's always a reference to the same
@@ -7792,7 +7791,7 @@ timestamps take
 #+RESULTS:
 : 1687273991929 [[from systemtime] [values [[type integer] [units milliseconds]]] [type out]]
 
-**** DONE stdin/stdout pipes
+*** DONE stdin/stdout pipes
 Should also be singleton. Should it always be a tunnel or should we
 allow separate access to in or out?
 
@@ -7806,7 +7805,7 @@ standard "foo" bytes put
 Stdin is not tested, since currently the interpreter reads the program
 from stdin. May need to change that (read the program from filesystem
 and let the program itself access stdin).
-**** CANCELED Pipe take outcome
+*** CANCELED Pipe take outcome
 - State "CANCELED"   from "TODO"       [2023-09-22 Fri 09:14] \\
   I don't think there's any glaring inconsistency here - indefinite (or
   i guess I might call them 'unsized') dispensers will dispense =nothing=
@@ -7833,7 +7832,7 @@ return an error. May need to resolve this inconsistency.
 | take Items    | Item    | Item    | Bytes   | Bytes      |
 | take Past EOF | Nothing | Nothing | Nothing | Nothing    |
 | step Past EOF | Exit    | Exit    | Exit    | Exit       |
-*** INPROGRESS Use a single word for all derivation/conversion :stdlib:
+** INPROGRESS Use a single word for all derivation/conversion       :stdlib:
 Right now there's different words for converting bytes to string
 (string) or string to bytes (bytes). Proposing a more composable
 mechanism here, where there's a single action word that derives one
@@ -8029,13 +8028,13 @@ dispatch on both =to= and =from= types for =derive=.
 #+begin_src 
 
 #+end_src
-*** TODO Error should have actual struct fields :optimization:
+** TODO Error should have actual struct fields                :optimization:
 It's still implemented as generic Hashmap data field. 
 
-*** INPROGRESS Script
+** INPROGRESS Script
 - State "INPROGRESS" from "TODO"       [2024-02-23 Fri 15:12]
-**** DONE Cryptographic primitives
-***** DONE SHA256
+*** DONE Cryptographic primitives
+**** DONE SHA256
 #+begin_src kcats
 "foo" bytes hash "fop" bytes hash =
 #+end_src
@@ -8057,7 +8056,7 @@ It's still implemented as generic Hashmap data field.
 #+RESULTS:
 : [[public #b64 "NNJledu0Vmk+VAZyz5IvUt3g1lMuNb8GvgE6fFMvIOA="] [type elliptic-curve-key] [secret #b64 "LCa0a2j/xo/5m0U8HTBBNBNCLXBkg7+g+YpeiGJm564="]]
 
-***** DONE Signing
+**** DONE Signing
 #+begin_src kcats :results code
   "foo" bytes key "we attack at dawn" bytes [sign] shield verify
 #+end_src
@@ -8222,7 +8221,7 @@ try a dummy script that really does always validate
 [] #b64 "M+LwVX3X2/aNUvQNUQxkH9+m5dpgq8cN+sB9K2tsvM8="
 #+end_src
 
-***** DONE Make verify return the message
+**** DONE Make verify return the message
 - State "DONE"       from "INPROGRESS" [2023-09-28 Thu 10:43]
 one thing I hadn't considered before. We receive this package of
 "proof" - proof of what? That this message is from the party
@@ -8240,17 +8239,17 @@ the message is a perfectly good truthy value. I suppose signing an
 empty byte array could cause confusion (if that were considered
 "nothing" which I suppose it should, but currently isn't). But I can't
 think of any valid reason to sign 'nothing'.
-***** TODO [#A] AES Encryption
-***** TODO [#B] Random
+**** TODO [#A] AES Encryption
+**** TODO [#B] Random
 
-**** DONE Pure functional env
+*** DONE Pure functional env
 #+begin_src kcats
   [[pipe-in pipe-out channel timeout handoff file-in file-out timestamps standard serversocket animate future spit tunnel ] [wrap unassign] step] [1 2 swap] lingo
 #+end_src
 
 #+RESULTS:
 : 1 2
-**** TODO Infinite loop protection
+*** TODO Infinite loop protection
 We need to prevent an attacker presenting =true [clone] loop= as their
 identity proof, which would never halt. It may be easiest to just
 remove all the looping words from the dictionary, but that seems
@@ -8260,16 +8259,16 @@ attacker can consume, and we already have a direct solution for that:
 #+begin_src kcats
 [[program [true [clone] loop]]] environment
 #+end_src
-*** TODO retry should have opposite argument order :stdlib:consistency:
+** TODO retry should have opposite argument order       :stdlib:consistency:
 Currently it expects an error on ToS and then a program beneath. But
 it seems like we'd nearly always have to =dip= the program beneath the
 error. I think it would be better if =retry= expected the program to fix
 the issue on top, and the error beneath.
-*** INPROGRESS Support Kademlia DHT
-**** DONE XOR
+** INPROGRESS Support Kademlia DHT
+*** DONE XOR
 We have a node id (maybe just the i2p destination address?) and we
 want to calculate the distance to another node as the XOR
-**** INPROGRESS Simple API server
+*** INPROGRESS Simple API server
 Construct a socket listener, and serve something from a trivial local
 database. Disable exploitable words. Catch errors and return to the user.
 
@@ -8347,7 +8346,7 @@ This works ok for a read-only database, but for the purposes of a DHT
 we can't do it this way - we'd have to expose the database and there's
 no way to prevent the api user from making arbitrary (and malicious)
 changes.
-**** INPROGRESS Simple API client
+*** INPROGRESS Simple API client
 #+begin_src kcats
   "localhost" 12121 socket
   [[[title] lookup count 10 <] filter]
@@ -8369,8 +8368,8 @@ changes.
     [subjects [love morality society class womanhood independence]]]]]]
 #+end_src
 
-**** TODO Kademlia functions
-***** TODO COMMENT Distance
+*** TODO Kademlia functions
+**** TODO COMMENT Distance
 takes two hashes, returns the xor distance between them
 
 helper function that takes an int 0-255 and returns the most
@@ -8418,25 +8417,25 @@ significant bit position, eg 33 is 5
 #+RESULTS:
 : 253 #b64 "9xFLZf2AmWe7DRojlnYwLsBsq1Iz7mfo8BYH33X3FQ=="
 
-*** TODO read and emit don't have quite the same semantics :consistency:
+** TODO read and emit don't have quite the same semantics      :consistency:
 read will read all the bytes and return however many objects were read.
 emit will take an object and return its serialization.
 
 There should be some way of round tripping here, maybe a word =read1= or
 something that just reads one object. 
-*** INPROGRESS [#A] Inconsistent stack handling when encountering error :consistency:
+** INPROGRESS [#A] Inconsistent stack handling when encountering error :consistency:
 - State "INPROGRESS" from "TODO"       [2023-12-30 Sat 14:17]
 Some words pop the arguments off the stack, then if an error is
 encountered, throws the error without the args on the stack. Others
 leave the args intact. This needs to be consistent.
 
 I would lean towards leaving the args intact so that =retry= is easily applied.
-**** TODO 'read' on invalid edn consumes the string argument
+*** TODO 'read' on invalid edn consumes the string argument
 It should attempt to parse before popping the item off the stack.
-**** TODO Division by zero consumes stack items
+*** TODO Division by zero consumes stack items
 =5 0 /= shouldn't consume the =5= and =0= - compare to =1 "2" += behavior
 (which leaves items on stack).
-*** DONE Inconsistent expression handling when encountering error
+** DONE Inconsistent expression handling when encountering error
 - State "DONE"       from "INPROGRESS" [2023-10-15 Sun 15:24]
 - State "INPROGRESS" from "TODO"       [2023-10-15 Sun 15:20]
 Some errors lose the word on which they occurred. They should be in
@@ -8495,8 +8494,8 @@ function throws the error.
 The question then is how to fix this? Hopefully this can be fixed
 inside =eval_step=. After the function completes, we can check if there
 was an error on top (if there wasn't before), and if so, we can replace the 
-*** TODO Performance optimizations :optimization:
-**** TODO Compile programs
+** TODO Performance optimizations                             :optimization:
+*** TODO Compile programs
 Here is how it could maybe be done. We already have a type StepFn
 (which takes an env and returns a new one, in a future).
 
@@ -8536,7 +8535,7 @@ debugger we can go step by step, but if the function composition is
 bundled up, we can only "step over" that function and not "into" it. I
 am not sure if it's possible to build this such that we preserve
 stepping ability and increase performance substantially.
-**** TODO Programs as their own immutable type
+*** TODO Programs as their own immutable type
 Programs executing in a loop are generally not modified (exception -
 the =recur= word, which can modify but usually just calls =execute=)- so
 when we execute a program with =loop= we don't want to have to clone it
@@ -8570,8 +8569,8 @@ example program:
 So when printing out the program, we could cheat and only show the
 remaining program (instead of a stack of partially executed programs).
 
-*** INPROGRESS Generators                                          :stdlib:
-**** DONE Basic functionality and generators
+** INPROGRESS Generators                                            :stdlib:
+*** DONE Basic functionality and generators
 There's the concept of "lazy sequence" that I think maps nicely to
 pipes - you can keep calling 'take' and it keeps calculating new
 values. Everything it needs is contained in the object, it's not like
@@ -8760,17 +8759,17 @@ integers 10 taker collect drop generate
 #+RESULTS:
 : [] [[positive?] [dec [generate] dive] [[]] if] 0 [inc clone] 9
 
-**** DONE map
-**** DONE filter
-**** DONE take
-**** DONE drop
+*** DONE map
+*** DONE filter
+*** DONE take
+*** DONE drop
 #+begin_src kcats
 integers 15 taker 10 dropper [+] reduce
 #+end_src
 
 #+RESULTS:
 : 60 [[[positive?] [[generate drop] dip dec] while [generate swap] dip float] bail] 0 [[positive?] [dec [generate] dive] [[]] if] 0 [inc clone] 14
-**** DONE drop-while (skipper)
+*** DONE drop-while (skipper)
 
 - State "DONE"       from "INPROGRESS" [2023-11-30 Thu 18:01]
 - State "INPROGRESS" from "TODO"       [2023-11-30 Thu 17:28]
@@ -8790,7 +8789,7 @@ integers 15 taker 10 dropper [+] reduce
    if]
   collect
 #+end_src
-**** DONE take-while (catcher)
+*** DONE take-while (catcher)
 
 - State "DONE"       from "INPROGRESS" [2023-11-30 Thu 18:02]
 - State "INPROGRESS" from "TODO"       [2023-11-30 Thu 17:30]
@@ -8817,8 +8816,8 @@ integers 15 taker 10 dropper [+] reduce
 [positive?] [take] []
 #+end_src
 
-**** CANCELED last
-**** TODO distinct
+*** CANCELED last
+*** TODO distinct
 depends on sets
 
 The difference between this and just calling =set= is that the result is
@@ -8840,7 +8839,7 @@ duplicates. Should be a similar impl to =keep=.
 #+RESULTS:
 : [1 1 3] [[generate] dive [contains?] [put [generate] dive] while] [] [take] []
 
-**** DONE partition
+*** DONE partition
 - State "DONE"       from "TODO"       [2023-12-07 Thu 17:39]
 #+begin_src kcats
   [1 2 3 4 5 6] [take]
@@ -8858,7 +8857,7 @@ duplicates. Should be a similar impl to =keep=.
 [] 2 [take] [1 2 3 4 5 6]
 #+end_src
 
-**** DONE joiner (aka catenate)
+*** DONE joiner (aka catenate)
 #+begin_src kcats
   [[1 2 3] [4 5 6] [7 8 9]]
   liberate
@@ -8873,7 +8872,7 @@ duplicates. Should be a similar impl to =keep=.
 #+RESULTS:
 : [1 2 3 4 5 6 7 8 9] [generate [] swap [] [join [generate] dip swap] while drop] [take] []
 
-**** TODO groupby
+*** TODO groupby
 #+begin_src kcats :results code
    ["foo" "bar" "baaz" "quux"]
    liberate ;; (the next word foo)
@@ -8913,8 +8912,8 @@ specifying it inline.
 [take] []
 #+end_src
 
-**** CANCELED Map/filter can't access lower stack items
-***** Problem
+*** CANCELED Map/filter can't access lower stack items
+**** Problem
 this doesn't work:
 
 #+begin_src kcats :results code
@@ -8947,7 +8946,7 @@ Perhaps we can split each stage into several parts:
 + dip underneath the layers to calculate the next value using lower stack items
 + swap the new value to the top of stack
 +
-***** Debug session
+**** Debug session
 #+begin_src kcats :results code
 [[program [10 [1 2 3] liberate [+] each generate]]] environment
 advance advance advance advance eval-step [advance] 5 times eval-step
@@ -8970,7 +8969,7 @@ advance advance advance advance eval-step [advance] 5 times eval-step
 #+begin_src kcats
 [[program [[[program] lookup count] shield swap [[program] lookup count [[positive?] [<=]] [execute] every?] [eval-step] while swap drop]] [stack [[[stack []] [program [+]]]]]]
 #+end_src
-***** Resolution
+**** Resolution
 After thinking about this some more, my conclusion:
 
 This is supporting multi-arity mapping functions, which did work in
@@ -9019,7 +9018,7 @@ In theory we could write a helper function called =capture1= or something that d
 
 #+RESULTS:
 : [6 7 5]
-***** DONE Add functions to help capture environment for map/filter fns
+**** DONE Add functions to help capture environment for map/filter fns
 It's too difficult to do this manually.
 
 #+begin_src kcats
@@ -9057,7 +9056,7 @@ and the generator equivalent
 109 5
 #+end_src
 
-**** DONE Reduce
+*** DONE Reduce
 #+begin_src kcats :results code
   0 [inc clone] 30 taker [+]
   [generate] dive clone ;; acc acc f
@@ -9140,7 +9139,7 @@ let's make an equivalent to =map= (that doesn't require a generator) for ease of
 
 ...wait a minute, isn't that just =step=?
 
-**** CANCELED Generator combinators?
+*** CANCELED Generator combinators?
 - State "CANCELED"   from "TODO"       [2024-01-16 Tue 17:10] \\
   Not sure there's anything to do here.
 When writing =partition=, it would be nice if we could use generators
@@ -9201,7 +9200,7 @@ Maybe we can even implement the window shifting version?
 1 3 [take] []
 #+end_src
 
-**** DONE Applying generator to an existing container
+*** DONE Applying generator to an existing container
 - State "DONE"       from "INPROGRESS" [2023-12-07 Thu 17:40]
 - State "INPROGRESS" from "TODO"       [2023-11-10 Fri 16:36]
 we commonly have this construct: =[[1 2 3] ... collect] shield=, where
@@ -9219,7 +9218,7 @@ we're transducing a list and we want to just get the result.
 [1 3 5]
 #+end_src
 
-**** INPROGRESS Combinations
+*** INPROGRESS Combinations
 - State "INPROGRESS" from "TODO"       [2024-01-17 Wed 09:13]
 #+begin_src kcats
   [1 2 3 4 5] [[count] shield -1 ;; l idx i
@@ -9365,9 +9364,9 @@ enumerate generator
 [a b c d e] [] 3 1 [a b c d e]
 #+end_src
 
-*** INPROGRESS Implement sorting                                   :stdlib:
+** INPROGRESS Implement sorting                                     :stdlib:
 
-**** TODO Implement partialord
+*** TODO Implement partialord
 Each type needs to be comparable to another.
 
 #+begin_src kcats
@@ -9429,7 +9428,7 @@ UHOH
 #+RESULTS:
 : [[reason "word is not defined"] [unwound [both]] [type error] [asked [both]] [handled true]] [inc] 2 1
 
-**** TODO Make floats hashable
+*** TODO Make floats hashable
 This will allow floats to be added to the =KeyItem= enum. Floats are not
 normally hashable, because mathematically identical numbers are not
 always represented the same way in memory and wouldn't hash the
@@ -9440,7 +9439,7 @@ be the same map key.
 This will then allow a list that contains floats, to be sorted, or be
 able to use float values as a sort-by key.
 
-**** TODO Implement compare
+*** TODO Implement compare
 Should expose Rust's comparison function. That will allow a native
 sort function, for max flexibility (but not performance).
 
@@ -9480,7 +9479,7 @@ This should work - the empty set and map maybe can't be compared but Nothing sho
 #+RESULTS:
 : less
 
-*** TODO Stream transformation
+** TODO Stream transformation
 Problem: kcats doesn't speak http or https or various other protocols
 and formats, but rust does. We want to be able to use the complicated
 bits of rust, but let kcats decide how to combine them.
@@ -9495,19 +9494,19 @@ iterate. All such transforms would probably have the same program.
 
 I think what I am getting at here is that Items should implement Rust
 traits where possible, eg Read/Write for file and network pipes.
-*** INPROGRESS Select from multiple pipes
+** INPROGRESS Select from multiple pipes
 A basic select (which I call =attend=) is in place. 
 
-**** TODO Attend should leave the pipe list argument
+*** TODO Attend should leave the pipe list argument
 A lot of callers would want to re-use that argument so it shouldn't
 need to be shielded by default.
 
-**** TODO Better error handling
+*** TODO Better error handling
 There's lots of places where flume could throw an error and we don't
 do anything about it.
 
-*** TODO Monitoring tools
-**** TODO Reporting back to the mothership
+** TODO Monitoring tools
+*** TODO Reporting back to the mothership
 When we spawn/animate, the environment is in its own universe and the
 main environment has no way to get any information about it, except by
 whatever means are baked into the spawned env's program. Users can
@@ -9535,7 +9534,7 @@ that leads back to the master env). What would be really handy is
 parsing the inner env data to see which references to channels it
 contains, seeing whether it's a sender or receiver, and drawing arrows
 between envs so users can see they talk to each other.
-**** TODO Monitoring UI
+*** TODO Monitoring UI
 We could show not only all the envs and ther recent state (perhaps
 dumped every few seconds), we could show arrows between environments
 that represent pipes (if two envs have a copy of the same pipe
@@ -9546,10 +9545,10 @@ direction of data flow along with the pipe id.
 We could also allow views into a particular pipe where we copy the
 last handful of values to pass through (this is doable for channels
 but probably not file/network pipes).
-*** INPROGRESS Native REPL
-**** DONE Main mode of reading program from cmdline or file
+** INPROGRESS Native REPL
+*** DONE Main mode of reading program from cmdline or file
 - State "DONE"       from "TODO"       [2023-10-19 Thu 21:08]
-**** INPROGRESS REPL as a kcats program
+*** INPROGRESS REPL as a kcats program
 - State "INPROGRESS" from "TODO"       [2023-10-19 Thu 21:08]
 Read inputs from stdin, eval in a nested env, write to stdout.
 
@@ -9586,7 +9585,7 @@ Read inputs from stdin, eval in a nested env, write to stdout.
         [type tunnel]]
 #+end_src
 
-*** TODO Words that quote programs instead of executing them
+** TODO Words that quote programs instead of executing them
 eg =liberate= - it is just =[take]=, so it doesn't actually do anything by
 itself. It seems like the quotedness should remain and maybe the word
 should always perform the action.
@@ -9616,7 +9615,7 @@ makes sense when you dive into it.
 
 Isn't this just an implementation detail? In theory =each= could be a
 separate generator and honestly it probably should be.
-**** TODO Get rid of self-inserting programs (esp with generators)
+*** TODO Get rid of self-inserting programs (esp with generators)
 Problem: words like =joiner= and =taker= don't do anything except insert a
 program. That, i think, should be an anti-pattern in kcats. If you
 want to put a program on the stack succintly,then define a word that
@@ -9641,13 +9640,13 @@ create it (since the state is always a list and otherwise it would see
 a number). But it's not generally possible for a generator to tell if
 it needs to add state - it should already be there. So if we're just
 quoting the generator, then what will add it?
-*** TODO Data compression
+** TODO Data compression
 Data streams that we intend to produce later are going to need
 compression - the streams should be as small as possible (they'll be
 encrypted later so it's too late to compress them after that). lz4 maybe?
-*** TODO Multimethod improvements
-**** TODO Convert to multi
-**** DONE Refactor addmethod
+** TODO Multimethod improvements
+*** TODO Convert to multi
+*** DONE Refactor addmethod
 - State "DONE"       from "INPROGRESS" [2023-12-04 Mon 16:24]
 - State "INPROGRESS" from "TODO"       [2023-12-04 Mon 16:13]
 #+begin_src kcats
@@ -9687,9 +9686,9 @@ encrypted later so it's too late to compress them after that). lz4 maybe?
 foo
 #+end_src
 
-**** DONE ismulti?
+*** DONE ismulti?
 - State "DONE"       from "TODO"       [2023-12-04 Mon 16:25]
-*** TODO run multiple programs on same argument to get list
+** TODO run multiple programs on same argument to get list
 #+begin_src kcats
   5 2 [[+] [*]] [execute] map
 #+end_src
@@ -9700,7 +9699,7 @@ foo
 2 5
 #+end_src
 
-*** INPROGRESS pairwise operations
+** INPROGRESS pairwise operations
 - State "INPROGRESS" from "TODO"       [2024-02-03 Sat 11:28]
 #+begin_src kcats
   1 2 3 4 5 [] both] [[] evert [2 2 partition] assemble] dip
@@ -9728,7 +9727,7 @@ this generator based impl doesn't support nil values on the stack:
 [4 3]
 #+end_src
 
-*** INPROGRESS Non-generator filter
+** INPROGRESS Non-generator filter
 - State "INPROGRESS" from "TODO"       [2024-02-04 Sun 13:50]
 map now doesn't require you to bind values (the map function has access to the rest of the stack).
  Do the same for =filter=.
@@ -9747,62 +9746,318 @@ map now doesn't require you to bind values (the map function has access to the r
  [2 4]
  5
  #+end_src
-*** INPROGRESS inscribe currently re-defines words repeatedly at runtime
-- State "INPROGRESS" from "TODO"       [2024-02-08 Thu 17:17]
-**** Problem statement
-The way it works now, it does the dictionary update and then runs the
-program. It should instead alter a program.
 
-Even with this functionality, the problem is the code will be
-difficult to read: instead of defining programs as inline literals,
-we'd have to "inscribe" the program so that its component words refer
-to the right definitions, and then bring that new program into an
-inscribe call by pulling it from the stack into a nested update structure. 
-
-
-#+begin_src kcats
-  [[pt [+ *]]]
-  vocab
-  -> partial dictionary with math = [[pt [+ *]]]
-
-  [9 3 pt] lingo
-  ;; iterate through the partial dict, for each word update the version
-  ;; in the program (to avoid having inner functions' meaning changed)
-  ;; 
-#+end_src
-
-Problems that need to be avoided:
-
-+ When code is defining new vocabulary, and it gets called in a tight
+** TODO Modules
+*** Problem statement
+**** TODO Efficient use
+ When code is defining new vocabulary, and it gets called in a tight
   loop, it should not be modifying the dictionary each
   time. Dictionary shoud be append only (to avoid having to swap back
   and forth between a modified and unmodified version)
-+ Dictionary modification should not happen at "runtime" (when the
+
+ #+begin_src kcats
+   ;; save a modified env or dictionary and use it
+   ;; again.
+   [crypto] stdmod ;; make the module
+   ;; apply it to the dictionary
+   ["foo" encode hash] confine
+ #+end_src
+
+ #+RESULTS:
+ #+begin_src kcats
+ #b64 "LCa0a2j/xo/5m0U8HTBBNBNCLXBkg7+g+YpeiGJm564="
+ #+end_src
+
+ Let's make a word to load multiple modules
+
+ #+begin_src kcats
+   [crypto time]
+   ;; apply the changes in order
+   dictionary swap [decache string read shielddown] step
+   ;; now execute
+   
+ #+end_src
+
+ #+RESULTS:
+ #+begin_src kcats
+ dictionary_redacted
+ #+end_src
+
+ Let's divide up the functionality:
+ + reading from cache and parsing (module)
+ + apply module to dictionary (inscribe)
+ + spawn env with new dict and program (spawn)
+ + capture result as our stack 
+
+**** TODO Modification happens once per program
+  Dictionary modification should not happen at "runtime" (when the
   program is actually being executed) - it should be modified when the
   program is *built*. However the consequence of this is pretty dire,
   because much of the standard library is currently just programs that
   are literals and don't need "building".
-+ Nested library calls need to work - I should be able to call =af= that
-  loads (or depends on  =b= and calls =bf= that loads =c= and calls =cf=, and those loads
-  should only happen once even if i call =af= in a tight loop.
-+ Building vocabulary and the programs that use that vocabulary need
-  to be separable (that's the whole point of a library). In practice
-  there will be some "mini-libs" that mostly just make code easier to
-  read and stay with the program that uses them. However we need to be
-  able to modify the dictionary, and then refer to that modification
-  later (by name? hash?), to support the typical library use
-  case. That maps to a use/require when a program starts, and then
-  later, in some arbitrary place in the code, you refer to the
-  library's functions via its namespace.
-  
-  This is starting to sound a lot like namespaces: It's an impl where
-  there's only a 'use' without aliasing that overrides any existing
-  definitions. Currently we avoid the whole issue of referring to
-  namespaces by name by insisting you pair the library to a program at
-  definition time. But that is a 1:1 relationship and it should be
-  1:many. I should be able to bind a 2nd program such that it uses the
-  library's vocab. There's no way to do that with the current impl of
-  =inscribe=.
+**** TODO Nested library calls need to work
+  I should be able to call =af= that loads (or depends on =b= and calls =bf=
+  that loads =c= and calls =cf=, and those loads should only happen once
+  even if i call =af= in a tight loop.
+**** TODO Code should be shareable
+That means, local names should generarlly not appear in code, as they
+change meaning.
+**** TODO Building vocabulary and the programs that use that vocabulary need to be separable
+  (that's the whole point of a library). In practice there will be
+  some "mini-libs" that mostly just make code easier to read and stay
+  with the program that uses them. However we need to be able to
+  modify the dictionary, and then refer to that modification later (by
+  name? hash?), to support the typical library use case. That maps to
+  a use/require when a program starts, and then later, in some
+  arbitrary place in the code, you refer to the library's functions
+  via its namespace.
+**** TODO Sandboxing
+***** TODO Preservation of meaning
+We execute untrusted code, then our own code, our code should mean the
+same thing as it would have before executing the untrusted code.
+***** TODO Access control
+We should be able to execute untrusted code in a limited environment
+(where, for example, it does not have access to the filesystem
+etc). 
+****** TODO [#C] Fine grained access control
+We could for example, limit filesystem access to a particular
+directory, or network access to a particular host. One way this could
+be done: have all such primitives run some other word as a predicate
+lock, and respect the outcome of that predicate. However, some care
+would need to be taken that the untrusted code couldn't just bootstrap
+a new env without that lock in place. I'm not sure this is possible
+within the overall language design.cause
+
+#+begin_quote
+Integrating an authentication scripting language directly into the
+core of your stack-based language and leveraging it for controlling
+access to sensitive operations could indeed be a powerful and flexible
+solution. This approach aligns well with your goal of making
+authentication programmable while addressing the specific challenges
+of providing fine-grained access control in a sandboxed
+environment. Here's how to address potential concerns and make the
+most out of this integration: Design Principles
+
+    Efficiency by Design: Since performance is a concern, designing
+    the authentication script execution to be as lightweight as
+    possible is crucial. Optimize the most common authentication paths
+    to reduce overhead. Consider caching results of authentication
+    checks where safe and applicable, especially in scenarios where
+    the same authentication decision is repeated.
+
+    Conditional Authentication Checks: Implement the authentication
+    scripts to run conditionally, i.e., only in contexts where
+    sandboxing is required. This minimizes the performance impact on
+    the overall system while still providing robust security measures
+    where they're most needed.
+
+    Customizable Script Complexity: Allow the complexity of the
+    authentication scripts to be tailored according to the security
+    needs of the sandbox environment. For less sensitive operations or
+    more trusted sandboxed environments, simpler scripts could be
+    used, reducing resource consumption.
+
+Practical Implementation
+
+    Authentication Context: Provide a rich context to the
+    authentication scripts, including details about the requested
+    operation (e.g., file path for file access, URL for network
+    requests), the environment's security status, and any relevant
+    user or process identifiers. This enables writing precise and
+    effective authentication logic.
+
+    Digital Signatures and Proof Checking: As part of the
+    authentication scripts, leverage digital signatures for verifying
+    the integrity and authenticity of the scripts themselves or any
+    other supplied credentials. Although checking digital signatures
+    can be resource-intensive, optimizing the cryptographic operations
+    and selectively applying them can help manage the performance
+    impact.
+
+    Expandable Security Model: By integrating authentication scripting
+    into the core, you lay a foundation that's not only useful for
+    sandboxed environment control but can also be expanded for broader
+    security features in the future, such as secure inter-process
+    communication or encrypted data storage, using the same flexible
+    scripting approach.
+
+Security and Performance Balance
+
+    Asynchronous Operations: When possible, make the authentication
+    checks asynchronous, especially for I/O bound tasks like network
+    requests or disk access. This can help mitigate the performance
+    impact on the rest of the system.
+
+    Resource Limits and Quotas: Introduce limits on the resources that
+    authentication scripts can consume, such as CPU time or memory
+    usage. This prevents potential abuse where overly complex scripts
+    could degrade system performance.
+
+In sum, your approach to incorporate an authentication scripting layer
+directly into the core of the language introduces a novel mechanism
+for fine-grained access control, effectively turning authentication
+checks into programmable gatekeepers for sensitive operations. While
+it introduces challenges in terms of complexity and resource
+management, careful design and optimizations can mitigate these
+issues, offering a powerful and flexible tool for secure sandboxing.
+I guess the question is, can the lock be unalterable? I can definitely
+hardcode some aspects of these locks so that they are alterable from
+the outside but not the inside. For example, if my trusted env wants
+to create an untrusted one, it could insert a lock into a field of the
+inner env, that is not accessible to the untrusted program. However,
+the inner env can still construct a new env itself with a very
+permissive lock and still use it to read the filesystem however it
+wants. So somehow, the construct needs to force new envs to inherit
+the locks of the current one. That's possible to implement. It could
+be a series of locks (append only), and the key has to unlock all of
+them.
+
+> I think the locks don't really even need cryptography in that case:
+the lock would say "can only read/write to /tmp" and the key would
+just be the file that the environment is trying to access. If it
+starts with /tmp then it is allowed.
+
+Yes, designing a lock mechanism that is both unalterable from inside
+the untrusted environment and inheritable for any subsequently created
+environments is indeed possible and can effectively secure the system
+according to your requirements. The append-only series of locks, where
+each new environment inherits the restrictions (locks) of its creator,
+ensures that no matter how deeply nested an environment is, it cannot
+escape the boundaries set by its original, trusted creator. Here's how
+such a mechanism could be structured:
+Lock Mechanism Design
+
+    Immutable Locks: Implement locks as immutable structures within
+    each environment. Once a lock is set, it cannot be modified from
+    within that environment. New environments inherit the lock state
+    of their parent environment upon creation.
+
+    Lock Inheritance and Aggregation: Ensure that when an environment
+    creates a new environment (even an untrusted one wants to create
+    another environment), the new environment inherits all the locks
+    of its parent environment, potentially adding its own restrictions
+    but never relaxing any existing ones. This could be done in an
+    append-only manner, where new locks add to the restrictions but do
+    not overwrite them.
+
+    Path-Based Access Control: Your description of using locks to
+    control file access based on paths (e.g., "can only read/write to
+    /tmp") is an example of path-based access control. This control is
+    straightforward yet effective and does not necessarily require
+    cryptographic keys for enforcement, simplifying implementation and
+    reducing overhead.
+
+Implementation Considerations
+
+    System-Enforced Lock Checks: The core system that mediates access
+    to resources (file system, network, etc.) must enforce the lock
+    checks before granting any operation. This ensures that no
+    environment, regardless of its programming, can bypass the
+    restrictions placed upon it by its defined locks.
+
+    Auditing and Monitoring: Although the lock mechanism provides a
+    strong control mechanism, implementing auditing and monitoring on
+    the enforcement points can help identify potential attempts to
+    bypass restrictions or exploit weaknesses in the lock design.
+
+    Error Handling and Feedback: Define clear behavior and feedback
+    mechanisms for when an environment attempts to perform an
+    operation that is denied by its locks. Good error handling is
+    crucial for developers working within these environments to
+    understand the boundaries and work effectively within them.
+
+    Documentation and Transparency: Providing clear documentation on
+    how locks work, how they are inherited, and how they restrict
+    operations will aid in the adoption and correct usage of the
+    environment creation and management functionalities you are
+    designing.
+
+In conclusion, your approach to using immutable, inheritable locks
+that enforce path-based access control offers a robust method to
+secure environments in a stack-based programming language, without
+necessitating the complexity and overhead associated with
+cryptographic solutions. This method provides a fine-grained control
+mechanism that's both practical and efficient, aligning well with the
+needs of a secure, sandboxed execution environment.
+#+end_quote
+*** Discussion
+**** pairs of program/dictionary.
+
+It's sort of like a passage of english prose, and a dictionary of what
+all the words used in that prose mean. In terms of "true" meaning,
+those two things are bound up together, you can change the meaning
+either by changing the prose or the dictionary. So in a sense the
+"meaning hash" is hash of the dict+program, not just the program
+itself.
+
+One potential hole in this concept is the existence of axiom words
+(that aren't defined in terms of other words). It's not clear how to
+hash them, we'd need the source of their implementation. Another issue
+is it's possible to make alterations in the interpreter that still
+execute the program the same way but the hash doesn't match. So
+non-matching hash doesn't mean "different meaning", but same hash
+generally means "same meaning". That's the way hashes work most places
+though.
+
+Can we do anything with this? Maybe not.
+
+
+**** not having to recalculate the whole dictionary each time we want to use a module.
+There's several possible mitigations:
+
++ Leave the modified dictionary on the stack so it can be reused
++ Make 2 levels of env nesting per library
+   + One where the modified dict is in the dict (but words are not available)
+   + One where we actually apply that dict so the words can be used
+
+**** Use of names
+It occurred to me that we don't have to use names at all when it comes
+to libaries or modules. We just let code refer to hashes, and the IDE
+tools will help resolve those hashes to names or vice versa. But the
+canonical form (in the actual code) will be hashes only.
+
+This solves a lot of issues:
+
++ There is no chicken and egg problem. The kcats language itself
+  simply does not support names or local address books. It refers to
+  content by hash and that's it. That's how libraries are loaded,
+  etc. After the kcats language is complete, then we write naming
+  tooling in kcats, and we run those tools against a kcats program to
+  resolve hashes to names (possibly as part of IDE functionality). For
+  example, the IDE replaces hashes with names (if known) and you can
+  hover over the name to see the hash if needed.
++ Code is sharable because there are no local names present
+
+#+begin_src kcats
+  ;; define a module
+  [[square [clone *]]] draft inscribe
+  ;; now the dictionary is on the stack
+  [9 square] confine
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+81
+#+end_src
+
+Defining a module hierarchy using only the stack can get diffcult. We
+can create dictionaries and make them a dictionary entry to refer to them.
+
+#+begin_src kcats
+  [[square [clone *]]] draft inscribe
+  ;; so now we have an updated dictionary, let's make this an entry we
+  ;; can access without polluting the dictionary with all the words we defined
+  wrap [math] swap put entry dictionary swap put
+  [math [8 square] confine] confine
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+64
+#+end_src
+
+*** INPROGRESS inscribe currently re-defines words repeatedly at runtime
+- State "INPROGRESS" from "TODO"       [2024-02-08 Thu 17:17]
 **** INPROGRESS Current design
 - State "INPROGRESS" from "TODO"       [2024-02-12 Mon 08:22]
 Have two separate words: one for loading new modules =loadlib=, and
@@ -9851,116 +10106,6 @@ mapping will exist before calling =inscribe=, =inscribe= needs a way of
 not creating the alias - we could do that by allowing =[]= as an alias.
 **** INPROGRESS Library loading
 - State "INPROGRESS" from "TODO"       [2024-02-17 Sat 14:51]
-***** INPROGRESS Hash-based namespace identification
-- State "INPROGRESS" from "TODO"       [2024-02-14 Wed 19:22]
-We identify which module a word's definition came from, by its
-hash. However it's not clear what exactly we hash or when.
-
-There are several ways to implement
-
-+ Take a hash from the user of what module he wants (mapping hashes to
-  documentation and version numbers is done elsewhere)
-+ Contact peers to retrieve the bytes corresponding to that hash
-+ Check the retrieved bytes in fact match the hash
-+ call =read= on those bytes to get a program datastructure
-+ Call =loadlib= and pass it a hash to execute that program on the
-  dictionary to add that hash's namespace.
-
-However that makes =loadlib= unsafe because malicious code would be able
-to masquerade as a trusted lib. We could do this
-
-+ Call loadlib and pass it the raw bytes, loadlib calculates the hash
-  itself and then calls =read=.
-
-This is not ideal either, since then defining modules inline would
-involve a round trip of serialization (you'd have to =emit= to get the
-bytes, and then loadlib would re-read). I don't really see any way
-around this though, as there's no other way to hash a program other
-than through =emit=. Note we need a deterministic =emit=. Add an issue for
-that.
-
-Should inscribe be responsible for hash checking? Options:
-+ First impl, inscribe takes bytes, hashes it itself, and calls
-  read. The problem is this causes a serialization round trip before
-  the library is interpreted, even when the library is "local" (inside
-  the main program or another lib). That erases word namespaces which
-  can be inconvenient.
-+ Inscribe takes list already parsed, and trusts the hash it is
-  given. Then the calling code has to be secure.
-+ Inscribe takes a list already parsed, but emits it itself, just to
-  calculate the hash. Then it could potentially do a serialize round
-  trip and a half (if it was read from disk) - serialized to disk,
-  parsed into program, and then serialized again to get the hash.
-+ Inscribe has two different modes, 1) bytes where it operates in the
-  first mode, and 2) program where it operates in the 3rd mode
-So what would an inline library use look like?
-#+begin_src kcats
-  [[clone *] [square] assign] [emit hash] shield loadlib
-  wrap
-  [9 square] using
-
-  ;; we could define `draft` to allow this:
-  [[clone *] [square] assign]
-  [9 square] draft
-
-  ;; but you can't nest, you'd have to do this:
-  [[clone *] [square] assign] [math] loadlib
-  [[[math]
-    [clone square *] resolve]
-
-   [cube] update]
-  [math2] loadlib
-  [[math2] [9 cube] using]
-
-#+end_src
-
-Test basic functionality: can define a new word in a scope and call it, but not outside the scope.
-#+begin_src kcats
-  [[cubez]
-   [[clone clone * *]
-    [[number] [number]]
-    [spec definition] label]
-   update] encode
-  [math] unwrap inscribe
-
-  [math] [9 cubez] using  ;; in scope
-  2 cubez ;; out of scope
-#+end_src
-
-#+RESULTS:
-#+begin_src kcats
-[[type error]
- [asked [cubez]]
- [reason "word is not defined"]
- [unwound [cubez]]
- [handled yes]]
-2 729
-#+end_src
-
-Words in a library can call each other
-#+begin_src kcats
-  [[square]
-   [[clone *]
-    [[number] [number]]
-    [spec definition] label]
-   update
-   [cube]
-   [[clone square *]
-    [[number] [number]]
-    [spec definition] label]
-   update]
-
-  encode [math] unwrap inscribe
-  [math] [9 cube] using 
-  ; tracer collect 
-  ;  [math] [9 cube] using execute ;; in scope
-
-#+end_src
-
-#+RESULTS:
-#+begin_src kcats
-729
-#+end_src
 ***** TODO Make library loading primitives
 ****** DONE Move hash to earlier loading module
 - State "DONE"       from "INPROGRESS" [2024-03-19 Tue 11:39]
@@ -10053,8 +10198,81 @@ We need it for library loading, can't stay as part of crypto lib.
   #+end_src
 
 
-****** TODO Primitive for aliasing a module
+****** CANCELED Primitive for aliasing a module
+- State "CANCELED"   from "TODO"       [2024-04-08 Mon 16:40] \\
+  Not going to use aliases.
 Needs to respect the "no overwrite" rule.
+
+****** TODO Test out saving modules as dict entries
+We can think of a module as a dictionary modification program. We can
+store those programs in the dictionary as definitions and use them
+later? No not really, because we can't modify the current
+dictionary. So there's no way to just install an alias to a module.
+
+#+begin_src kcats
+  "123" encode
+  [crypto] stdmod
+  [hash] boomerang
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+#b64 "pmWkWSBCL51Bfkhn79xPuKBKHz//H6B+mY6G9/eieuM="
+#+end_src
+
+Ok so this is straight forward enough but what if we want to use a
+module later? Do we need to reload it? We could save dictionaries but
+that's not the same as saving the modules that comprise it so that
+they can be combined in different ways.
+
+In most languages, a module continues to be addressable by an alias
+after you've loaded it (and doesn't result in loading it again).
+
+A couple ways to deal with that - can store a diff instead of the
+module program and just apply it. Can just reload the module every
+time. Can keep the resulting dictionary somewhere (on the stack?).
+
+Kcats is just function composition, I don't think there's any case
+where more than one function needs to be available at a time. Dividing
+the dictionary seems to be more of a security feature - you're saying
+"this program should only need these functions but I don't know what
+the lower levels try to do". In theory you could give different
+dictionaries to every word of the program that consisted of all the
+words that word calls, etc. So this whole system is more of a
+"matching my expectations to the actual behavior" type of feature.
+
+****** TODO Test out nested envs as library mechanism
+#+begin_src kcats
+  ;; load a module
+  [crypto] unwrap decache string read
+  [["foo" "bar" "baz"] [hash] map] spawn clone evaluate
+
+  ;;boomerang
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[program []]
+ [stack [[#b64 "LCa0a2j/xo/5m0U8HTBBNBNCLXBkg7+g+YpeiGJm564=" #b64 "/N4rLtula/QIYB+3If6bXDONEO5CnqBPrlURto+/j7k="
+          #b64 "uqWglk0zIPvAxqkiFARTyFE+okq4/QV3A0gEqWckgJY="]]]]
+[[program [["foo" "bar" "baz"] [hash] map]]
+ [stack []]]
+#+end_src
+
+So what is =let= in this model?
+
+#+begin_src kcats 
+  [[plus2 [2 +]]]
+  [5 plus2]
+  [draft] dip
+  boomerang
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+7
+#+end_src
+
 **** INPROGRESS Nesting scopes
 - State "INPROGRESS" from "TODO"       [2024-02-14 Wed 20:07]
 We should be able to chain calls to =using= without repeating any
@@ -10194,7 +10412,8 @@ If a program refers to a word, and at the time that program is put on
 the stack, that word means something, it should still carry the same
 meaning if that program is later run with =execute=. That means that
 module changes must be permanent.
-**** TODO Sandboxing support
+**** INPROGRESS Sandboxing support
+- State "INPROGRESS" from "TODO"       [2024-04-03 Wed 20:41]
 It must be possible for a module to *deny* access to a given word. Given
 that dictionary changes are permanent, we can't just delete words from
 the dictionary (once the given program is done, that word needs to be
@@ -10211,7 +10430,108 @@ may be others.
   modification)
 + The word should be accessible again after the program using the
   module has completed.
-**** TODO Access control
+***** TODO experiment with nested envs as module loading mechanism
+First let's see if a nested env allows sandboxing
+#+begin_src kcats
+  ;; make an env with no access to io
+
+  ;; load the functional module code
+  [functional] unwrap decache string read
+
+  ;; get the current dictionary and modify it
+  [dictionary] dip execute
+
+  ;; Now create a new env with this dictionary and execute it
+  ["hi" print] [program dictionary] label environment evaluate
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[program []]
+ [stack [[[asked [standard]]
+          [handled yes]
+          [reason "word is not defined"]
+          [type error]
+          [unwound [standard ["hi"] unwrap "\n" join encode put drop]]]]]]
+#+end_src
+
+Yes!
+
+Ok now let's make a word that takes a module and a program, builds a
+new env.
+
+#+begin_src kcats
+   "foo" [bar]
+   [[plus2 [2 +]]] [entry] map
+   wrap [join] join
+   [5 plus2]
+   spawn
+   ;dictionary
+   ;float shielddown [dictionary program] label environment
+   evaluate [stack] lookup restore
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+7 [bar] "foo"
+#+end_src
+
+Also, for debugging purposes it would seem we need a way of running
+eval-step (outer) in a loop - perhaps an axiom that checks if the
+program is empty, if not eval-step it and place eval-step back in the
+program? Slightly better than a =loop= impl. Maybe it's ok for now.
+
+#+begin_src kcats
+[[program [1 2 3 +]]] environment eval-step
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[program [2 3 +]]
+ [stack [1]]]
+#+end_src
+
+Let's see if it's possible to use an inner-env module and still debug it.
+#+begin_src kcats
+  ;; the program we want to debug in the top level
+  [10 11
+   [[plus2 [2 +]]] draft inscribe
+   [plus2] confine]
+  ;; TODO: the issue here is that we can't just eval-step once, We have
+  ;; to make the next instruction also eval-step (unless the program is
+  ;; already empty)
+  [[evaluate definition]
+   ;; The inner env debugger - when we call `confine`, it's going to
+   ;; call `evaluate`, which will not allow us to step through the inner
+   ;; env's execution. In order to do that, we have to just eval-step
+   ;; it. Instead of running evaluate as a single atomic word we just
+   ;; make a kcats version of it.
+   [[[program] lookup] [eval-step] while] assign] inscribe  
+  swap
+  spawn [advance] 7 times advance
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[program []]
+ [stack [13 10]]]
+#+end_src
+
+#+begin_src kcats
+  ;; the program we want to debug in the top level
+  10 11
+  [[plus2 [2 +]]] draft inscribe
+  [plus2] confine
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+13 10
+#+end_src
+
+
+**** INPROGRESS Access control
+- State "INPROGRESS" from "TODO"       [2024-04-07 Sun 13:53]
 Take the word =define= which allows the caller to make arbitrary and
 permanent changes to the dictionary. What if we wanted to restrict
 access to that word such that authorized programs can call it but
@@ -10669,7 +10989,9 @@ Warning: empty local module
 + stack motion [flip] (only depends on own builtins)
 + collection builtins [join put count first step take wrap unwrap ...]
 + execution builtins [dip execute branch recur loop decide] 
-**** TODO Disallow module alias overwriting
+**** CANCELED Disallow module alias overwriting
+- State "CANCELED"   from "TODO"       [2024-04-07 Sun 13:53] \\
+  We're not going to be using aliases in this branch
 It is a security problem to allow code to overwrite some other code's
 alias for a module. Throw an error in this case. We should call insert
 on the aliases, and if it returns something, it better be equal to
@@ -10681,9 +11003,29 @@ could just always look there by default, i guess. But if we need to
 allow custom sources, we could add that alongside the aliases
 **** TODO Find stdlib by alias
 ***** TODO hardcode the aliases in the source
-*** INPROGRESS Database
+**** TODO LIbrary loading should be in order of decreasing trust
+We shouldn't start with a standard env with access to the
+filesystem. Instead the standard env should lack IO capability, and
+force that to be loaded in an inner env.
+
+So instead of dropping back to a functional env, we start with one and
+load io capability when needed.
+
+Questions:
++ How do we decide what "less trusted" means?
++ Does decreasing trust make sense?
++ Does that mean we should never need to delete words? Seems like
+  sometimes we might.
+
+Decreasing trust seems to make sense, since you can't make a
+trustworthy construct out of an untrusted, only vice versa.
+
+What makes an env less trusted than its parent? Is it the additional
+words? Is it just that any additional code requires more trust, since
+it needs to be vetted?
+** INPROGRESS Database
 - State "INPROGRESS" from "TODO"       [2023-12-31 Sun 10:17]
-**** Books db
+*** Books db
 #+begin_src kcats
   [[author-first "George"] [author-last "Orwell"] [title "1984"] [year 1949] [subjects [government dystopia surveillance totalitarianism freedom]]]
   [[author-first "Aldous"] [author-last "Huxley"] [title "Brave New World"] [year 1932] [subjects [society technology dystopia happiness drugs]]]
@@ -10715,7 +11057,7 @@ allow custom sources, we could add that alongside the aliases
    [execute] every?]
   keep
 #+end_src
-**** EAVTO (entity, attribute, value, time, observer)
+*** EAVTO (entity, attribute, value, time, observer)
 Here's a database of the most basic and abstract observations
 (ignoring time and observer for now - those are all "now" and "me").
 
@@ -10981,151 +11323,167 @@ it? (May need to add some set-based words here).
 #+end_src
 
 #+begin_src kcats
-  ;; Module to operate on generic data, that are used throughout
-  [generic]
-  [[fork [[execute] map]]
-   [triangle [[[] [[take] dip swap [[put] shield sink swap pair] bail] collect] shielddown]]
-   [indexed-as-property [swap indexed
-                         [unwrap sink assign] map dropdown]]
-   [join-all [[first empty] shield swap [join] step]]
-   [selectkeys [set swap [first contains?] filter]]
-   [invert [[reverse] map association]]] draft inscribe drop 
+    ;; Module to operate on generic data, that are used throughout
+    [[fork [[execute] map]]
+     [triangle [[[] [[take] dip swap [[put] shield sink swap pair] bail] collect] shielddown]]
+     [indexed-as-property [swap indexed
+                           [unwrap sink assign] map dropdown]]
+     [join-all [[first empty] shield swap [join] step]]
+     [selectkeys [set swap [first contains?] filter]]
+     [invert [[reverse] map association]]
 
-  ;; Module for datalog variables
-  [variables]
-  [generic]
-  [[variable? [[[word?]
-                [string last \? =]] [execute] every?]]
-   [variable= [[[pair [variable?] every?] [=]] [execute] every?]]] resolve
-  draft inscribe drop
+     ;; datalog variables
+     [variable? [[[word?]
+                  [string last \? =]] [execute] every?]]
+     [variable= [[[pair [variable?] every?] [=]] [execute] every?]] 
 
-  ;; Module for datalog constraints
-  [eav]
-  [generic]
-  [[slots [[entity attribute value]]]
-   [slot-combos [slots [slots [pair] map] map join-all]]
-   [constraint [unwrap slots reverse label]]] resolve
-  draft inscribe drop
+     ;; datalog constraints
+     [slots [[entity attribute value]]]
+     [slot-combos [slots [slots [pair] map] map join-all]]
+     [constraint [unwrap slots reverse label]] 
 
-  ;; Module for links between datalog constraints
-  [links]
-  [eav variables]
-  [[links [slot-combos
-           [[wrap] map unwrap swapdown 
-            [[[lookup] inject] both] pairwise 
-            variable=]
-           filter   
-           [unwrap pair sink pair
-            [[index] lookup] map swap zip]
-           map]]
-   [all-links [[] sink
-               [[[[index] lookup] shield] both ;; lookup the indices of both constraints
-                [swapdown] dip sink ;; move the indices under the constraints
-                [links] shielddown
-                swap [dropdown dropdown join] dip] 
+     ;; links between datalog constraints
+     [links [slot-combos
+             [[wrap] map unwrap swapdown 
+              [[[lookup] inject] both] pairwise 
+              variable=]
+             filter   
+             [unwrap pair sink pair
+              [[index] lookup] map swap zip]
+             map]]
+     [all-links [[] sink
+                 [[[[index] lookup] shield] both ;; lookup the indices of both constraints
+                  [swapdown] dip sink ;; move the indices under the constraints
+                  [links] shielddown
+                  swap [dropdown dropdown join] dip] 
 
-               step drop]]
-   [format-link [[join] inject unwrap [string] map
-                 "c{0}.{1} = c{2}.{3}" swap format]]] resolve
-  draft inscribe drop
+                 step drop]]
+     [format-link [[join] inject unwrap [string] map
+                   "c{0}.{1} = c{2}.{3}" swap format]] 
 
-  ;; Module for formatting pieces of query data into text
-  [formatting]
-  [generic]
-  [[anded-together [[" AND " interpose join-all] resolve]]] resolve
-  draft inscribe drop
+     ;; formatting pieces of query data into text
+     [anded-together [" AND " interpose join-all]]
 
-  ;; Module for where clause data processing
-  [where-clauses]
-  [generic formatting variables]
-  [[where-data [[[index] lookup] shield swap 
-                [[[second variable? not]
-                  [first [index] unwrap = not]] [execute] every?] filter 
-                [swap prepend] map dropdown]]
-   [format-where [[string] map 
-                  "c{0}.{1} = :c{0}{1}" swap format]]
-   [make-where [first [where] lookup anded-together]]] resolve
-  draft inscribe drop
+     ;; where clause data processing
+     [where-data [[[index] lookup] shield swap 
+                  [[[second variable? not]
+                    [first [index] unwrap = not]] [execute] every?] filter 
+                  [swap prepend] map dropdown]]
+     [format-where [[string] map 
+                    "c{0}.{1} = :c{0}{1}" swap format]]
+     [make-where [first [where] lookup anded-together]]
+     [format-join [[[[on] lookup]
+                     [[where] lookup]
+                     [[index] lookup string]] [execute] map
+                    [join anded-together] inject 
+                    "JOIN EAV c{1} ON {0}" swap format]]
+     [make-query [rest [[on]
+                        [[format-link] map] update
+                        [format-join] shield [join] swap assign] map]]
 
-  ;; Module for SQL parameters for rusqlite
-  [params]
-  [[param-name [[string] map ":c{0}{1}" swap format]]
-   [extract-params [[] association swap [[params] lookup join] step]]]
-  draft inscribe drop
+     ;; SQL parameters for rusqlite
+     [param-name [[string] map ":c{0}{1}" swap format]]
+     [extract-params [[] association swap [[params] lookup join] step]]
 
-  ;; Module for SELECT clause
-  [select]
-  [generic links]
-  [[wordval? [second word?]]
-   [invert [[reverse] map association]]
-   [validate [[[second not]
-               [first "All selected query variables must appear somewhere in constraints"
-                [reason variable] label fail]
-               when] map]]
-   [select-data [swap
-                 [[slots selectkeys invert] shield
-                  [wordval?] filter join association] map
-                 swap
-                 [[[index] swap put ;; make a list of the variable and 'index'
-                   wrap [selectkeys] join ;; make the program to cut down
-                   map [count 2 =] filter first [second] map
-                   [first number?] [reverse] when] ;; items are in random order due to coming from association, fix the order
-                  map]
-                 shield dropdeep zip
-                 validate]]] resolve
-  draft inscribe drop
 
-  [database]
-  ;; work with the constraints first [swap
-  ;; expand all combinations of constraints
-  [select eav params generic links where-clauses params]
-  [[extract-data [[[[unwrap all-links]
-                    [first where-data   ; [join] inject unwrap
-                     ;; build the query param map
-                     [[[] swap
-                       [[param-name] shield [last] dip wrap swap assign]
-                       step]
-                      ;; build the actual query where clauses
-                      [[format-where] map]]
-                     fork]]
-                   fork] shield
-                  ;; combine extracted items
+     ;; SELECT clause
+     [wordval? [second word?]]
+     [invert [[reverse] map association]]
+     [validate [[[second not]
+                 [first "All selected query variables must appear somewhere in constraints"
+                  [reason variable] label fail]
+                 when] map]]
+     [select-data [swap
+                   [[slots selectkeys invert] shield
+                    [wordval?] filter join association] map
+                   swap
+                   [[[index] swap put ;; make a list of the variable and 'index'
+                     wrap [selectkeys] join ;; make the program to cut down
+                     map [count 2 =] filter first [second] map
+                     [first number?] [reverse] when] ;; items are in random order due to coming from association, fix the order
+                    map]
+                   shield dropdeep zip
+                   validate]]
 
-                  [first] dip ;; keep the original constraint to add properties to
-                  unwrap unwrap [where params on] label join]]
-   [query [swap
-           ;; expand all combinations of constraints
-           [constraint] map 
-           ;;[] prepend ;; an empty constraint to represent the orignal EAV table we're joining with
-           [index] indexed-as-property
-           triangle
-           ;; for each pair of constraints, build the "ON" clause data for the JOIN
-           [extract-data] map
+     ;; query 
+     [extract-data [[[[unwrap all-links]
+                      [first where-data   ; [join] inject unwrap
+                       ;; build the query param map
+                       [[[] swap
+                         [[param-name] shield [last] dip wrap swap assign]
+                         step]
+                        ;; build the actual query where clauses
+                        [[format-where] map]]
+                       fork]]
+                     fork] shield
+                    ;; combine extracted items
 
-           [[extract-params]
-            [make-query]
-            [make-where]
-            [swap select-data]] fork 
-           dropdown ;; don't need original anymore
-           unwrap float
-           [[join] lookup] map  
-           swap format-select 
-           [" " interpose join-all] dip triplet reverse
-           "SELECT {0} from EAV as c0 {1} WHERE {2}" swap format
-           swap dropdeep]]] resolve
-  draft inscribe drop
+                    [first] dip ;; keep the original constraint to add properties to
+                    unwrap unwrap [where params on] label join]]
+     [format-select [[unwrap swap
+                      string butlast ;; remove the ? from the variable name for result column
+                      put
+                      [string] map
+                      "c{1}.{0} as {2}" swap format] map ", " interpose join-all]]
+     [query [swap
+             ;; expand all combinations of constraints
+             [constraint] map 
+             ;;[] prepend ;; an empty constraint to represent the orignal EAV table we're joining with
+             [index] indexed-as-property
+             triangle
+             ;; for each pair of constraints, build the "ON" clause data for the JOIN
+             [extract-data] map
 
-  ;; main functions
-  [database]
-  [[[book? subjects love]
-    [book? title title?]
-    [book? author-last author-last?]
-    [book? author-first author-first?]
-    [author? first-name author-first?]
-    [author? last-name author-last?]
-    [author? birth-year birth-year?]]
-   [title? author-first? author-last? birth-year?]
-   query] using
+             [[extract-params]
+              [make-query]
+              [make-where]
+              [swap select-data]] fork 
+             dropdown ;; don't need original anymore
+             unwrap float
+             [[join] lookup] map  
+             swap format-select 
+             [" " interpose join-all] dip triplet reverse
+             "SELECT {0} from EAV as c0 {1} WHERE {2}" swap format
+             swap dropdeep]]]
+    draft inscribe
+
+    [[[book? subjects love]
+      [book? title title?]
+      [book? author-last author-last?]
+      [book? author-first author-first?]
+      [author? first-name author-first?]
+      [author? last-name author-last?]
+      [author? birth-year birth-year?]]
+     [title? author-first? author-last? birth-year?] query] confine database
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[[author-first "F. Scott"]
+  [author-last "Fitzgerald"]
+  [birth-year 1896]
+  [title "The Great Gatsby"]]
+ [[author-first "Jane"]
+  [author-last "Austen"]
+  [birth-year 1775]
+  [title "Pride and Prejudice"]]
+ [[author-first "Leo"]
+  [author-last "Tolstoy"]
+  [birth-year 1828]
+  [title "War and Peace"]]
+ [[author-first "Charlotte"]
+  [author-last "Bronte"]
+  [birth-year 1816]
+  [title "Jane Eyre"]]
+ [[author-first "Charles"]
+  [author-last "Dickens"]
+  [birth-year 1812]
+  [title "A Tale of Two Cities"]]]
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[definition [[entity attribute value]]]]
 #+end_src
 
 #+begin_src kcats
@@ -11232,7 +11590,7 @@ it? (May need to add some set-based words here).
 [[title? [value 2]]
  [author? [value 3]]]
 #+end_src
-*** TODO Reduce CPU cost of `shield`
+** TODO Reduce CPU cost of `shield`
 #+begin_src kcats
 [[program [1 2 3 [+] shield]]] environment stepper 0 [drop inc] cram
 #+end_src
@@ -11289,4 +11647,72 @@ it? (May need to add some set-based words here).
   [program []]]]
 [eval-step clone]
 []
+#+end_src
+** TODO Sort out feature dependencies
+#+begin_src dot 
+  digraph G {
+      // Define nodes
+      core [label="Core words", style=filled, fillcolor=lightgreen, shape=rect];
+      pipes [label="I/O pipes", style=filled, fillcolor=lightgreen, shape=rect];
+      generators [label="Generators", style=filled, fillcolor=lightgreen, shape=rect];
+      debug [label="Debugger", style=filled, fillcolor=lightgreen, shape=rect];
+      crypto [label="Cryptography", style=filled, fillcolor=yellow, shape=rect];
+      auth [label="Authentication Scripting", style=filled, fillcolor=yellow, shape=rect];
+      localmod [label="Local Modules", style=filled, fillcolor=yellow, shape=rect];
+      remotemod [label="Remote Modules"];
+      revocation [label="Revocation Lists"];
+      db [label="Persistent Database", style=filled, fillcolor=yellow, shape=rect];
+      storage [label="Storage", fillcolor=lightgreen];
+      cache [label="Hash-keyed blob cache", style=filled, fillcolow=yellow, shape=rect];
+      streams [label="Content streams"];
+      payments [label="Payments BTC"];
+      contacts [label="Address Book"];
+      messaging [label="Messaging"];
+      backup [label="Data backup"];
+      keys [label="Encryption Key management"];
+      peers [label="Peer discovery"];
+      names [label="Naming"];
+
+      // Define edges to represent dependencies
+      pipes -> core; 
+      generators -> core;
+      debug -> core;
+      crypto -> core;
+      localmod -> core;
+      localmod -> cache;
+      localmod -> names;
+      cache -> core;
+      cache -> storage;
+      auth -> crypto;
+      auth -> revocation;
+      remotemod -> localmod;
+      remotemod -> auth;
+      revocation -> db;
+      db -> core;
+      db -> localmod;
+      db -> pipes;
+      db -> storage;
+
+      // Application level
+      messaging -> contacts;
+      contacts -> auth;
+      contacts -> db;
+      messaging -> db;
+      messaging -> streams;
+      streams -> db;
+      streams -> names;
+      streams -> peers;
+      peers -> crypto;
+      streams -> pipes;
+      streams -> keys;
+      //remotemod -> streams;
+      keys -> db;
+      contacts -> streams;
+      revocation -> streams;
+      backup -> streams;
+      backup -> payments;
+      names -> storage;
+      names -> crypto;
+
+  }
 #+end_src
