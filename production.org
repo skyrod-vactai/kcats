@@ -1656,8 +1656,18 @@ internally, to keep track of things like the stack, program, lists etc.
       /// the right type, we [Self::insert] the value using the key,
       /// otherwise return an error.
       pub fn put(self, other: Item) -> Result<Associative, Error> {
-          let entry: (KeyItem, Item) = other.try_into()?;
-          Ok(self.insert(entry.0, entry.1).0)
+          match (self, other) {
+              (Associative::Dictionary(mut this), other) => {
+                  let (word, entry) = <(Word, dict::Entry)>::try_from(other)?;
+                  let thismut = this.make_mut();
+                  thismut.insert(word.into(), entry.into());
+                  Ok(Associative::Dictionary(this))
+              }
+              (this, other) => {
+                  let entry: (KeyItem, Item) = other.try_into()?;
+                  Ok(this.insert(entry.0, entry.1).0)
+              }
+          }
       }
 
       /// The join operation is for generic containers, but we can join
@@ -3614,6 +3624,43 @@ example, in order to read/write to/from disk).
       }
   }
 
+  fn from_sized(s: &coll::Sized) -> edn_format::Value {
+      match s {
+          coll::Sized::Associative(assoc::Associative::Dictionary(_)) => {
+              edn_format::Value::Symbol(edn_format::Symbol::from_name("dictionary_redacted"))
+          }
+          coll::Sized::Associative(assoc::Associative::Env(e)) => from_item(&e.representation()),
+          coll::Sized::String(s) => edn_format::Value::String(s.to_string()),
+          coll::Sized::Bytes(bs) => edn_format::Value::TaggedElement(
+              edn_format::Symbol::from_name("b64"),
+              Box::new(edn_format::Value::String(base64::encode(bs))),
+          ),
+          coll::Sized::Associative(a) => {
+              let mut av = a
+                  .clone()
+                  .into_iter()
+                  .collect::<Vec<(assoc::KeyItem, Item)>>();
+              av.sort_by(|(ka, _), (kb, _)| ka.cmp(kb));
+              edn_format::Value::Vector(
+                  av.into_iter()
+                      .map(|i| from_item(&i.into()))
+                      .collect::<Vec<edn_format::Value>>(),
+              )
+          }
+          coll::Sized::Set(s) => {
+              let mut v = s.inner().into_iter().collect::<Vec<assoc::KeyItem>>();
+              v.sort();
+              edn_format::Value::Vector(v.into_iter().map(|ki| from_item(&Item::from(ki))).collect())
+          }
+          v => edn_format::Value::Vector(
+              v.clone()
+                  .into_iter()
+                  .map(|i| from_item(&i))
+                  .collect::<Vec<edn_format::Value>>(),
+          ),
+      }
+  }
+
   /// Serializes the item deterministically. Certain data is lost in
   /// serialization, including the type of container (sets/maps/lists
   /// all are serialized as vectors)
@@ -3621,84 +3668,17 @@ example, in order to read/write to/from disk).
       match item {
           // dictionaries are big and it's ugly to print them for
           // environments.
-          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
-              assoc::Associative::Dictionary(_),
-          ))) => edn_format::Value::Symbol(edn_format::Symbol::from_name("dictionary_redacted")),
-          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
-              assoc::Associative::Env(e),
-          ))) => from_item(&e.representation()),
           Item::Number(Number::Int(i)) => edn_format::Value::Integer(*i),
           Item::Number(Number::Float(f)) => edn_format::Value::from(*f),
           Item::Char(c) => edn_format::Value::Character(*c),
-          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(s))) => {
-              edn_format::Value::String(s.to_string())
-          }
-          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(bs))) => {
-              edn_format::Value::TaggedElement(
-                  edn_format::Symbol::from_name("b64"),
-                  Box::new(edn_format::Value::String(base64::encode(bs))),
-              )
-          }
-          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(a))) => {
-              let mut av = a
-                  .clone()
-                  .into_iter()
-                  .collect::<Vec<(assoc::KeyItem, Item)>>();
-              av.sort_by(|(ka, _), (kb, _)| ka.cmp(kb));
-              edn_format::Value::Vector(
-                  av.into_iter()
-                      .map(|i| from_item(&i.into()))
-                      .collect::<Vec<edn_format::Value>>(),
-              )
-          }
-          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Set(s))) => {
-              let mut v = s.inner().into_iter().collect::<Vec<assoc::KeyItem>>();
-              v.sort();
-              edn_format::Value::Vector(v.into_iter().map(|ki| from_item(&Item::from(ki))).collect())
-          }
-          Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Set(s))) => {
-              let mut v = s.inner().into_iter().collect::<Vec<assoc::KeyItem>>();
-              v.sort();
-              edn_format::Value::Vector(v.into_iter().map(|ki| from_item(&Item::from(ki))).collect())
-          }
-          Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(a))) => {
-              let mut av = a
-                  .clone()
-                  .into_iter()
-                  .collect::<Vec<(assoc::KeyItem, Item)>>();
-              av.sort_by(|(ka, _), (kb, _)| ka.cmp(kb));
-              edn_format::Value::Vector(
-                  av.into_iter()
-                      .map(|i| from_item(&i.into()))
-                      .collect::<Vec<edn_format::Value>>(),
-              )
-          }
-
-          Item::Receptacle(coll::Receptacle::Sized(coll::Sized::String(s))) => {
-              edn_format::Value::String(s.to_string())
-          }
-          Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(bs))) => {
-              edn_format::Value::TaggedElement(
-                  edn_format::Symbol::from_name("b64"),
-                  Box::new(edn_format::Value::String(base64::encode(bs))),
-              )
-          }
-
-          Item::Dispenser(coll::Dispenser::Sized(v)) => edn_format::Value::Vector(
-              v.clone()
-                  .into_iter()
-                  .map(|i| from_item(&i))
-                  .collect::<Vec<edn_format::Value>>(),
-          ),
-          Item::Receptacle(coll::Receptacle::Sized(v)) => {
-              from_item(&Item::Dispenser(coll::Dispenser::Sized(v.clone())))
-          }
           Item::Word(w) => edn_format::Value::Symbol(edn_format::Symbol::from_name(w.into())),
           //Item::Entry(w) => edn_format::Value::Symbol(edn_format::Symbol::from_name(&w.word)),
           Item::Dispenser(coll::Dispenser::Out(o)) => from_item(&o.representation()),
           Item::Dispenser(coll::Dispenser::Tunnel(t)) => from_item(&t.representation()),
           Item::Receptacle(coll::Receptacle::In(i)) => from_item(&i.representation()),
           Item::Receptacle(coll::Receptacle::Tunnel(t)) => from_item(&t.representation()),
+          Item::Dispenser(coll::Dispenser::Sized(s)) => from_sized(s),
+          Item::Receptacle(coll::Receptacle::Sized(s)) => from_sized(s),
       }
   }
 
