@@ -930,6 +930,66 @@ Containers whose items are kept in a specific order. Includes
         [spec [[ordered] [item]]]]]]
 #+end_src
 
+*** Promotion
+Data types are automatically converted when needed.
+
+For example, if you have a list of pairs and you use the word =lookup=,
+it assumes your intention is to use the list as an associative data
+type, so it will be automatically converted, and remain converted
+after =lookup= completes.
+
+You can often tell by the spec when the return type is a promoted
+type:
+#+begin_src kcats :results code :exports both
+dictionary [assign spec] lookup
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[[item value]
+  [list keys]
+  sized]
+ [association]]
+#+end_src
+
+Here you can see that the spec for =assign= takes a =sized= and returns an
+=association=. This allows you to do things like this:
+
+#+begin_src kcats :results code :exports both
+[[name "Susie"] [age 25]] [sport] "bowling" assign
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[age 25]
+ [name "Susie"]
+ [sport "bowling"]]
+#+end_src
+
+The initial value of =[[name "Susie"] [age 25]]= is not an =associative=,
+it's just a =list=. You could explicitly convert it using the word
+=association= but =assign= will do it for you, because it needs an
+associative type.
+
+Note that the conversion can fail, because converting to =associative=
+requires that you have a list of pairs. If you don't, that's an error:
+
+#+begin_src kcats :results code :exports both
+["foo" "bar"] [age] 25 assign
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[unwound []]
+ [asked [pair]]
+ [reason "type mismatch"]
+ [type error]
+ [actual "foo"]
+ [handled yes]]
+#+end_src
+
+The most common promotion is from =list= to =associative= but there are
+others.
 ** Stack motion
 Often you have all the data a word needs on the stack, but it's in the
 wrong order. There's lots of handy words to help there.
@@ -1253,65 +1313,257 @@ Similarly the =deep= variants are one level even deeper than that:
 + dipdeep :: hide the top 3 items
 + shielddeep :: protect all but the top two item
 + dropdeep :: drops the 3rd item
-** Promotion
-Data types are automatically converted when needed.
+** Programmable runtime
+*** Overview
+One unusual and important feature of kcats is that you can program the
+runtime. What does that mean? It means you can control exactly *how* a
+program is executed.
 
-For example, if you have a list of pairs and you use the word =lookup=,
-it assumes your intention is to use the list as an associative data
-type, so it will be automatically converted, and remain converted
-after =lookup= completes.
+Why would you want to do that? Well, one common use case is that you
+want to debug the program: you'd like to manually control execution
+while you examine the state of the program, to figure out where it's
+going wrong.
 
-You can tell by the spec when the return type is a promoted type:
-#+begin_src kcats :results code :exports both
-dictionary [assign spec] lookup
+Another use case is security: you want to execute a program but not
+allow it to access things that programs normally can access (like the
+filesystem or network). You also don't want the program to be able to
+permanently redefine what words mean.
+
+So how exactly do we alter how programs are executed? A kcats program
+keep track of 3 things as it is running, its state: the *stack* (the
+data the program is working with), the *program* (the remaining
+instructions left to be executed), and the *dictionary* (the words that
+have meaning in a program). We call the whole state an *environment*,
+and we can create and work with environments in kcats just like any
+other data, including executing the progams within them.
+*** Environments
+First let's look at how to create an environment:
+#+begin_src kcats
+[[program [1 2 +]]] environment
 #+end_src
 
 #+RESULTS:
 #+begin_src kcats
-[[[item value]
-  [list keys]
-  sized]
- [association]]
+[[dictionary dictionary_redacted]
+ [program [1 2 +]]
+ [stack []]]
 #+end_src
 
-Here you can see that the spec for =assign= takes a =sized= and returns an
-=association=. This allows you to do things like this:
+Notice how `environment` takes an association and fills out the
+`dictionary` and `stack`. Why does it say `dictionary_redacted`?
+Normally dictionaries would be printed out in their entirety, just
+like any other data, but because they're large (there are hundreds of
+entries) by default the runtime prints it as the word
+`dictionary_redacted`.
 
-#+begin_src kcats :results code :exports both
-[[name "Susie"] [age 25]] [sport] "bowling" assign
+So this is an environment. What words are useful here? Well, first of
+all we can treat it as an association, which it is. Here we replace
+the last item in the program so we're subtracting instead of adding.
+
+#+begin_src kcats
+[[program [1 2 +]]] environment
+[program] [pop drop [-] join] update
 #+end_src
 
 #+RESULTS:
 #+begin_src kcats
-[[age 25]
- [name "Susie"]
- [sport "bowling"]]
+[[dictionary dictionary_redacted]
+ [program [1 2 -]]
+ [stack []]]
 #+end_src
 
-The initial value of =[[name "Susie"] [age 25]]= is not an =associative=,
-it's just a =list=. You could explicitly convert it using the word
-=association= but =assign= will do it for you, because it needs an
-associative type.
+Ok, well, this is not that exciting, if =environment= is just another
+kind of association right? Point taken, but now let's use the word
+`eval-step`:
 
-Note that the conversion can fail, because converting to =associative=
-requires that you have a list of pairs. If you don't, that's an error:
-
-#+begin_src kcats :results code :exports both
-["foo" "bar"] [age] 25 assign
+#+begin_src kcats
+  [[program [1 2 +]]] environment
+  eval-step
 #+end_src
 
 #+RESULTS:
 #+begin_src kcats
-[[unwound []]
- [asked [pair]]
- [reason "type mismatch"]
- [type error]
- [actual "foo"]
- [handled yes]]
+[[dictionary dictionary_redacted]
+ [program [2 +]]
+ [stack [1]]]
 #+end_src
 
-The most common promotion is from =list= to =associative= but there are
-others.
+That evaluates the environment one step! We can do two more steps to finish the program:
+
+#+begin_src kcats
+  [[program [1 2 +]]] environment
+  [eval-step] 3 times
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[dictionary dictionary_redacted]
+ [program []]
+ [stack [3]]]
+#+end_src
+*** Debugging
+**** The debugger
+In kcats, we don't need an external debugger. We can debug our
+programs right in the kcats interpeter. We can specify the program to
+run and step through it.
+
+Let's say this is the program we want to step through. This is how
+we'd normally run it:
+#+begin_src kcats :exports both :results code
+0 1 3 inc 1 range [+] step
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+6
+#+end_src
+
+To debug, we put it into an environment item which we can then use
+debugging words like =advance=:
+
+#+begin_src kcats :exports both :results code
+  [[program [0 1 3 inc 1 range [+] step]]] environment
+  [advance] 7 times
+  eval-step
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[dictionary dictionary_redacted]
+ [program [+ [2 3]
+           [+] step]]
+ [stack [1 0]]]
+#+end_src
+
+Note that =advance= is like =step-over= in a traditional debugger, and
+=eval-step= is like =step-into=.  So above we advance until we reach the
+word =step= in the program, and then we step into it. We end up showing
+the environment in the middle of execution. The stack has a program
+=[+]= on top, and the next word is =execute= which will run that program.
+
+You can also use a =until= loop to run the program until an arbitrary
+condition is hit. Here's one that runs the program until the number =4=
+is on the top of stack (note the handy word =tos= shortcut)
+
+#+begin_src kcats
+  [[program [0 1 3 inc 1 range [+] step]]] environment
+  [tos 2 =] [eval-step] until
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[dictionary dictionary_redacted]
+ [program [+ [3] [+] step]]
+ [stack [2 1]]]
+#+end_src
+
+You can do whatever you want with the environment data - you can
+retain the environment at every step, filter the steps, change them,
+and continue the execution from any arbitrary place.
+
+It's particularly handy to save an environment at the "last known
+good" state and continue from there, instead of having to re-execute
+from the beginning each time.
+
+Just as an example of what's possible, here we show only the states
+where =+= is about to be executed. =stepper= is a generator that takes an
+environment and generates all the steps of execution. Note =top= means
+"top of program", so it's keeping the states where =+= is the next
+item in the program.
+#+begin_src kcats
+  [[[program [0 1 3 inc 1 range [+] step]]] environment
+   stepper
+   [toe wrap [+] =] keep
+   collect] shield 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[[dictionary dictionary_redacted]
+  [program [+ [2 3] [+] step]]
+  [stack [1 0]]]
+ [[dictionary dictionary_redacted]
+  [program [+ [3] [+] step]]
+  [stack [2 1]]]
+ [[dictionary dictionary_redacted]
+  [program [+ [] [+] step]]
+  [stack [3 3]]]]
+#+end_src
+
+Then just to show that all these environments work on their own, we'll
+add some code to select the first one and step it forward. So we've
+essentially gone back in time and rolled forward again.
+#+begin_src kcats
+  [[[program [0 1 3 inc 1 range [+] step]]] environment
+   stepper
+   [top wrap [+] =] keep
+   collect] shield
+
+  ;; add this
+  first ;; to select the first env from above
+  eval-step ;; 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[stack [1]]
+ [program [[2 3] [+] step]]]
+#+end_src
+
+We can even mess with the stack and the program:
+#+begin_src kcats
+  [[[program [0 1 3 inc 1 range [+] step]]] environment
+   stepper
+   [top wrap [+] =] keep
+   collect] shield
+
+  ;; add this
+  first ;; to select the first env from above
+  [program 0] [-] unwrap assign ;; change + to - right before it is run
+
+  ;; now step forward again
+  eval-step
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[stack [-1]]
+ [program [[2 3]
+              [+] step]]]
+#+end_src
+
+**** Other tools
+The "good old fashioned" method of debugging a program is to put =print=
+statements throughout the program to get insight into what's
+happening.
+
+You can do that in kcats too!
+
+#+begin_src kcats
+3 [odd?] ["it was odd" print inc] ["it was even" print 2 *] if
+#+end_src
+
+=print= takes a string and will print it to standard out.
+
+#+RESULTS:
+#+begin_src kcats
+it was odd
+4
+#+end_src
+
+There's also a way to print the current stack, it's called =dump=, and
+it has has no stack effect, so it's safe to put anywhere.
+
+#+begin_src kcats
+1 2 3 [odd?] [dump inc] [dump 2 *] if 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[3 2 1]
+4 2 1
+#+end_src
+
 ** Error handling
 In kcats, when a program encounters an error, an error item is
 placed on the stack instead of the usual result.
@@ -1399,19 +1651,35 @@ recover, examine the error, and if it's one you don't want to handle,
 re-activate it with =fail=.
 ** Your own words
 You're not stuck with just the vocabulary in the starting
-environment. You can make changes, including adding your own words,
-and altering existing ones.
-**** New Words
-The most straightforward and common change you can make to the
-dictionary, is to add a word that wasn't in there before, and use it
-in some limited scope after which it is no longer accessible.
+environment. You can add your own vocabulary!
+*** Concepts
+The dictionary of any executing program is immutable, it can't be
+changed. So how can we add any new words?
 
-The word =let= makes these kind of changes easy and safe. 
+You can't change the dictionary your program is using from within that
+program, but you can run your program inside another environment with
+a different dictionary.
 
+The word `dictionary` retrieves the current dictionary and places it
+on the stack. Then we can treat it like any other data and alter
+it. Then we can create a new environment and `evaluate` that
+environment, and retrieve its stack.
+
+Doing this with low level constructs looks like this:
 #+begin_src kcats
-  [[square [clone *]]]
+  ;; Fetch the current dictionary
+  dictionary
+  ;; Create a new set of words
+  [[square [clone *]]] draft
+  ;; apply the change to the dictionary
+  shielddown
+  ;; The program to run with the new dictionary
   [9 square]
-  let
+  ;; Create an environment and evaluate it
+  [program dictionary] label environment
+  evaluate
+  ;; make the inner stack the new stack
+  [stack] lookup restore
 #+end_src
 
 #+RESULTS:
@@ -1419,10 +1687,31 @@ The word =let= makes these kind of changes easy and safe.
 81
 #+end_src
 
+Obviously this is quite cumbersome, so there are higher level words to
+do all of this for you, like `let`.
+*** New Words
+The most straightforward and common change you can make to the
+dictionary, is to add a word that wasn't in there before, and use it
+in some limited scope after which it is no longer accessible.
+
+The word =let= is handy for small bits of code where you don't want to
+repeat yourself:
+
+#+begin_src kcats
+  [[square [clone *]]]
+  [9 square 8 square +]
+  let
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+145
+#+end_src
+
 Let's break this down. The word =let= takes two arguments, a list of
 new words paired with their definitions, and a program to run that
 uses those words. We define a new word =square= to mean =[clone *]=, and
-then we run =[9 square]= to get =81=.
+then we run =[9 square 8 square +]= to get =145=. 
 
 The list of new words can even refer to another word from the same list:
 
@@ -1445,15 +1734,15 @@ are great!
   [[factorial [[swap positive?]
                [[*] shielddown [dec] dip factorial]
                when]]]
-  [6 1 factorial dropdown]
+  [9 1 factorial dropdown]
   let
 #+end_src
 
 #+RESULTS:
 #+begin_src kcats
-720
+362880
 #+end_src
-**** Altering meanings of existing words
+*** Altering meanings of existing words
 Creating new words is relatively safe - presumably no one is using
 those words, so giving them meaning doesn't cause any confusion. It's
 when you start changing an existing meaning that things get hairy.
@@ -1626,10 +1915,10 @@ yes
 
 Here we change how a =foo= is encoded, and specify it's always encoded
 as the word "foo" converted to bytes. Then we test that equality holds.
-**** Sharing code
+*** Sharing code
 
 
-***** Overview
+**** Overview
 Sometimes you want to add some vocabulary to your environment that
 someone else wrote. We call those =modules=. A module makes some changes
 to the standard dictionary, usually by adding new words (as you saw
@@ -1638,7 +1927,7 @@ changes are bound up together and given an =alias=. You can load a
 module and then use it by using some words in it, we'll see how in a
 bit.
 
-***** Contents
+**** Contents
 The contents of a module is a program whose input will be the current
 environment's dictionary, and it should output a new, modified
 dictionary. Typically, the module will add some new words to the
@@ -1659,7 +1948,7 @@ action =dropdown= to the end of the definition of the word =foo=.
   [foo definition] [[dropdown] join] update
 #+end_src
 
-***** Inscribing a module vs using a module
+**** Inscribing a module vs using a module
 When you =inscribe= a module, you make it available to be used, but the
 module's changes remain invisible until called upon with =using=.
 
@@ -1686,7 +1975,7 @@ module's changes remain invisible until called upon with =using=.
 =using= takes a list of modules so you can use more than one at a
 time. It only applies to the given program.
 
-***** Quick and dirty words with let
+**** Quick and dirty words with let
 Sometimes you want to define some words and use them right away and
 not care about making a module for use elsewhere. There's a word that
 combines =inscribe= and =using= for you, it's called =let=:
@@ -1738,7 +2027,7 @@ program to the looping construct:
 [[definition [2 +]]] [plus2] dictionary_redacted #b64 "M4G/6zwsAHWojAeJtU/Zrg/qYfE2QrnF3l5Bh9pqja4="
 #+end_src
 
-***** Aliases
+**** Aliases
 Modules are identified by their cryptographic hash [fn:4]. That lets
 you be sure that the code you meant to run, is actually what you are
 running. However since hashes look like this
@@ -1762,7 +2051,7 @@ integrity checks. By comparing the computed hash of the content at two
 points in time, one can verify that the content has not been altered,
 providing a simple yet powerful tool for ensuring data integrity and
 security.
-***** Security rules
+**** Security rules
 There are some safeguards in place to ensure that words mean what you
 expect them to mean, and that modules you load can't change the
 meaning of words outside of where you intended.
@@ -2593,164 +2882,6 @@ Here's the whole program:
   [year 1898]
   [subjects [invasion aliens society technology war humanity]]]]
 #+end_src
-** Debugging
-*** The debugger
-In kcats, we don't need an external debugger. We can debug our
-programs right in the kcats interpeter. We can specify the program to
-run and step through it.
-
-Let's say this is the program we want to step through. This is how
-we'd normally run it:
-#+begin_src kcats :exports both :results code
-0 1 3 inc 1 range [+] step
-#+end_src
-
-#+RESULTS:
-#+begin_src kcats
-6
-#+end_src
-
-To debug, we put it into an environment item which we can then use
-debugging words like =advance=:
-
-#+begin_src kcats :exports both :results code
-  [[program [0 1 3 inc 1 range [+] step]]] environment
-  [advance] 7 times
-  eval-step
-#+end_src
-
-#+RESULTS:
-#+begin_src kcats
-[[stack [[+] 1 0]]
- [program [execute [2 3]
-              [+] step]]]
-#+end_src
-
-Note that =advance= is like =step-over= in a traditional debugger, and
-=eval-step= is like =step-into=.  So above we advance until we reach the
-word =step= in the program, and then we step into it. We end up showing
-the environment in the middle of execution. The stack has a program
-=[+]= on top, and the next word is =execute= which will run that program.
-
-You can also use a =until= loop to run the program until an arbitrary
-condition is hit. Here's one that runs the program until the number =4=
-is on the top of stack (note the handy word =tos= shortcut)
-
-#+begin_src kcats
-  [[program [0 1 3 inc 1 range [+] step]]] environment
-  [tos 2 =] [eval-step] until
-#+end_src
-
-#+RESULTS:
-#+begin_src kcats
-[[stack [2 1]]
- [program [+ [3] [+] step]]]
-#+end_src
-
-You can do whatever you want with the environment data - you can
-retain the environment at every step, filter the steps, change them,
-and continue the execution from any arbitrary place.
-
-It's particularly handy to save an environment at the "last known
-good" state and continue from there, instead of having to re-execute
-from the beginning each time.
-
-Just as an example of what's possible, here we show only the states
-where =+= is about to be executed. =stepper= is a generator that takes an
-environment and generates all the steps of execution. Note =top= means
-"top of program", so it's keeping the states where =+= is the next
-item in the program.
-#+begin_src kcats
-  [[[program [0 1 3 inc 1 range [+] step]]] environment
-   stepper
-   [top wrap [+] =] keep
-   collect] shield 
-#+end_src
-
-#+RESULTS:
-#+begin_src kcats
-  [[[stack [1 0]]
-    [program [+ [2 3] [+] step]]]
-   [[stack [2 1]]
-    [program [+ [3] [+] step]]]
-   [[stack [3 3]]
-    [program [+ [] [+] step]]]]
-#+end_src
-
-Then just to show that all these environments work on their own, we'll
-add some code to select the first one and step it forward. So we've
-essentially gone back in time and rolled forward again.
-#+begin_src kcats
-  [[[program [0 1 3 inc 1 range [+] step]]] environment
-   stepper
-   [top wrap [+] =] keep
-   collect] shield
-
-  ;; add this
-  first ;; to select the first env from above
-  eval-step ;; 
-#+end_src
-
-#+RESULTS:
-#+begin_src kcats
-[[stack [1]]
- [program [[2 3] [+] step]]]
-#+end_src
-
-We can even mess with the stack and the program:
-#+begin_src kcats
-  [[[program [0 1 3 inc 1 range [+] step]]] environment
-   stepper
-   [top wrap [+] =] keep
-   collect] shield
-
-  ;; add this
-  first ;; to select the first env from above
-  [program 0] [-] unwrap assign ;; change + to - right before it is run
-
-  ;; now step forward again
-  eval-step
-#+end_src
-
-#+RESULTS:
-#+begin_src kcats
-[[stack [-1]]
- [program [[2 3]
-              [+] step]]]
-#+end_src
-
-*** Other tools
-The "good old fashioned" method of debugging a program is to put =print=
-statements throughout the program to get insight into what's
-happening.
-
-You can do that in kcats too!
-
-#+begin_src kcats
-3 [odd?] ["it was odd" print inc] ["it was even" print 2 *] if
-#+end_src
-
-=print= takes a string and will print it to standard out.
-
-#+RESULTS:
-#+begin_src kcats
-it was odd
-4
-#+end_src
-
-There's also a way to print the current stack, it's called =dump=, and
-it has has no stack effect, so it's safe to put anywhere.
-
-#+begin_src kcats
-1 2 3 [odd?] [dump inc] [dump 2 *] if 
-#+end_src
-
-#+RESULTS:
-#+begin_src kcats
-[3 2 1]
-4 2 1
-#+end_src
-
 * More Examples
 ** Query a flat file database
 #+begin_src kcats
