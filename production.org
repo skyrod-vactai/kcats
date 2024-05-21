@@ -388,9 +388,11 @@ internally, to keep track of things like the stack, program, lists etc.
                   let i2 = i.clone();
                   let l = coll::List::try_from(i);
                   match l {
-                      Ok(l) => {
+                      Ok(mut l) => {
                           if l.len() == 1 {
-                              let i = l.inner().pop_front().unwrap();
+                              let lm = l.make_mut();
+
+                              let i = lm.pop_front().unwrap();
                               i.try_into()
                           } else {
                               Err(Error::expected("word", l))
@@ -668,12 +670,6 @@ internally, to keep track of things like the stack, program, lists etc.
       /// passes through to [sync::Arc].
       pub fn make_mut(&mut self) -> &mut T {
           sync::Arc::make_mut(&mut self.0)
-      }
-
-      /// Returns the inner value - cloning if this Arc is not the only
-      /// pointer to the inner value.
-      pub fn inner(&self) -> T {
-          sync::Arc::try_unwrap(self.0.clone()).unwrap_or_else(|rc| (*rc).clone())
       }
 
       /// Wraps the given value in an Arc.
@@ -977,33 +973,33 @@ internally, to keep track of things like the stack, program, lists etc.
           Ok(match (self, other) {
               (Sized::Associative(a), Sized::List(l)) => {
                   let la = assoc::Associative::Assoc(assoc::Association::try_from_iter(
-                      l.clone().inner().into_iter(),
+                      l.iter().cloned(),
                   )?);
                   Sized::Associative(a.join(la))
               }
               (Sized::List(l), Sized::Associative(a)) => {
                   let la = assoc::Associative::Assoc(assoc::Association::try_from_iter(
-                      l.clone().inner().into_iter(),
+                      l.iter().cloned(),
                   )?);
                   Sized::Associative(la.join(a))
               }
               (Sized::Associative(a), Sized::Associative(b)) => Sized::Associative(a.join(b)),
               (Sized::List(mut a), Sized::List(b)) => {
                   let am = a.make_mut();
-                  am.extend(b.inner());
+                  am.extend(b.iter().cloned());
                   Sized::List(a)
               }
               (Sized::Set(mut a), Sized::Set(b)) => {
                   let am = a.make_mut();
-                  am.extend(b.inner());
+                  am.extend(b.iter().cloned());
                   Sized::Set(a)
               }
               (Sized::List(a), Sized::Set(mut b)) => {
                   let bm = b.make_mut();
 
                   bm.extend(
-                      a.inner()
-                          .into_iter()
+                      a.iter()
+                          .cloned()
                           .map(assoc::KeyItem::try_from)
                           .collect::<Result<Vec<assoc::KeyItem>, Error>>()?,
                   );
@@ -1013,8 +1009,8 @@ internally, to keep track of things like the stack, program, lists etc.
                   let am = a.make_mut();
 
                   am.extend(
-                      b.inner()
-                          .into_iter()
+                      b.iter()
+                          .cloned()
                           .map(assoc::KeyItem::try_from)
                           .collect::<Result<Vec<assoc::KeyItem>, Error>>()?,
                   );
@@ -1109,7 +1105,10 @@ internally, to keep track of things like the stack, program, lists etc.
       fn into_iter(self) -> Self::IntoIter {
           match self {
               Sized::Associative(map) => Box::new(map.into_iter().map(|kv| kv.into())),
-              Sized::List(list) => Box::new(list.inner().into_iter()),
+              Sized::List(list) => {
+                  let items: Vec<_> = list.iter().cloned().collect();
+                  Box::new(items.into_iter())
+              }
               Sized::String(s) => {
                   let chars: Vec<char> = s.chars().collect();
                   Box::new(chars.into_iter().map(|c| c.into()))
@@ -1118,7 +1117,10 @@ internally, to keep track of things like the stack, program, lists etc.
                   let vec: Vec<Item> = b.into_iter().map(|byte| Item::from(byte as Int)).collect();
                   Box::new(vec.into_iter())
               }
-              Sized::Set(s) => Box::new(s.inner().into_iter().map(|i| i.into())),
+              Sized::Set(s) => {
+                  let items: Vec<_> = s.iter().cloned().map(|i| i.into()).collect();
+                  Box::new(items.into_iter())
+              }
           }
       }
   }
@@ -1374,7 +1376,7 @@ internally, to keep track of things like the stack, program, lists etc.
                       // Start serializing a map
                       let assoc = assoc::Association::from(a.clone());
                       let mut map = serializer.serialize_map(Some(assoc.len()))?;
-                      for (key, value) in assoc.inner() {
+                      for (key, value) in assoc.iter() {
                           // Serialize each entry in the map
                           map.serialize_entry(&key, &value)?;
                       }
@@ -1385,7 +1387,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   Sized::List(ref l) => {
                       // Serialize a list (sequence)
                       let mut seq = serializer.serialize_seq(Some(l.len()))?;
-                      for element in l.inner() {
+                      for element in l.iter() {
                           seq.serialize_element(&element)?;
                       }
                       seq.end()
@@ -1394,7 +1396,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   Sized::Set(s) => {
                       // Serialize a list (sequence)
                       let mut seq = serializer.serialize_seq(Some(s.len()))?;
-                      for element in s.inner() {
+                      for element in s.iter() {
                           seq.serialize_element(&element)?;
                       }
                       seq.end()
@@ -1485,7 +1487,7 @@ internally, to keep track of things like the stack, program, lists etc.
           match i {
               KeyItem::Int(i) => Item::Number(Number::Int(i)),
               KeyItem::String(i) => i.into(),
-              KeyItem::List(l) => coll::List::from_iter(l.inner().into_iter().map(Item::from)).into(),
+              KeyItem::List(l) => coll::List::from_iter(l.iter().cloned().map(Item::from)).into(),
               KeyItem::Word(w) => Item::Word(w),
               KeyItem::Bytes(bs) => bs.into(),
               KeyItem::Char(c) => Item::Char(c),
@@ -1520,9 +1522,9 @@ internally, to keep track of things like the stack, program, lists etc.
               Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(i))) => {
                   Ok(KeyItem::Bytes(i))
               }
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(l))) => Ok(KeyItem::List(
-                  KeyList::try_from_iter(l.inner().into_iter())?,
-              )),
+              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(l))) => {
+                  Ok(KeyItem::List(KeyList::try_from_iter(l.iter().cloned())?))
+              }
               Item::Word(w) => Ok(KeyItem::Word(w)),
               Item::Char(c) => Ok(KeyItem::Char(c)),
 
@@ -1691,12 +1693,16 @@ internally, to keep track of things like the stack, program, lists etc.
               }
               (Associative::Dictionary(mut this), Associative::Dictionary(other)) => {
                   let thism = coll::Arc::make_mut(&mut this);
-                  thism.extend(other.inner());
+                  thism.extend(
+                      other
+                          .iter()
+                          .map(|(key, value)| (key.clone(), value.clone())),
+                  );
                   Associative::Dictionary(this)
               }
               (Associative::Dictionary(mut this), Associative::Assoc(other)) => {
                   // Try to convert to dictionary type
-                  match other.inner().convert::<Word, dict::Entry>() {
+                  match other.convert::<Word, dict::Entry>() {
                       Ok(d) => {
                           let tm = this.make_mut();
                           tm.extend(d);
@@ -1778,6 +1784,10 @@ internally, to keep track of things like the stack, program, lists etc.
                   let v = a.remove(k);
                   (Associative::Error(e), v)
               }
+              Associative::Env(e) => {
+                  let a = Association::from_iter(e);
+                  Associative::Assoc(a).remove(k)
+              }
               _ => todo!("Removing from other associative types"),
           }
       }
@@ -1788,7 +1798,7 @@ internally, to keep track of things like the stack, program, lists etc.
       pub fn take(self) -> (Self, Option<Item>) {
           match self {
               Associative::Assoc(mut a) => {
-                  let maybe_key = a.inner().keys().next().cloned();
+                  let maybe_key = a.keys().next().cloned();
                   let am = a.make_mut();
                   let maybe_value = maybe_key.as_ref().and_then(|key| am.remove(key));
                   (
@@ -1803,7 +1813,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   )
               }
               Associative::Dictionary(mut d) => {
-                  let maybe_key = d.inner().keys().next().cloned();
+                  let maybe_key = d.keys().next().cloned();
                   let dm = d.make_mut();
                   let maybe_value = maybe_key.clone().and_then(|key| dm.remove(&key));
                   (
@@ -1830,10 +1840,17 @@ internally, to keep track of things like the stack, program, lists etc.
 
       fn into_iter<'a>(self) -> Self::IntoIter {
           match self {
-              Associative::Assoc(a) => Box::new(a.inner().into_iter()),
+              Associative::Assoc(a) => {
+                  let items: Vec<_> = a.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                  Box::new(items.into_iter())
+              }
               Associative::DictEntry(e) => Box::new(e.into_iter()),
               Associative::Dictionary(d) => {
-                  Box::new(d.inner().into_iter().map(|(k, v)| (k.into(), v.into())))
+                  let items: Vec<_> = d
+                      .iter()
+                      .map(|(k, v)| (k.clone().into(), v.clone().into()))
+                      .collect();
+                  Box::new(items.into_iter())
               }
               Associative::Error(e) => e.into_iter(),
               Associative::Env(e) => e.into_iter(),
@@ -1981,7 +1998,7 @@ internally, to keep track of things like the stack, program, lists etc.
   /// Convert from any type of hashmap to any other, assuming the keys
   /// and values convert
   impl<KA, VA> Newtype<HashMap<KA, VA>> {
-      pub fn convert<KB, VB>(self) -> Result<Newtype<HashMap<KB, VB>>, Error>
+      pub fn convert<KB, VB>(&self) -> Result<Newtype<HashMap<KB, VB>>, Error>
       where
           KB: Clone + Eq + Hash + TryFrom<KA, Error = Error>,
           VB: Clone + TryFrom<VA, Error = Error>,
@@ -1990,7 +2007,7 @@ internally, to keep track of things like the stack, program, lists etc.
       {
           let mut new_hashmap = HashMap::new();
 
-          for (key, value) in self.into_iter() {
+          for (key, value) in self.iter().map(|(k, v)| (k.clone(), v.clone())) {
               let new_key: KB = key.try_into()?;
               let new_value: VB = value.try_into()?;
               new_hashmap.insert(new_key, new_value);
@@ -2077,7 +2094,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   KeyItem::List(ref l) => {
                       // Serialize a list (sequence)
                       let mut seq = serializer.serialize_seq(Some(l.len()))?;
-                      for element in l.inner() {
+                      for element in l.iter() {
                           seq.serialize_element(&element)?;
                       }
                       seq.end()
@@ -2284,12 +2301,13 @@ internally, to keep track of things like the stack, program, lists etc.
       type IntoIter = Box<dyn Iterator<Item = assoc::Entry>>;
 
       fn into_iter(self) -> Self::IntoIter {
-          Box::new(
-              self.data
-                  .inner()
-                  .into_iter()
-                  .chain(std::iter::once(("handled".into(), self.is_handled.into()))),
-          )
+          let items: Vec<_> = self
+              .data
+              .iter()
+              .map(|(k, v)| (k.clone(), v.clone()))
+              .chain(std::iter::once(("handled".into(), self.is_handled.into())))
+              .collect();
+          Box::new(items.into_iter())
       }
   }
 #+end_src
@@ -2357,8 +2375,8 @@ internally, to keep track of things like the stack, program, lists etc.
   impl TryFrom<coll::List> for StackSpec {
       type Error = Error;
       fn try_from(s: coll::List) -> Result<StackSpec, Error> {
-          s.inner()
-              .into_iter()
+          s.iter()
+              .cloned()
               .map(SpecElement::try_from)
               //.map(|r| r.and_then(SpecElement::try_from))
               .collect::<Result<StackSpec, Error>>()
@@ -2441,7 +2459,7 @@ internally, to keep track of things like the stack, program, lists etc.
       /// Returns the difference between this dictionary and a "newer"
       /// one: The additions/updates, and the deletions.
       pub fn diff(&self, newer: Dictionary) -> (Vec<(Word, Entry)>, Vec<Word>) {
-          diff_hashmaps(&self.inner(), &newer.inner())
+          diff_hashmaps(&self, &newer)
       }
 
       /// Takes a core module (in string form - should contain a series
@@ -2451,7 +2469,7 @@ internally, to keep track of things like the stack, program, lists etc.
       pub fn insert_core_module(&mut self, lexicon: String) {
           //println!("Parsing: {}", lexicon);
           let items = serialize::parse(lexicon).unwrap();
-          for r in Box::new(items.inner().into_iter()) {
+          for r in Box::new(items.iter().cloned()) {
               let (k, def): (assoc::KeyItem, Item) = r.try_into().unwrap();
               let word: Word = k.try_into().unwrap();
 
@@ -2811,8 +2829,9 @@ internally, to keep track of things like the stack, program, lists etc.
                                   (assoc::Associative::Env(self), Some(old.into()))
                               }
                               Err(_) => {
-                                  let a = assoc::Association::from_iter(self);
-                                  let old = a.inner().insert(k, v);
+                                  let mut a = assoc::Association::from_iter(self);
+                                  let am = a.make_mut();
+                                  let old = am.insert(k, v);
                                   (assoc::Associative::Assoc(a), old)
                               }
                           }
@@ -2826,8 +2845,9 @@ internally, to keep track of things like the stack, program, lists etc.
                                   (assoc::Associative::Env(self), Some(old.into()))
                               }
                               Err(_) => {
-                                  let a = assoc::Association::from_iter(self);
-                                  let old = a.inner().insert(k, v);
+                                  let mut a = assoc::Association::from_iter(self);
+                                  let am = a.make_mut();
+                                  let old = am.insert(k, v);
                                   (assoc::Associative::Assoc(a), old)
                               }
                           }
@@ -2841,22 +2861,25 @@ internally, to keep track of things like the stack, program, lists etc.
                                   (assoc::Associative::Env(self), Some(old.into()))
                               }
                               Err(_) => {
-                                  let a = assoc::Association::from_iter(self);
-                                  let old = a.inner().insert(k, v);
+                                  let mut a = assoc::Association::from_iter(self);
+                                  let am = a.make_mut();
+                                  let old = am.insert(k, v);
                                   (assoc::Associative::Assoc(a), old)
                               }
                           }
                       }
                       k => {
-                          let a = assoc::Association::from_iter(self);
-                          let old = a.inner().insert(k.into(), v);
+                          let mut a = assoc::Association::from_iter(self);
+                          let am = a.make_mut();
+                          let old = am.insert(k.into(), v);
                           (assoc::Associative::Assoc(a), old)
                       }
                   }
               }
               _ => {
-                  let a = assoc::Association::from_iter(self);
-                  let old = a.inner().insert(k, v);
+                  let mut a = assoc::Association::from_iter(self);
+                  let am = a.make_mut();
+                  let old = am.insert(k, v);
                   (assoc::Associative::Assoc(a), old)
               }
           }
@@ -2929,6 +2952,10 @@ internally, to keep track of things like the stack, program, lists etc.
               let spec = specs.get(i).unwrap();
               check_type(item, &spec.elemtype)
           })
+      }
+
+      pub fn is_finished(&self) -> bool {
+          self.program.is_empty()
       }
   }
 
@@ -3139,9 +3166,9 @@ internally, to keep track of things like the stack, program, lists etc.
 
   impl serialize::Display for Environment {
       fn representation(&self) -> Item {
-          let mut assoc = assoc::Association::from_iter(self.clone());
-          let am = assoc.make_mut();
-          am.remove(&("dictionary".into()));
+          let assoc = assoc::Association::from_iter(self.clone());
+          //let am = assoc.make_mut();
+          //am.remove(&("dictionary".into()));
           assoc.into()
       }
   }
@@ -3648,7 +3675,7 @@ example, in order to read/write to/from disk).
               )
           }
           coll::Sized::Set(s) => {
-              let mut v = s.inner().into_iter().collect::<Vec<assoc::KeyItem>>();
+              let mut v = s.iter().cloned().collect::<Vec<assoc::KeyItem>>();
               v.sort();
               edn_format::Value::Vector(v.into_iter().map(|ki| from_item(&Item::from(ki))).collect())
           }
@@ -4226,6 +4253,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               "file-out",
               Box::leak(Box::new(f_stack1(crate::types::container::pipe::fs::file_out))),
           ),
+          ("finished?", Box::leak(Box::new(f_stack1(is_finished)))),
           ("first", Box::leak(Box::new(f_stack1(first)))),
           ("float", Box::leak(Box::new(float))),
           ("floor", Box::leak(Box::new(f_stack1(floor)))),
@@ -4626,7 +4654,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       match coll::List::try_from(env.pop()) {
           Ok(l) => {
               env.pop_prog();
-              env.stack.extend(l.inner().into_iter().rev());
+              env.stack.extend(l.iter().cloned().rev());
               env
           }
           Err(e) => {
@@ -5005,7 +5033,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn assign(m: Item, ks: Item, v: Item) -> ItemResult {
       let kit = coll::List::try_from(ks)?;
-      let mut ksvec: assoc::KeyList = assoc::KeyList::try_from_iter(kit.inner().into_iter())?;
+      let mut ksvec: assoc::KeyList = assoc::KeyList::try_from_iter(kit.iter().cloned())?;
       ksvec.make_mut().make_contiguous();
       let (ks, _) = ksvec.as_slices();
       assoc_in(m, ks, v)
@@ -5013,7 +5041,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn unassign(m: Item, ks: Item) -> ItemResult {
       let kit = coll::List::try_from(ks)?;
-      let mut ksvec: assoc::KeyList = assoc::KeyList::try_from_iter(kit.inner().into_iter())?;
+      let mut ksvec: assoc::KeyList = assoc::KeyList::try_from_iter(kit.iter().cloned())?;
       ksvec.make_mut().make_contiguous();
       let (ks, _) = ksvec.as_slices();
       unassoc_in(m, ks)
@@ -5219,7 +5247,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   fn reverse(s: coll::Sized) -> Result<coll::Sized, Error> {
       match s {
-          coll::Sized::List(l) => Ok(coll::List::from_iter(l.inner().into_iter().rev()).into()),
+          coll::Sized::List(l) => Ok(coll::List::from_iter(l.iter().rev().cloned()).into()),
           coll::Sized::String(s) => Ok(s.chars().rev().collect::<String>().into()),
           coll::Sized::Bytes(b) => Ok(b.into_iter().rev().collect::<Vec<u8>>().into()),
           s => Err(Error::expected("ordered", s)),
@@ -5543,7 +5571,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn sort_by_key(l: coll::List) -> Result<coll::List, Error> {
-      let it = l.inner().into_iter().map(as_pair);
+      let it = l.iter().cloned().map(as_pair);
       let mut it = it.collect::<Result<Vec<(Item, assoc::KeyItem)>, Error>>()?;
       it.sort_unstable_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Less));
       Ok(coll::List::from_iter(it.into_iter().map(|(k, _)| k)))
@@ -5604,8 +5632,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let fstr = String::try_from(fstr)?;
       let items = coll::List::try_from(items)?;
       let strings = items
-          .inner()
-          .into_iter()
+          .iter()
+          .cloned()
           .map(String::try_from)
           .collect::<Result<Vec<String>, Error>>()?;
       Ok(SimpleCurlyFormat
@@ -5628,6 +5656,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   fn encode_json(i: Item) -> ItemResult {
       Ok(Item::from(serde_json::to_string(&i)?))
   }
+
+  fn is_finished(env: Environment) -> Result<bool, Infallible> {
+      Ok(env.is_finished())
+  }
 #+end_src
 *** Top level execution
 We'll define the main module which reads input for the kcats
@@ -5638,7 +5670,6 @@ We'll also define how to run unit tests.
   //! The main kcats module, that executes the kcats interpreter. See [main]
   mod axiom;
   mod crypto;
-  mod module_map;
   mod serialize;
   mod types;
 
@@ -5967,12 +5998,14 @@ We'll also define how to run unit tests.
       #[test_case("execute")]
       #[test_case("exp")]
       #[test_case("filter")]
+      #[test_case("finished?" ; "is_finished")]
       #[test_case("first")]
       #[test_case("flip")]
       #[test_case("float")]
       #[test_case("floor")]
       #[test_case("fold")]
       #[test_case("format")]
+      #[test_case("frequencies")]
       #[test_case("future")]
       #[test_case("get")]
       #[test_case("generate")]
@@ -6945,8 +6978,8 @@ Implement the =handoff= type
 
       //Create references out of any [pipe item] pairs
       let lr = l
-          .inner()
-          .into_iter()
+          .iter()
+          .cloned()
           .enumerate()
           .map(move |(idx, i)| match i {
               Item::Dispenser(coll::Dispenser::Out(pipe::Out::Handoff(p))) => {
@@ -9364,6 +9397,129 @@ enumerate generator
 [a b c d e] [] 3 1 [a b c d e]
 #+end_src
 
+*** TODO Frequencies
+Given a generator, keep track of how many times each value occurs.
+
+#+begin_src kcats
+  [1 2 3 1 2 3 4 -1 3 3]
+  [take]
+  [] association
+  [wrap [[] [inc] [1] if] update]
+  cram
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[-1 1]
+ [1 2]
+ [2 2]
+ [3 4]
+ [4 1]]
+[take] []
+#+end_src
+
+
+#+begin_src kcats :results code
+
+  [program [3 [0 >] [clone dec] while]]  ;; the sample program to run
+  tracer
+  [[program] lookup first] each ;; what item is being executed
+  [word?] keep ;; only words
+  ;;frequencies
+  [] association
+  [wrap [[] [inc] [1] if] update]
+  cram
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[actual [[dictionary dictionary_redacted]
+          [program [program [3 [0 >]
+                             [clone dec]
+                             while]]]
+          [stack [[[asked [program]]
+                   [handled []]
+                   [reason "word is not defined"]
+                   [type error]]]]]]
+ [asked [program]]
+ [handled yes]
+ [reason "type mismatch"]
+ [type error]
+ [unwound [shielddown [[generate shielddown]] unwrap swap [[]] unwrap swap [[[generate]
+                                                                             dive]] unwrap [[]] unwrap [[wrap [[] [inc] [1] if] update]] unwrap float join while
+           drop]]]
+[[dictionary dictionary_redacted]
+ [program [program [3 [0 >]
+                    [clone dec]
+                    while]]]
+ [stack [[[asked [program]]
+          [handled []]
+          [reason "word is not defined"]
+          [type error]]]]]
+[eval-step clone]
+[[dictionary dictionary_redacted]
+ [program [program [3 [0 >]
+                    [clone dec]
+                    while]]]
+ [stack [[[asked [program]]
+          [handled []]
+          [reason "word is not defined"]
+          [type error]]]]]
+#+end_src
+
+#+begin_src kcats :results code
+  [2 [0 >] [clone dec] while]  ;; the sample program to run
+  [tracer
+   [[program] lookup [first] bail 0 or] each ;; what item is being
+                                             ;; executed, don't emit []
+                                             ;; or the execution stops,
+                                             ;; use 0 instead
+   [word?] keep ;; count only words
+   frequencies] shielddown
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[> 3]
+ [clone 6]
+ [dec 2]
+ [decorate 2]
+ [decorated 1]
+ [dip 11]
+ [dipdown 1]
+ [evert 12]
+ [execute 1]
+ [first 3]
+ [inject 3]
+ [join 1]
+ [loop 3]
+ [put 3]
+ [shield 3]
+ [snapshot 3]
+ [step 5]
+ [swap 4]
+ [take 3]
+ [unwrap 14]
+ 
+ [while 1]
+ [wrap 3]]
+#+end_src
+
+#+begin_src kcats
+  [foo bar [] quux] [take] [word?] keep collect
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[foo bar]
+[clone [[generate] dip [drop generate]
+        while]
+ dive]
+[[[something?] [word? not]]
+ [execute] every?]
+[take] [quux]
+#+end_src
+
 ** INPROGRESS Implement sorting                                     :stdlib:
 
 *** TODO Implement partialord
@@ -10056,6 +10212,23 @@ can create dictionaries and make them a dictionary entry to refer to them.
 64
 #+end_src
 
+So how would we make a hierarchy with this mechanism? For example the
+db has a hierarchy. Maybe make some words to help. Let's say we have =a=
+that depends on =b= and =c=. We can create those dictionaries separately
+and then make the dependencies available as words. So the environment
+that runs =a= has entries for =b= and =c= dictionaries. So when it needs to
+call b/c words, it calls them with confine. Does it makes sense to
+keep calling confine or just merge all the necessary words at the
+beginning of the program? How do we not end up with either calling
+confine just for one word, or just using one giant dictionary? I don't
+know. Neither makes any sense, this whole design is crap. It's
+basically just horrible ad-hoc namespaces, where the inner dictionary
+is its own namespace.
+
+#+begin_src kcats
+  ;; using: takes a list of words that point to dictionaries and merges them
+  
+#+end_src
 *** INPROGRESS inscribe currently re-defines words repeatedly at runtime
 - State "INPROGRESS" from "TODO"       [2024-02-08 Thu 17:17]
 **** INPROGRESS Current design
@@ -10508,13 +10681,19 @@ Let's see if it's possible to use an inner-env module and still debug it.
    ;; make a kcats version of it.
    [[[program] lookup] [eval-step] while] assign] inscribe  
   swap
-  spawn [advance] 7 times advance
+  spawn 
 #+end_src
 
 #+RESULTS:
 #+begin_src kcats
-[[program []]
- [stack [13 10]]]
+[[asked [consume]]
+ [handled yes]
+ [reason "not enough items on stack"]
+ [type error]
+ [unwound [confine]]]
+[[dictionary dictionary_redacted]
+ [program [10 11 [[plus2 [2 +]]] draft inscribe [plus2] confine]]
+ [stack []]]
 #+end_src
 
 #+begin_src kcats
@@ -11023,6 +11202,43 @@ trustworthy construct out of an untrusted, only vice versa.
 What makes an env less trusted than its parent? Is it the additional
 words? Is it just that any additional code requires more trust, since
 it needs to be vetted?
+*** TODO Debugger needs special handling to work with nested environments
+For example to collect a histogram of how many times each word was
+executed, we can pass the word up the env chain, but we need some
+extra words to deal with this.
+#+begin_src kcats
+  ; inner env
+  [1 2 3 + +] stage
+  wrap [evaluate [stack] lookup restore] join stage
+  wrap [evaluate [stack] lookup restore] join execute
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+6
+#+end_src
+
+Let's compare =evaluate= with the step-wise version
+#+begin_src kcats
+
+  [0 1 100000 1 range [+] step] stage wrap [evaluate] join
+  timestamps take
+  float dipdown
+  [take] dip - 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+66 [[from systemtime]
+    [type out]
+    [values [[type integer]
+             [units milliseconds]]]]
+[[dictionary dictionary_redacted]
+ [program []]
+ [stack [4999950000]]]
+#+end_src
+
+Hm even with the rust impl of =finished?= it's 1500ms vs 66ms, about 25x slower.
 ** INPROGRESS Database
 - State "INPROGRESS" from "TODO"       [2023-12-31 Sun 10:17]
 *** Books db
@@ -11323,145 +11539,301 @@ it? (May need to add some set-based words here).
 #+end_src
 
 #+begin_src kcats
-      ;; Module to operate on generic data, that are used throughout
-      [[fork [[execute] map]]
-       [triangle [[[] [[take] dip swap [[put] shield sink swap pair] bail] collect] shielddown]]
-       [indexed-as-property [swap indexed
-                             [unwrap sink assign] map dropdown]]
-       [join-all [[first empty] shield swap [join] step]]
-       [selectkeys [set swap [first contains?] filter]]
-       [invert [[reverse] map association]]
+  ;; Module to operate on generic data, that are used throughout
+  [[fork [[execute] map]]
+   [triangle [[[] [[take] dip swap [[put] shield sink swap pair] bail] collect] shielddown]]
+   [indexed-as-property [swap indexed
+                         [unwrap sink assign] map dropdown]]
+   [join-all [[first empty] shield swap [join] step]]
+   [selectkeys [set swap [first contains?] filter]]
+   [invert [[reverse] map association]]
 
-       ;; datalog variables
-       [variable? [[[word?]
-                    [string last \? =]] [execute] every?]]
-       [variable= [[[pair [variable?] every?] [=]] [execute] every?]] 
+   ;; datalog variables
+   [variable? [[[word?]
+                [string last \? =]] [execute] every?]]
+   [variable= [[[pair [variable?] every?] [=]] [execute] every?]] 
 
-       ;; datalog constraints
-       [slots [[entity attribute value]]]
-       [slot-combos [slots [slots [pair] map] map join-all]]
-       [constraint [unwrap slots reverse label]] 
+   ;; datalog constraints
+   [slots [[entity attribute value]]]
+   [slot-combos [slots [slots [pair] map] map join-all]]
+   [constraint [unwrap slots reverse label]] 
 
-       ;; links between datalog constraints
-       [links [slot-combos
-               [[wrap] map unwrap swapdown 
-                [[[lookup] inject] both] pairwise 
-                variable=]
-               filter   
-               [unwrap pair sink pair
-                [[index] lookup] map swap zip]
-               map]]
-       [all-links [[] sink
-                   [[[[index] lookup] shield] both ;; lookup the indices of both constraints
-                    [swapdown] dip sink ;; move the indices under the constraints
-                    [links] shielddown
-                    swap [dropdown dropdown join] dip] 
+   ;; links between datalog constraints
+   [links [slot-combos
+           [[wrap] map unwrap swapdown 
+            [[[lookup] inject] both] pairwise 
+            variable=]
+           filter    
+           [unwrap pair sink pair
+            [[index] lookup] map swap zip]
+           map]]
+   [all-links [[] sink
+               [[[[index] lookup] shield] both ;; lookup the indices of both constraints
+                [swapdown] dip sink ;; move the indices under the constraints
+                [links] shielddown
+                swap [dropdown dropdown join] dip] 
 
-                   step drop]]
-       [format-link [[join] inject unwrap [string] map
-                     "c{0}.{1} = c{2}.{3}" swap format]] 
+               step drop]]
+   [format-link [[join] inject unwrap [string] map
+                 "c{0}.{1} = c{2}.{3}" swap format]] 
 
-       ;; formatting pieces of query data into text
-       [anded-together [" AND " interpose join-all]]
+   ;; formatting pieces of query data into text
+   [anded-together [" AND " interpose join-all]]
 
-       ;; where clause data processing
-       [where-data [[[index] lookup] shield swap 
-                    [[[second variable? not]
-                      [first [index] unwrap = not]] [execute] every?] filter 
-                    [swap prepend] map dropdown]]
-       [format-where [[string] map 
-                      "c{0}.{1} = :c{0}{1}" swap format]]
-       [make-where [first [where] lookup anded-together]]
-       [format-join [[[[on] lookup]
-                       [[where] lookup]
-                       [[index] lookup string]] [execute] map
-                      [join anded-together] inject 
-                      "JOIN EAV c{1} ON {0}" swap format]]
-       [make-query [rest [[on]
-                          [[format-link] map] update
-                          [format-join] shield [join] swap assign] map]]
+   ;; where clause data processing
+   [where-data [[[index] lookup] shield swap 
+                [[[second variable? not]
+                  [first [index] unwrap = not]] [execute] every?] filter 
+                [swap prepend] map dropdown]]
+   [format-where [[string] map 
+                  "c{0}.{1} = :c{0}{1}" swap format]]
+   [make-where [first [where] lookup anded-together]]
+   [format-join [[[[on] lookup]
+                  [[where] lookup]
+                  [[index] lookup string]] [execute] map
+                 [join anded-together] inject 
+                 "JOIN EAV c{1} ON {0}" swap format]]
+   [make-query [rest [[on]
+                      [[format-link] map] update
+                      [format-join] shield [join] swap assign] map]]
 
-       ;; SQL parameters for rusqlite
-       [param-name [[string] map ":c{0}{1}" swap format]]
-       [extract-params [[] association swap [[params] lookup join] step]]
+   ;; SQL parameters for rusqlite
+   [param-name [[string] map ":c{0}{1}" swap format]]
+   [extract-params [[] association swap [[params] lookup join] step]]
 
 
-       ;; SELECT clause
-       [wordval? [second word?]]
-       [invert [[reverse] map association]]
-       [validate [[[second not]
-                   [first "All selected query variables must appear somewhere in constraints"
-                    [reason variable] label fail]
-                   when] map]]
-       [select-data [swap
-                     [[slots selectkeys invert] shield
-                      [wordval?] filter join association] map
-                     swap
-                     [[[index] swap put ;; make a list of the variable and 'index'
-                       wrap [selectkeys] join ;; make the program to cut down
-                       map [count 2 =] filter first [second] map
-                       [first number?] [reverse] when] ;; items are in random order due to coming from association, fix the order
-                      map]
-                     shield dropdeep zip
-                     validate]]
+   ;; SELECT clause
+   [wordval? [second word?]]
+   [invert [[reverse] map association]]
+   [validate [[[second not]
+               [first "All selected query variables must appear somewhere in constraints"
+                [reason variable] label fail]
+               when] map]]
+   [select-data [swap
+                 [[slots selectkeys invert] shield
+                  [wordval?] filter join association] map
+                 swap
+                 [[[index] swap put ;; make a list of the variable and 'index'
+                   wrap [selectkeys] join ;; make the program to cut down
+                   map [count 2 =] filter first [second] map
+                   [first number?] [reverse] when] ;; items are in random order due to coming from association, fix the order
+                  map]
+                 shield dropdeep zip
+                 validate]]
 
-       ;; query 
-       [extract-data [[[[unwrap all-links]
-                        [first where-data   ; [join] inject unwrap
-                         ;; build the query param map
-                         [[[] swap
-                           [[param-name] shield [last] dip wrap swap assign]
-                           step]
-                          ;; build the actual query where clauses
-                          [[format-where] map]]
-                         fork]]
-                       fork] shield
-                      ;; combine extracted items
+   ;; query 
+   [extract-data [[[[unwrap all-links]
+                    [first where-data   ; [join] inject unwrap
+                     ;; build the query param map
+                     [[[] swap
+                       [[param-name] shield [last] dip wrap swap assign]
+                       step]
+                      ;; build the actual query where clauses
+                      [[format-where] map]]
+                     fork]]
+                   fork] shield
+                  ;; combine extracted items
 
-                      [first] dip ;; keep the original constraint to add properties to
-                      unwrap unwrap [where params on] label join]]
-       [format-select [[unwrap swap
-                        string butlast ;; remove the ? from the variable name for result column
-                        put
-                        [string] map
-                        "c{1}.{0} as {2}" swap format] map ", " interpose join-all]]
-       [query [swap
-               ;; expand all combinations of constraints
-               [constraint] map 
-               ;;[] prepend ;; an empty constraint to represent the orignal EAV table we're joining with
-               [index] indexed-as-property
-               triangle
-               ;; for each pair of constraints, build the "ON" clause data for the JOIN
-               [extract-data] map
+                  [first] dip ;; keep the original constraint to add properties to
+                  unwrap unwrap [where params on] label join]]
+   [format-select [[unwrap swap
+                    string butlast ;; remove the ? from the variable name for result column
+                    put
+                    [string] map
+                    "c{1}.{0} as {2}" swap format] map ", " interpose join-all]]
+   [time [timestamps take emit print drop]]
+   [query [
+           swap
+           ;; expand all combinations of constraints
+           [constraint] map
+           ;;[] prepend ;; an empty constraint to represent the orignal EAV table we're joining with
+           [index] indexed-as-property
+           triangle
+           ;; for each pair of constraints, build the "ON" clause data for the JOIN
+           [extract-data] map
+           [[extract-params]
+            [make-query]
+            [make-where]
+            [swap select-data]] fork 
+           dropdown ;; don't need original anymore
+           unwrap float
+           [[join] lookup] map  
+           swap format-select 
+           [" " interpose join-all] dip triplet reverse
+           "SELECT {0} from EAV as c0 {1} WHERE {2}" swap format
+           swap dropdeep]]]
+  draft inscribe
 
-               [[extract-params]
-                [make-query]
-                [make-where]
-                [swap select-data]] fork 
-               dropdown ;; don't need original anymore
-               unwrap float
-               [[join] lookup] map  
-               swap format-select 
-               [" " interpose join-all] dip triplet reverse
-               "SELECT {0} from EAV as c0 {1} WHERE {2}" swap format
-               swap dropdeep]]]
-      draft inscribe
-
-      [[[book? subjects love]
-        [book? title title?]
-        [book? author-last author-last?]
-        [book? author-first author-first?]
-        [author? first-name author-first?]
-        [author? last-name author-last?]
-        [author? sex f]
-        [author? birth-year birth-year?]]
-       [title? author-first? author-last? birth-year?]
-       query
-      ] confine; database
+  [[[book? subjects love]
+    [book? title title?]
+    [book? author-last author-last?]
+    [book? author-first author-first?]
+    [author? first-name author-first?]
+    [author? last-name author-last?]
+    [author? sex f]
+    [author? birth-year birth-year?]]
+   [title? author-first? author-last? birth-year?]
+   query
+  ] confine; database
+  ;execute
+  ;heatmap ;0 swap [second +] step
 #+end_src
 
 #+RESULTS:
 #+begin_src kcats
+[[[[attribute subjects]
+   [entity book?]
+   [index 0]
+   [value love]]
+  []]
+ [title? author-first? author-last? birth-year?]]
+[[[[attribute title]
+   [entity book?]
+   [index 1]
+   [value title?]]
+  [[[attribute subjects]
+    [entity book?]
+    [index 0]
+    [value love]]]]
+ [title? author-first? author-last? birth-year?]]
+[[[[attribute author-last]
+   [entity book?]
+   [index 2]
+   [value author-last?]]
+  [[[attribute subjects]
+    [entity book?]
+    [index 0]
+    [value love]]
+   [[attribute title]
+    [entity book?]
+    [index 1]
+    [value title?]]]]
+ [title? author-first? author-last? birth-year?]]
+[[[[attribute author-first]
+   [entity book?]
+   [index 3]
+   [value author-first?]]
+  [[[attribute subjects]
+    [entity book?]
+    [index 0]
+    [value love]]
+   [[attribute title]
+    [entity book?]
+    [index 1]
+    [value title?]]
+   [[attribute author-last]
+    [entity book?]
+    [index 2]
+    [value author-last?]]]]
+ [title? author-first? author-last? birth-year?]]
+[[[[attribute first-name]
+   [entity author?]
+   [index 4]
+   [value author-first?]]
+  [[[attribute subjects]
+    [entity book?]
+    [index 0]
+    [value love]]
+   [[attribute title]
+    [entity book?]
+    [index 1]
+    [value title?]]
+   [[attribute author-last]
+    [entity book?]
+    [index 2]
+    [value author-last?]]
+   [[attribute author-first]
+    [entity book?]
+    [index 3]
+    [value author-first?]]]]
+ [title? author-first? author-last? birth-year?]]
+[[[[attribute last-name]
+   [entity author?]
+   [index 5]
+   [value author-last?]]
+  [[[attribute subjects]
+    [entity book?]
+    [index 0]
+    [value love]]
+   [[attribute title]
+    [entity book?]
+    [index 1]
+    [value title?]]
+   [[attribute author-last]
+    [entity book?]
+    [index 2]
+    [value author-last?]]
+   [[attribute author-first]
+    [entity book?]
+    [index 3]
+    [value author-first?]]
+   [[attribute first-name]
+    [entity author?]
+    [index 4]
+    [value author-first?]]]]
+ [title? author-first? author-last? birth-year?]]
+[[[[attribute sex]
+   [entity author?]
+   [index 6]
+   [value f]]
+  [[[attribute subjects]
+    [entity book?]
+    [index 0]
+    [value love]]
+   [[attribute title]
+    [entity book?]
+    [index 1]
+    [value title?]]
+   [[attribute author-last]
+    [entity book?]
+    [index 2]
+    [value author-last?]]
+   [[attribute author-first]
+    [entity book?]
+    [index 3]
+    [value author-first?]]
+   [[attribute first-name]
+    [entity author?]
+    [index 4]
+    [value author-first?]]
+   [[attribute last-name]
+    [entity author?]
+    [index 5]
+    [value author-last?]]]]
+ [title? author-first? author-last? birth-year?]]
+[[[[attribute birth-year]
+   [entity author?]
+   [index 7]
+   [value birth-year?]]
+  [[[attribute subjects]
+    [entity book?]
+    [index 0]
+    [value love]]
+   [[attribute title]
+    [entity book?]
+    [index 1]
+    [value title?]]
+   [[attribute author-last]
+    [entity book?]
+    [index 2]
+    [value author-last?]]
+   [[attribute author-first]
+    [entity book?]
+    [index 3]
+    [value author-first?]]
+   [[attribute first-name]
+    [entity author?]
+    [index 4]
+    [value author-first?]]
+   [[attribute last-name]
+    [entity author?]
+    [index 5]
+    [value author-last?]]
+   [[attribute sex]
+    [entity author?]
+    [index 6]
+    [value f]]]]
+ [title? author-first? author-last? birth-year?]]
 [[":c0attribute" subjects]
  [":c0value" love]
  [":c1attribute" title]
@@ -11472,7 +11844,7 @@ it? (May need to add some set-based words here).
  [":c6attribute" sex]
  [":c6value" f]
  [":c7attribute" birth-year]]
-"SELECT c1.value as \"title\", c3.value as \"author-first\", c2.value as \"author-last\", c7.value as \"birth-year\" from EAV as c0 JOIN EAV c1 ON c1.attribute = :c1attribute AND c0.entity = c1.entity JOIN EAV c2 ON c2.attribute = :c2attribute AND c0.entity = c2.entity AND c1.entity = c2.entity JOIN EAV c3 ON c3.attribute = :c3attribute AND c0.entity = c3.entity AND c1.entity = c3.entity AND c2.entity = c3.entity JOIN EAV c4 ON c4.attribute = :c4attribute AND c3.value = c4.value JOIN EAV c5 ON c5.attribute = :c5attribute AND c2.value = c5.value AND c4.entity = c5.entity JOIN EAV c6 ON c6.attribute = :c6attribute AND c6.value = :c6value AND c4.entity = c6.entity AND c5.entity = c6.entity JOIN EAV c7 ON c7.attribute = :c7attribute AND c4.entity = c7.entity AND c5.entity = c7.entity AND c6.entity = c7.entity WHERE c0.value = :c0value AND c0.attribute = :c0attribute"
+"SELECT c1.value as \"title\", c3.value as \"author-first\", c2.value as \"author-last\", c7.value as \"birth-year\" from EAV as c0 JOIN EAV c1 ON c1.attribute = :c1attribute AND c0.entity = c1.entity JOIN EAV c2 ON c2.attribute = :c2attribute AND c0.entity = c2.entity AND c1.entity = c2.entity JOIN EAV c3 ON c3.attribute = :c3attribute AND c0.entity = c3.entity AND c1.entity = c3.entity AND c2.entity = c3.entity JOIN EAV c4 ON c4.attribute = :c4attribute AND c3.value = c4.value JOIN EAV c5 ON c5.attribute = :c5attribute AND c2.value = c5.value AND c4.entity = c5.entity JOIN EAV c6 ON c6.attribute = :c6attribute AND c6.value = :c6value AND c4.entity = c6.entity AND c5.entity = c6.entity JOIN EAV c7 ON c7.attribute = :c7attribute AND c4.entity = c7.entity AND c5.entity = c7.entity AND c6.entity = c7.entity WHERE c0.attribute = :c0attribute AND c0.value = :c0value"
 #+end_src
 
 #+RESULTS:
@@ -11710,3 +12082,4 @@ it? (May need to add some set-based words here).
 
   }
 #+end_src
+
