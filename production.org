@@ -1702,6 +1702,7 @@ internally, to keep track of things like the stack, program, lists etc.
               }
               (Associative::Dictionary(mut this), Associative::Assoc(other)) => {
                   // Try to convert to dictionary type
+                  //println!("dict + assoc join");
                   match other.convert::<Word, dict::Entry>() {
                       Ok(d) => {
                           let tm = this.make_mut();
@@ -1709,7 +1710,23 @@ internally, to keep track of things like the stack, program, lists etc.
                           Associative::Dictionary(this)
                       }
                       // TODO: convert the other way (to assoc) instead
-                      Err(_) => Associative::Dictionary(this),
+                      Err(e) => {
+                          println!("Conversion error: {:?}", e);
+                          Associative::Dictionary(this)
+                      }
+                  }
+              }
+              (Associative::Assoc(this), Associative::Dictionary(mut dict)) => {
+                  // Try to convert to dictionary type
+                  //println!("assoc + dict join");
+                  match this.convert::<Word, dict::Entry>() {
+                      Ok(d) => {
+                          let tm = dict.make_mut();
+                          tm.extend(d);
+                          Associative::Dictionary(dict)
+                      }
+                      // TODO: convert the other way (to assoc) instead
+                      Err(_) => Associative::Dictionary(dict),
                   }
               }
               (Associative::Error(_), Associative::Error(other)) => Associative::Error(other),
@@ -2977,18 +2994,19 @@ internally, to keep track of things like the stack, program, lists etc.
                   "environment-builtins",
                   "encode",
                   "sets-builtins",
-                  "time",
+                  "time", // good candidate for lib
                   "pipes",
                   "methods",
                   "generators",
                   "template",
-                  "debug" // END default namespace
+                  "debug" // END default namespace // another good candidate for lib
               ));
 
               // Here we can no longer modify our own dictionary, so
               // here's what we do instead, we build a new dictionary
               // and leave it on the stack. Then when finished we grab
               // it at the end of this function.
+              // We also want to load a few optional (non-core) libs
               env.program.append(list!(
                   "dictionary",
                   "swap",
@@ -10282,6 +10300,56 @@ There's several possible mitigations:
   time? Can we save that dictionary too? Do we need to? I don't know
   why we'd need to call =using= in a tight loop, =using= could just go
   around the loop.
+
+  Let's just try some stuff. Create a module and cache it
+  #+begin_src kcats
+    [[square [clone *]]
+     [cube [clone square *]]] draft
+    encode [] cache
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  #b64 "Tz9VhU5ISws4N7I7ckTcKBEpjCGHp5Svc1O7t7JRWX4="
+  #+end_src
+
+  ok now we want to use this module
+  #+begin_src kcats
+    #b64 "Tz9VhU5ISws4N7I7ckTcKBEpjCGHp5Svc1O7t7JRWX4=" decache string read first inscribe
+    [9 cube] 
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  [9 cube]
+  dictionary_redacted
+  #+end_src
+
+**** Separate manifest
+If we look at other languages, usually there's a separate piece of
+data from the actual program: the build manifest. It specifies what
+versions of what libraries are to be loaded. Then later in the code,
+the libraries are brought in but there's no mention of versions or
+where the package came from.
+
+kcats could have a similar mechanism, but since there's no separate
+build tool (yet, eventually will need something to at least fetch
+remote libraries), we can have a sort of prelude section to a program
+where we specify all the hashes of libs we want to use in the
+program. By that point, presumably they are already in the cache.
+
+This brings up the question of how dependencies are specified. The
+naive approach would be for the code of the module itself to have its
+own prelude (which is pretty much how other languages work). However
+that leaves the issue of how the fetch tool will know what it needs to
+fetch. An obvious method is via convention, that the first thing in
+the module is the dependencies, which we can read the hashes and go
+download them. Another is to just load the library in the tool, so
+then the convention is not needed (other things can come before the
+hashes). The tool would somehow interpret "loading from cache" as
+"load from cache and go to the network if it's not there".
+
+
 **** Use of names
 It occurred to me that we don't have to use names at all when it comes
 to libaries or modules. We just let code refer to hashes, and the IDE
@@ -10345,6 +10413,145 @@ is its own namespace.
   ;; using: takes a list of words that point to dictionaries and merges them
   
 #+end_src
+
+*** Implementation
+**** TODO take a dictionary and a program and execute the program with that dict
+**** TODO take a mapping of name to module and return a dictionary with those modules
+#+begin_src kcats
+  [[square [clone *]]
+   [cube [clone square *]]] draft
+
+  [[foo ["foo"]]] draft
+
+  [foo math] label draft
+  inscribe
+
+  [[foo math]
+   [9 square foo]
+   using]
+  confine
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+"foo" 81
+#+end_src
+**** TODO One module depends on another, loads it
+So, how exactly should this work?
+
+How does one module ensure another is loaded before this one is used?
+
+#+begin_src kcats
+  [[square [clone *]]
+   [cube [clone square *]]] draft
+
+  [[sixth [square cube]]] draft
+
+  [foo math] label draft
+  inscribe
+
+  [[foo math]
+   [9 sixth]
+   using]
+  confine
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+531441
+#+end_src
+
+So here we have modules that depend on each other, but the actual
+dependency is not expressed here. We have to manually load =math= even
+though we are only calling =foo=.
+
+At what point do we load the dep and how? Inside the module code we do
+have access to the dictionary as input.
+
+Let's list the steps:
++ retrieve dictionary
++ "Main" - load prelude
++ prelude says hashA
++ decache, read hashA -> moduleA
++ execute moduleA
+  + moduleAprelude empty (no deps)
+  + execute rest of moduleA to modify dict
+
+Re below: does the math module need to be available as a module or
+just merged with the dictionary or both?  If we just make it a module,
+we need to put =using= in the impl of =sixth= which would be very slow if
+called repeatedly. Some kind of caching might be needed.
+
+I think perhaps the original model of a single namespaced dictionary
+might be best, such that we don't have to repeatedly apply changes -
+we just do it at library loading time and then the entire execution
+uses the same dictionary. During executing we can change how words are
+resolved via =using=. But the difference between this and the previous
+implementation of namespaces, is that resolution is altered for the
+entire execution of a program and not just the words within that
+program. That should fix the sandboxing security hole that existed in
+that implementation. So we can have a word =depend= that loads libraries
+into their own namespace (including deletions) (and assigns them
+words), and then =using= (or =use=) that alters name resolution for the
+duration of a program.
+#+begin_src kcats
+  ;; then the outer mod
+  [[[math #b64 "ULY02dWGqy3G7x9Hd7RgBG2q+Dw9RE8hC4dUjzyCqRk="]]
+   ;; load each dep module
+   [unwrap module [wrap] dip entry assign] step ;; this makes the modules available as a package,
+;; also need to integrate them into this dictionary
+   [[sixth [square cube]]] draft execute] 
+  encode [] cache
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+#b64 "cCbiMlCaBKwnUJ/EJaHb9oC5Q1i+N4Arq27yJ4tcLVE="
+#+end_src
+
+#+begin_src kcats
+  ;; first cache the inner mod
+  ;[[[square [clone *]]
+  ;  [cube [clone square *]]] draft] encode [] cache
+  ;; then the outer mod
+  ;[[[[math #b64 "ULY02dWGqy3G7x9Hd7RgBG2q+Dw9RE8hC4dUjzyCqRk="]]
+  ;  ;; load each dep module
+  ;  [unwrap module [wrap] dip assign] step]
+  ; [[sixth [square cube]]] draft join]
+  ;encode [] cache
+
+  dictionary
+  ;; outer mod
+  ;; first the prelude
+  [[foo #b64 "cCbiMlCaBKwnUJ/EJaHb9oC5Q1i+N4Arq27yJ4tcLVE="]]
+  ;; load each dep module
+  [unwrap module [wrap] dip entry assign] step
+  ;[[foo] lookup] shield dump drop
+  [[foo]
+   [9 sixth]
+   [dictionary swap [wrap shielddown] step] dip confine]
+  confine
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[asked [square]]
+ [handled yes]
+ [reason "word is not defined"]
+ [type error]
+ [unwound [square cube]]]
+9
+#+end_src
+
+#+begin_src kcats
+2 3 [3 2] shielddown
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+2 2
+#+end_src
+
 *** INPROGRESS inscribe currently re-defines words repeatedly at runtime
 - State "INPROGRESS" from "TODO"       [2024-02-08 Thu 17:17]
 **** INPROGRESS Current design
