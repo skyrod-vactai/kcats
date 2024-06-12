@@ -181,24 +181,45 @@ internally, to keep track of things like the stack, program, lists etc.
   pub mod number;
 
   // Define custom traits that mimic std ones
+  /// a trait similar to [std::convert::From]
   pub trait Derive<T>: Sized {
       fn derive(value: T) -> Self;
   }
 
+  /// a trait similar to [std::convert::TryFrom]
   pub trait TryDerive<T>: Sized {
       type Error;
 
       fn try_derive(value: T) -> Result<Self, Self::Error>;
   }
 
+  /// a trait similar to [std::convert::Into]
   pub trait Fit<T>: Sized {
       fn fit(self) -> T;
   }
 
+  /// a trait similar to [std::convert::TryInto]
   pub trait TryFit<T>: Sized {
       type Error;
 
       fn try_fit(self) -> Result<T, Self::Error>;
+  }
+
+  pub trait ToIterator {
+      type Item;
+      type IntoIter: Iterator<Item = Self::Item>;
+
+      fn to_iter(self) -> Self::IntoIter;
+  }
+
+  pub trait DeriveIterator<A>: Sized {
+      fn derive_iter<T: IntoIterator<Item = A>>(iter: T) -> Self;
+  }
+
+  pub trait TryDeriveIterator<A>: Sized {
+      fn try_from_iter<I>(l: I) -> Result<Self, Error>
+      where
+          I: IntoIterator<Item = A>;
   }
 
   //blanket impl
@@ -709,15 +730,16 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::types::*;
 
   use std::{collections::HashSet, future, sync};
+  use sync::Arc;
 
   /// A generic Arc type that we control
-  pub type Arc<T> = Newtype<sync::Arc<T>>;
+  //pub type Arc<T> = Newtype<sync::Arc<T>>;
 
   /// A generic List type
-  pub type Listy<I> = Newtype<VecDeque<I>>;
+  pub type Listy<I> = VecDeque<I>;
 
   /// A generic Set type
-  pub type Setty<I> = Newtype<HashSet<I>>;
+  pub type Setty<I> = HashSet<I>;
 
   /// A specific List type
   pub type ListContent = Listy<Item>;
@@ -725,34 +747,15 @@ internally, to keep track of things like the stack, program, lists etc.
   pub type List = Arc<ListContent>;
   pub type Set = Arc<Setty<assoc::KeyItem>>;
 
-  impl<T: Clone> Arc<T> {
-      /// Returns a mutable reference to the value inside this Arc, just
-      /// passes through to [sync::Arc].
-      pub fn make_mut(&mut self) -> &mut T {
-          sync::Arc::make_mut(&mut self.0)
-      }
-
-      /// Wraps the given value in an Arc.
-      pub fn wrap(inner: T) -> Self {
-          Self(sync::Arc::new(inner))
-      }
-  }
-
   impl Derive<HashSet<assoc::KeyItem>> for Set {
       fn derive(h: HashSet<assoc::KeyItem>) -> Set {
-          Newtype(sync::Arc::new(Newtype(h)))
-      }
-  }
-
-  impl Derive<VecDeque<Item>> for List {
-      fn derive(l: VecDeque<Item>) -> List {
-          Newtype(sync::Arc::new(Newtype(l)))
+          Arc::new(h)
       }
   }
 
   impl Derive<ListContent> for List {
       fn derive(l: ListContent) -> List {
-          Newtype(sync::Arc::new(l))
+          Arc::new(l)
       }
   }
 
@@ -778,14 +781,35 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  impl List {
+  pub trait Ordered {
       /// Appends the items to the beginning of this list, preserving
       /// their order. eg `[1, 2, 3].append([4, 5, 6])` -> `[4, 5, 6, 1,
       /// 2, 3]`.
-      pub fn append(&mut self, mut items: List) {
+      fn prepend(&mut self, items: List);
+
+      /// Appends the items in the iterator to the beginning of this
+      /// list, preserving order.
+      fn extend<T: IntoIterator<Item = Item>>(&mut self, items: T);
+
+      /// Reverses the order of the list.
+      fn reverse(&mut self);
+  }
+
+  pub trait Mutey<T> {
+      fn mutate(&mut self) -> &mut T;
+  }
+
+  impl<T: Clone> Mutey<T> for Arc<T> {
+      fn mutate(&mut self) -> &mut T {
+          Arc::make_mut(self)
+      }
+  }
+
+  impl Ordered for List {
+      fn prepend(&mut self, mut items: List) {
           // Ensure both VecDeques are uniquely owned to avoid cloning during modifications
-          let self_mut = self.make_mut();
-          let items_mut = items.make_mut();
+          let self_mut = self.mutate();
+          let items_mut = items.mutate();
 
           // Prepend the elements of `items` to `self`
           while let Some(item) = items_mut.pop_back() {
@@ -793,18 +817,15 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
-      /// Appends the items in the iterator to the beginning of this
-      /// list, preserving order.
-      pub fn extend<T: IntoIterator<Item = Item>>(&mut self, items: T) {
-          let m = self.make_mut();
+      fn extend<T: IntoIterator<Item = Item>>(&mut self, items: T) {
+          let m = sync::Arc::make_mut(self);
           let ct = m.len();
           m.extend(items);
           m.rotate_left(ct);
       }
 
-      /// Reverses the order of the list.
-      pub fn reverse(&mut self) {
-          let m = self.make_mut();
+      fn reverse(&mut self) {
+          let m = sync::Arc::make_mut(self);
           m.make_contiguous().reverse();
       }
   }
@@ -939,7 +960,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   (Sized::Associative(a), i)
               }
               Sized::List(mut l) => {
-                  let lm = l.make_mut();
+                  let lm = l.mutate();
                   let i = lm.pop_front();
                   (Sized::List(l), i)
               }
@@ -961,7 +982,7 @@ internally, to keep track of things like the stack, program, lists etc.
               }
               Sized::Set(mut s) => {
                   let i = s.iter().next().cloned();
-                  let sm = s.make_mut();
+                  let sm = s.mutate();
                   if let Some(i) = i.clone() {
                       sm.take(&i);
                   }
@@ -978,7 +999,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   (Sized::Associative(a), i)
               }
               Sized::List(mut l) => {
-                  let lm = l.make_mut();
+                  let lm = l.mutate();
                   let i = lm.pop_back();
                   (Sized::List(l), i)
               }
@@ -992,7 +1013,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   .unwrap_or((Sized::Bytes(vec![]), None)),
               Sized::Set(mut s) => {
                   let i = s.iter().next().cloned();
-                  let sm = s.make_mut();
+                  let sm = s.mutate();
                   if let Some(i) = i.clone() {
                       sm.take(&i);
                   }
@@ -1005,12 +1026,12 @@ internally, to keep track of things like the stack, program, lists etc.
       pub fn put(self, other: Item) -> Result<Sized, Error> {
           match (self, other) {
               (Sized::List(mut c), i) => {
-                  c.make_mut().push_back(i);
+                  c.mutate().push_back(i);
                   Ok(Sized::List(c))
               }
               (Sized::Associative(a), l) => Ok(Sized::Associative(a.put(l)?)),
               (Sized::Set(mut s), i) => {
-                  s.make_mut().insert(assoc::KeyItem::try_derive(i)?);
+                  s.mutate().insert(assoc::KeyItem::try_derive(i)?);
                   Ok(Sized::Set(s))
               }
               (Sized::Bytes(mut b), Item::Number(Number::Int(i))) => {
@@ -1045,17 +1066,17 @@ internally, to keep track of things like the stack, program, lists etc.
               }
               (Sized::Associative(a), Sized::Associative(b)) => Sized::Associative(a.join(b)),
               (Sized::List(mut a), Sized::List(b)) => {
-                  let am = a.make_mut();
+                  let am = a.mutate();
                   am.extend(b.iter().cloned());
                   Sized::List(a)
               }
               (Sized::Set(mut a), Sized::Set(b)) => {
-                  let am = a.make_mut();
+                  let am = a.mutate();
                   am.extend(b.iter().cloned());
                   Sized::Set(a)
               }
               (Sized::List(a), Sized::Set(mut b)) => {
-                  let bm = b.make_mut();
+                  let bm = b.mutate();
 
                   bm.extend(
                       a.iter()
@@ -1066,7 +1087,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   Sized::Set(b)
               }
               (Sized::Set(mut a), Sized::List(b)) => {
-                  let am = a.make_mut();
+                  let am = a.mutate();
 
                   am.extend(
                       b.iter()
@@ -1479,6 +1500,7 @@ internally, to keep track of things like the stack, program, lists etc.
   //! called "associations" in kcats)
   use super::{dictionary as dict, environment as env};
   use crate::types::container as coll;
+  use crate::types::container::Mutey;
   use crate::types::number::{Int, Number};
   use crate::types::*;
   use std::iter::FromIterator;
@@ -1510,16 +1532,16 @@ internally, to keep track of things like the stack, program, lists etc.
   pub type KeyListContent = coll::Listy<KeyItem>;
   pub type KeyList = coll::Arc<KeyListContent>;
 
-  impl KeyList {
-      pub fn try_from_iter<I>(l: I) -> Result<Self, Error>
+  impl TryDeriveIterator<Item> for KeyList {
+      fn try_from_iter<I>(l: I) -> Result<Self, Error>
       where
           I: IntoIterator<Item = Item>,
       {
-          Ok(coll::Arc::wrap(Newtype(
+          Ok(sync::Arc::new(
               l.into_iter()
                   .map(KeyItem::try_derive)
                   .collect::<Result<VecDeque<KeyItem>, Error>>()?,
-          )))
+          ))
       }
   }
 
@@ -1769,7 +1791,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   //println!("dict + assoc join");
                   match other.convert::<Word, dict::Entry>() {
                       Ok(d) => {
-                          let tm = this.make_mut();
+                          let tm = this.mutate();
                           tm.extend(d);
                           Associative::Dictionary(this)
                       }
@@ -1785,7 +1807,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   //println!("assoc + dict join");
                   match this.convert::<Word, dict::Entry>() {
                       Ok(d) => {
-                          let tm = dict.make_mut();
+                          let tm = dict.mutate();
                           tm.extend(d);
                           Associative::Dictionary(dict)
                       }
@@ -1861,7 +1883,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   (Associative::Dictionary(d), v.map(|v| v.fit()))
               }
               Associative::Error(mut e) => {
-                  let a = e.data.make_mut();
+                  let a = e.data.mutate();
                   let v = a.remove(k);
                   (Associative::Error(e), v)
               }
@@ -1880,7 +1902,7 @@ internally, to keep track of things like the stack, program, lists etc.
           match self {
               Associative::Assoc(mut a) => {
                   let maybe_key = a.keys().next().cloned();
-                  let am = a.make_mut();
+                  let am = a.mutate();
                   let maybe_value = maybe_key.as_ref().and_then(|key| am.remove(key));
                   (
                       Associative::Assoc(a),
@@ -1895,7 +1917,7 @@ internally, to keep track of things like the stack, program, lists etc.
               }
               Associative::Dictionary(mut d) => {
                   let maybe_key = d.keys().next().cloned();
-                  let dm = d.make_mut();
+                  let dm = d.mutate();
                   let maybe_value = maybe_key.clone().and_then(|key| dm.remove(&key));
                   (
                       Associative::Dictionary(d),
@@ -1969,20 +1991,16 @@ internally, to keep track of things like the stack, program, lists etc.
   // Convert anything that can be iterated over as Items, to an
   // Association. The items must be pairs that are
   // convertable to Entry, otherwise it will return an error.
-  impl Association {
-      pub fn new() -> Association {
-          coll::Arc::wrap(Newtype(HashMap::new()))
-      }
-
-      pub fn try_from_iter<I>(l: I) -> Result<Self, Error>
+  impl TryDeriveIterator<Item> for Association {
+      fn try_from_iter<I>(l: I) -> Result<Self, Error>
       where
           I: IntoIterator<Item = Item>,
       {
-          Ok(coll::Arc::wrap(Newtype(
+          Ok(sync::Arc::new(
               l.into_iter()
                   .map(|i| Entry::try_derive(i.clone()))
                   .collect::<Result<HashMap<KeyItem, Item>, Error>>()?,
-          )))
+          ))
       }
   }
 
@@ -1992,8 +2010,8 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  impl FromIterator<Entry> for Association {
-      fn from_iter<I>(iter: I) -> Self
+  impl DeriveIterator<Entry> for Association {
+      fn derive_iter<I>(iter: I) -> Self
       where
           I: IntoIterator<Item = Entry>,
       {
@@ -2003,8 +2021,8 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  impl FromIterator<Entry> for coll::List {
-      fn from_iter<I>(iter: I) -> Self
+  impl DeriveIterator<Entry> for coll::List {
+      fn derive_iter<I>(iter: I) -> Self
       where
           I: IntoIterator<Item = Entry>,
       {
@@ -2191,7 +2209,7 @@ internally, to keep track of things like the stack, program, lists etc.
 #+begin_src rust :tangle src/types/container/error.rs :mkdirp yes
   use super::associative as assoc;
   use crate::list;
-  use crate::types::container as coll;
+  use crate::types::container::{self as coll, Mutey};
   use crate::types::number::Int;
   use crate::types::{Derive, Fit, Item, TryDerive, TryFit, Word};
   use std::convert::Infallible;
@@ -2292,7 +2310,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
       pub fn test_assertion(program: coll::List, expected: coll::List, actual: coll::List) -> Error {
           let mut e = Error::create(program, "assertion failed", Some(actual));
-          let d = e.data.make_mut();
+          let d = e.data.mutate();
           d.insert("expected-program".fit(), expected.fit());
           e
       }
@@ -2399,7 +2417,8 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::axiom::BUILTIN_FUNCTIONS;
   use crate::list;
   use crate::serialize;
-  use crate::types::container as coll;
+  use crate::types::container::{self as coll, Mutey};
+
   use crate::types::*;
   use std::collections::HashSet;
   use std::ptr;
@@ -2537,18 +2556,42 @@ internally, to keep track of things like the stack, program, lists etc.
   /// definitions.
   pub type Dictionary = coll::Arc<HashMap<Word, Entry>>;
 
-  impl Dictionary {
+  pub trait Dict {
       /// Returns the difference between this dictionary and a "newer"
       /// one: The additions/updates, and the deletions.
-      pub fn diff(&self, newer: Dictionary) -> (Vec<(Word, Entry)>, Vec<Word>) {
-          diff_hashmaps(&self, &newer)
-      }
+      fn diff(&self, newer: Dictionary) -> (Vec<(Word, Entry)>, Vec<Word>);
 
       /// Takes a core module (in string form - should contain a series
       /// of word definitions, not wrapped in a single list), and
       /// inserts all the definitions into the dictionary, with an
       /// optional namespace.
-      pub fn insert_core_module(&mut self, lexicon: String) {
+      fn insert_core_module(&mut self, lexicon: String);
+
+      /// Takes a mapping of word to definition, and updates all the
+      /// dictionary entries so that the word will call that definition
+      /// when the word is executed. The definitions should be Axiom
+      /// variants, since those are the ones we have to define in rust.
+      ///
+      /// This method is used during bootstrap of the default environment.
+      fn insert_axiom_fns(&mut self, updates: Vec<(Word, Definition)>);
+
+      /// For stdlib words that are both built-in and part of a module
+      /// that isn't necessarily loaded as part of the standard
+      /// environment, we need to be able to link the word to its rust
+      /// definition. Calling this function on a dictionary (whether
+      /// full or just the partial dictionary created from a module),
+      /// will create those links. In order for the links to be created,
+      /// the current word currently has to have no definition field
+      /// (set to None). Otherwise changes will not be applied.
+      fn add_builtins(&mut self);
+  }
+
+  impl Dict for Dictionary {
+      fn diff(&self, newer: Dictionary) -> (Vec<(Word, Entry)>, Vec<Word>) {
+          diff_hashmaps(&self, &newer)
+      }
+
+      fn insert_core_module(&mut self, lexicon: String) {
           //println!("Parsing: {}", lexicon);
           let items = serialize::parse(lexicon).unwrap();
           for r in Box::new(items.iter().cloned()) {
@@ -2558,7 +2601,7 @@ internally, to keep track of things like the stack, program, lists etc.
               let iter: Box<dyn Iterator<Item = Item>> = def.try_fit().unwrap();
               let new_entry: dict::Entry = iter.try_fit().unwrap();
               let new_entry2 = new_entry.clone();
-              let dict = self.make_mut();
+              let dict = self.mutate();
               dict.entry(word)
                   .and_modify(|e| {
                       e.examples = new_entry.examples;
@@ -2569,29 +2612,15 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
-      /// Takes a mapping of word to definition, and updates all the
-      /// dictionary entries so that the word will call that definition
-      /// when the word is executed. The definitions should be Axiom
-      /// variants, since those are the ones we have to define in rust.
-      ///
-      /// This method is used during bootstrap of the default environment.
-      pub fn insert_axiom_fns(&mut self, updates: Vec<(Word, Definition)>) {
-          let dm = self.make_mut();
+      fn insert_axiom_fns(&mut self, updates: Vec<(Word, Definition)>) {
+          let dm = self.mutate();
           for (w, f) in updates {
               dm.entry(w).and_modify(|e| e.definition = f);
           }
       }
 
-      /// For stdlib words that are both built-in and part of a module
-      /// that isn't necessarily loaded as part of the standard
-      /// environment, we need to be able to link the word to its rust
-      /// definition. Calling this function on a dictionary (whether
-      /// full or just the partial dictionary created from a module),
-      /// will create those links. In order for the links to be created,
-      /// the current word currently has to have no definition field
-      /// (set to None). Otherwise changes will not be applied.
-      pub fn add_builtins(&mut self) {
-          let dm = self.make_mut();
+      fn add_builtins(&mut self) {
+          let dm = self.mutate();
           for (bw, bd) in BUILTIN_FUNCTIONS.iter() {
               dm.entry(bw.clone()).and_modify(|d| match &d.definition {
                   Definition::Derived(dd) => {
@@ -2751,7 +2780,7 @@ internally, to keep track of things like the stack, program, lists etc.
   impl Derive<Entry> for assoc::Associative {
       fn derive(d: Entry) -> assoc::Associative {
           let mut assoc = assoc::Association::new();
-          let a = assoc.make_mut();
+          let a = assoc.mutate();
           d.examples.and_then(|l| a.insert("examples".fit(), l.fit()));
           d.spec.and_then(|l| a.insert("spec".fit(), l.fit()));
 
@@ -2820,11 +2849,13 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::list;
   use crate::serialize;
   use crate::types::container as coll;
+  use crate::types::container::dictionary::Dict;
   use crate::types::number::Number;
   use crate::types::*;
   use once_cell::sync::Lazy;
   use std::future;
   use std::ops::Range;
+  use std::sync;
 
   /// A struct to hold the state of an executing kcats program. The
   /// `stack` is the data being manipulated, the `program` is program
@@ -3047,7 +3078,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn default() -> Self {
           static INST: Lazy<Environment> = Lazy::new(|| {
               let mut env = Environment {
-                  dictionary: coll::Arc::wrap(HashMap::new()),
+                  dictionary: sync::Arc::new(HashMap::new()),
                   stack: Default::default(),
                   program: Default::default(),
               };
@@ -4042,7 +4073,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   use crate::types::container::pipe::db;
   use crate::types::container::{
       self as coll, associative as assoc, dictionary as dict, environment::Environment, error::Error,
-      pipe,
+      pipe, Mutey, Ordered,
   };
   use crate::types::number::{Float, Int, Number};
   use crate::types::*;
@@ -4056,6 +4087,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   use std::convert::Infallible;
   use std::default::Default;
   use std::mem;
+  use std::sync::Arc;
 
   pub type ItemResult = Result<Item, Error>;
 
@@ -4588,7 +4620,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   fn swap2(mut env: Environment, offset: usize) -> Future<Environment> {
-      coll::Arc::make_mut(&mut env.stack).swap(offset, offset + 1);
+      env.stack.mutate().swap(offset, offset + 1);
       env.fit()
   }
 
@@ -4603,17 +4635,17 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn sink(mut env: Environment) -> Future<Environment> {
-      let s = coll::Arc::make_mut(&mut env.stack);
-      s.swap(0, 2);
-      s.swap(0, 1);
+      let stack = env.stack.mutate();
+      stack.swap(0, 2);
+      stack.swap(0, 1);
       env.pop_prog();
       env.fit()
   }
 
   pub fn float(mut env: Environment) -> Future<Environment> {
-      let s = coll::Arc::make_mut(&mut env.stack);
-      s.swap(0, 2);
-      s.swap(1, 2);
+      let stack = env.stack.mutate();
+      stack.swap(0, 2);
+      stack.swap(1, 2);
       env.pop_prog();
       env.fit()
   }
@@ -4705,10 +4737,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               let f = env.pop();
               if is_truthy(f) {
                   let p2 = p.clone();
-                  let pm = coll::Arc::make_mut(&mut p);
+                  let pm = Arc::make_mut(&mut p);
                   pm.push_back(Item::derive(p2));
                   pm.push_back("loop".fit());
-                  env.program.append(p);
+                  env.program.prepend(p);
               }
           }
           Err(e) => env.push(Item::derive(e)),
@@ -4721,7 +4753,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       match coll::List::try_derive(i) {
           Ok(program) => {
               env.pop_prog();
-              env.program.append(program);
+              env.program.prepend(program);
           }
           Err(e) => {
               env.push(e);
@@ -4756,11 +4788,11 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       match coll::List::try_derive(env.pop()) {
           Ok(program) => {
               let item = env.pop();
-              let expr = env.program.make_mut();
+              let expr = Arc::make_mut(&mut env.program);
               expr.pop_front();
               expr.push_front("unwrap".fit());
               expr.push_front(list!(item).fit());
-              env.program.append(program)
+              env.program.prepend(program)
           }
           Err(e) => env.push(e),
       }
@@ -4772,11 +4804,11 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           Ok(program) => {
               let item1 = env.pop();
               let item2 = env.pop();
-              let expr = env.program.make_mut();
-              expr.pop_front();
-              expr.push_front("unwrap".fit());
-              expr.push_front(list!(item2, item1).fit());
-              env.program.append(program)
+              let prog = env.program.mutate();
+              prog.pop_front();
+              prog.push_front("unwrap".fit());
+              prog.push_front(list!(item2, item1).fit());
+              env.program.prepend(program)
           }
           Err(e) => env.push(e),
       }
@@ -4786,7 +4818,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   pub fn take(mut env: Environment) -> Future<Environment> {
       // TODO: handle Nothing case
       let coll = {
-          let stack = env.stack.make_mut();
+          let stack = Arc::make_mut(&mut env.stack);
           stack.pop_front()
       };
       match coll {
@@ -4799,14 +4831,14 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       Box::pin(async move {
                           let (c, i) = f.await;
                           env.pop_prog();
-                          let stack = env.stack.make_mut();
+                          let stack = Arc::make_mut(&mut env.stack);
                           stack.push_front(c.fit());
                           stack.push_front(i.unwrap_or_default());
                           env
                       })
                   }
                   Err(e) => {
-                      let stack = env.stack.make_mut();
+                      let stack = Arc::make_mut(&mut env.stack);
                       stack.push_front(i2);
                       stack.push_front(e.fit());
                       env.fit()
@@ -4814,7 +4846,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               }
           }
           None => {
-              let stack = env.stack.make_mut();
+              let stack = env.stack.mutate();
               stack.push_front(Error::stack_underflow().fit());
               env.fit()
           }
@@ -4823,7 +4855,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn pop(mut env: Environment) -> Future<Environment> {
       let coll = {
-          let stack = env.stack.make_mut();
+          let stack = env.stack.mutate();
           stack.pop_front()
       };
       match coll {
@@ -4868,7 +4900,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               env.pop_prog();
               let b = env.pop();
 
-              env.program.append(if is_truthy(b) {
+              env.program.prepend(if is_truthy(b) {
                   true_branch
               } else {
                   false_branch
@@ -4885,13 +4917,13 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let dispenser = coll::Dispenser::try_derive(env.pop()).unwrap();
       Box::pin(async move {
           if let (dispenser, Some(litem)) = dispenser.take().await {
-              let expr = env.program.make_mut();
+              let prog = env.program.mutate();
               // prepare the next iteration, even if the iterator is now
               // empty. step is still the next instruction, so we don't
               // pop it off.
-              expr.push_front(p.clone().fit());
-              expr.push_front(dispenser.fit());
-              env.program.append(p);
+              prog.push_front(p.clone().fit());
+              prog.push_front(dispenser.fit());
+              env.program.prepend(p);
 
               env.push(litem);
           } else {
@@ -4933,9 +4965,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       // it with rec1, then push r, then extend again with rec2. now
       // start with rec1 (copied on write), then push r, then extend
       // with rec2.  That should be equivalent.
-      let rm = rec1.make_mut();
+      let rm = Arc::make_mut(&mut rec1);
       rm.push_back(r);
-      rm.extend(rec2.make_mut().drain(..));
+      rm.extend(Arc::make_mut(&mut rec2).drain(..));
       //env.pop_expr();
       env.push(pred);
       env.push(then);
@@ -4955,7 +4987,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   fn assoc_vec(mut l: coll::List, ks: &[assoc::KeyItem], k: Int, v: Item) -> Result<Item, Error> {
-      let lm = coll::Arc::make_mut(&mut l);
+      let lm = Arc::make_mut(&mut l);
       let idx = k as usize;
       // extend the size of the vector to be big enough to set
       // the given index, pad with 'nothing' values.
@@ -4995,7 +5027,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       assoc::KeyItem::Int(k),
                   ) => {
                       // vector set by index
-                      let lm = coll::Arc::make_mut(&mut l);
+                      let lm = Arc::make_mut(&mut l);
                       let idx = *k as usize;
                       // extend the size of the vector to be big enough to set
                       // the given index, pad with 'nothing' values.
@@ -5010,7 +5042,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       assoc::KeyItem::Int(k),
                   ) => {
                       // vector set by index
-                      let lm = coll::Arc::make_mut(&mut l);
+                      let lm = Arc::make_mut(&mut l);
                       let idx = *k as usize;
                       // extend the size of the vector to be big enough to set
                       // the given index, pad with 'nothing' values.
@@ -5085,7 +5117,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(mut l))),
                       assoc::KeyItem::Int(k),
                   ) => {
-                      let lm = l.make_mut();
+                      let lm = l.mutate();
                       let old_value = if let Some(item) = lm.get_mut(*k as usize) {
                           mem::take(item)
                       } else {
@@ -5098,7 +5130,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   (a, k) => {
                       let a: assoc::Associative = a.try_fit()?;
                       let mut a: assoc::Association = a.into_iter().collect();
-                      let am = a.make_mut();
+                      let am = a.mutate();
                       let mut res: Option<Result<_, Error>> = None;
                       am.entry(k.clone()).and_modify(|v| {
                           let new_value = unassoc_in(v.clone(), ks);
@@ -5121,7 +5153,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   pub fn assign(m: Item, ks: Item, v: Item) -> ItemResult {
       let kit = coll::List::try_derive(ks)?;
       let mut ksvec: assoc::KeyList = assoc::KeyList::try_from_iter(kit.iter().cloned())?;
-      ksvec.make_mut().make_contiguous();
+      ksvec.mutate().make_contiguous();
       let (ks, _) = ksvec.as_slices();
       assoc_in(m, ks, v)
   }
@@ -5129,7 +5161,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   pub fn unassign(m: Item, ks: Item) -> ItemResult {
       let kit = coll::List::try_derive(ks)?;
       let mut ksvec: assoc::KeyList = assoc::KeyList::try_from_iter(kit.iter().cloned())?;
-      ksvec.make_mut().make_contiguous();
+      ksvec.mutate().make_contiguous();
       let (ks, _) = ksvec.as_slices();
       unassoc_in(m, ks)
   }
@@ -5208,7 +5240,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn decide(mut env: Environment) -> Future<Environment> {
       let mut clauses = coll::List::try_derive(env.pop()).unwrap();
-      let clauses_data = coll::Arc::make_mut(&mut clauses);
+      let clauses_data = Arc::make_mut(&mut clauses);
       let clause = clauses_data.pop_front();
 
       if let Some(clause) = clause {
@@ -5218,7 +5250,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   if clause.len() != 2 {
                       env.push(Error::list_count(2));
                   } else {
-                      let clause_data = clause.make_mut();
+                      let clause_data = clause.mutate();
                       let test: Result<coll::List, Error> = clause_data
                           .pop_front()
                           .ok_or(Error::list_count(2))
@@ -5249,7 +5281,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                                   "branch"
                               );
                               env.pop_prog();
-                              env.program.append(newexpr);
+                              env.program.prepend(newexpr);
                           }
                           (Err(test), _) => {
                               env.push(test);
@@ -5308,7 +5340,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                               dict::Definition::Derived(d) => {
                                   let items = d.clone();
                                   env.pop_prog();
-                                  env.program.append(items);
+                                  env.program.prepend(items);
                                   env.fit()
                               }
                           }
@@ -5410,7 +5442,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               }
               // set the is_handled bit
               e.is_handled = true;
-              let em = coll::Arc::make_mut(&mut e.data);
+              let em = Arc::make_mut(&mut e.data);
               em.insert("unwound".fit(), coll::List::from_iter(unwound).fit());
               e.fit()
           }
@@ -5648,7 +5680,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   fn as_pair(i: Item) -> Result<(Item, assoc::KeyItem), Error> {
       let mut i = coll::List::try_derive(i)?;
-      let im = i.make_mut();
+      let im = i.mutate();
       let j = im.pop_front().ok_or(Error::short_list(1))?;
       let k = im
           .pop_front()
