@@ -151,35 +151,14 @@ the location where you installed the kcats binary.
   [features]
   database = ["rusqlite"]
 #+END_SRC
-*** Internal data types
-**** Basic internal types
-We'll start by defining the basic data structures that kcats will use
-internally, to keep track of things like the stack, program, lists etc.
-#+begin_src rust :tangle src/types.rs :mkdirp yes
-  //! Defines kcats internal data types.
-  /// Include Our own traits so we aren't saddled with orphan rule
-  /// issues.
-  use crate::list;
-  use crate::types::container as coll;
-  use crate::types::container::dictionary as dict;
-  use crate::types::container::environment as env;
+
+*** Interal traits
+Because of Rust's orphan rule (you can't implement a trait on a type
+unless you own either the trait or the type), we'll opt for making our
+own traits rather than using the "newtype" pattern of making our own
+types to wrap stdlib types.
+#+begin_src rust :tangle src/traits.rs :mkdirp yes
   use crate::types::container::error::Error;
-  use crate::types::container::Mutey;
-
-  use core::default::Default;
-  use internment::Intern;
-  use lazy_static::lazy_static;
-  use std::collections::{HashMap, VecDeque};
-
-  use std::fmt;
-  use std::fmt::Display;
-  use std::hash::Hash;
-  use std::marker::Sync;
-  use std::ops::{Deref, DerefMut};
-  use std::pin::Pin;
-
-  pub mod container;
-  pub mod number;
 
   // Define custom traits that mimic std ones
   /// a trait similar to [std::convert::From]
@@ -273,6 +252,37 @@ internally, to keep track of things like the stack, program, lists etc.
   pub trait Fresh {
       fn fresh() -> Self;
   }
+#+end_src
+*** Internal data types
+**** Basic internal types
+We'll start by defining the basic data structures that kcats will use
+internally, to keep track of things like the stack, program, lists etc.
+#+begin_src rust :tangle src/types.rs :mkdirp yes
+  //! Defines kcats internal data types.
+  /// Include Our own traits so we aren't saddled with orphan rule
+  /// issues.
+  use crate::list;
+  use crate::traits::*;
+  use crate::types::container as coll;
+  use crate::types::container::dictionary as dict;
+  use crate::types::container::environment as env;
+  use crate::types::container::error::Error;
+  use crate::types::container::Mutey;
+
+  use core::default::Default;
+  use internment::Intern;
+  use lazy_static::lazy_static;
+  use std::collections::{HashMap, VecDeque};
+
+  use std::fmt;
+  use std::fmt::Display;
+  use std::hash::Hash;
+  use std::marker::Sync;
+  use std::ops::{Deref, DerefMut};
+  use std::pin::Pin;
+
+  pub mod container;
+  pub mod number;
 
   /// A generic newtype to contain various types, so that we can
   /// implement traits on them.
@@ -581,7 +591,8 @@ internally, to keep track of things like the stack, program, lists etc.
   macro_rules! list {
       ( $( $x:expr ),* $(,)? ) => {
           {
-              use $crate::types::{Item, Fit, Derive};
+              use $crate::traits::*;
+              use $crate::types::Item;
               let v: Vec<Item> = vec![
                   $( $x.fit(), )*
               ];
@@ -593,10 +604,11 @@ internally, to keep track of things like the stack, program, lists etc.
   mod serde {
       //! Support for json serialization of kcats objects
       use super::Item;
+      use crate::traits::*;
       use crate::types::container as coll;
       use crate::types::container::associative as assoc;
       use crate::types::number;
-      use crate::types::{Derive, Error, Fit};
+      use crate::types::Error;
       use serde::de::{self, Deserialize, Deserializer, Visitor};
       use serde::ser::{Serialize, Serializer};
       use std::collections::HashMap;
@@ -722,6 +734,206 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 #+end_src
+**** Number types
+#+begin_src rust :tangle src/types/number.rs :mkdirp yes
+  //! Support for numbers in kcats. Currently just [i64] and [f64], but
+  //! this module will eventually support bignums and autopromotion.
+  use super::container::error::Error;
+  use crate::traits::*;
+  use crate::types::Item;
+  use num_integer::Roots;
+  use serde::ser::{Serialize, Serializer};
+  /// An integer type
+  pub type Int = i64;
+
+  /// A floating point type
+  pub type Float = f64;
+
+  #[derive(Clone, Debug)]
+  pub enum Number {
+      Int(Int),
+      Float(Float),
+  }
+
+  impl Number {
+      pub fn add(&self, other: Number) -> Number {
+          match (self, other) {
+              (Number::Int(i), Number::Int(j)) => Number::Int(i + j),
+              (Number::Float(i), Number::Float(j)) => Number::Float(i + j),
+              (Number::Int(i), Number::Float(j)) => Number::Float(*i as Float + j),
+              (Number::Float(i), Number::Int(j)) => Number::Float(i + j as Float),
+          }
+      }
+
+      pub fn subtract(&self, other: Number) -> Number {
+          match (self, other) {
+              (Number::Int(i), Number::Int(j)) => Number::Int(i - j),
+              (Number::Float(i), Number::Float(j)) => Number::Float(i - j),
+              (Number::Int(i), Number::Float(j)) => Number::Float(*i as Float - j),
+              (Number::Float(i), Number::Int(j)) => Number::Float(i - j as Float),
+          }
+      }
+
+      pub fn multiply(&self, other: Number) -> Number {
+          match (self, other) {
+              (Number::Int(i), Number::Int(j)) => Number::Int(i * j),
+              (Number::Float(i), Number::Float(j)) => Number::Float(i * j),
+              (Number::Int(i), Number::Float(j)) => Number::Float(*i as Float * j),
+              (Number::Float(i), Number::Int(j)) => Number::Float(i * j as Float),
+          }
+      }
+
+      pub fn divide(i: Float, j: Float) -> Result<Float, Error> {
+          let q = i / j;
+          if q.is_nan() {
+              Err(Error::division_by_zero())
+          } else {
+              Ok(q)
+          }
+      }
+
+      pub fn gt(i: Number, j: Number) -> bool {
+          match (i, j) {
+              (Number::Int(i), Number::Int(j)) => i > j,
+              (Number::Float(i), Number::Float(j)) => i > j,
+              (Number::Int(i), Number::Float(j)) => i as Float > j,
+              (Number::Float(i), Number::Int(j)) => i > j as Float,
+          }
+      }
+
+      pub fn lt(i: Number, j: Number) -> bool {
+          match (i, j) {
+              (Number::Int(i), Number::Int(j)) => i < j,
+              (Number::Float(i), Number::Float(j)) => i < j,
+              (Number::Int(i), Number::Float(j)) => (i as Float) < j,
+              (Number::Float(i), Number::Int(j)) => i < j as Float,
+          }
+      }
+
+      pub fn gte(i: Number, j: Number) -> bool {
+          match (i, j) {
+              (Number::Int(i), Number::Int(j)) => i >= j,
+              (Number::Float(i), Number::Float(j)) => i >= j,
+              (Number::Int(i), Number::Float(j)) => (i as Float) >= j,
+              (Number::Float(i), Number::Int(j)) => i >= j as Float,
+          }
+      }
+
+      pub fn lte(i: Number, j: Number) -> bool {
+          match (i, j) {
+              (Number::Int(i), Number::Int(j)) => i <= j,
+              (Number::Float(i), Number::Float(j)) => i <= j,
+              (Number::Int(i), Number::Float(j)) => (i as Float) <= j,
+              (Number::Float(i), Number::Int(j)) => i <= j as Float,
+          }
+      }
+
+      pub fn abs(&self) -> Number {
+          match self {
+              Number::Int(i) => Number::Int(i.abs()),
+              Number::Float(f) => Number::Float(f.abs()),
+          }
+      }
+
+      pub fn sqrt(&self) -> Number {
+          match self {
+              Number::Int(i) => Number::Int(i.sqrt()),
+              Number::Float(f) => Number::Float(f.sqrt()),
+          }
+      }
+  }
+
+  impl PartialEq for Number {
+      fn eq(&self, other: &Self) -> bool {
+          match (self, other) {
+              (Number::Int(a), Number::Int(b)) => a == b,
+              (Number::Float(a), Number::Float(b)) => a == b,
+              (Number::Float(a), Number::Int(b)) => *a == *b as Float,
+              (Number::Int(a), Number::Float(b)) => *a as Float == *b,
+          }
+      }
+  }
+
+  impl TryDerive<Number> for Float {
+      type Error = Error;
+      fn try_derive(i: Number) -> Result<Self, Self::Error> {
+          match i {
+              Number::Float(i) => Ok(i),
+              i => Err(Error::expected("float", i)),
+          }
+      }
+  }
+
+  impl TryDerive<Number> for Int {
+      type Error = Error;
+      fn try_derive(i: Number) -> Result<Self, Self::Error> {
+          match i {
+              Number::Int(i) => Ok(i),
+              i => Err(Error::expected("integer", i)),
+          }
+      }
+  }
+
+  impl Derive<Int> for Item {
+      fn derive(c: Int) -> Self {
+          Item::Number(Number::Int(c))
+      }
+  }
+
+  impl Derive<Float> for Item {
+      fn derive(c: Float) -> Self {
+          Item::Number(Number::Float(c))
+      }
+  }
+
+  impl TryDerive<Item> for Number {
+      type Error = Error;
+      fn try_derive(i: Item) -> Result<Self, Self::Error> {
+          match i {
+              Item::Number(i) => Ok(i),
+              i => Err(Error::expected("number", i)),
+          }
+      }
+  }
+
+  impl TryDerive<Item> for Int {
+      type Error = Error;
+      fn try_derive(i: Item) -> Result<Self, Self::Error> {
+          match Number::try_derive(i)? {
+              Number::Int(i) => Ok(i),
+              i => Err(Error::expected("integer", i)),
+          }
+      }
+  }
+
+  impl TryDerive<Item> for Float {
+      type Error = Error;
+      fn try_derive(i: Item) -> Result<Self, Self::Error> {
+          match Number::try_derive(i)? {
+              Number::Float(i) => Ok(i),
+              i => Err(Error::expected("float", i)),
+          }
+      }
+  }
+
+  impl Derive<Number> for Item {
+      fn derive(c: Number) -> Self {
+          Item::Number(c)
+      }
+  }
+
+  impl Serialize for Number {
+      fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+      where
+          S: Serializer,
+      {
+          match self {
+              Number::Int(i) => serializer.serialize_i64(*i),
+              Number::Float(f) => serializer.serialize_f64(*f),
+          }
+      }
+  }
+#+end_src
 **** Container types
 #+begin_src rust :tangle src/types/container.rs :mkdirp yes
   //! Support for containers in kcats. Includes types like
@@ -743,6 +955,7 @@ internally, to keep track of things like the stack, program, lists etc.
   use futures::FutureExt;
 
   use self::associative as assoc;
+  use crate::traits::*;
   use crate::types::number::{Int, Number};
   use crate::types::*;
 
@@ -1443,8 +1656,8 @@ internally, to keep track of things like the stack, program, lists etc.
   mod serde {
       use super::{Dispenser, Receptacle, Sized};
       use crate::serialize::Display;
+      use crate::traits::*;
       use crate::types::container::associative as assoc;
-      use crate::types::Derive;
       use serde::ser::{Serialize, SerializeMap, SerializeSeq};
 
       impl Serialize for Dispenser {
@@ -1521,6 +1734,7 @@ internally, to keep track of things like the stack, program, lists etc.
   //! Dictionaries, Environments, as well as generic maps (which are
   //! called "associations" in kcats)
   use super::{dictionary as dict, environment as env};
+  use crate::traits::*;
   use crate::types::container as coll;
   use crate::types::container::Mutey;
   use crate::types::number::{Int, Number};
@@ -2166,7 +2380,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
   mod serde {
       use super::{KeyItem, KeyList};
-      use crate::types::{DeriveIterator, Fit};
+      use crate::traits::*;
       use serde::de::{self, Deserialize, Deserializer, Visitor};
       use serde::ser::{Serialize, SerializeSeq};
       use std::fmt;
@@ -2257,9 +2471,10 @@ internally, to keep track of things like the stack, program, lists etc.
 #+begin_src rust :tangle src/types/container/error.rs :mkdirp yes
   use super::associative as assoc;
   use crate::list;
+  use crate::traits::*;
   use crate::types::container::{self as coll, Mutey};
   use crate::types::number::Int;
-  use crate::types::{Derive, DeriveIterator, Fit, Item, TryDerive, TryDeriveIterator, TryFit, Word};
+  use crate::types::{Item, Word};
   use std::convert::Infallible;
 
   /// Represents a runtime error type. Contains generic fields to hold
@@ -2465,9 +2680,10 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::axiom::BUILTIN_FUNCTIONS;
   use crate::list;
   use crate::serialize;
+  use crate::traits::*;
   use crate::types::container::{self as coll, Mutey};
-
   use crate::types::*;
+
   use std::collections::HashSet;
   use std::ptr;
   use std::sync::Arc;
@@ -2897,10 +3113,12 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::axiom;
   use crate::list;
   use crate::serialize;
+  use crate::traits::*;
   use crate::types::container::dictionary::Dict;
   use crate::types::container::{self as coll, Mutey, Ordered};
   use crate::types::number::Number;
   use crate::types::*;
+
   use once_cell::sync::Lazy;
   use std::future;
   use std::ops::Range;
@@ -3596,9 +3814,10 @@ We'll implement certain cryptography functions in rust and make kcats
 words for them (hashing, encryption, signing)
 #+begin_src rust :tangle src/crypto.rs :mkdirp yes
   use crate::axiom::ItemResult;
+  use crate::traits::*;
   use crate::types::container::{associative as assoc, error::Error};
   use crate::types::number::Int;
-  use crate::types::{Bytes, DeriveIterator, Fit, Item, TryDerive, TryFit};
+  use crate::types::{Bytes, Item};
   use core::ops::Deref;
   use ed25519_dalek as signing;
   use ed25519_dalek::{Signer, Verifier};
@@ -3762,11 +3981,13 @@ example, in order to read/write to/from disk).
   //! containers from edn are used, no lists, maps or sets). Currently
   //! one custom tag is used for encoding byte arrays, but this is
   //! subject to change.
+  use crate::traits::*;
   use crate::types::container::{
       self as coll, associative as assoc, environment::Environment, error::Error,
   };
   use crate::types::number::Number;
   use crate::types::*;
+
   use std::collections::VecDeque;
   use std::fmt;
   use std::string;
@@ -4115,6 +4336,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   //! rust, instead of in terms of other kcats words.
   use crate::list;
   use crate::serialize;
+  use crate::traits::*;
   #[cfg(feature = "database")]
   use crate::types::container::pipe::db;
   use crate::types::container::{
@@ -5836,11 +6058,13 @@ We'll also define how to run unit tests.
   mod axiom;
   mod crypto;
   mod serialize;
+  mod traits;
   mod types;
+  pub use traits::*;
 
   use std::io::{self, BufRead, Read, Write};
   use std::sync::Arc;
-  use types::container::{environment::Environment, error, Ordered};
+  use types::container::{environment::Environment, error};
 
   fn print_result(env: Environment) {
       if env.program.is_empty() {
@@ -6023,7 +6247,9 @@ We'll also define how to run unit tests.
       use super::error::Error;
       use super::*;
       use crate::types::container as coll;
-      use crate::types::{Fit, Item, TryDerive, Word};
+      use crate::types::container::Ordered;
+      use crate::types::{Item, Word};
+
       use std::borrow::Borrow;
       use test_case::test_case;
 
@@ -6289,8 +6515,9 @@ can be impure. Everything else is a value.
 The basic pipe contracts.
 #+begin_src rust :tangle src/types/container/pipe.rs :mkdirp yes
   use super::error::Error;
+  use crate::traits::*;
   use crate::types::container as coll;
-  use crate::types::{self, Derive, DeriveIterator, Fit, Item, TryDerive};
+  use crate::types::{self, Item};
   use std::sync::Arc;
   use tokio::sync::RwLock;
 
@@ -6626,9 +6853,11 @@ The basic pipe contracts.
 How to interact with files on disk
 #+begin_src rust :tangle src/types/container/pipe/fs.rs :mkdirp yes
   use crate::axiom::ItemResult;
+  use crate::traits::*;
   use crate::types::container::associative as assoc;
   use crate::types::container::error::Error;
   use crate::types::*;
+
   use std::future;
   use std::pin::Pin;
   use std::ptr;
@@ -6743,10 +6972,11 @@ How to interact with the network (TCP/IP sockets)
 #+begin_src rust :tangle src/types/container/pipe/net.rs :mkdirp yes
   use crate::axiom::ItemResult;
   use crate::list;
+  use crate::traits::*;
   use crate::types::container::associative as assoc;
   use crate::types::container::error::Error;
   use crate::types::number::Int;
-  use crate::types::{self, DeriveIterator, Fit, Item, TryDerive};
+  use crate::types::{self, Item};
   use futures::future::FutureExt;
   use std::future::{self};
   use std::net::{Ipv4Addr, SocketAddrV4};
@@ -6992,10 +7222,12 @@ How to interact with the network (TCP/IP sockets)
 Implement the =handoff= type
 #+begin_src rust :tangle src/types/container/pipe/channel.rs :mkdirp yes
   use crate::axiom;
+  use crate::traits::*;
   use crate::types::container as coll;
   use crate::types::container::{associative as assoc, environment::Environment, error, pipe};
   use crate::types::number::Int;
-  use crate::types::{self, Derive, DeriveIterator, Fit, Item, TryDerive};
+  use crate::types::{self, Item};
+
   use flume;
   use std::future;
   use std::ptr;
@@ -7323,9 +7555,10 @@ Implement the =handoff= type
 #+begin_src rust :tangle src/types/container/pipe/db.rs :mkdirp yes
   use crate::axiom;
   use crate::list;
+  use crate::traits::*;
   use crate::types::container::{self as coll, associative as assoc, error::Error};
   use crate::types::number::Number;
-  use crate::types::{self, Derive, Fit, Item, MyCollect, ToIterator, TryDerive, TryFit};
+  use crate::types::{self, Item};
   use directories::ProjectDirs;
 
   use rusqlite::types::{ToSql, ToSqlOutput, Value, ValueRef};
