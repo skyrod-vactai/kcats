@@ -286,12 +286,10 @@ internally, to keep track of things like the stack, program, lists etc.
   /// A Word causes a kcats program to do something, usually taking some
   /// items derive the top of the stack, and using them to create new
   /// stack items. (examples: `swap`, `+`, `dip`).
-  pub type Word = Intern<String>;
-
-  impl Derive<&str> for Word {
-      fn derive(s: &str) -> Self {
-          Intern::<String>::from(s)
-      }
+  #[derive(Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord, Default)]
+  pub struct Word {
+      pub data: Intern<String>,
+      pub namespace: dict::Namespace,
   }
 
   impl Derive<String> for Word {
@@ -300,15 +298,24 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  impl Derive<&str> for Word {
+      fn derive(s: &str) -> Self {
+          Word {
+              data: Intern::<String>::from(s),
+              namespace: Default::default(),
+          }
+      }
+  }
+
   impl<'a> Derive<&'a Word> for &'a str {
       fn derive(s: &'a Word) -> Self {
-          s.as_str()
+          s.data.as_str()
       }
   }
 
   impl Derive<Word> for String {
       fn derive(s: Word) -> Self {
-          s.to_string()
+          s.data.to_string()
       }
   }
 
@@ -386,7 +393,7 @@ internally, to keep track of things like the stack, program, lists etc.
           match (self, other) {
               // same types, just use their own eq
               (Item::Number(a), Item::Number(b)) => a == b,
-              (Item::Word(a), Item::Word(b)) => a == b,
+              (Item::Word(a), Item::Word(b)) => a.data == b.data,
               (
                   Item::Dispenser(coll::Dispenser::Sized(a)),
                   Item::Receptacle(coll::Receptacle::Sized(b)),
@@ -528,17 +535,17 @@ internally, to keep track of things like the stack, program, lists etc.
   /// convertible to [Item].
   #[macro_export]
   macro_rules! list {
-      ( $( $x:expr ),* $(,)? ) => {
-          {
-              use $crate::traits::*;
-              use $crate::types::Item;
-              let v: Vec<Item> = vec![
-                  $( $x.fit(), )*
-              ];
-              $crate::types::container::List::derive(v)
-          }
-      };
-  }
+        ( $( $x:expr ),* $(,)? ) => {
+            {
+                use $crate::traits::*;
+                use $crate::types::Item;
+                let v: Vec<Item> = vec![
+                    $( $x.fit(), )*
+                ];
+                $crate::types::container::List::derive(v)
+            }
+        };
+    }
 
   mod serde {
       //! Support for json serialization of kcats objects
@@ -1042,6 +1049,7 @@ internally, to keep track of things like the stack, program, lists etc.
       /// Set containers have multiple Items in no particular order, and
       /// each Item can only appear once.
       Set(Set),
+      //TODO: these should be inside an Arc too
       /// A String is a chunk of text, like a list of individual
       /// characters.
       String(String),
@@ -2622,7 +2630,7 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::traits::*;
   use crate::types::container::{self as coll, Mutey};
   use crate::types::*;
-
+  use internment::Intern;
   use std::collections::HashSet;
   use std::ptr;
   use std::sync::Arc;
@@ -2755,6 +2763,35 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  // TODO: Use the builtin Bytes type
+  pub type Namespace = Option<Intern<Vec<u8>>>;
+
+  pub fn bytes_to_ns(b: Bytes) -> Namespace {
+      if b.is_empty() {
+          Default::default()
+      } else {
+          Some(Intern::new(b))
+      }
+  }
+
+  impl TryDerive<Item> for Namespace {
+      type Error = Error;
+      fn try_derive(i: Item) -> Result<Namespace, Error> {
+          match i {
+              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(b))) => Ok(bytes_to_ns(b)),
+              Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(b))) => Ok(bytes_to_ns(b)),
+              i => {
+                  let s = coll::Sized::try_derive(i)?;
+                  if s.is_empty() {
+                      Ok(Default::default())
+                  } else {
+                      Err(Error::expected("namespace", s))
+                  }
+              }
+          }
+      }
+  }
+
   /// One of the main components of an
   /// [crate::types::container::environment::Environment], holds [Word]s and their
   /// definitions.
@@ -2788,11 +2825,43 @@ internally, to keep track of things like the stack, program, lists etc.
       /// the current word currently has to have no definition field
       /// (set to None). Otherwise changes will not be applied.
       fn add_builtins(&mut self);
+
+      /// Find the word in the dictionary in one of the given
+      /// namespaces. The first match is applied to the word, or None if
+      /// no matches.
+      fn resolve_word(&self, w: &mut Word, namespaces: &[dict::Namespace]);
+
+      /// Merges this dictionary with the given new dictionary. The new
+      /// entries are added with the given namespace.
+      fn merge(&mut self, new: Dictionary, namespace: &Namespace);
   }
 
   impl Dict for Dictionary {
       fn diff(&self, newer: Dictionary) -> (Vec<(Word, Entry)>, Vec<Word>) {
           diff_hashmaps(&self, &newer)
+      }
+
+      fn merge(&mut self, new: Dictionary, namespace: &Namespace) {
+          let (adds, deletes) = self.diff(new);
+          // add namepaces to the adds and deletes
+          let adds: Vec<_> = adds
+              .into_iter()
+              .map(|(mut w, e)| {
+                  w.namespace = namespace.clone();
+                  (w, e)
+              })
+              .collect();
+          let deletes: Vec<_> = deletes
+              .into_iter()
+              .map(|mut w| {
+                  w.namespace = namespace.clone();
+                  w
+              })
+              .collect();
+          let d = self.mutate();
+
+          d.extend(adds.into_iter());
+          d.extend(make_deletes(deletes));
       }
 
       fn insert_core_module(&mut self, lexicon: String) {
@@ -2836,6 +2905,43 @@ internally, to keep track of things like the stack, program, lists etc.
               });
           }
       }
+
+      fn resolve_word(&self, w: &mut Word, namespaces: &[dict::Namespace]) {
+          // if the word is already namespaced we're done
+          if w.namespace.is_none() {
+              for namespace in namespaces.iter() {
+                  w.namespace = namespace.clone();
+                  if self.contains_key(w) {
+                      return;
+                  }
+              }
+              // no match found, clear the namespace
+              w.namespace = Default::default();
+          }
+      }
+  }
+
+  /// Each word should run a program that calls fail (already namespaced
+  /// to the stdlib so that the word acts like it isn't in the dictionary
+  /// even though it is.)
+  fn make_deletes(words: Vec<Word>) -> Vec<(Word, dict::Entry)> {
+      words
+          .into_iter()
+          .map(|word| {
+              println!("Shadowing word: {:?}", word);
+              let err = Error::create(
+                  list!(word.clone()),
+                  "word removed by module",
+                  Some("access-denied"),
+              );
+              let entry = dict::Entry {
+                  examples: None,
+                  spec: None,
+                  definition: dict::Definition::Derived(list!(err, "fail")),
+              };
+              (word, entry)
+          })
+          .collect()
   }
 
   /// Returns the differences between two hashmaps, including the keys
@@ -4296,6 +4402,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   use crate::types::*;
 
   use cache::cache;
+  use dict::Dict;
   use dynfmt::{Format, SimpleCurlyFormat};
   use futures::future::FutureExt;
   use lazy_static::lazy_static;
@@ -4557,6 +4664,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("decache", Box::leak(Box::new(f_result(read_blob)))),
           ("decide", Box::leak(Box::new(decide))),
           ("decodejson", Box::leak(Box::new(f_stack1(decode_json)))),
+          ("dictmerge", Box::leak(Box::new(f_result(dictmerge)))),
           ("dip", Box::leak(Box::new(dip))),
           ("dictionary", Box::leak(Box::new(dictionary))),
           ("dipdown", Box::leak(Box::new(dipdown))),
@@ -5775,12 +5883,35 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       Ok(())
   }
 
+  /// Takes a dictionary diff, merges it into an existing dictionary,
+  /// with all the changes marked with the given namespace.
+  pub fn dictmerge(env: &mut Environment) -> Result<(), Error> {
+      //println!("dictmerge: {:?}", env);
+      let modified = dict::Dictionary::try_derive(env.pop())?;
+      let mut existing = dict::Dictionary::try_derive(env.pop())?;
+
+      let ns = env.pop();
+      let namespace = dict::Namespace::try_derive(ns)?;
+
+      existing.merge(modified, &namespace);
+      // not sure if this is really needed - was here for use during
+      // bootstrapping when some builtins are not yet loaded but need to
+      // be
+      //if namespace.is_none() {
+      //    env.dictionary.add_builtins();
+      //}
+      // pop the word dictmerge
+      env.pop_prog();
+      env.push(existing);
+      Ok(())
+  }
+
   /// Fetches a binary blob from the cache. The top of stack should be
   /// either the hash of the content or its alias (a [Word]).
   pub fn read_blob(env: &mut Environment) -> Result<(), Error> {
       //println!("Env: {:?}", env);
       let contents = match env.pop() {
-          Item::Word(alias) => cache::Key::Alias(alias.to_string()).get()?,
+          Item::Word(alias) => cache::Key::Alias(alias.fit()).get()?,
           i => {
               let hash = Bytes::try_derive(i)?;
               cache::Key::Hash(hash).get()?
@@ -5798,7 +5929,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   /// hash. Returns the hash.
   pub fn write_blob(env: &mut Environment) -> Result<(), Error> {
       let alias = match env.pop() {
-          Item::Word(w) => Some(w.to_string()),
+          Item::Word(w) => Some(w.fit()),
           _ => None,
       };
       match env.pop() {
@@ -10788,7 +10919,18 @@ How does one module ensure another is loaded before this one is used?
 
 #+RESULTS:
 #+begin_src kcats
-531441
+[[actual foo]
+ [asked [sized]]
+ [handled yes]
+ [reason "type mismatch"]
+ [type error]
+ [unwound [get [[definition]] unwrap [something?] shield [take swap [get] dip [something?]
+                                                          shield]
+           loop drop [[[math definition]
+                       [foo definition [sixth [[definition [square cube]]]]] dictionary_redacted]] unwrap
+           evert first shielddown [] [[definition] unwrap pair [lookup] shield shielddown] step
+           [[9 sixth]] unwrap confine]]]
+math [foo definition [sixth [[definition [square cube]]]]] dictionary_redacted
 #+end_src
 
 So here we have modules that depend on each other, but the actual
@@ -10836,24 +10978,24 @@ duration of a program.
 
 #+RESULTS:
 #+begin_src kcats
-#b64 "cCbiMlCaBKwnUJ/EJaHb9oC5Q1i+N4Arq27yJ4tcLVE="
+#b64 "QUsvdqQ6E46RsswGPAAlbz7tTWpdefkXPA5NByxGr4c="
 #+end_src
 
 #+begin_src kcats
   ;; first cache the inner mod
-  ;[[[square [clone *]]
-  ;  [cube [clone square *]]] draft] encode [] cache
+  [[[square [clone *]]
+    [cube [clone square *]]] draft] encode [] cache
   ;; then the outer mod
-  ;[[[[math #b64 "ULY02dWGqy3G7x9Hd7RgBG2q+Dw9RE8hC4dUjzyCqRk="]]
-  ;  ;; load each dep module
-  ;  [unwrap module [wrap] dip assign] step]
-  ; [[sixth [square cube]]] draft join]
-  ;encode [] cache
+  [[[[math #b64 "ULY02dWGqy3G7x9Hd7RgBG2q+Dw9RE8hC4dUjzyCqRk="]]
+    ;; load each dep module
+    [unwrap module [wrap] dip assign] step]
+   [[sixth [square cube]]] draft join]
+  encode [] cache
 
   dictionary
   ;; outer mod
   ;; first the prelude
-  [[foo #b64 "cCbiMlCaBKwnUJ/EJaHb9oC5Q1i+N4Arq27yJ4tcLVE="]]
+  [[foo #b64 "QUsvdqQ6E46RsswGPAAlbz7tTWpdefkXPA5NByxGr4c="]]
   ;; load each dep module
   [unwrap module [wrap] dip entry assign] step
   ;[[foo] lookup] shield dump drop
@@ -10865,12 +11007,15 @@ duration of a program.
 
 #+RESULTS:
 #+begin_src kcats
-[[asked [square]]
+[[actual [math #b64 "ULY02dWGqy3G7x9Hd7RgBG2q+Dw9RE8hC4dUjzyCqRk="]]
+ [asked [dictionary]]
  [handled yes]
- [reason "word is not defined"]
+ [reason "type mismatch"]
  [type error]
- [unwound [square cube]]]
-9
+ [unwound [confine]]]
+[9 sixth]
+[math #b64 "ULY02dWGqy3G7x9Hd7RgBG2q+Dw9RE8hC4dUjzyCqRk="]
+#b64 "rJDrBYlO0RF3MHLh9tisE6kvRpGdVqtcKaWm0VyG6CQ=" #b64 "i4VyOtSDZ8aKk1YkF4scKaml+ULiClqGdeG3D8NST30="
 #+end_src
 
 #+begin_src kcats
@@ -10880,6 +11025,18 @@ duration of a program.
 #+RESULTS:
 #+begin_src kcats
 2 2
+#+end_src
+**** TODO Revert back to namespaces
+
+#+begin_src kcats
+    [[square [clone *]]] draft [emit] map  ;encode
+    ;[hashbytes] shield swap string read
+    ;[dictionary clone] dip shielddown 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+["[[square [[definition [clone *]]]]]" "join"]
 #+end_src
 
 *** INPROGRESS inscribe currently re-defines words repeatedly at runtime
