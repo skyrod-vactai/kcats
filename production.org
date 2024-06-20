@@ -185,12 +185,26 @@ types to wrap stdlib types.
       fn try_fit(self) -> Result<T, Self::Error>;
   }
 
+  /// a trait that marks iterable types that can return arbitrary
+  /// numbers of items. For example lists, maps, etc. But not things
+  /// like Result or Option.
+  pub trait IntoList {}
+
   pub trait ToIterator {
       type Item;
       type IntoIter: Iterator<Item = Self::Item>;
 
       fn to_iter(self) -> Self::IntoIter;
   }
+
+  // impl<T> ToIterator for Vec<T> {
+  //     type Item = T;
+  //     type IntoIter = std::vec::IntoIter<T>;
+
+  //     fn to_iter(self) -> Self::IntoIter {
+  //         self.into_iter()
+  //     }
+  // }
 
   pub trait DeriveIterator<A>: Sized {
       fn derive_iter<T: IntoIterator<Item = A>>(iter: T) -> Self;
@@ -286,10 +300,16 @@ internally, to keep track of things like the stack, program, lists etc.
   /// A Word causes a kcats program to do something, usually taking some
   /// items derive the top of the stack, and using them to create new
   /// stack items. (examples: `swap`, `+`, `dip`).
-  #[derive(Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord, Default)]
+  #[derive(Clone, Eq, Hash, Debug, PartialOrd, Ord, Default)]
   pub struct Word {
       pub data: Intern<String>,
       pub namespace: dict::Namespace,
+  }
+
+  impl PartialEq for Word {
+      fn eq(&self, other: &Self) -> bool {
+          self.data == other.data
+      }
   }
 
   impl Derive<String> for Word {
@@ -1423,6 +1443,25 @@ internally, to keep track of things like the stack, program, lists etc.
               Sized::Associative(a) => Ok(List::derive_iter(a.to_iter().map(Item::derive))),
               i => Err(Error::expected("list", i)),
           }
+      }
+  }
+  // Implement Derive for Item where T is an Iterator
+  impl<T, I> Derive<T> for Item
+  where
+      T: ToIterator<Item = I> + IntoList,
+      I: Fit<Item>,
+  {
+      fn derive(iter: T) -> Self {
+          let l: List = iter.to_iter().map(|t| t.fit()).my_collect();
+          Item::derive(l)
+      }
+  }
+
+  impl TryDerive<List> for Vec<dict::Namespace> {
+      type Error = Error;
+
+      fn try_derive(l: List) -> Result<Self, Self::Error> {
+          l.iter().cloned().map(dict::Namespace::try_derive).collect()
       }
   }
 
@@ -2717,12 +2756,6 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  impl Derive<StackSpec> for Item {
-      fn derive(ss: StackSpec) -> Item {
-          coll::List::derive_iter(ss.into_iter().map(Item::derive)).fit()
-      }
-  }
-
   impl Derive<SpecElement> for Item {
       fn derive(se: SpecElement) -> Item {
           if se.name.is_some() {
@@ -2738,6 +2771,38 @@ internally, to keep track of things like the stack, program, lists etc.
           list!(s.0, s.1).fit()
       }
   }
+
+  impl ToIterator for Vec<SpecElement> {
+      type Item = SpecElement;
+      type IntoIter = std::vec::IntoIter<SpecElement>;
+
+      fn to_iter(self) -> Self::IntoIter {
+          self.into_iter()
+      }
+  }
+
+  impl ToIterator for Vec<Namespace> {
+      type Item = Namespace;
+      type IntoIter = std::vec::IntoIter<Namespace>;
+
+      fn to_iter(self) -> Self::IntoIter {
+          self.into_iter()
+      }
+  }
+
+  impl Derive<Namespace> for Item {
+      fn derive(ns: Namespace) -> Item {
+          match ns {
+              Some(ns) => (*ns).clone().fit(),
+              None => Item::default(),
+          }
+      }
+  }
+
+  impl IntoList for Vec<Namespace> {}
+  impl IntoList for Vec<SpecElement> {}
+
+  //impl Derive<Intern<Vec<u8>>> for
 
   impl Entry {
       pub fn len(&self) -> usize {
@@ -3178,6 +3243,7 @@ internally, to keep track of things like the stack, program, lists etc.
       pub stack: Stack,
       pub program: Stack,
       pub dictionary: dict::Dictionary,
+      pub resolver: Vec<dict::Namespace>,
   }
 
   impl Environment {
@@ -3240,6 +3306,12 @@ internally, to keep track of things like the stack, program, lists etc.
       /// any key. Also optionally return any old value that might get
       /// overwritten.
       pub fn insert(mut self, k: assoc::KeyItem, v: Item) -> (assoc::Associative, Option<Item>) {
+          let demote = |o: Environment, k: assoc::KeyItem, v: Item| {
+              let mut a = assoc::Association::derive_iter(o);
+              let am = a.mutate();
+              let old = am.insert(k, v);
+              (assoc::Associative::Assoc(a), old)
+          };
           match k {
               assoc::KeyItem::Word(ref w) => {
                   let w: &str = w.fit();
@@ -3252,12 +3324,7 @@ internally, to keep track of things like the stack, program, lists etc.
                                   self.stack = l;
                                   (assoc::Associative::Env(self), Some(old.fit()))
                               }
-                              Err(_) => {
-                                  let mut a = assoc::Association::derive_iter(self);
-                                  let am = a.mutate();
-                                  let old = am.insert(k, v);
-                                  (assoc::Associative::Assoc(a), old)
-                              }
+                              Err(_) => demote(self, k, v),
                           }
                       }
                       "program" => {
@@ -3268,12 +3335,7 @@ internally, to keep track of things like the stack, program, lists etc.
                                   self.program = l;
                                   (assoc::Associative::Env(self), Some(old.fit()))
                               }
-                              Err(_) => {
-                                  let mut a = assoc::Association::derive_iter(self);
-                                  let am = a.mutate();
-                                  let old = am.insert(k, v);
-                                  (assoc::Associative::Assoc(a), old)
-                              }
+                              Err(_) => demote(self, k, v),
                           }
                       }
                       "dictionary" => {
@@ -3284,28 +3346,30 @@ internally, to keep track of things like the stack, program, lists etc.
                                   self.dictionary = d;
                                   (assoc::Associative::Env(self), Some(old.fit()))
                               }
-                              Err(_) => {
-                                  let mut a = assoc::Association::derive_iter(self);
-                                  let am = a.mutate();
-                                  let old = am.insert(k, v);
-                                  (assoc::Associative::Assoc(a), old)
-                              }
+                              Err(_) => demote(self, k, v),
                           }
                       }
-                      k => {
-                          let mut a = assoc::Association::derive_iter(self);
-                          let am = a.mutate();
-                          let old = am.insert(k.fit(), v);
-                          (assoc::Associative::Assoc(a), old)
+                      "resolver" => {
+                          let l = coll::List::try_derive(v.clone());
+                          match l {
+                              Ok(l) => {
+                                  let old = self.resolver.clone();
+                                  let namespaces: Result<Vec<dict::Namespace>, Error> = l.try_fit();
+                                  match namespaces {
+                                      Ok(ns) => {
+                                          self.resolver = ns;
+                                          (assoc::Associative::Env(self), Some(old.fit()))
+                                      }
+                                      Err(_) => demote(self, k, v),
+                                  }
+                              }
+                              Err(_) => demote(self, k, v),
+                          }
                       }
+                      k => demote(self, k.fit(), v),
                   }
               }
-              _ => {
-                  let mut a = assoc::Association::derive_iter(self);
-                  let am = a.mutate();
-                  let old = am.insert(k, v);
-                  (assoc::Associative::Assoc(a), old)
-              }
+              _ => demote(self, k, v),
           }
       }
 
@@ -3393,6 +3457,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   dictionary: sync::Arc::new(HashMap::new()),
                   stack: Default::default(),
                   program: Default::default(),
+                  resolver: Default::default(),
               };
               env.load_core_modules()
                   .expect("failed to load core modules");
@@ -5649,7 +5714,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       if let Some(val) = next_item {
           match val {
               Item::Word(word) => {
-                  if let Some(dfn) = env.dictionary.get(word) {
+                  let mut word = word.clone();
+                  env.dictionary.resolve_word(&mut word, &env.resolver);
+                  if let Some(dfn) = env.dictionary.get(&word) {
                       {
                           if let Some(spec) = &dfn.spec {
                               //println!("Checking spec for {:?}: {:?}", word, spec.0);
@@ -10982,40 +11049,37 @@ duration of a program.
 #+end_src
 
 #+begin_src kcats
-  ;; first cache the inner mod
-  [[[square [clone *]]
-    [cube [clone square *]]] draft] encode [] cache
-  ;; then the outer mod
-  [[[[math #b64 "ULY02dWGqy3G7x9Hd7RgBG2q+Dw9RE8hC4dUjzyCqRk="]]
-    ;; load each dep module
-    [unwrap module [wrap] dip assign] step]
-   [[sixth [square cube]]] draft join]
-  encode [] cache
+    ;; first cache the inner mod
+    [[[square [clone *]]
+      [cube [clone square *]]] draft] encode [] cache
+    ;; then the outer mod
+    [[[[math #b64 "ULY02dWGqy3G7x9Hd7RgBG2q+Dw9RE8hC4dUjzyCqRk="]]
+      ;; load each dep module
+      [unwrap module [wrap] dip assign] step]
+     [[sixth [square cube]]] draft join]
+    encode [] cache
 
-  dictionary
-  ;; outer mod
-  ;; first the prelude
-  [[foo #b64 "QUsvdqQ6E46RsswGPAAlbz7tTWpdefkXPA5NByxGr4c="]]
-  ;; load each dep module
-  [unwrap module [wrap] dip entry assign] step
-  ;[[foo] lookup] shield dump drop
-  [[foo]
-   [9 sixth]
-   [dictionary swap [wrap shielddown] step] dip confine]
-  confine
+    dictionary
+    ;; outer mod
+    ;; first the prelude
+    [[foo #b64 "QUsvdqQ6E46RsswGPAAlbz7tTWpdefkXPA5NByxGr4c="]]
+    ;; load each dep module
+    [unwrap module [wrap] dip entry assign] step
+    ;[[foo] lookup] shield dump drop
+    [[foo]
+     [9 sixth]
+     [dictionary swap [wrap shielddown] step] dip
+     confine]
+   confine ;; outer confine creates a dictionary with all the module words
 #+end_src
 
 #+RESULTS:
 #+begin_src kcats
-[[actual [math #b64 "ULY02dWGqy3G7x9Hd7RgBG2q+Dw9RE8hC4dUjzyCqRk="]]
- [asked [dictionary]]
- [handled yes]
- [reason "type mismatch"]
- [type error]
- [unwound [confine]]]
-[9 sixth]
-[math #b64 "ULY02dWGqy3G7x9Hd7RgBG2q+Dw9RE8hC4dUjzyCqRk="]
-#b64 "rJDrBYlO0RF3MHLh9tisE6kvRpGdVqtcKaWm0VyG6CQ=" #b64 "i4VyOtSDZ8aKk1YkF4scKaml+ULiClqGdeG3D8NST30="
+[[foo] [9 sixth]
+ [dictionary swap [wrap shielddown]
+  step]
+ dip confine]
+dictionary_redacted #b64 "rJDrBYlO0RF3MHLh9tisE6kvRpGdVqtcKaWm0VyG6CQ=" #b64 "i4VyOtSDZ8aKk1YkF4scKaml+ULiClqGdeG3D8NST30="
 #+end_src
 
 #+begin_src kcats
@@ -11037,6 +11101,17 @@ duration of a program.
 #+RESULTS:
 #+begin_src kcats
 ["[[square [[definition [clone *]]]]]" "join"]
+#+end_src
+
+#+begin_src kcats
+[[plus2 [2 +]]] draft dictionary swap [emit encode hashbytes] shield
+[shield] dip
+sink dictmerge [= un] filter
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[]
 #+end_src
 
 *** INPROGRESS inscribe currently re-defines words repeatedly at runtime
