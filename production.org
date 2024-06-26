@@ -185,12 +185,26 @@ types to wrap stdlib types.
       fn try_fit(self) -> Result<T, Self::Error>;
   }
 
+  /// a trait that marks iterable types that can return arbitrary
+  /// numbers of items. For example lists, maps, etc. But not things
+  /// like Result or Option.
+  pub trait IntoList {}
+
   pub trait ToIterator {
       type Item;
       type IntoIter: Iterator<Item = Self::Item>;
 
       fn to_iter(self) -> Self::IntoIter;
   }
+
+  // impl<T> ToIterator for Vec<T> {
+  //     type Item = T;
+  //     type IntoIter = std::vec::IntoIter<T>;
+
+  //     fn to_iter(self) -> Self::IntoIter {
+  //         self.into_iter()
+  //     }
+  // }
 
   pub trait DeriveIterator<A>: Sized {
       fn derive_iter<T: IntoIterator<Item = A>>(iter: T) -> Self;
@@ -286,11 +300,15 @@ internally, to keep track of things like the stack, program, lists etc.
   /// A Word causes a kcats program to do something, usually taking some
   /// items derive the top of the stack, and using them to create new
   /// stack items. (examples: `swap`, `+`, `dip`).
-  pub type Word = Intern<String>;
+  #[derive(Clone, Eq, Hash, Debug, PartialOrd, Ord, Default)]
+  pub struct Word {
+      pub data: Intern<String>,
+      pub namespace: dict::Namespace,
+  }
 
-  impl Derive<&str> for Word {
-      fn derive(s: &str) -> Self {
-          Intern::<String>::from(s)
+  impl PartialEq for Word {
+      fn eq(&self, other: &Self) -> bool {
+          self.data == other.data
       }
   }
 
@@ -300,15 +318,24 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  impl Derive<&str> for Word {
+      fn derive(s: &str) -> Self {
+          Word {
+              data: Intern::<String>::from(s),
+              namespace: Default::default(),
+          }
+      }
+  }
+
   impl<'a> Derive<&'a Word> for &'a str {
       fn derive(s: &'a Word) -> Self {
-          s.as_str()
+          s.data.as_str()
       }
   }
 
   impl Derive<Word> for String {
       fn derive(s: Word) -> Self {
-          s.to_string()
+          s.data.to_string()
       }
   }
 
@@ -386,7 +413,7 @@ internally, to keep track of things like the stack, program, lists etc.
           match (self, other) {
               // same types, just use their own eq
               (Item::Number(a), Item::Number(b)) => a == b,
-              (Item::Word(a), Item::Word(b)) => a == b,
+              (Item::Word(a), Item::Word(b)) => a.data == b.data,
               (
                   Item::Dispenser(coll::Dispenser::Sized(a)),
                   Item::Receptacle(coll::Receptacle::Sized(b)),
@@ -524,21 +551,34 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  /// A generic impl to convert an Item to a vec of the given
+  /// type. Assumes the Item is some sort of container and converts each
+  /// item in the container.
+  impl<T: TryDerive<Item, Error = Error>> TryDerive<Item> for Vec<T> {
+      type Error = Error;
+
+      fn try_derive(i: Item) -> Result<Self, Self::Error> {
+          // First try to convert the Item to an IntoIterator<Item>
+          let it: Box<dyn Iterator<Item = Item>> = i.try_fit()?;
+          it.map(T::try_derive).collect()
+      }
+  }
+
   /// A macro to build a kcats List, accepts any values that are
   /// convertible to [Item].
   #[macro_export]
   macro_rules! list {
-      ( $( $x:expr ),* $(,)? ) => {
-          {
-              use $crate::traits::*;
-              use $crate::types::Item;
-              let v: Vec<Item> = vec![
-                  $( $x.fit(), )*
-              ];
-              $crate::types::container::List::derive(v)
-          }
-      };
-  }
+        ( $( $x:expr ),* $(,)? ) => {
+            {
+                use $crate::traits::*;
+                use $crate::types::Item;
+                let v: Vec<Item> = vec![
+                    $( $x.fit(), )*
+                ];
+                $crate::types::container::List::derive(v)
+            }
+        };
+    }
 
   mod serde {
       //! Support for json serialization of kcats objects
@@ -1042,6 +1082,7 @@ internally, to keep track of things like the stack, program, lists etc.
       /// Set containers have multiple Items in no particular order, and
       /// each Item can only appear once.
       Set(Set),
+      //TODO: these should be inside an Arc too
       /// A String is a chunk of text, like a list of individual
       /// characters.
       String(String),
@@ -1415,6 +1456,25 @@ internally, to keep track of things like the stack, program, lists etc.
               Sized::Associative(a) => Ok(List::derive_iter(a.to_iter().map(Item::derive))),
               i => Err(Error::expected("list", i)),
           }
+      }
+  }
+  // Implement Derive for Item where T is an Iterator
+  impl<T, I> Derive<T> for Item
+  where
+      T: ToIterator<Item = I> + IntoList,
+      I: Fit<Item>,
+  {
+      fn derive(iter: T) -> Self {
+          let l: List = iter.to_iter().map(|t| t.fit()).my_collect();
+          Item::derive(l)
+      }
+  }
+
+  impl TryDerive<List> for Vec<dict::Namespace> {
+      type Error = Error;
+
+      fn try_derive(l: List) -> Result<Self, Self::Error> {
+          l.iter().cloned().map(dict::Namespace::try_derive).collect()
       }
   }
 
@@ -2622,7 +2682,7 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::traits::*;
   use crate::types::container::{self as coll, Mutey};
   use crate::types::*;
-
+  use internment::Intern;
   use std::collections::HashSet;
   use std::ptr;
   use std::sync::Arc;
@@ -2709,12 +2769,6 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  impl Derive<StackSpec> for Item {
-      fn derive(ss: StackSpec) -> Item {
-          coll::List::derive_iter(ss.into_iter().map(Item::derive)).fit()
-      }
-  }
-
   impl Derive<SpecElement> for Item {
       fn derive(se: SpecElement) -> Item {
           if se.name.is_some() {
@@ -2730,6 +2784,38 @@ internally, to keep track of things like the stack, program, lists etc.
           list!(s.0, s.1).fit()
       }
   }
+
+  impl ToIterator for Vec<SpecElement> {
+      type Item = SpecElement;
+      type IntoIter = std::vec::IntoIter<SpecElement>;
+
+      fn to_iter(self) -> Self::IntoIter {
+          self.into_iter()
+      }
+  }
+
+  impl ToIterator for Vec<Namespace> {
+      type Item = Namespace;
+      type IntoIter = std::vec::IntoIter<Namespace>;
+
+      fn to_iter(self) -> Self::IntoIter {
+          self.into_iter()
+      }
+  }
+
+  impl Derive<Namespace> for Item {
+      fn derive(ns: Namespace) -> Item {
+          match ns {
+              Some(ns) => (*ns).clone().fit(),
+              None => Item::default(),
+          }
+      }
+  }
+
+  impl IntoList for Vec<Namespace> {}
+  impl IntoList for Vec<SpecElement> {}
+
+  //impl Derive<Intern<Vec<u8>>> for
 
   impl Entry {
       pub fn len(&self) -> usize {
@@ -2752,6 +2838,35 @@ internally, to keep track of things like the stack, program, lists etc.
           Word::try_derive(key.clone()).map_or(false, |ref w| {
               matches!(w.fit(), "examples" | "spec" | "definition")
           })
+      }
+  }
+
+  // TODO: Use the builtin Bytes type
+  pub type Namespace = Option<Intern<Vec<u8>>>;
+
+  pub fn bytes_to_ns(b: Bytes) -> Namespace {
+      if b.is_empty() {
+          Default::default()
+      } else {
+          Some(Intern::new(b))
+      }
+  }
+
+  impl TryDerive<Item> for Namespace {
+      type Error = Error;
+      fn try_derive(i: Item) -> Result<Namespace, Error> {
+          match i {
+              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(b))) => Ok(bytes_to_ns(b)),
+              Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(b))) => Ok(bytes_to_ns(b)),
+              i => {
+                  let s = coll::Sized::try_derive(i)?;
+                  if s.is_empty() {
+                      Ok(Default::default())
+                  } else {
+                      Err(Error::expected("namespace", s))
+                  }
+              }
+          }
       }
   }
 
@@ -2788,11 +2903,43 @@ internally, to keep track of things like the stack, program, lists etc.
       /// the current word currently has to have no definition field
       /// (set to None). Otherwise changes will not be applied.
       fn add_builtins(&mut self);
+
+      /// Find the word in the dictionary in one of the given
+      /// namespaces. The first match is applied to the word, or None if
+      /// no matches.
+      fn resolve_word(&self, w: &mut Word, namespaces: &[dict::Namespace]);
+
+      /// Merges this dictionary with the given new dictionary. The new
+      /// entries are added with the given namespace.
+      fn merge(&mut self, new: Dictionary, namespace: &Namespace);
   }
 
   impl Dict for Dictionary {
       fn diff(&self, newer: Dictionary) -> (Vec<(Word, Entry)>, Vec<Word>) {
           diff_hashmaps(&self, &newer)
+      }
+
+      fn merge(&mut self, new: Dictionary, namespace: &Namespace) {
+          let (adds, deletes) = self.diff(new);
+          // add namepaces to the adds and deletes
+          let adds: Vec<_> = adds
+              .into_iter()
+              .map(|(mut w, e)| {
+                  w.namespace = namespace.clone();
+                  (w, e)
+              })
+              .collect();
+          let deletes: Vec<_> = deletes
+              .into_iter()
+              .map(|mut w| {
+                  w.namespace = namespace.clone();
+                  w
+              })
+              .collect();
+          let d = self.mutate();
+
+          d.extend(adds.into_iter());
+          d.extend(make_deletes(deletes));
       }
 
       fn insert_core_module(&mut self, lexicon: String) {
@@ -2836,6 +2983,43 @@ internally, to keep track of things like the stack, program, lists etc.
               });
           }
       }
+
+      fn resolve_word(&self, w: &mut Word, namespaces: &[dict::Namespace]) {
+          // if the word is already namespaced we're done
+          if w.namespace.is_none() {
+              for namespace in namespaces.iter() {
+                  w.namespace = namespace.clone();
+                  if self.contains_key(w) {
+                      return;
+                  }
+              }
+              // no match found, clear the namespace
+              w.namespace = Default::default();
+          }
+      }
+  }
+
+  /// Each word should run a program that calls fail (already namespaced
+  /// to the stdlib so that the word acts like it isn't in the dictionary
+  /// even though it is.)
+  fn make_deletes(words: Vec<Word>) -> Vec<(Word, dict::Entry)> {
+      words
+          .into_iter()
+          .map(|word| {
+              println!("Shadowing word: {:?}", word);
+              let err = Error::create(
+                  list!(word.clone()),
+                  "word removed by module",
+                  Some("access-denied"),
+              );
+              let entry = dict::Entry {
+                  examples: None,
+                  spec: None,
+                  definition: dict::Definition::Derived(list!(err, "fail")),
+              };
+              (word, entry)
+          })
+          .collect()
   }
 
   /// Returns the differences between two hashmaps, including the keys
@@ -3072,6 +3256,7 @@ internally, to keep track of things like the stack, program, lists etc.
       pub stack: Stack,
       pub program: Stack,
       pub dictionary: dict::Dictionary,
+      pub resolver: Vec<dict::Namespace>,
   }
 
   impl Environment {
@@ -3134,6 +3319,12 @@ internally, to keep track of things like the stack, program, lists etc.
       /// any key. Also optionally return any old value that might get
       /// overwritten.
       pub fn insert(mut self, k: assoc::KeyItem, v: Item) -> (assoc::Associative, Option<Item>) {
+          let demote = |o: Environment, k: assoc::KeyItem, v: Item| {
+              let mut a = assoc::Association::derive_iter(o);
+              let am = a.mutate();
+              let old = am.insert(k, v);
+              (assoc::Associative::Assoc(a), old)
+          };
           match k {
               assoc::KeyItem::Word(ref w) => {
                   let w: &str = w.fit();
@@ -3146,12 +3337,7 @@ internally, to keep track of things like the stack, program, lists etc.
                                   self.stack = l;
                                   (assoc::Associative::Env(self), Some(old.fit()))
                               }
-                              Err(_) => {
-                                  let mut a = assoc::Association::derive_iter(self);
-                                  let am = a.mutate();
-                                  let old = am.insert(k, v);
-                                  (assoc::Associative::Assoc(a), old)
-                              }
+                              Err(_) => demote(self, k, v),
                           }
                       }
                       "program" => {
@@ -3162,12 +3348,7 @@ internally, to keep track of things like the stack, program, lists etc.
                                   self.program = l;
                                   (assoc::Associative::Env(self), Some(old.fit()))
                               }
-                              Err(_) => {
-                                  let mut a = assoc::Association::derive_iter(self);
-                                  let am = a.mutate();
-                                  let old = am.insert(k, v);
-                                  (assoc::Associative::Assoc(a), old)
-                              }
+                              Err(_) => demote(self, k, v),
                           }
                       }
                       "dictionary" => {
@@ -3178,28 +3359,30 @@ internally, to keep track of things like the stack, program, lists etc.
                                   self.dictionary = d;
                                   (assoc::Associative::Env(self), Some(old.fit()))
                               }
-                              Err(_) => {
-                                  let mut a = assoc::Association::derive_iter(self);
-                                  let am = a.mutate();
-                                  let old = am.insert(k, v);
-                                  (assoc::Associative::Assoc(a), old)
-                              }
+                              Err(_) => demote(self, k, v),
                           }
                       }
-                      k => {
-                          let mut a = assoc::Association::derive_iter(self);
-                          let am = a.mutate();
-                          let old = am.insert(k.fit(), v);
-                          (assoc::Associative::Assoc(a), old)
+                      "resolver" => {
+                          let l = coll::List::try_derive(v.clone());
+                          match l {
+                              Ok(l) => {
+                                  let old = self.resolver.clone();
+                                  let namespaces: Result<Vec<dict::Namespace>, Error> = l.try_fit();
+                                  match namespaces {
+                                      Ok(ns) => {
+                                          self.resolver = ns;
+                                          (assoc::Associative::Env(self), Some(old.fit()))
+                                      }
+                                      Err(_) => demote(self, k, v),
+                                  }
+                              }
+                              Err(_) => demote(self, k, v),
+                          }
                       }
+                      k => demote(self, k.fit(), v),
                   }
               }
-              _ => {
-                  let mut a = assoc::Association::derive_iter(self);
-                  let am = a.mutate();
-                  let old = am.insert(k, v);
-                  (assoc::Associative::Assoc(a), old)
-              }
+              _ => demote(self, k, v),
           }
       }
 
@@ -3287,6 +3470,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   dictionary: sync::Arc::new(HashMap::new()),
                   stack: Default::default(),
                   program: Default::default(),
+                  resolver: Default::default(),
               };
               env.load_core_modules()
                   .expect("failed to load core modules");
@@ -3426,6 +3610,7 @@ internally, to keep track of things like the stack, program, lists etc.
           let mut stack: Option<coll::List> = None;
           let mut program: Option<coll::List> = None;
           let mut dictionary: Option<dict::Dictionary> = None;
+          let mut resolver: Option<Vec<dict::Namespace>> = None;
           for i in iter {
               let (k, v): (assoc::KeyItem, Item) = i.try_fit()?;
               if k == "stack".fit() {
@@ -3434,6 +3619,8 @@ internally, to keep track of things like the stack, program, lists etc.
                   program = Some(v.try_fit()?)
               } else if k == "dictionary".fit() {
                   dictionary = Some(v.try_fit()?)
+              } else if k == "resolver".fit() {
+                  resolver = Some(v.try_fit()?)
               } else {
                   continue;
               }
@@ -3442,6 +3629,7 @@ internally, to keep track of things like the stack, program, lists etc.
           env.stack = stack.unwrap_or_default();
           env.program = program.unwrap_or_default();
           env.dictionary = dictionary.unwrap_or_else(|| Environment::default().dictionary);
+          env.resolver = resolver.unwrap_or_default();
           Ok(env)
       }
   }
@@ -3978,7 +4166,7 @@ example, in order to read/write to/from disk).
           coll::Sized::Associative(assoc::Associative::Dictionary(_)) => {
               edn_format::Value::Symbol(edn_format::Symbol::from_name("dictionary_redacted"))
           }
-          coll::Sized::Associative(assoc::Associative::Env(e)) => from_item(&e.representation()),
+          coll::Sized::Associative(assoc::Associative::Env(e)) => (&e.representation()).into(),
           coll::Sized::String(s) => edn_format::Value::String(s.to_string()),
           coll::Sized::Bytes(bs) => edn_format::Value::TaggedElement(
               edn_format::Symbol::from_name("b64"),
@@ -3989,23 +4177,19 @@ example, in order to read/write to/from disk).
               av.sort_by(|(ka, _), (kb, _)| ka.cmp(kb));
               edn_format::Value::Vector(
                   av.into_iter()
-                      .map(|i| from_item(&i.fit()))
+                      .map(|i| (&Item::derive(i)).into())
                       .collect::<Vec<edn_format::Value>>(),
               )
           }
           coll::Sized::Set(s) => {
               let mut v = s.iter().cloned().collect::<Vec<assoc::KeyItem>>();
               v.sort();
-              edn_format::Value::Vector(
-                  v.into_iter()
-                      .map(|ki| from_item(&Item::derive(ki)))
-                      .collect(),
-              )
+              edn_format::Value::Vector(v.into_iter().map(|ki| (&Item::derive(ki)).into()).collect())
           }
           v => edn_format::Value::Vector(
               v.clone()
                   .into_iter()
-                  .map(|i| from_item(&i))
+                  .map(|i| (&i).into())
                   .collect::<Vec<edn_format::Value>>(),
           ),
       }
@@ -4014,21 +4198,23 @@ example, in order to read/write to/from disk).
   /// Serializes the item deterministically. Certain data is lost in
   /// serialization, including the type of container (sets/maps/lists
   /// all are serialized as vectors)
-  pub fn from_item(item: &Item) -> edn_format::Value {
-      match item {
-          // dictionaries are big and it's ugly to print them for
-          // environments.
-          Item::Number(Number::Int(i)) => edn_format::Value::Integer(*i),
-          Item::Number(Number::Float(f)) => edn_format::Value::from(*f),
-          Item::Char(c) => edn_format::Value::Character(*c),
-          Item::Word(w) => edn_format::Value::Symbol(edn_format::Symbol::from_name(w.fit())),
-          //Item::Entry(w) => edn_format::Value::Symbol(edn_format::Symbol::from_name(&w.word)),
-          Item::Dispenser(coll::Dispenser::Out(o)) => from_item(&o.representation()),
-          Item::Dispenser(coll::Dispenser::Tunnel(t)) => from_item(&t.representation()),
-          Item::Receptacle(coll::Receptacle::In(i)) => from_item(&i.representation()),
-          Item::Receptacle(coll::Receptacle::Tunnel(t)) => from_item(&t.representation()),
-          Item::Dispenser(coll::Dispenser::Sized(s)) => from_sized(s),
-          Item::Receptacle(coll::Receptacle::Sized(s)) => from_sized(s),
+  impl<'a> From<&'a Item> for edn_format::Value {
+      fn from(item: &Item) -> Self {
+          match item {
+              // dictionaries are big and it's ugly to print them for
+              // environments.
+              Item::Number(Number::Int(i)) => edn_format::Value::Integer(*i),
+              Item::Number(Number::Float(f)) => edn_format::Value::from(*f),
+              Item::Char(c) => edn_format::Value::Character(*c),
+              Item::Word(w) => edn_format::Value::Symbol(edn_format::Symbol::from_name(w.fit())),
+              //Item::Entry(w) => edn_format::Value::Symbol(edn_format::Symbol::from_name(&w.word)),
+              Item::Dispenser(coll::Dispenser::Out(o)) => (&o.representation()).into(),
+              Item::Dispenser(coll::Dispenser::Tunnel(t)) => (&t.representation()).into(),
+              Item::Receptacle(coll::Receptacle::In(i)) => (&i.representation()).into(),
+              Item::Receptacle(coll::Receptacle::Tunnel(t)) => (&t.representation()).into(),
+              Item::Dispenser(coll::Dispenser::Sized(s)) => from_sized(s),
+              Item::Receptacle(coll::Receptacle::Sized(s)) => from_sized(s),
+          }
       }
   }
 
@@ -4050,7 +4236,7 @@ example, in order to read/write to/from disk).
 
   impl<'a> Emit for &'a Item {
       fn emit(self) -> String {
-          edn_format::emit_str(&from_item(self))
+          edn_format::emit_str(&(self).into())
       }
   }
 
@@ -4298,6 +4484,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   use crate::types::*;
 
   use cache::cache;
+  use dict::Dict;
   use dynfmt::{Format, SimpleCurlyFormat};
   use futures::future::FutureExt;
   use lazy_static::lazy_static;
@@ -4559,6 +4746,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("decache", Box::leak(Box::new(f_result(read_blob)))),
           ("decide", Box::leak(Box::new(decide))),
           ("decodejson", Box::leak(Box::new(f_stack1(decode_json)))),
+          ("dictmerge", Box::leak(Box::new(f_result(dictmerge)))),
           ("dip", Box::leak(Box::new(dip))),
           ("dictionary", Box::leak(Box::new(dictionary))),
           ("dipdown", Box::leak(Box::new(dipdown))),
@@ -4674,6 +4862,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("unassign", Box::leak(Box::new(f_stack2(unassign)))),
           ("take", Box::leak(Box::new(take))),
           ("unwrap", Box::leak(Box::new(unwrap))),
+          ("using", Box::leak(Box::new(f_result(using)))),
           (
               "verify",
               Box::leak(Box::new(f_stack3(crate::crypto::verify))),
@@ -5543,7 +5732,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       if let Some(val) = next_item {
           match val {
               Item::Word(word) => {
-                  if let Some(dfn) = env.dictionary.get(word) {
+                  let mut word = word.clone();
+                  env.dictionary.resolve_word(&mut word, &env.resolver);
+                  if let Some(dfn) = env.dictionary.get(&word) {
                       {
                           if let Some(spec) = &dfn.spec {
                               //println!("Checking spec for {:?}: {:?}", word, spec.0);
@@ -5777,12 +5968,35 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       Ok(())
   }
 
+  /// Takes a dictionary diff, merges it into an existing dictionary,
+  /// with all the changes marked with the given namespace.
+  pub fn dictmerge(env: &mut Environment) -> Result<(), Error> {
+      //println!("dictmerge: {:?}", env);
+      let modified = dict::Dictionary::try_derive(env.pop())?;
+      let mut existing = dict::Dictionary::try_derive(env.pop())?;
+
+      let ns = env.pop();
+      let namespace = dict::Namespace::try_derive(ns)?;
+
+      existing.merge(modified, &namespace);
+      // not sure if this is really needed - was here for use during
+      // bootstrapping when some builtins are not yet loaded but need to
+      // be
+      //if namespace.is_none() {
+      //    env.dictionary.add_builtins();
+      //}
+      // pop the word dictmerge
+      env.pop_prog();
+      env.push(existing);
+      Ok(())
+  }
+
   /// Fetches a binary blob from the cache. The top of stack should be
   /// either the hash of the content or its alias (a [Word]).
   pub fn read_blob(env: &mut Environment) -> Result<(), Error> {
       //println!("Env: {:?}", env);
       let contents = match env.pop() {
-          Item::Word(alias) => cache::Key::Alias(alias.to_string()).get()?,
+          Item::Word(alias) => cache::Key::Alias(alias.fit()).get()?,
           i => {
               let hash = Bytes::try_derive(i)?;
               cache::Key::Hash(hash).get()?
@@ -5800,7 +6014,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   /// hash. Returns the hash.
   pub fn write_blob(env: &mut Environment) -> Result<(), Error> {
       let alias = match env.pop() {
-          Item::Word(w) => Some(w.to_string()),
+          Item::Word(w) => Some(w.fit()),
           _ => None,
       };
       match env.pop() {
@@ -5997,6 +6211,15 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   fn is_finished(env: Environment) -> Result<bool, Infallible> {
       Ok(env.is_finished())
+  }
+
+  fn using(env: &mut Environment) -> Result<(), Error> {
+      let namespaces: Vec<dict::Namespace> = env.pop().try_fit()?;
+      let mut inner_env: Environment = env.pop().try_fit()?;
+      env.pop_prog();
+      inner_env.resolver.extend(namespaces);
+      env.push(inner_env);
+      Ok(())
   }
 #+end_src
 *** Top level execution
@@ -7717,10 +7940,6 @@ state, clear it, write to file, etc.
 + snapshot?
 + drop
 + sink / float
-** TODO Source mapping                             :debugging:errorHandling:
-It would be nice if we could tell which file any given word was read
-from. We could do this at read time, but i don't think our edn parser
-remembers byte positions, so that might need modification.
 ** INPROGRESS Implement pipes                                       :stdlib:
 *** DONE Write to a file
 #+begin_src kcats
@@ -10746,6 +10965,80 @@ is its own namespace.
   
 #+end_src
 
+**** How to implement let
+It's something most languages just don't have - functions scoped to a
+function. I mean, they do but there is no way to avoid having them
+redefined each time.
+
+Can we do better?
+
+So I guess what we want is to take a program that contains local
+functions and an outer program, and transform that into a program that
+contains an altered dictionary.
+
+Maybe let just transforms the program without executing it?
+
+#+begin_src kcats
+  [[plus2 [2 +]]] draft dictionary swap [emit encode hashbytes] shield
+   [shield] dip
+   sink [dictmerge] shielddeep
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+dictionary_redacted #b64 "g5nJOWpyglIeN2EgJOdFRVQ0ix76q42bTs2uG5w5J/s="
+#+end_src
+
+This gives us basically a closure 
+#+begin_src kcats
+  3 4
+  [[plus2 [2 +]]
+   [stuff [plus2 3 *]]] [stuff]
+  [draft dictionary swap [emit encode hashbytes] shield
+   [shield] dip
+   sink [dictmerge] shielddeep] dip ;; under the let program ;; prog dict hash
+  [wrap] dipdown ;; wrap the hash to make a list of 1 namespace
+  
+  [program dictionary resolver] label environment ;; creates closure
+  ;; now execute the closure by capturing outer stack
+  [stack] [snapshot] divedown assign
+  evaluate [stack] lookup restore
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+18 3
+#+end_src
+
+So I guess the challenge then is to be able to reuse it (eg inside map), which we can this way:
+
+#+begin_src kcats
+  1 10 1 range
+  ;; the inner functions
+  [[plus2 [2 +]]
+   [stuff [plus2 3 *]]]
+  ;; program to run that uses them
+  [stuff]
+
+  [draft dictionary swap [emit encode hashbytes] shield
+   [shield] dip
+   sink [dictmerge] shielddeep] dip ;; under the let program ;; prog dict hash
+  [wrap] dipdown ;; wrap the hash to make a list of 1 namespace
+
+  [program dictionary resolver] label environment ;; creates closure
+  ;; when the closure executes, capture the outer stack first
+  wrap
+  [[stack] [snapshot] divedown assign evaluate [stack] lookup restore] join
+
+  map
+
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[9 12 15 18 21 24 27 30 33]
+#+end_src
+
 *** Implementation
 **** TODO take a dictionary and a program and execute the program with that dict
 **** TODO take a mapping of name to module and return a dictionary with those modules
@@ -10790,7 +11083,18 @@ How does one module ensure another is loaded before this one is used?
 
 #+RESULTS:
 #+begin_src kcats
-531441
+[[actual foo]
+ [asked [sized]]
+ [handled yes]
+ [reason "type mismatch"]
+ [type error]
+ [unwound [get [[definition]] unwrap [something?] shield [take swap [get] dip [something?]
+                                                          shield]
+           loop drop [[[math definition]
+                       [foo definition [sixth [[definition [square cube]]]]] dictionary_redacted]] unwrap
+           evert first shielddown [] [[definition] unwrap pair [lookup] shield shielddown] step
+           [[9 sixth]] unwrap confine]]]
+math [foo definition [sixth [[definition [square cube]]]]] dictionary_redacted
 #+end_src
 
 So here we have modules that depend on each other, but the actual
@@ -10838,41 +11142,41 @@ duration of a program.
 
 #+RESULTS:
 #+begin_src kcats
-#b64 "cCbiMlCaBKwnUJ/EJaHb9oC5Q1i+N4Arq27yJ4tcLVE="
+#b64 "QUsvdqQ6E46RsswGPAAlbz7tTWpdefkXPA5NByxGr4c="
 #+end_src
 
 #+begin_src kcats
-  ;; first cache the inner mod
-  ;[[[square [clone *]]
-  ;  [cube [clone square *]]] draft] encode [] cache
-  ;; then the outer mod
-  ;[[[[math #b64 "ULY02dWGqy3G7x9Hd7RgBG2q+Dw9RE8hC4dUjzyCqRk="]]
-  ;  ;; load each dep module
-  ;  [unwrap module [wrap] dip assign] step]
-  ; [[sixth [square cube]]] draft join]
-  ;encode [] cache
+    ;; first cache the inner mod
+    [[[square [clone *]]
+      [cube [clone square *]]] draft] encode [] cache
+    ;; then the outer mod
+    [[[[math #b64 "ULY02dWGqy3G7x9Hd7RgBG2q+Dw9RE8hC4dUjzyCqRk="]]
+      ;; load each dep module
+      [unwrap module [wrap] dip assign] step]
+     [[sixth [square cube]]] draft join]
+    encode [] cache
 
-  dictionary
-  ;; outer mod
-  ;; first the prelude
-  [[foo #b64 "cCbiMlCaBKwnUJ/EJaHb9oC5Q1i+N4Arq27yJ4tcLVE="]]
-  ;; load each dep module
-  [unwrap module [wrap] dip entry assign] step
-  ;[[foo] lookup] shield dump drop
-  [[foo]
-   [9 sixth]
-   [dictionary swap [wrap shielddown] step] dip confine]
-  confine
+    dictionary
+    ;; outer mod
+    ;; first the prelude
+    [[foo #b64 "QUsvdqQ6E46RsswGPAAlbz7tTWpdefkXPA5NByxGr4c="]]
+    ;; load each dep module
+    [unwrap module [wrap] dip entry assign] step
+    ;[[foo] lookup] shield dump drop
+    [[foo]
+     [9 sixth]
+     [dictionary swap [wrap shielddown] step] dip
+     confine]
+   confine ;; outer confine creates a dictionary with all the module words
 #+end_src
 
 #+RESULTS:
 #+begin_src kcats
-[[asked [square]]
- [handled yes]
- [reason "word is not defined"]
- [type error]
- [unwound [square cube]]]
-9
+[[foo] [9 sixth]
+ [dictionary swap [wrap shielddown]
+  step]
+ dip confine]
+dictionary_redacted #b64 "rJDrBYlO0RF3MHLh9tisE6kvRpGdVqtcKaWm0VyG6CQ=" #b64 "i4VyOtSDZ8aKk1YkF4scKaml+ULiClqGdeG3D8NST30="
 #+end_src
 
 #+begin_src kcats
@@ -10882,6 +11186,56 @@ duration of a program.
 #+RESULTS:
 #+begin_src kcats
 2 2
+#+end_src
+**** TODO Revert back to namespaces
+
+#+begin_src kcats
+    [[square [clone *]]] draft [emit] map  ;encode
+    ;[hashbytes] shield swap string read
+    ;[dictionary clone] dip shielddown 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+["[[square [[definition [clone *]]]]]" "join"]
+#+end_src
+
+Let's figure out how to implement =inscribe= without the caller having
+to provide a hash (which is a security flaw anyway). Do we require
+going through the cache all the time or do we round trip serialize so
+we can support inline modules? I lean toward the latter, let's try that first.
+
+#+begin_src kcats
+  [[plus2 [2 +]]] draft dictionary swap [emit encode hashbytes] shield
+  [shield] dip
+  sink dictmerge
+  ;; [first [plus2] unwrap =] filter ;; to check if the word is there
+  [#b64 "g5nJOWpyglIeN2EgJOdFRVQ0ix76q42bTs2uG5w5J/s="] [5 plus2]
+  [program resolver dictionary] label environment evaluate
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[dictionary dictionary_redacted]
+ [program []]
+ [stack [7]]]
+#+end_src
+
+Ok now let's refactor this into the form we want for =let=. 
+
+#+begin_src kcats
+  [[plus2 [2 +]]
+   [stuff [plus2 3 *]]] [5 stuff]
+  [draft dictionary swap [emit encode hashbytes] shield
+   [shield] dip
+   sink [dictmerge] shielddeep] dip ;; under the let program ;; prog dict hash
+  [wrap] dipdown ;; wrap the hash to make a list of 1 namespace
+  [program dictionary resolver] label environment evaluate [stack] lookup restore
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+21
 #+end_src
 
 *** INPROGRESS inscribe currently re-defines words repeatedly at runtime
@@ -12737,4 +13091,17 @@ it? (May need to add some set-based words here).
 
   }
 #+end_src
+** TODO Improved error messages :errorHandling:
+*** TODO Source mapping                            :debugging:errorHandling:
+It would be nice if we could tell which file any given word was read
+from. We could do this at read time, but i don't think our edn parser
+remembers byte positions, so that might need modification.
+*** TODO Causal chaining
+Like java exceptions, we'd like to be able to say what other error
+caused this one. Then the chain would go from the most general to the
+most specific, eg "could not load library", "could not open file",
+"permission denied".
 
+The unwound field could be shortened too, to just whatever is extra,
+similar to java's eliding of common stack elements in chained
+exceptions.
