@@ -551,6 +551,19 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  /// A generic impl to convert an Item to a vec of the given
+  /// type. Assumes the Item is some sort of container and converts each
+  /// item in the container.
+  impl<T: TryDerive<Item, Error = Error>> TryDerive<Item> for Vec<T> {
+      type Error = Error;
+
+      fn try_derive(i: Item) -> Result<Self, Self::Error> {
+          // First try to convert the Item to an IntoIterator<Item>
+          let it: Box<dyn Iterator<Item = Item>> = i.try_fit()?;
+          it.map(T::try_derive).collect()
+      }
+  }
+
   /// A macro to build a kcats List, accepts any values that are
   /// convertible to [Item].
   #[macro_export]
@@ -3597,6 +3610,7 @@ internally, to keep track of things like the stack, program, lists etc.
           let mut stack: Option<coll::List> = None;
           let mut program: Option<coll::List> = None;
           let mut dictionary: Option<dict::Dictionary> = None;
+          let mut resolver: Option<Vec<dict::Namespace>> = None;
           for i in iter {
               let (k, v): (assoc::KeyItem, Item) = i.try_fit()?;
               if k == "stack".fit() {
@@ -3605,6 +3619,8 @@ internally, to keep track of things like the stack, program, lists etc.
                   program = Some(v.try_fit()?)
               } else if k == "dictionary".fit() {
                   dictionary = Some(v.try_fit()?)
+              } else if k == "resolver".fit() {
+                  resolver = Some(v.try_fit()?)
               } else {
                   continue;
               }
@@ -3613,6 +3629,7 @@ internally, to keep track of things like the stack, program, lists etc.
           env.stack = stack.unwrap_or_default();
           env.program = program.unwrap_or_default();
           env.dictionary = dictionary.unwrap_or_else(|| Environment::default().dictionary);
+          env.resolver = resolver.unwrap_or_default();
           Ok(env)
       }
   }
@@ -4845,6 +4862,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("unassign", Box::leak(Box::new(f_stack2(unassign)))),
           ("take", Box::leak(Box::new(take))),
           ("unwrap", Box::leak(Box::new(unwrap))),
+          ("using", Box::leak(Box::new(f_result(using)))),
           (
               "verify",
               Box::leak(Box::new(f_stack3(crate::crypto::verify))),
@@ -6193,6 +6211,15 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   fn is_finished(env: Environment) -> Result<bool, Infallible> {
       Ok(env.is_finished())
+  }
+
+  fn using(env: &mut Environment) -> Result<(), Error> {
+      let namespaces: Vec<dict::Namespace> = env.pop().try_fit()?;
+      let mut inner_env: Environment = env.pop().try_fit()?;
+      env.pop_prog();
+      inner_env.resolver.extend(namespaces);
+      env.push(inner_env);
+      Ok(())
   }
 #+end_src
 *** Top level execution
@@ -7913,10 +7940,6 @@ state, clear it, write to file, etc.
 + snapshot?
 + drop
 + sink / float
-** TODO Source mapping                             :debugging:errorHandling:
-It would be nice if we could tell which file any given word was read
-from. We could do this at read time, but i don't think our edn parser
-remembers byte positions, so that might need modification.
 ** INPROGRESS Implement pipes                                       :stdlib:
 *** DONE Write to a file
 #+begin_src kcats
@@ -10942,6 +10965,80 @@ is its own namespace.
   
 #+end_src
 
+**** How to implement let
+It's something most languages just don't have - functions scoped to a
+function. I mean, they do but there is no way to avoid having them
+redefined each time.
+
+Can we do better?
+
+So I guess what we want is to take a program that contains local
+functions and an outer program, and transform that into a program that
+contains an altered dictionary.
+
+Maybe let just transforms the program without executing it?
+
+#+begin_src kcats
+  [[plus2 [2 +]]] draft dictionary swap [emit encode hashbytes] shield
+   [shield] dip
+   sink [dictmerge] shielddeep
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+dictionary_redacted #b64 "g5nJOWpyglIeN2EgJOdFRVQ0ix76q42bTs2uG5w5J/s="
+#+end_src
+
+This gives us basically a closure 
+#+begin_src kcats
+  3 4
+  [[plus2 [2 +]]
+   [stuff [plus2 3 *]]] [stuff]
+  [draft dictionary swap [emit encode hashbytes] shield
+   [shield] dip
+   sink [dictmerge] shielddeep] dip ;; under the let program ;; prog dict hash
+  [wrap] dipdown ;; wrap the hash to make a list of 1 namespace
+  
+  [program dictionary resolver] label environment ;; creates closure
+  ;; now execute the closure by capturing outer stack
+  [stack] [snapshot] divedown assign
+  evaluate [stack] lookup restore
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+18 3
+#+end_src
+
+So I guess the challenge then is to be able to reuse it (eg inside map), which we can this way:
+
+#+begin_src kcats
+  1 10 1 range
+  ;; the inner functions
+  [[plus2 [2 +]]
+   [stuff [plus2 3 *]]]
+  ;; program to run that uses them
+  [stuff]
+
+  [draft dictionary swap [emit encode hashbytes] shield
+   [shield] dip
+   sink [dictmerge] shielddeep] dip ;; under the let program ;; prog dict hash
+  [wrap] dipdown ;; wrap the hash to make a list of 1 namespace
+
+  [program dictionary resolver] label environment ;; creates closure
+  ;; when the closure executes, capture the outer stack first
+  wrap
+  [[stack] [snapshot] divedown assign evaluate [stack] lookup restore] join
+
+  map
+
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[9 12 15 18 21 24 27 30 33]
+#+end_src
+
 *** Implementation
 **** TODO take a dictionary and a program and execute the program with that dict
 **** TODO take a mapping of name to module and return a dictionary with those modules
@@ -11103,15 +11200,42 @@ dictionary_redacted #b64 "rJDrBYlO0RF3MHLh9tisE6kvRpGdVqtcKaWm0VyG6CQ=" #b64 "i4
 ["[[square [[definition [clone *]]]]]" "join"]
 #+end_src
 
+Let's figure out how to implement =inscribe= without the caller having
+to provide a hash (which is a security flaw anyway). Do we require
+going through the cache all the time or do we round trip serialize so
+we can support inline modules? I lean toward the latter, let's try that first.
+
 #+begin_src kcats
-[[plus2 [2 +]]] draft dictionary swap [emit encode hashbytes] shield
-[shield] dip
-sink dictmerge [= un] filter
+  [[plus2 [2 +]]] draft dictionary swap [emit encode hashbytes] shield
+  [shield] dip
+  sink dictmerge
+  ;; [first [plus2] unwrap =] filter ;; to check if the word is there
+  [#b64 "g5nJOWpyglIeN2EgJOdFRVQ0ix76q42bTs2uG5w5J/s="] [5 plus2]
+  [program resolver dictionary] label environment evaluate
 #+end_src
 
 #+RESULTS:
 #+begin_src kcats
-[]
+[[dictionary dictionary_redacted]
+ [program []]
+ [stack [7]]]
+#+end_src
+
+Ok now let's refactor this into the form we want for =let=. 
+
+#+begin_src kcats
+  [[plus2 [2 +]]
+   [stuff [plus2 3 *]]] [5 stuff]
+  [draft dictionary swap [emit encode hashbytes] shield
+   [shield] dip
+   sink [dictmerge] shielddeep] dip ;; under the let program ;; prog dict hash
+  [wrap] dipdown ;; wrap the hash to make a list of 1 namespace
+  [program dictionary resolver] label environment evaluate [stack] lookup restore
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+21
 #+end_src
 
 *** INPROGRESS inscribe currently re-defines words repeatedly at runtime
@@ -12967,4 +13091,17 @@ it? (May need to add some set-based words here).
 
   }
 #+end_src
+** TODO Improved error messages :errorHandling:
+*** TODO Source mapping                            :debugging:errorHandling:
+It would be nice if we could tell which file any given word was read
+from. We could do this at read time, but i don't think our edn parser
+remembers byte positions, so that might need modification.
+*** TODO Causal chaining
+Like java exceptions, we'd like to be able to say what other error
+caused this one. Then the chain would go from the most general to the
+most specific, eg "could not load library", "could not open file",
+"permission denied".
 
+The unwound field could be shortened too, to just whatever is extra,
+similar to java's eliding of common stack elements in chained
+exceptions.
