@@ -273,8 +273,6 @@ We'll start by defining the basic data structures that kcats will use
 internally, to keep track of things like the stack, program, lists etc.
 #+begin_src rust :tangle src/types.rs :mkdirp yes
   //! Defines kcats internal data types.
-  /// Include Our own traits so we aren't saddled with orphan rule
-  /// issues.
   use crate::list;
   use crate::traits::*;
   use crate::types::container as coll;
@@ -306,6 +304,10 @@ internally, to keep track of things like the stack, program, lists etc.
       pub namespace: dict::Namespace,
   }
 
+  /// Two words are equal if their data are equal, even if they're not
+  /// in the same namespace. The rationale for this is that comparisons
+  /// are only when we're using a word as data, and namespace only
+  /// matters when using a word to perform an action (ie as a verb)
   impl PartialEq for Word {
       fn eq(&self, other: &Self) -> bool {
           self.data == other.data
@@ -350,27 +352,28 @@ internally, to keep track of things like the stack, program, lists etc.
   /// A character type
   pub type Char = char;
 
+  // Some static values for commonly used words
   lazy_static! {
-      pub static ref S_ASSOC: Word = Word::derive("association");
-      pub static ref S_BOOLEAN: Word = Word::derive("boolean");
-      pub static ref S_BYTES: Word = Word::derive("bytes");
-      pub static ref S_CHAR: Word = Word::derive("character");
-      pub static ref S_DICTIONARY: Word = Word::derive("dictionary");
-      pub static ref S_DISPENSER: Word = Word::derive("dispenser");
-      pub static ref S_ENVIRONMENT: Word = Word::derive("environment");
-      pub static ref S_ERROR: Word = Word::derive("error");
-      pub static ref S_FLOAT: Word = Word::derive("float");
-      pub static ref S_INTEGER: Word = Word::derive("integer");
-      pub static ref S_ITEM: Word = Word::derive("item");
-      pub static ref S_LIST: Word = Word::derive("list");
-      pub static ref S_NUMBER: Word = Word::derive("number");
-      pub static ref S_ORDERED: Word = Word::derive("ordered");
-      pub static ref S_PIPE: Word = Word::derive("pipe");
-      pub static ref S_PROGRAM: Word = Word::derive("program");
-      pub static ref S_RECEPTACLE: Word = Word::derive("receptacle");
-      pub static ref S_SIZED: Word = Word::derive("sized");
-      pub static ref S_STRING: Word = Word::derive("string");
-      pub static ref S_WORD: Word = Word::derive("word");
+      pub static ref S_ASSOC: Word = "association".fit();
+      pub static ref S_BOOLEAN: Word = "boolean".fit();
+      pub static ref S_BYTES: Word = "bytes".fit();
+      pub static ref S_CHAR: Word = "character".fit();
+      pub static ref S_DICTIONARY: Word = "dictionary".fit();
+      pub static ref S_DISPENSER: Word = "dispenser".fit();
+      pub static ref S_ENVIRONMENT: Word = "environment".fit();
+      pub static ref S_ERROR: Word = "error".fit();
+      pub static ref S_FLOAT: Word = "float".fit();
+      pub static ref S_INTEGER: Word = "integer".fit();
+      pub static ref S_ITEM: Word = "item".fit();
+      pub static ref S_LIST: Word = "list".fit();
+      pub static ref S_NUMBER: Word = "number".fit();
+      pub static ref S_ORDERED: Word = "ordered".fit();
+      pub static ref S_PIPE: Word = "pipe".fit();
+      pub static ref S_PROGRAM: Word = "program".fit();
+      pub static ref S_RECEPTACLE: Word = "receptacle".fit();
+      pub static ref S_SIZED: Word = "sized".fit();
+      pub static ref S_STRING: Word = "string".fit();
+      pub static ref S_WORD: Word = "word".fit();
   }
 
   /// A kcats data value.
@@ -383,7 +386,7 @@ internally, to keep track of things like the stack, program, lists etc.
       Word(Word),
       /// A character value, like 'a', or '\n'.
       Char(Char),
-      /// A container value (that [Item]s can be taken derive)
+      /// A container value (that [Item]s can be taken from)
       Dispenser(coll::Dispenser),
       /// A container value (that [Item]s can be put into)
       Receptacle(coll::Receptacle),
@@ -405,7 +408,7 @@ internally, to keep track of things like the stack, program, lists etc.
   pub type Future<T> = Pin<Box<dyn std::future::Future<Output = T> + Send>>;
 
   /// A type for a function that advances the execution of a kcats
-  /// program by one step.
+  /// [env::Environment] by one step.
   pub type StepFn = dyn Fn(env::Environment) -> Future<env::Environment> + Sync + Send;
 
   impl PartialEq for Item {
@@ -456,6 +459,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn try_derive(i: Item) -> Result<Self, Self::Error> {
           match i {
               Item::Word(i) => Ok(i),
+              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(s))) => Ok(s.fit()),
               i => {
                   let i2 = i.clone();
                   let l = coll::List::try_derive(i);
@@ -719,9 +723,11 @@ internally, to keep track of things like the stack, program, lists etc.
   //! this module will eventually support bignums and autopromotion.
   use super::container::error::Error;
   use crate::traits::*;
+  use crate::types::container as cont;
   use crate::types::Item;
   use num_integer::Roots;
   use serde::ser::{Serialize, Serializer};
+  use std::num::{ParseFloatError, ParseIntError};
   /// An integer type
   pub type Int = i64;
 
@@ -865,11 +871,35 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  impl From<ParseIntError> for Error {
+      fn from(e: ParseIntError) -> Self {
+          Error::parse(e.to_string().as_str())
+      }
+  }
+  impl From<ParseFloatError> for Error {
+      fn from(e: ParseFloatError) -> Self {
+          Error::parse(e.to_string().as_str())
+      }
+  }
+
   impl TryDerive<Item> for Number {
       type Error = Error;
       fn try_derive(i: Item) -> Result<Self, Self::Error> {
+          let fromstr = |s: String| {
+              let r = s
+                  .as_str()
+                  .parse::<i64>()
+                  .map(Number::Int)
+                  .map_err(Error::from);
+
+              r.or_else(|_| s.as_str().parse::<Float>().map(Number::Float))
+                  .map_err(Error::from)
+          };
           match i {
               Item::Number(i) => Ok(i),
+              Item::Char(c) => Ok(Number::Int(c as Int)),
+              Item::Dispenser(cont::Dispenser::Sized(cont::Sized::String(s))) => fromstr(s),
+              Item::Receptacle(cont::Receptacle::Sized(cont::Sized::String(s))) => fromstr(s),
               i => Err(Error::expected("number", i)),
           }
       }
@@ -915,16 +945,13 @@ internally, to keep track of things like the stack, program, lists etc.
 #+end_src
 **** Container types
 #+begin_src rust :tangle src/types/container.rs :mkdirp yes
-  //! Support for containers in kcats. Includes types like
-  //! [List], [Set],
-  //! [associative::Association], String,
-  //! [pipe::In],
-  //! [pipe::Out], and Byte arrays. The
-  //! container contract is you can put things into, or take things out
-  //! of them. [Receptacle]s are for putting into, and [Dispenser]s are
-  //! for taking out of. For underlying types that support both
-  //! operations (like [List]), we can easily convert between
-  //! [Receptacle] and [Dispenser] as needed.
+  //! Support for containers in kcats. Includes types like [List],
+  //! [Set], [associative::Association], String, [pipe::In],
+  //! [pipe::Out], and Byte arrays. The container contract is you can
+  //! put things into, or take things out of them. [Receptacle]s are for
+  //! putting into, and [Dispenser]s are for taking out of. For
+  //! underlying types that support both operations (like [List]), we
+  //! can easily convert between [Receptacle] and [Dispenser] as needed.
   pub mod associative;
   pub mod dictionary;
   pub mod environment;
@@ -1091,6 +1118,7 @@ internally, to keep track of things like the stack, program, lists etc.
       Bytes(Bytes),
   }
 
+  /// Empty Sized containers are equal to each other.
   impl PartialEq for Sized {
       fn eq(&self, other: &Self) -> bool {
           if self.is_empty() && other.is_empty() {
@@ -1149,12 +1177,12 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl Sized {
-      /// Returns whether the collection is empty
+      /// Returns whether the container is empty
       pub fn is_empty(&self) -> bool {
           self.len() == 0
       }
 
-      /// Returns the number of items in the collection.
+      /// Returns the number of items in the container.
       pub fn len(&self) -> usize {
           match self {
               Sized::Associative(a) => a.len(),
@@ -1165,9 +1193,9 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
-      /// Takes an item out of the collection, returning the item and
-      /// the rest of the collection separately. Items are taken from
-      /// the front (beginning) of the collection.
+      /// Takes an item out of the container, returning the item and
+      /// the rest of the container separately. Items are taken from
+      /// the front (beginning) of the container.
       pub fn take(self) -> (Self, Option<Item>) {
           match self {
               Sized::Associative(a) => {
@@ -1206,7 +1234,7 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
-      /// Takes an item from the back (end) of the collection.
+      /// Takes an item from the back (end) of the container.
       pub fn pop(self) -> (Self, Option<Item>) {
           match self {
               Sized::Associative(a) => {
@@ -1237,7 +1265,7 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
-      /// Puts an item into the collection, at the end.
+      /// Puts an item into the container, at the end.
       pub fn put(self, other: Item) -> Result<Sized, Error> {
           match (self, other) {
               (Sized::List(mut c), i) => {
@@ -1262,9 +1290,8 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
-      /// Joins two collections into one. If the collections are
-      /// different types, generally the result is the type of the first
-      /// argument.
+      /// Joins two containers into one. If the containers are different
+      /// types, generally the result is the type of the first argument.
       pub fn join(self, other: Sized) -> Result<Sized, Error> {
           Ok(match (self, other) {
               (Sized::Associative(a), Sized::List(l)) => {
@@ -1332,7 +1359,7 @@ internally, to keep track of things like the stack, program, lists etc.
           })
       }
 
-      /// Returns whether this collection contains the given [Item].
+      /// Returns whether this container contains the given [Item].
       pub fn contains(&self, other: &Item) -> bool {
           match (self, other) {
               (Sized::Associative(a), other) => {
@@ -1362,8 +1389,8 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
-      /// Returns a new empty version of this collection. Does not
-      /// modify this collection. The new collection will be the same
+      /// Returns a new empty version of this container. Does not
+      /// modify this container. The new container will be the same
       /// type as this one (if this is a [Sized::String], you'll get an empty
       /// [Sized::String], etc)
       pub fn empty(&self) -> Sized {
@@ -1380,7 +1407,7 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl Receptacle {
-      /// Puts the given [Item] into this collection, items are added at
+      /// Puts the given [Item] into this container, items are added at
       /// the end.
       pub fn put(self, i: Item) -> Future<Result<Receptacle, Error>> {
           match self {
@@ -1518,7 +1545,7 @@ internally, to keep track of things like the stack, program, lists etc.
           match item {
               Item::Receptacle(p) => Ok(p),
               Item::Dispenser(c) => c.try_fit(),
-              i => Err(Error::expected("packable", i)),
+              i => Err(Error::expected("receptacle", i)),
           }
       }
   }
@@ -1530,7 +1557,7 @@ internally, to keep track of things like the stack, program, lists etc.
           match c {
               Dispenser::Sized(s) => Ok(Receptacle::Sized(s)),
               Dispenser::Tunnel(t) => Ok(Receptacle::Tunnel(t)),
-              i => Err(Error::expected("packable", i)),
+              i => Err(Error::expected("receptacle", i)),
           }
       }
   }
@@ -4804,6 +4831,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("loop", Box::leak(Box::new(loop_))),
           ("mod", Box::leak(Box::new(f_stack2(mod_)))),
           ("not", Box::leak(Box::new(f_stack1(not)))),
+          ("number", Box::leak(Box::new(f_stack1::<Number, Item, Error>(
+              Number::try_derive,
+          )))),
           ("number?", Box::leak(Box::new(f_stack1(is_number)))),
           ("odd?", Box::leak(Box::new(f_stack1(is_odd)))),
           ("or", Box::leak(Box::new(f_stack2(or)))),
@@ -4868,6 +4898,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               Box::leak(Box::new(f_stack3(crate::crypto::verify))),
           ),
           //("version", Box::leak(Box::new(f_stack2(version)))),
+          ("word", Box::leak(Box::new(f_stack1::<Word, Item, Error>(
+              Word::try_derive,
+          )))),
           ("word?", Box::leak(Box::new(f_stack1(is_word)))),
           ("wrap", Box::leak(Box::new(wrap))),
           ("xor", Box::leak(Box::new(f_stack2(xor)))),
@@ -6579,6 +6612,8 @@ We'll also define how to run unit tests.
       #[test_case("if")]
       #[test_case("inc")]
       #[test_case("indexed")]
+      #[test_case("indexer")]
+      #[test_case("indexof")]
       #[test_case("inject")]
       //#[test_case("inscribe")]
       #[test_case("intersection")]
@@ -6598,6 +6633,7 @@ We'll also define how to run unit tests.
       #[test_case("mod")]
       #[test_case("not")]
       #[test_case("empty?" ; "is_empty")]
+      #[test_case("number")]
       #[test_case("number?" ; "is_number")]
       #[test_case("odd?" ; "is_odd")]
       #[test_case("or")]
@@ -6651,10 +6687,12 @@ We'll also define how to run unit tests.
       #[test_case("unwrap")]
       #[test_case("update")]
       #[test_case("value")]
+      #[test_case("walk")]
       #[test_case("when")]
       #[test_case("while")]
       #[test_case("within?" ; "is_within")]
-      #[test_case("word?")]
+      #[test_case("word")]
+      #[test_case("word?" ; "is_word")]
       #[test_case("wrap")]
       #[test_case("xor")]
       #[test_case("zero?" ; "is_zero")]
@@ -11031,7 +11069,7 @@ So I guess the challenge then is to be able to reuse it (eg inside map), which w
   [[stack] [snapshot] divedown assign evaluate [stack] lookup restore] join
 
   map
-
+  
 #+end_src
 
 #+RESULTS:
@@ -12548,131 +12586,213 @@ it? (May need to add some set-based words here).
 #+end_src
 
 #+begin_src kcats
-  ;; Module to operate on generic data, that are used throughout
-  [[fork [[execute] map]]
-   [triangle [[[] [[take] dip swap [[put] shield sink swap pair] bail] collect] shielddown]]
-   [indexed-as-property [swap indexed
-                         [unwrap sink assign] map dropdown]]
-   [join-all [[first empty] shield swap [join] step]]
-   [selectkeys [set swap [first contains?] filter]]
-   [invert [[reverse] map association]]
+    ;; Module to operate on generic data, that are used throughout
+    [[fork [[execute] map]]
+     [triangle [[[] [[take] dip swap [[put] shield sink swap pair] bail] collect] shielddown]]
+     [indexed-as-property [swap indexed
+                           [unwrap sink assign] map dropdown]]
+     [join-all [[first empty] shield swap [join] step]]
+     [selectkeys [set swap [first contains?] filter]]
+     [invert [[reverse] map association]]
 
-   ;; datalog variables
-   [variable? [[[word?]
+     ;; datalog variables
+     [variable? [[[word?]
+                  [string last \? =]] [execute] every?]]
+     [variable= [[[pair [variable?] every?] [=]] [execute] every?]] 
+
+     ;; datalog constraints
+     [slots [[entity attribute value]]]
+     [slot-combos [slots [slots [pair] map] map join-all]]
+     [constraint [unwrap slots reverse label]] 
+
+     ;; links between datalog constraints
+     [links [slot-combos
+             [[wrap] map unwrap swapdown 
+              [[[lookup] inject] both] pairwise 
+              variable=]
+             filter    
+             [unwrap pair sink pair
+              [[index] lookup] map swap zip]
+             map]]
+     [all-links [[] sink
+                 [[[[index] lookup] shield] both ;; lookup the indices of both constraints
+                  [swapdown] dip sink ;; move the indices under the constraints
+                  [links] shielddown
+                  swap [dropdown dropdown join] dip] 
+
+                 step drop]]
+     [format-link [[join] inject unwrap [string] map
+                   "c{0}.{1} = c{2}.{3}" swap format]] 
+
+     ;; formatting pieces of query data into text
+     [anded-together [" AND " interpose join-all]]
+
+     ;; where clause data processing
+     [where-data [[[index] lookup] shield swap 
+                  [[[second variable? not]
+                    [first [index] unwrap = not]] [execute] every?] filter 
+                  [swap prepend] map dropdown]]
+     [format-where [[string] map 
+                    "c{0}.{1} = :c{0}{1}" swap format]]
+     [make-where [first [where] lookup anded-together]]
+     [format-join [[[[on] lookup]
+                    [[where] lookup]
+                    [[index] lookup string]] [execute] map
+                   [join anded-together] inject 
+                   "JOIN EAV c{1} ON {0}" swap format]]
+     [make-query [rest [[on]
+                        [[format-link] map] update
+                        [format-join] shield [join] swap assign] map]]
+
+     ;; SQL parameters for rusqlite
+     [param-name [[string] map ":c{0}{1}" swap format]]
+     [extract-params [[] association swap [[params] lookup join] step]]
+
+
+     ;; SELECT clause
+     [wordval? [second word?]]
+     [invert [[reverse] map association]]
+     [validate [[[second not]
+                 [first "All selected query variables must appear somewhere in constraints"
+                  [reason variable] label fail]
+                 when] map]]
+     [select-data [swap
+                   [[slots selectkeys invert] shield
+                    [wordval?] filter join association] map
+                   swap
+                   [[[index] swap put ;; make a list of the variable and 'index'
+                     wrap [selectkeys] join ;; make the program to cut down
+                      map [count 2 =] filter first [second] map
+                     [first number?] [reverse] when] ;; items are in random order due to coming from association, fix the order
+                    map]
+                   shield dropdeep zip
+                   validate]]
+
+     ;; query 
+     [extract-data [[[[unwrap all-links]
+                      [first where-data   ; [join] inject unwrap
+                       ;; build the query param map
+                       [[[] swap
+                         [[param-name] shield [last] dip wrap swap assign]
+                         step]
+                        ;; build the actual query where clauses
+                        [[format-where] map]]
+                       fork]]
+                     fork] shield
+                    ;; combine extracted items
+
+                    [first] dip ;; keep the original constraint to add properties to
+                    unwrap unwrap [where params on] label join]]
+     [format-select [[unwrap swap
+                      string butlast ;; remove the ? from the variable name for result column
+                      put
+                      [string] map
+                      "c{1}.{0} as {2}" swap format] map ", " interpose join-all]]
+     [time [timestamps take emit print drop]]]
+
+    ;; This is the program we need to modify that is `query`
+
+    [swap
+     ;; expand all combinations of constraints
+     [constraint] map
+     ;;[] prepend ;; an empty constraint to represent the orignal EAV table we're joining with
+     [index] indexed-as-property
+     triangle
+     ;; for each pair of constraints, build the "ON" clause data for the JOIN
+     [extract-data] map
+     [[extract-params]
+      [make-query]
+      [make-where]
+      [swap select-data]] fork 
+     dropdown ;; don't need original anymore
+     unwrap float
+     [[join] lookup] map  
+     swap format-select 
+     [" " interpose join-all] dip triplet reverse
+     "SELECT {0} from EAV as c0 {1} WHERE {2}" swap format
+     swap dropdeep]
+
+    let
+    [query] label draft
+
+    dictionary swap [emit encode hashbytes] shield [shield] dip sink [dictmerge] shielddeep
+
+    [wrap] dip
+
+    [[[book? subjects love]
+      [book? title title?]
+      [book? author-last author-last?]
+      [book? author-first author-first?]
+      [author? first-name author-first?]
+      [author? last-name author-last?]
+      [author? sex f]
+      [author? birth-year birth-year?]]
+     [title? author-first? author-last? birth-year?]
+     query
+     ;database
+    ]
+
+    [program dictionary] label environment
+    swap using evaluate [stack] lookup restore
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+  [[":c0attribute" subjects]
+   [":c0value" love]
+   [":c1attribute" title]
+   [":c2attribute" author-last]
+   [":c3attribute" author-first]
+   [":c4attribute" first-name]
+   [":c5attribute" last-name]
+   [":c6attribute" sex]
+   [":c6value" f]
+   [":c7attribute" birth-year]]
+  "SELECT c1.value as \"title\",
+    c3.value as \"author-first\",
+    c2.value as \"author-last\",
+    c7.value as \"birth-year\"
+   from EAV as c0
+  JOIN EAV c1 ON
+     c1.attribute = :c1attribute AND
+     c0.entity = c1.entity
+  JOIN EAV c2 ON
+     c2.attribute = :c2attribute AND
+     c0.entity = c2.entity AND
+     c1.entity = c2.entity
+  JOIN EAV c3 ON
+    c3.attribute = :c3attribute AND
+    c0.entity = c3.entity AND
+    c1.entity = c3.entity AND
+    c2.entity = c3.entity
+  JOIN EAV c4 ON
+    c4.attribute = :c4attribute AND
+    c3.value = c4.value
+  JOIN EAV c5 ON
+    c5.attribute = :c5attribute AND
+    c2.value = c5.value AND
+    c4.entity = c5.entity
+  JOIN EAV c6 ON
+    c6.value = :c6value AND
+    c6.attribute = :c6attribute AND
+    c4.entity = c6.entity AND
+    c5.entity = c6.entity
+  JOIN EAV c7 ON
+    c7.attribute = :c7attribute AND
+    c4.entity = c7.entity AND
+    c5.entity = c7.entity AND
+    c6.entity = c7.entity
+  WHERE c0.value = :c0value AND
+        c0.attribute = :c0attribute"
+#+end_src
+
+We need to rewrite the link-finding logic so that it does everything in one pass
+#+begin_src kcats
+  [[variable? [[[word?]
                 [string last \? =]] [execute] every?]]
-   [variable= [[[pair [variable?] every?] [=]] [execute] every?]] 
-
-   ;; datalog constraints
+   [linked-line? [second [first] map set swap contains?]]
    [slots [[entity attribute value]]]
-   [slot-combos [slots [slots [pair] map] map join-all]]
-   [constraint [unwrap slots reverse label]] 
-
-   ;; links between datalog constraints
-   [links [slot-combos
-           [[wrap] map unwrap swapdown 
-            [[[lookup] inject] both] pairwise 
-            variable=]
-           filter    
-           [unwrap pair sink pair
-            [[index] lookup] map swap zip]
-           map]]
-   [all-links [[] sink
-               [[[[index] lookup] shield] both ;; lookup the indices of both constraints
-                [swapdown] dip sink ;; move the indices under the constraints
-                [links] shielddown
-                swap [dropdown dropdown join] dip] 
-
-               step drop]]
-   [format-link [[join] inject unwrap [string] map
-                 "c{0}.{1} = c{2}.{3}" swap format]] 
-
-   ;; formatting pieces of query data into text
-   [anded-together [" AND " interpose join-all]]
-
-   ;; where clause data processing
-   [where-data [[[index] lookup] shield swap 
-                [[[second variable? not]
-                  [first [index] unwrap = not]] [execute] every?] filter 
-                [swap prepend] map dropdown]]
-   [format-where [[string] map 
-                  "c{0}.{1} = :c{0}{1}" swap format]]
-   [make-where [first [where] lookup anded-together]]
-   [format-join [[[[on] lookup]
-                  [[where] lookup]
-                  [[index] lookup string]] [execute] map
-                 [join anded-together] inject 
-                 "JOIN EAV c{1} ON {0}" swap format]]
-   [make-query [rest [[on]
-                      [[format-link] map] update
-                      [format-join] shield [join] swap assign] map]]
-
-   ;; SQL parameters for rusqlite
-   [param-name [[string] map ":c{0}{1}" swap format]]
-   [extract-params [[] association swap [[params] lookup join] step]]
-
-
-   ;; SELECT clause
-   [wordval? [second word?]]
-   [invert [[reverse] map association]]
-   [validate [[[second not]
-               [first "All selected query variables must appear somewhere in constraints"
-                [reason variable] label fail]
-               when] map]]
-   [select-data [swap
-                 [[slots selectkeys invert] shield
-                  [wordval?] filter join association] map
-                 swap
-                 [[[index] swap put ;; make a list of the variable and 'index'
-                   wrap [selectkeys] join ;; make the program to cut down
-                   map [count 2 =] filter first [second] map
-                   [first number?] [reverse] when] ;; items are in random order due to coming from association, fix the order
-                  map]
-                 shield dropdeep zip
-                 validate]]
-
-   ;; query 
-   [extract-data [[[[unwrap all-links]
-                    [first where-data   ; [join] inject unwrap
-                     ;; build the query param map
-                     [[[] swap
-                       [[param-name] shield [last] dip wrap swap assign]
-                       step]
-                      ;; build the actual query where clauses
-                      [[format-where] map]]
-                     fork]]
-                   fork] shield
-                  ;; combine extracted items
-
-                  [first] dip ;; keep the original constraint to add properties to
-                  unwrap unwrap [where params on] label join]]
-   [format-select [[unwrap swap
-                    string butlast ;; remove the ? from the variable name for result column
-                    put
-                    [string] map
-                    "c{1}.{0} as {2}" swap format] map ", " interpose join-all]]
-   [time [timestamps take emit print drop]]
-   [query [
-           swap
-           ;; expand all combinations of constraints
-           [constraint] map
-           ;;[] prepend ;; an empty constraint to represent the orignal EAV table we're joining with
-           [index] indexed-as-property
-           triangle
-           ;; for each pair of constraints, build the "ON" clause data for the JOIN
-           [extract-data] map
-           [[extract-params]
-            [make-query]
-            [make-where]
-            [swap select-data]] fork 
-           dropdown ;; don't need original anymore
-           unwrap float
-           [[join] lookup] map  
-           swap format-select 
-           [" " interpose join-all] dip triplet reverse
-           "SELECT {0} from EAV as c0 {1} WHERE {2}" swap format
-           swap dropdeep]]]
-  draft inscribe
-
+   [index->slot [slots indexed]]]
   [[[book? subjects love]
     [book? title title?]
     [book? author-last author-last?]
@@ -12681,184 +12801,138 @@ it? (May need to add some set-based words here).
     [author? last-name author-last?]
     [author? sex f]
     [author? birth-year birth-year?]]
-   [title? author-first? author-last? birth-year?]
-   query
-  ] confine; database
-  ;execute
-  ;heatmap ;0 swap [second +] step
+   ;; add indices to the constraint rows and internal items
+   [indexed
+    [[1] [indexed] update] map
+    [] swap
+    ;; pull in the row number into each cell
+    [unwrap [swap prepend [swap pair] inject] map] map
+    ;; catenate
+    [joiner] assemble unwrap
+    ;; filter out non variables
+   ; [second variable?] filter
+    [unwrap wrap swap [put] swap prepend update] step
+    ;; anything with only 1 entry is not a link
+    ;[second count 1 >] filter association
+    ] shield
+   ;; now group by relevant line
+   [count] dive 0 swap 1 range [swap [linked-line?] filter] map
+  ]
+  let execute
 #+end_src
 
 #+RESULTS:
 #+begin_src kcats
-[[[[attribute subjects]
-   [entity book?]
-   [index 0]
-   [value love]]
-  []]
- [title? author-first? author-last? birth-year?]]
-[[[[attribute title]
-   [entity book?]
-   [index 1]
-   [value title?]]
-  [[[attribute subjects]
-    [entity book?]
-    [index 0]
-    [value love]]]]
- [title? author-first? author-last? birth-year?]]
-[[[[attribute author-last]
-   [entity book?]
-   [index 2]
-   [value author-last?]]
-  [[[attribute subjects]
-    [entity book?]
-    [index 0]
-    [value love]]
-   [[attribute title]
-    [entity book?]
-    [index 1]
-    [value title?]]]]
- [title? author-first? author-last? birth-year?]]
-[[[[attribute author-first]
-   [entity book?]
-   [index 3]
-   [value author-first?]]
-  [[[attribute subjects]
-    [entity book?]
-    [index 0]
-    [value love]]
-   [[attribute title]
-    [entity book?]
-    [index 1]
-    [value title?]]
-   [[attribute author-last]
-    [entity book?]
-    [index 2]
-    [value author-last?]]]]
- [title? author-first? author-last? birth-year?]]
-[[[[attribute first-name]
-   [entity author?]
-   [index 4]
-   [value author-first?]]
-  [[[attribute subjects]
-    [entity book?]
-    [index 0]
-    [value love]]
-   [[attribute title]
-    [entity book?]
-    [index 1]
-    [value title?]]
-   [[attribute author-last]
-    [entity book?]
-    [index 2]
-    [value author-last?]]
-   [[attribute author-first]
-    [entity book?]
-    [index 3]
-    [value author-first?]]]]
- [title? author-first? author-last? birth-year?]]
-[[[[attribute last-name]
-   [entity author?]
-   [index 5]
-   [value author-last?]]
-  [[[attribute subjects]
-    [entity book?]
-    [index 0]
-    [value love]]
-   [[attribute title]
-    [entity book?]
-    [index 1]
-    [value title?]]
-   [[attribute author-last]
-    [entity book?]
-    [index 2]
-    [value author-last?]]
-   [[attribute author-first]
-    [entity book?]
-    [index 3]
-    [value author-first?]]
-   [[attribute first-name]
-    [entity author?]
-    [index 4]
-    [value author-first?]]]]
- [title? author-first? author-last? birth-year?]]
-[[[[attribute sex]
-   [entity author?]
-   [index 6]
-   [value f]]
-  [[[attribute subjects]
-    [entity book?]
-    [index 0]
-    [value love]]
-   [[attribute title]
-    [entity book?]
-    [index 1]
-    [value title?]]
-   [[attribute author-last]
-    [entity book?]
-    [index 2]
-    [value author-last?]]
-   [[attribute author-first]
-    [entity book?]
-    [index 3]
-    [value author-first?]]
-   [[attribute first-name]
-    [entity author?]
-    [index 4]
-    [value author-first?]]
-   [[attribute last-name]
-    [entity author?]
-    [index 5]
-    [value author-last?]]]]
- [title? author-first? author-last? birth-year?]]
-[[[[attribute birth-year]
-   [entity author?]
-   [index 7]
-   [value birth-year?]]
-  [[[attribute subjects]
-    [entity book?]
-    [index 0]
-    [value love]]
-   [[attribute title]
-    [entity book?]
-    [index 1]
-    [value title?]]
-   [[attribute author-last]
-    [entity book?]
-    [index 2]
-    [value author-last?]]
-   [[attribute author-first]
-    [entity book?]
-    [index 3]
-    [value author-first?]]
-   [[attribute first-name]
-    [entity author?]
-    [index 4]
-    [value author-first?]]
-   [[attribute last-name]
-    [entity author?]
-    [index 5]
-    [value author-last?]]
-   [[attribute sex]
-    [entity author?]
-    [index 6]
-    [value f]]]]
- [title? author-first? author-last? birth-year?]]
-[[":c0attribute" subjects]
- [":c0value" love]
- [":c1attribute" title]
- [":c2attribute" author-last]
- [":c3attribute" author-first]
- [":c4attribute" first-name]
- [":c5attribute" last-name]
- [":c6attribute" sex]
- [":c6value" f]
- [":c7attribute" birth-year]]
-"SELECT c1.value as \"title\", c3.value as \"author-first\", c2.value as \"author-last\", c7.value as \"birth-year\" from EAV as c0 JOIN EAV c1 ON c1.attribute = :c1attribute AND c0.entity = c1.entity JOIN EAV c2 ON c2.attribute = :c2attribute AND c0.entity = c2.entity AND c1.entity = c2.entity JOIN EAV c3 ON c3.attribute = :c3attribute AND c0.entity = c3.entity AND c1.entity = c3.entity AND c2.entity = c3.entity JOIN EAV c4 ON c4.attribute = :c4attribute AND c3.value = c4.value JOIN EAV c5 ON c5.attribute = :c5attribute AND c2.value = c5.value AND c4.entity = c5.entity JOIN EAV c6 ON c6.attribute = :c6attribute AND c6.value = :c6value AND c4.entity = c6.entity AND c5.entity = c6.entity JOIN EAV c7 ON c7.attribute = :c7attribute AND c4.entity = c7.entity AND c5.entity = c7.entity AND c6.entity = c7.entity WHERE c0.attribute = :c0attribute AND c0.value = :c0value"
+[[[book? [[0 0]
+          [1 0]
+          [2 0]
+          [3 0]]]
+  [subjects [[0 1]]]
+  [love [[0 2]]]]
+ [[title [[1 1]]]
+  [title? [[1 2]]]
+  [book? [[0 0]
+          [1 0]
+          [2 0]
+          [3 0]]]]
+ [[author-last? [[2 2]
+                 [5 2]]]
+  [book? [[0 0]
+          [1 0]
+          [2 0]
+          [3 0]]]
+  [author-last [[2 1]]]]
+ [[author-first [[3 1]]]
+  [author-first? [[3 2]
+                  [4 2]]]
+  [book? [[0 0]
+          [1 0]
+          [2 0]
+          [3 0]]]]
+ [[author? [[4 0]
+            [5 0]
+            [6 0]
+            [7 0]]]
+  [first-name [[4 1]]]
+  [author-first? [[3 2]
+                  [4 2]]]]
+ [[author? [[4 0]
+            [5 0]
+            [6 0]
+            [7 0]]]
+  [author-last? [[2 2]
+                 [5 2]]]
+  [last-name [[5 1]]]]
+ [[author? [[4 0]
+            [5 0]
+            [6 0]
+            [7 0]]]
+  [f [[6 2]]]
+  [sex [[6 1]]]]
+ [[author? [[4 0]
+            [5 0]
+            [6 0]
+            [7 0]]]
+  [birth-year [[7 1]]]
+  [birth-year? [[7 2]]]]]
+[[author-first [[3 1]]]
+ [author-first? [[3 2]
+                 [4 2]]]
+ [author-last [[2 1]]]
+ [author-last? [[2 2]
+                [5 2]]]
+ [author? [[4 0]
+           [5 0]
+           [6 0]
+           [7 0]]]
+ [birth-year [[7 1]]]
+ [birth-year? [[7 2]]]
+ [book? [[0 0]
+         [1 0]
+         [2 0]
+         [3 0]]]
+ [f [[6 2]]]
+ [first-name [[4 1]]]
+ [last-name [[5 1]]]
+ [love [[0 2]]]
+ [sex [[6 1]]]
+ [subjects [[0 1]]]
+ [title [[1 1]]]
+ [title? [[1 2]]]]
 #+end_src
 
-#+RESULTS:
 #+begin_src kcats
-[[definition [[entity attribute value]]]]
+  [[variable? [[[word?]
+                [string last \? =]] [execute] every?]]
+   [linked-line? [second [first] map set swap contains?]]
+   [slots [[entity attribute value]]]
+   [index->slot [slots indexed]]]
+  [[[book? subjects love]
+    [book? title title?]
+    [book? author-last author-last?]
+    [book? author-first author-first?]
+    [author? first-name author-first?]
+    [author? last-name author-last?]
+    [author? sex f]
+    [author? birth-year birth-year?]]
+   ;; add indices to the constraint rows and internal items
+   [indexed
+    [[1] [indexed] update] map
+    [] swap
+    ;; pull in the row number into each cell
+    [unwrap [swap prepend [swap pair] inject] map] map
+    ;; catenate
+    [joiner] assemble unwrap
+    ;; filter out non variables
+   ; [second variable?] filter
+    [unwrap wrap swap [put] swap prepend update] step
+    ;; anything with only 1 entry is not a link
+    ;[second count 1 >] filter association
+    ] shield
+   ;; now group by relevant line
+   [count] dive 0 swap 1 range [swap [linked-line?] filter] map
+  ]
+  let execute
 #+end_src
 
 #+begin_src kcats
