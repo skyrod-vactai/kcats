@@ -3487,6 +3487,25 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  /// A reducing function that loads modules one at a time. Takes an
+  /// existing env, loads the given module and returns the new env with
+  /// the dictionary that the module built on the stack.
+  fn load_module(mut env: Environment, module: &&str) -> Environment {
+      env.push(Word::derive(*module));
+      env.program.prepend(list!(
+          "dictionary",
+          "swap",
+          "decache",
+          "string",
+          "read",
+          "shielddown",
+      ));
+      let mut new_env = futures::executor::block_on(async move { axiom::eval(env).await });
+      println!("Env: {:?}", new_env);
+      let dict: dict::Dictionary = new_env.pop().try_fit().unwrap();
+      new_env.dictionary = dict;
+      new_env
+  }
   impl Default for Environment {
       /// Returns the default environment, which is the "standard"
       /// environment. It loads some standard libraries and core
@@ -3501,7 +3520,9 @@ internally, to keep track of things like the stack, program, lists etc.
               };
               env.load_core_modules()
                   .expect("failed to load core modules");
-              env.push(list!(
+              env.dictionary.add_builtins();
+
+              let mut env = vec![
                   "errors",
                   "environment-builtins",
                   "encode",
@@ -3511,33 +3532,17 @@ internally, to keep track of things like the stack, program, lists etc.
                   "methods",
                   "generators",
                   //"template",
-                  "debug" // END default namespace // another good candidate for lib
-              ));
+                  "debug", // END default namespace // another good candidate for lib
+              ]
+              .iter()
+              .fold(env, load_module);
 
-              // Here we can no longer modify our own dictionary, so
-              // here's what we do instead, we build a new dictionary
-              // and leave it on the stack. Then when finished we grab
-              // it at the end of this function.
-              // We also want to load a few optional (non-core) libs
-              env.program.prepend(list!(
-                  "dictionary",
-                  "swap",
-                  list!("decache", "string", "read", "shielddown"),
-                  "step"
-              ));
-
-              // There's a problem here: the builtins need to be added in a
-              // way that they don't get overwritten. They may need to get
-              // added piece by piece, somehow. Perhaps a hashmap that we
-              // can lookup values in as words get loaded, and specify
-              // they're builtin somehow (maybe [builtin yes], but just not
-              // having definition would also do it)
+              // need to do this again because we loaded some builtins
+              // above, need to add the rust definitions back that got
+              // overwritten.
               env.dictionary.add_builtins();
-              let mut env = futures::executor::block_on(async move { axiom::eval(env).await });
-              //print!("Env: {:?}", env);
-              let mut dict: dict::Dictionary = env.pop().try_fit().unwrap();
-              dict.add_builtins();
-              env.dictionary = dict;
+              print!("Env: {:?}", env);
+
               env
           });
           INST.clone()
@@ -6598,6 +6603,7 @@ We'll also define how to run unit tests.
       #[test_case("filter")]
       #[test_case("finished?" ; "is_finished")]
       #[test_case("first")]
+      #[test_case("flatten")]
       #[test_case("flip")]
       #[test_case("float")]
       #[test_case("floor")]
