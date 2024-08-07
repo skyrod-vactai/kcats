@@ -995,6 +995,12 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  impl Derive<ListContent> for Item {
+      fn derive(l: ListContent) -> Item {
+          List::derive(l).fit()
+      }
+  }
+
   impl DeriveIterator<Item> for List {
       fn derive_iter<I>(iter: I) -> Self
       where
@@ -4534,6 +4540,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   use dynfmt::{Format, SimpleCurlyFormat};
   use futures::future::FutureExt;
   use lazy_static::lazy_static;
+  use std::cmp::max;
   use std::collections::HashMap;
   use std::collections::VecDeque;
   use std::convert::Infallible;
@@ -4903,6 +4910,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("string?", Box::leak(Box::new(f_stack1(is_string)))),
           ("swap", Box::leak(Box::new(swap))),
           ("swapdown", Box::leak(Box::new(swapdown))),
+          ("template", Box::leak(Box::new(f_result(template)))),
           (
               "timer",
               Box::leak(Box::new(f_stack1(crate::types::container::pipe::channel::timer))),
@@ -6272,6 +6280,55 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       inner_env.resolver.extend(namespaces);
       env.push(inner_env);
       Ok(())
+  }
+
+  fn template(env: &mut Environment) -> Result<(), Error> {
+      let template: coll::List = env.pop().try_fit()?;
+      let mut last_stack_item_used = 0;
+
+      fn stackpoint(w: Word) -> Option<usize> {
+          let s = String::derive(w.clone());
+          if s.starts_with('*') {
+              s[1..]
+                  .parse::<usize>()
+                  .ok()
+                  .and_then(|n| if n > 0 { Some(n) } else { None })
+          } else {
+              None
+          }
+      }
+
+      fn substitute(stack: &Stack, i: &Item, last_stack_item_used: &mut usize) -> ItemResult {
+          match i {
+              Item::Word(w) => {
+                  if let Some(n) = stackpoint(w.clone()) {
+                      ,*last_stack_item_used = max(n, *last_stack_item_used);
+                      stack
+                          .get((n - 1) as usize)
+                          .ok_or_else(|| Error::list_count(n as Int))
+                          .map(|i| i.clone())
+                  } else {
+                      Ok(Item::Word(w.clone()))
+                  }
+              }
+              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(l))) => l
+                  .iter()
+                  .map(|i| substitute(stack, i, last_stack_item_used))
+                  .collect::<Result<coll::ListContent, Error>>()
+                  .map(|r| r.fit()),
+              i => Ok(i.clone()),
+          }
+      }
+
+      let filled = substitute(&env.stack, &(template.fit()), &mut last_stack_item_used)?;
+
+      env.pop_prog();
+      // pop all the used items
+      for _ in 0..last_stack_item_used {
+          env.pop();
+      }
+
+      Ok(env.push(Item::derive(filled)))
   }
 #+end_src
 *** Top level execution
