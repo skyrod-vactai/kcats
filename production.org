@@ -995,6 +995,12 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  impl Derive<ListContent> for Item {
+      fn derive(l: ListContent) -> Item {
+          List::derive(l).fit()
+      }
+  }
+
   impl DeriveIterator<Item> for List {
       fn derive_iter<I>(iter: I) -> Self
       where
@@ -2607,6 +2613,10 @@ internally, to keep track of things like the stack, program, lists etc.
       pub fn len(&self) -> usize {
           self.data.len()
       }
+
+      pub fn push(&mut self, key: assoc::KeyItem, value: Item) -> Option<Item> {
+          self.data.mutate().insert(key, value)
+      }
   }
 
   impl Derive<Infallible> for Error {
@@ -2911,7 +2921,7 @@ internally, to keep track of things like the stack, program, lists etc.
       /// of word definitions, not wrapped in a single list), and
       /// inserts all the definitions into the dictionary, with an
       /// optional namespace.
-      fn insert_core_module(&mut self, lexicon: String);
+      fn insert_core_module(&mut self, lexicon: String) -> Result<(), Error>;
 
       /// Takes a mapping of word to definition, and updates all the
       /// dictionary entries so that the word will call that definition
@@ -2969,9 +2979,9 @@ internally, to keep track of things like the stack, program, lists etc.
           d.extend(make_deletes(deletes));
       }
 
-      fn insert_core_module(&mut self, lexicon: String) {
+      fn insert_core_module(&mut self, lexicon: String) -> Result<(), Error> {
           //println!("Parsing: {}", lexicon);
-          let items = serialize::parse(lexicon).unwrap();
+          let items = serialize::parse(lexicon)?;
           for r in Box::new(items.iter().cloned()) {
               let (k, def): (assoc::KeyItem, Item) = r.try_fit().unwrap();
               let word: Word = k.try_fit().unwrap();
@@ -2988,6 +2998,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   })
                   .or_insert(new_entry2);
           }
+          Ok(())
       }
 
       fn insert_axiom_fns(&mut self, updates: Vec<(Word, Definition)>) {
@@ -3328,6 +3339,7 @@ internally, to keep track of things like the stack, program, lists etc.
               "stack" => Some(self.stack.clone().fit()),
               "program" => Some(self.program.clone().fit()),
               "dictionary" => Some(self.dictionary.clone().fit()),
+              "resolver" => Some(self.resolver.clone().fit()),
               _ => None,
           }
       }
@@ -3452,7 +3464,13 @@ internally, to keep track of things like the stack, program, lists etc.
 
           for &file_contents in &files {
               let lexicon = String::from_utf8_lossy(file_contents).into_owned();
-              self.dictionary.insert_core_module(lexicon);
+              match self.dictionary.insert_core_module(lexicon.clone()) {
+                  Ok(_) => {}
+                  Err(mut e) => {
+                      e.push("content".fit(), lexicon.fit());
+                      return Err(e);
+                  }
+              }
           }
           Ok(())
       }
@@ -3487,6 +3505,25 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  /// A reducing function that loads modules one at a time. Takes an
+  /// existing env, loads the given module and returns the new env with
+  /// the dictionary that the module built on the stack.
+  fn load_module(mut env: Environment, module: &&str) -> Environment {
+      env.push(Word::derive(*module));
+      env.program.prepend(list!(
+          "dictionary",
+          "swap",
+          "decache",
+          "string",
+          "read",
+          "shielddown",
+      ));
+      let mut new_env = futures::executor::block_on(async move { axiom::eval(env).await });
+      //println!("Env: {:?}", new_env);
+      let dict: dict::Dictionary = new_env.pop().try_fit().unwrap();
+      new_env.dictionary = dict;
+      new_env
+  }
   impl Default for Environment {
       /// Returns the default environment, which is the "standard"
       /// environment. It loads some standard libraries and core
@@ -3501,7 +3538,9 @@ internally, to keep track of things like the stack, program, lists etc.
               };
               env.load_core_modules()
                   .expect("failed to load core modules");
-              env.push(list!(
+              env.dictionary.add_builtins();
+
+              let mut env = vec![
                   "errors",
                   "environment-builtins",
                   "encode",
@@ -3510,34 +3549,19 @@ internally, to keep track of things like the stack, program, lists etc.
                   "pipes",
                   "methods",
                   "generators",
+                  "more-generators",
                   //"template",
-                  "debug" // END default namespace // another good candidate for lib
-              ));
+                  "debug", // END default namespace // another good candidate for lib
+              ]
+              .iter()
+              .fold(env, load_module);
 
-              // Here we can no longer modify our own dictionary, so
-              // here's what we do instead, we build a new dictionary
-              // and leave it on the stack. Then when finished we grab
-              // it at the end of this function.
-              // We also want to load a few optional (non-core) libs
-              env.program.prepend(list!(
-                  "dictionary",
-                  "swap",
-                  list!("decache", "string", "read", "shielddown"),
-                  "step"
-              ));
-
-              // There's a problem here: the builtins need to be added in a
-              // way that they don't get overwritten. They may need to get
-              // added piece by piece, somehow. Perhaps a hashmap that we
-              // can lookup values in as words get loaded, and specify
-              // they're builtin somehow (maybe [builtin yes], but just not
-              // having definition would also do it)
+              // need to do this again because we loaded some builtins
+              // above, need to add the rust definitions back that got
+              // overwritten.
               env.dictionary.add_builtins();
-              let mut env = futures::executor::block_on(async move { axiom::eval(env).await });
               //print!("Env: {:?}", env);
-              let mut dict: dict::Dictionary = env.pop().try_fit().unwrap();
-              dict.add_builtins();
-              env.dictionary = dict;
+
               env
           });
           INST.clone()
@@ -3693,6 +3717,7 @@ internally, to keep track of things like the stack, program, lists etc.
               ("stack".fit(), self.stack.fit()),
               ("program".fit(), self.program.fit()),
               ("dictionary".fit(), self.dictionary.fit()),
+              ("resolver".fit(), self.resolver.fit()),
           ];
           Box::new(v.into_iter())
       }
@@ -4515,6 +4540,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   use dynfmt::{Format, SimpleCurlyFormat};
   use futures::future::FutureExt;
   use lazy_static::lazy_static;
+  use std::cmp::max;
   use std::collections::HashMap;
   use std::collections::VecDeque;
   use std::convert::Infallible;
@@ -4884,6 +4910,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("string?", Box::leak(Box::new(f_stack1(is_string)))),
           ("swap", Box::leak(Box::new(swap))),
           ("swapdown", Box::leak(Box::new(swapdown))),
+          ("template", Box::leak(Box::new(f_result(template)))),
           (
               "timer",
               Box::leak(Box::new(f_stack1(crate::types::container::pipe::channel::timer))),
@@ -5184,7 +5211,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   env.program.prepend(p);
               }
           }
-          Err(e) => env.push(Item::derive(e)),
+          Err(e) => env.push(e),
       }
       env.fit()
   }
@@ -6254,6 +6281,101 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       env.push(inner_env);
       Ok(())
   }
+
+  fn template(env: &mut Environment) -> Result<(), Error> {
+      let template: coll::List = env.pop().try_fit()?;
+      let mut last_stack_item_used = 0;
+
+      fn stackpoint(w: Word) -> Option<(usize, bool)> {
+          let s = String::derive(w.clone());
+          //println!("string! {:?}", s);
+          if s.starts_with("**") {
+              //println!("Splice! {:?}", s);
+              s[2..]
+                  .parse::<usize>()
+                  .ok()
+                  .and_then(|n| if n > 0 { Some((n, true)) } else { None })
+          } else if s.starts_with('*') {
+              s[1..]
+                  .parse::<usize>()
+                  .ok()
+                  .and_then(|n| if n > 0 { Some((n, false)) } else { None })
+          } else {
+              None
+          }
+      }
+
+      /// Takes an accumulator that is a pair of the stack and the
+      /// compiled result so far, and then an item to incorporate. If
+      /// the item is a template placeholder, inserts or splices the
+      /// item from the stack.
+      fn splice(
+          acc: Result<(Stack, &mut usize, Vec<Item>), Error>,
+          i: Item,
+      ) -> Result<(Stack, &mut usize, Vec<Item>), Error> {
+          match acc {
+              Ok((stack, last_stack_item_used, mut list)) => match i {
+                  Item::Word(w) => {
+                      if let Some((n, is_splice)) = stackpoint(w.clone()) {
+                          ,*last_stack_item_used = max(n, *last_stack_item_used);
+                          let r = stack
+                              .get((n - 1) as usize)
+                              .ok_or_else(|| Error::list_count(n as Int))
+                              .map(|i| i.clone());
+                          match r {
+                              Ok(item) => {
+                                  if is_splice {
+                                      match item {
+                                          Item::Dispenser(coll::Dispenser::Sized(s)) => {
+                                              list.extend(s.into_iter())
+                                          }
+                                          Item::Receptacle(coll::Receptacle::Sized(s)) => {
+                                              list.extend(s.into_iter())
+                                          }
+                                          i => return Err(Error::expected("sized", i)),
+                                      }
+                                  } else {
+                                      list.push(item);
+                                  }
+                                  Ok((stack, last_stack_item_used, list))
+                              }
+                              Err(e) => Err(e),
+                          }
+                      } else {
+                          list.push(Item::Word(w.clone()));
+                          Ok((stack, last_stack_item_used, list))
+                      }
+                  }
+                  Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(l))) => {
+                      // recurse
+                      let (stack, last_stack_item_used, filled) = l.iter().cloned().fold(
+                          Ok((stack.clone(), last_stack_item_used, Vec::new())),
+                          splice,
+                      )?;
+                      list.push(coll::List::derive(filled).fit());
+                      Ok((stack, last_stack_item_used, list))
+                  }
+                  i => {
+                      list.push(i);
+                      Ok((stack, last_stack_item_used, list))
+                  }
+              },
+              Err(e) => Err(e),
+          }
+      }
+
+      let (_, last_stack_item_used, filled) = template.iter().cloned().fold(
+          Ok((env.stack.clone(), &mut last_stack_item_used, Vec::new())),
+          splice,
+      )?;
+      env.pop_prog();
+      // pop all the used items
+      for _ in 0..*last_stack_item_used {
+          env.pop();
+      }
+
+      Ok(env.push(coll::List::derive(filled)))
+  }
 #+end_src
 *** Top level execution
 We'll define the main module which reads input for the kcats
@@ -6598,6 +6720,7 @@ We'll also define how to run unit tests.
       #[test_case("filter")]
       #[test_case("finished?" ; "is_finished")]
       #[test_case("first")]
+      #[test_case("flatten")]
       #[test_case("flip")]
       #[test_case("float")]
       #[test_case("floor")]
@@ -10411,29 +10534,25 @@ that needs to go on the stack before the generator program. With =taker=
 the user provides the initial state because we don't know what it is in advance.
 
 #+begin_src kcats
-  [1 2 3 4 5] 2 2 partition generate
+  [a b c d e] [take] 2 2 partition generate
 #+end_src
 
 #+RESULTS:
 #+begin_src kcats
-[[asked [consume]]
+[[asked [taker]]
  [handled yes]
- [reason "not enough items on stack"]
+ [reason "word is not defined"]
  [type error]
- [unwound [generate [1] unwrap swap [[[positive?] [dec [generate] dive] [[]] if]]
-           unwrap swap [[]] unwrap swap clone [put [generate] dip swap clone] loop drop dropdown
-           dropdown [2] unwrap [2] unwrap
-           float [[]] unwrap swap swap drop shift]]]
-[[[take-chunk [[taker collect dropdown dropdown] join divedeep]]
-  [shift [[[count <=]
-           [swap 0 slice] [[]] if]
-          shield swap]]]
- [[] [over wrap take-chunk [join shift]
-      bail]
-  [[over] dive wrap take-chunk swap drop shift]
-  if]
- let]
-[1 2 3 4 5]
+ [unwound [taker collect dropdown dropdown [2] unwrap [2] unwrap float [[]] unwrap
+           swap swap drop shift]]]
+[[[dictionary dictionary_redacted]
+  [program [[] [over wrap take-chunk [join shift]
+                bail]
+            [[over] dive wrap take-chunk swap drop shift]
+            if]]
+  [resolver [#b64 "yO3LwN0ITlhqAj8T1IKcUqNoiQmEAyrBwbFpGixDtQ8="]]]
+ [stack] [snapshot] divedown assign environment evaluate [stack] lookup restore]
+2 [take] [a b c d e]
 #+end_src
 
 It's possible for partition to check if the state is present and
@@ -11077,6 +11196,21 @@ So I guess the challenge then is to be able to reuse it (eg inside map), which w
 [9 12 15 18 21 24 27 30 33]
 #+end_src
 
+**** Sandboxing
+In the context of how the rest of kcats works, I think sandboxing should work as follows:
+
+As always, when altering the dictionary, we can only do it in a new
+environment. Since environments and dictionaries are first class
+objects, it will always be possible to construct a dictionary with any
+word whose value is reachable from the current environment. Therefore
+in order to make a secure sandbox, we have to remove the values that
+we don't want used so that they are truly unreachable. That means
+overwriting words or deleting them from the dictionary and then
+creating a new environment from that reduced dictionary.
+
+As mentioned before, this is mostly about axiom words (that do things
+like access network etc). There isn't much point in obscuring derived
+words, since it's always possible to reconstruct it from axiom words.
 *** Implementation
 **** TODO take a dictionary and a program and execute the program with that dict
 **** TODO take a mapping of name to module and return a dictionary with those modules
@@ -11276,6 +11410,28 @@ Ok now let's refactor this into the form we want for =let=.
 21
 #+end_src
 
+Ok seems like we have a reasonable definition of =let= so what would a
+nested call look like? Would we even do this or just use actual modules?
+
+Let's say some local function has its own local function.
+
+#+begin_src kcats
+  [[cube [clone clone * *]]]
+  [2 + cube] let
+  [plus2cube] label
+  [4 plus2cube] let execute
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+216
+#+end_src
+
+**** TODO Fix partition module logic
+The problem is that =let= should modify the given program to wrap in a
+'using', so that the module is defined once and then the program can
+be run many times even with different dictionaries in different
+environments - the 'using' will just add one more module to the resolver.
 *** INPROGRESS inscribe currently re-defines words repeatedly at runtime
 - State "INPROGRESS" from "TODO"       [2024-02-08 Thu 17:17]
 **** INPROGRESS Current design
@@ -13248,8 +13404,15 @@ Extract one item from inner
 #+begin_src kcats
 [foo []]
 #+end_src
-** TODO Let doesn't inherit the current resolver
+** INPROGRESS Let doesn't inherit the current resolver
+- State "INPROGRESS" from "TODO"       [2024-08-04 Sun 09:33]
 We need to capture the resolver like we do with the dictionary and
 append to it. This is probably a code smell that says the resolver
 should be part of the dictionary. Just bite the bullet and make the
 dictionary a struct.
+** TODO Make templating a rust function
+Templating is important enough to make it a rust function. No kcats
+programs need to be called during the execution of templating so I
+think it's easily done in rust. Then that solves the chicken/egg
+problem where other stuff depends on template but template depends on
+it. 
