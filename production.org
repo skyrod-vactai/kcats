@@ -6286,49 +6286,95 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let template: coll::List = env.pop().try_fit()?;
       let mut last_stack_item_used = 0;
 
-      fn stackpoint(w: Word) -> Option<usize> {
+      fn stackpoint(w: Word) -> Option<(usize, bool)> {
           let s = String::derive(w.clone());
-          if s.starts_with('*') {
+          //println!("string! {:?}", s);
+          if s.starts_with("**") {
+              //println!("Splice! {:?}", s);
+              s[2..]
+                  .parse::<usize>()
+                  .ok()
+                  .and_then(|n| if n > 0 { Some((n, true)) } else { None })
+          } else if s.starts_with('*') {
               s[1..]
                   .parse::<usize>()
                   .ok()
-                  .and_then(|n| if n > 0 { Some(n) } else { None })
+                  .and_then(|n| if n > 0 { Some((n, false)) } else { None })
           } else {
               None
           }
       }
 
-      fn substitute(stack: &Stack, i: &Item, last_stack_item_used: &mut usize) -> ItemResult {
-          match i {
-              Item::Word(w) => {
-                  if let Some(n) = stackpoint(w.clone()) {
-                      ,*last_stack_item_used = max(n, *last_stack_item_used);
-                      stack
-                          .get((n - 1) as usize)
-                          .ok_or_else(|| Error::list_count(n as Int))
-                          .map(|i| i.clone())
-                  } else {
-                      Ok(Item::Word(w.clone()))
+      /// Takes an accumulator that is a pair of the stack and the
+      /// compiled result so far, and then an item to incorporate. If
+      /// the item is a template placeholder, inserts or splices the
+      /// item from the stack.
+      fn splice(
+          acc: Result<(Stack, &mut usize, Vec<Item>), Error>,
+          i: Item,
+      ) -> Result<(Stack, &mut usize, Vec<Item>), Error> {
+          match acc {
+              Ok((stack, last_stack_item_used, mut list)) => match i {
+                  Item::Word(w) => {
+                      if let Some((n, is_splice)) = stackpoint(w.clone()) {
+                          ,*last_stack_item_used = max(n, *last_stack_item_used);
+                          let r = stack
+                              .get((n - 1) as usize)
+                              .ok_or_else(|| Error::list_count(n as Int))
+                              .map(|i| i.clone());
+                          match r {
+                              Ok(item) => {
+                                  if is_splice {
+                                      match item {
+                                          Item::Dispenser(coll::Dispenser::Sized(s)) => {
+                                              list.extend(s.into_iter())
+                                          }
+                                          Item::Receptacle(coll::Receptacle::Sized(s)) => {
+                                              list.extend(s.into_iter())
+                                          }
+                                          i => return Err(Error::expected("sized", i)),
+                                      }
+                                  } else {
+                                      list.push(item);
+                                  }
+                                  Ok((stack, last_stack_item_used, list))
+                              }
+                              Err(e) => Err(e),
+                          }
+                      } else {
+                          list.push(Item::Word(w.clone()));
+                          Ok((stack, last_stack_item_used, list))
+                      }
                   }
-              }
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(l))) => l
-                  .iter()
-                  .map(|i| substitute(stack, i, last_stack_item_used))
-                  .collect::<Result<coll::ListContent, Error>>()
-                  .map(|r| r.fit()),
-              i => Ok(i.clone()),
+                  Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(l))) => {
+                      // recurse
+                      let (stack, last_stack_item_used, filled) = l.iter().cloned().fold(
+                          Ok((stack.clone(), last_stack_item_used, Vec::new())),
+                          splice,
+                      )?;
+                      list.push(coll::List::derive(filled).fit());
+                      Ok((stack, last_stack_item_used, list))
+                  }
+                  i => {
+                      list.push(i);
+                      Ok((stack, last_stack_item_used, list))
+                  }
+              },
+              Err(e) => Err(e),
           }
       }
 
-      let filled = substitute(&env.stack, &(template.fit()), &mut last_stack_item_used)?;
-
+      let (_, last_stack_item_used, filled) = template.iter().cloned().fold(
+          Ok((env.stack.clone(), &mut last_stack_item_used, Vec::new())),
+          splice,
+      )?;
       env.pop_prog();
       // pop all the used items
-      for _ in 0..last_stack_item_used {
+      for _ in 0..*last_stack_item_used {
           env.pop();
       }
 
-      Ok(env.push(Item::derive(filled)))
+      Ok(env.push(coll::List::derive(filled)))
   }
 #+end_src
 *** Top level execution
