@@ -38,15 +38,13 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.is_file() {
-                    if path.file_name().is_some() {
-                        let module_name = <PathBuf as AsRef<Path>>::as_ref(&path)
-                            .file_stem()
-                            .unwrap()
-                            .to_str()
-                            .unwrap();
-                        cache::put_from_path(&path, Some(module_name.to_string()))?;
-                    }
+                if path.is_file() && path.file_name().is_some() {
+                    let module_name = <PathBuf as AsRef<Path>>::as_ref(&path)
+                        .file_stem()
+                        .unwrap()
+                        .to_str()
+                        .unwrap();
+                    cache::put_from_path(&path, Some(module_name.to_string()))?;
                 }
             }
             Ok(())

@@ -287,7 +287,7 @@ internally, to keep track of things like the stack, program, lists etc.
   use std::collections::{HashMap, VecDeque};
 
   use std::fmt;
-  use std::hash::Hash;
+  use std::hash::{Hash, Hasher};
   use std::marker::Sync;
 
   use std::pin::Pin;
@@ -298,9 +298,10 @@ internally, to keep track of things like the stack, program, lists etc.
   /// A Word causes a kcats program to do something, usually taking some
   /// items derive the top of the stack, and using them to create new
   /// stack items. (examples: `swap`, `+`, `dip`).
-  #[derive(Clone, Eq, Hash, Debug, PartialOrd, Ord, Default)]
+  #[derive(Clone, Eq, Debug, PartialOrd, Ord, Default)]
   pub struct Word {
       pub data: Intern<String>,
+      pub quoted: bool,
       pub namespace: dict::Namespace,
   }
 
@@ -311,6 +312,12 @@ internally, to keep track of things like the stack, program, lists etc.
   impl PartialEq for Word {
       fn eq(&self, other: &Self) -> bool {
           self.data == other.data
+      }
+  }
+
+  impl Hash for Word {
+      fn hash<H: Hasher>(&self, state: &mut H) {
+          self.data.hash(state);
       }
   }
 
@@ -325,6 +332,7 @@ internally, to keep track of things like the stack, program, lists etc.
           Word {
               data: Intern::<String>::from(s),
               namespace: Default::default(),
+              quoted: false,
           }
       }
   }
@@ -2755,7 +2763,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   if s.len() != 2 {
                       Err(Error::list_count(2))
                   } else {
-                      let t = Word::try_derive(s.get(0).unwrap().clone())?;
+                      let t = Word::try_derive(s.front().unwrap().clone())?;
                       let n = Word::try_derive(s.get(1).unwrap().clone())?;
                       Ok(SpecElement {
                           elemtype: t,
@@ -2785,7 +2793,7 @@ internally, to keep track of things like the stack, program, lists etc.
               Err(Error::list_count(2))
           } else {
               Ok((
-                  StackSpec::try_derive(coll::List::try_derive(s.get(0).unwrap().clone())?)?,
+                  StackSpec::try_derive(coll::List::try_derive(s.front().unwrap().clone())?)?,
                   StackSpec::try_derive(coll::List::try_derive(s.get(1).unwrap().clone())?)?,
               ))
           }
@@ -2916,14 +2924,6 @@ internally, to keep track of things like the stack, program, lists etc.
       /// optional namespace.
       fn insert_core_module(&mut self, lexicon: String) -> Result<(), Error>;
 
-      /// Takes a mapping of word to definition, and updates all the
-      /// dictionary entries so that the word will call that definition
-      /// when the word is executed. The definitions should be Axiom
-      /// variants, since those are the ones we have to define in rust.
-      ///
-      /// This method is used during bootstrap of the default environment.
-      fn insert_axiom_fns(&mut self, updates: Vec<(Word, Definition)>);
-
       /// For stdlib words that are both built-in and part of a module
       /// that isn't necessarily loaded as part of the standard
       /// environment, we need to be able to link the word to its rust
@@ -2946,7 +2946,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
   impl Dict for Dictionary {
       fn diff(&self, newer: Dictionary) -> (Vec<(Word, Entry)>, Vec<Word>) {
-          diff_hashmaps(&self, &newer)
+          diff_hashmaps(self, &newer)
       }
 
       fn merge(&mut self, new: Dictionary, namespace: &Namespace) {
@@ -2955,20 +2955,20 @@ internally, to keep track of things like the stack, program, lists etc.
           let adds: Vec<_> = adds
               .into_iter()
               .map(|(mut w, e)| {
-                  w.namespace = namespace.clone();
+                  w.namespace = *namespace;
                   (w, e)
               })
               .collect();
           let deletes: Vec<_> = deletes
               .into_iter()
               .map(|mut w| {
-                  w.namespace = namespace.clone();
+                  w.namespace = *namespace;
                   w
               })
               .collect();
           let d = self.mutate();
 
-          d.extend(adds.into_iter());
+          d.extend(adds);
           d.extend(make_deletes(deletes));
       }
 
@@ -2994,23 +2994,15 @@ internally, to keep track of things like the stack, program, lists etc.
           Ok(())
       }
 
-      fn insert_axiom_fns(&mut self, updates: Vec<(Word, Definition)>) {
-          let dm = self.mutate();
-          for (w, f) in updates {
-              dm.entry(w).and_modify(|e| e.definition = f);
-          }
-      }
-
       fn add_builtins(&mut self) {
           let dm = self.mutate();
           for (bw, bd) in BUILTIN_FUNCTIONS.iter() {
-              dm.entry(bw.clone()).and_modify(|d| match &d.definition {
-                  Definition::Derived(dd) => {
+              dm.entry(bw.clone()).and_modify(|d| {
+                  if let Definition::Derived(dd) = &d.definition {
                       if dd.is_empty() {
                           d.definition = bd.clone();
                       }
                   }
-                  _ => {}
               });
           }
       }
@@ -3019,7 +3011,7 @@ internally, to keep track of things like the stack, program, lists etc.
           // if the word is already namespaced we're done
           if w.namespace.is_none() {
               for namespace in namespaces.iter() {
-                  w.namespace = namespace.clone();
+                  w.namespace = *namespace;
                   if self.contains_key(w) {
                       return;
                   }
@@ -3533,7 +3525,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   .expect("failed to load core modules");
               env.dictionary.add_builtins();
 
-              let mut env = vec![
+              let mut env = [
                   "errors",
                   "environment-builtins",
                   "encode",
@@ -3669,11 +3661,13 @@ internally, to keep track of things like the stack, program, lists etc.
                   continue;
               }
           }
-          let mut env = Environment::default();
-          env.stack = stack.unwrap_or_default();
-          env.program = program.unwrap_or_default();
-          env.dictionary = dictionary.unwrap_or_else(|| Environment::default().dictionary);
-          env.resolver = resolver.unwrap_or_default();
+
+          let env = Environment {
+              stack: stack.unwrap_or_default(),
+              program: program.unwrap_or_default(),
+              dictionary: dictionary.unwrap_or_else(|| Environment::default().dictionary),
+              resolver: resolver.unwrap_or_default(),
+          };
           Ok(env)
       }
   }
@@ -4040,7 +4034,7 @@ words for them (hashing, encryption, signing)
   }
 
   #[allow(dead_code)]
-  pub fn hash_bytes(contents: &Vec<u8>) -> Vec<u8> {
+  pub fn hash_bytes(contents: &[u8]) -> Vec<u8> {
       let mut hasher = sha2::Sha256::new();
       //let mut buffer = [0; 1024]; // Read in chunks of 1024 bytes
       let count = contents.len();
@@ -5243,14 +5237,23 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       env.fit()
   }
 
+  /// If it's a word, don't bother wrapping and
+  /// unwrapping, just flag it as quoted, and the
+  /// evaluator will just push it unexamined.
+  fn dip_quote(i: &mut Item) {
+      if let Item::Word(ref mut w) = i {
+          w.quoted = true;
+      }
+  }
+
   pub fn dip(mut env: Environment) -> Future<Environment> {
       match coll::List::try_derive(env.pop()) {
           Ok(program) => {
-              let item = env.pop();
+              let mut item = env.pop();
               let expr = env.program.mutate();
               expr.pop_front();
-              expr.push_front("unwrap".fit());
-              expr.push_front(list!(item).fit());
+              dip_quote(&mut item);
+              expr.push_front(item);
               env.program.prepend(program)
           }
           Err(e) => env.push(e),
@@ -5261,12 +5264,14 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   pub fn dipdown(mut env: Environment) -> Future<Environment> {
       match coll::List::try_derive(env.pop()) {
           Ok(program) => {
-              let item1 = env.pop();
-              let item2 = env.pop();
+              let mut item1 = env.pop();
+              let mut item2 = env.pop();
               let prog = env.program.mutate();
               prog.pop_front();
-              prog.push_front("unwrap".fit());
-              prog.push_front(list!(item2, item1).fit());
+              dip_quote(&mut item1);
+              dip_quote(&mut item2);
+              prog.push_front(item1);
+              prog.push_front(item2);
               env.program.prepend(program)
           }
           Err(e) => env.push(e),
@@ -5761,33 +5766,44 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       if let Some(val) = next_item {
           match val {
               Item::Word(word) => {
-                  let mut word = word.clone();
-                  env.dictionary.resolve_word(&mut word, &env.resolver);
-                  if let Some(dfn) = env.dictionary.get(&word) {
-                      {
-                          if let Some(spec) = &dfn.spec {
-                              //println!("Checking spec for {:?}: {:?}", word, spec.0);
-                              if let Err(e) = env.check_input_spec(&spec.0) {
-                                  env.push(e);
-                                  return env.fit();
-                              }
-                          } else {
-                              //  println!("No spec for {}!", word);
-                          }
-                          match &dfn.definition {
-                              dict::Definition::Axiom(a) => (*a)(env),
-                              dict::Definition::Derived(d) => {
-                                  let items = d.clone();
-                                  env.pop_prog();
-                                  env.program.prepend(items);
-                                  env.fit()
-                              }
-                          }
-                      }
-                  } else {
-                      let w = word.clone();
-                      env.push(Error::undefined(w));
+                  if word.quoted {
+                      // word was quoted (see axiom::dip), just push onto stack
+                      // and remove the quotedness
+                      let mut w = word.clone();
+                      env.pop_prog();
+
+                      w.quoted = false;
+                      env.push(w);
                       env.fit()
+                  } else {
+                      let mut word = word.clone();
+                      env.dictionary.resolve_word(&mut word, &env.resolver);
+                      if let Some(dfn) = env.dictionary.get(&word) {
+                          {
+                              if let Some(spec) = &dfn.spec {
+                                  //println!("Checking spec for {:?}: {:?}", word, spec.0);
+                                  if let Err(e) = env.check_input_spec(&spec.0) {
+                                      env.push(e);
+                                      return env.fit();
+                                  }
+                              } else {
+                                  //  println!("No spec for {}!", word);
+                              }
+                              match &dfn.definition {
+                                  dict::Definition::Axiom(a) => (*a)(env),
+                                  dict::Definition::Derived(d) => {
+                                      let items = d.clone();
+                                      env.pop_prog();
+                                      env.program.prepend(items);
+                                      env.fit()
+                                  }
+                              }
+                          }
+                      } else {
+                          let w = word.clone();
+                          env.push(Error::undefined(w));
+                          env.fit()
+                      }
                   }
               }
               _ => {
@@ -5805,7 +5821,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   fn reverse(s: coll::Sized) -> Result<coll::Sized, Error> {
       match s {
-          coll::Sized::List(l) => Ok(coll::List::derive_iter(l.iter().rev().cloned()).fit()),
+          coll::Sized::List(mut l) => Ok({
+              l.reverse();
+              l.fit()
+          }),
           coll::Sized::String(s) => Ok(s.chars().rev().collect::<String>().fit()),
           coll::Sized::Bytes(b) => Ok(b.into_iter().rev().collect::<Vec<u8>>().fit()),
           s => Err(Error::expected("ordered", s)),
@@ -6259,15 +6278,12 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       fn stackpoint(w: Word) -> Option<(usize, bool)> {
           let s = String::derive(w.clone());
           //println!("string! {:?}", s);
-          if s.starts_with("**") {
-              //println!("Splice! {:?}", s);
-              s[2..]
-                  .parse::<usize>()
+          if let Some(slot) = s.strip_prefix("**") {
+              slot.parse::<usize>()
                   .ok()
                   .and_then(|n| if n > 0 { Some((n, true)) } else { None })
-          } else if s.starts_with('*') {
-              s[1..]
-                  .parse::<usize>()
+          } else if let Some(slot) = s.strip_prefix("*") {
+              slot.parse::<usize>()
                   .ok()
                   .and_then(|n| if n > 0 { Some((n, false)) } else { None })
           } else {
@@ -6289,18 +6305,18 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       if let Some((n, is_splice)) = stackpoint(w.clone()) {
                           ,*last_stack_item_used = max(n, *last_stack_item_used);
                           let r = stack
-                              .get((n - 1) as usize)
+                              .get(n - 1)
                               .ok_or_else(|| Error::list_count(n as Int))
-                              .map(|i| i.clone());
+                              .cloned();
                           match r {
                               Ok(item) => {
                                   if is_splice {
                                       match item {
                                           Item::Dispenser(coll::Dispenser::Sized(s)) => {
-                                              list.extend(s.into_iter())
+                                              list.extend(s)
                                           }
                                           Item::Receptacle(coll::Receptacle::Sized(s)) => {
-                                              list.extend(s.into_iter())
+                                              list.extend(s)
                                           }
                                           i => return Err(Error::expected("sized", i)),
                                       }
@@ -6343,8 +6359,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       for _ in 0..*last_stack_item_used {
           env.pop();
       }
-
-      Ok(env.push(coll::List::derive(filled)))
+      env.push(coll::List::derive(filled));
+      Ok(())
   }
 #+end_src
 *** Top level execution
@@ -7668,12 +7684,13 @@ Implement the =handoff= type
   }
 
   enum ChannelOp<T> {
-      Send(Arc<flume::Sender<T>>, usize, T),
-      Receive(Arc<flume::Receiver<T>>, usize),
+      Send(Arc<flume::Sender<T>>, T),
+      Receive(Arc<flume::Receiver<T>>),
   }
-  // Given a list of pipes (channels) on top of stack, use flume's
-  // selector to choose the next ready pipe.  A pipe means it's a
-  // receive, a pipe/item pair means it's a send.
+
+  /// Given a list of pipes (channels) on top of stack, use flume's
+  /// selector to choose the next ready pipe.  A pipe means it's a
+  /// receive, a pipe/item pair means it's a send.
   pub fn select(i: Item) -> axiom::ItemResult {
       let l = coll::List::try_derive(i)?;
       let original = l.clone();
@@ -7682,35 +7699,33 @@ Implement the =handoff= type
       let lr = l
           .iter()
           .cloned()
-          .enumerate()
-          .map(move |(idx, i)| match i {
+          .map(move |i| match i {
               Item::Dispenser(coll::Dispenser::Out(pipe::Out::Handoff(p))) => {
-                  Ok(ChannelOp::Receive(Arc::new(p.receiver.unwrap()), idx))
+                  Ok(ChannelOp::Receive(Arc::new(p.receiver.unwrap())))
               }
               Item::Dispenser(coll::Dispenser::Tunnel(pipe::Tunnel::Handoff(p))) => {
-                  Ok(ChannelOp::Receive(Arc::new(p.receiver.unwrap()), idx))
+                  Ok(ChannelOp::Receive(Arc::new(p.receiver.unwrap())))
               }
               // Handle timeout channels - start the timer and add receive op
               Item::Dispenser(coll::Dispenser::Out(pipe::Out::Timer(t))) => {
                   let mut t = t.clone();
                   t.start();
-                  Ok(ChannelOp::Receive(Arc::new(t.receiver.unwrap()), idx))
+                  Ok(ChannelOp::Receive(Arc::new(t.receiver.unwrap())))
               }
               i => {
                   let l = coll::List::try_derive(i.clone())?;
-                  let p = l.get(0);
+                  let p = l.front();
                   let i = l.get(1);
                   match (p, i) {
                       (Some(p), Some(i)) => match (p, i) {
                           (Item::Receptacle(coll::Receptacle::In(pipe::In::Handoff(p))), i) => Ok(
-                              ChannelOp::Send(Arc::new(p.sender.clone().unwrap()), idx, i.clone()),
+                              ChannelOp::Send(Arc::new(p.sender.clone().unwrap()), i.clone()),
                           ),
                           (
                               Item::Receptacle(coll::Receptacle::Tunnel(pipe::Tunnel::Handoff(p))),
                               i,
                           ) => Ok(ChannelOp::Send(
                               Arc::new(p.sender.clone().unwrap()),
-                              idx,
                               i.clone(),
                           )),
                           (p, _i) => Err(error::Error::expected("handoff", p.clone())),
@@ -7730,12 +7745,12 @@ Implement the =handoff= type
           for (idx, item) in lr.iter().enumerate() {
               let idx_clone = idx;
               match &item {
-                  ChannelOp::Receive(r, _) => {
+                  ChannelOp::Receive(r) => {
                       selector = selector.recv(&**r, move |i| {
                           (i.map(Some).map_err(error::Error::from), idx_clone)
                       });
                   }
-                  ChannelOp::Send(s, _, i) => {
+                  ChannelOp::Send(s, i) => {
                       selector = selector.send(&**s, i.clone(), move |i| {
                           (i.map(|_| None).map_err(error::Error::from), idx)
                       });
@@ -13415,3 +13430,42 @@ problem where other stuff depends on template but template depends on
 it. 
 ** TODO Add description to each example :testing:
 ** TODO Add integration tests :testing:
+** TODO Size of option enums
+#+begin_src rust :toolchain 'stable :crates '((internment . "0.6"))
+  use std::mem;
+  extern crate internment;
+  use internment::Intern;
+
+  fn main() {
+      // Let's suppose this is our large type
+      struct MyLargeType(Vec<u8>);
+
+      // Using Intern to intern Vec<u8>
+      type InternedLargeType = Intern<Vec<u8>>;
+
+      // Size of Intern<Vec<u8>>
+      println!("Size of Intern<Vec<u8>>: {}", mem::size_of::<Intern<Vec<u8>>>());
+
+      // Size of Option<Intern<Vec<u8>>>
+      println!("Size of Option<Intern<Vec<u8>>>: {}", mem::size_of::<Option<Intern<Vec<u8>>>>());
+
+      // Example using MyLargeType with Intern
+      let interned_value: InternedLargeType = Intern::new(vec![0; 32]);
+      let instance_with_intern = Option::Some(interned_value);
+      println!("Size of instance_with_intern: {}", mem::size_of_val(&instance_with_intern));
+
+      // Another way to illustrate
+      let interned_value_none: Option<InternedLargeType> = Option::None;
+      let interned_value_some: Option<InternedLargeType> = Option::Some(Intern::new(vec![0; 32]));
+
+      println!("Size of interned_value_none: {}", mem::size_of_val(&interned_value_none));
+      println!("Size of interned_value_some: {}", mem::size_of_val(&interned_value_some));
+  }
+#+end_src
+
+#+RESULTS:
+: Size of Intern<Vec<u8>>: 8
+: Size of Option<Intern<Vec<u8>>>: 8
+: Size of instance_with_intern: 8
+: Size of interned_value_none: 8
+: Size of interned_value_some: 8
