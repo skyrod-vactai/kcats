@@ -1037,6 +1037,19 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  /// A trait for joining two values together. There are some precedence rules:
+  ///
+  /// 1. If there are two different types being joined, the type that is
+  /// returned is either the most specialized types of the two being
+  /// joined, or the most specialized type that's possible to construct
+  /// given the two values. (For example, joining a Set with a List, or
+  /// vice versa, will always be a Set. Joining an Association with a
+  /// Dictionary will be an Associative enum but the variant will depend
+  /// on whether the Association data fits the schema of a
+  /// Dictionary. If so, it will be Dictionary, otherwise Assoc.)
+  ///
+  /// 2. If the result type is keyed, (eg, Map or Set or struct types),
+  /// the RHS argument's keys take precedence over self's.
   pub trait Join<RHS> {
       type Output;
       type Error;
@@ -1078,6 +1091,90 @@ internally, to keep track of things like the stack, program, lists etc.
           let am = self.mutate();
           am.extend(rhs.iter().cloned());
           Ok(self)
+      }
+  }
+
+  impl Join<List> for assoc::Associative {
+      type Output = assoc::Associative;
+      type Error = Error;
+      fn join(self, other: List) -> Result<Self::Output, Error> {
+          let la =
+              assoc::Associative::Assoc(assoc::Association::try_from_iter(other.iter().cloned())?);
+          self.join(la)
+      }
+  }
+
+  impl Join<assoc::Associative> for List {
+      type Output = assoc::Associative;
+      type Error = Error;
+      fn join(self, other: assoc::Associative) -> Result<Self::Output, Error> {
+          println!("self: {:?}, other: {:?}", self, other);
+          let sa =
+              assoc::Associative::Assoc(assoc::Association::try_from_iter(self.iter().cloned())?);
+          sa.join(other)
+      }
+  }
+
+  /// Joining a List with a Set will be a set.
+  impl Join<Set> for List {
+      type Output = Set;
+      type Error = Error;
+      fn join(self, mut other: Set) -> Result<Self::Output, Error> {
+          let bm = other.mutate();
+
+          bm.extend(
+              self.iter()
+                  .cloned()
+                  .map(assoc::KeyItem::try_derive)
+                  .collect::<Result<Vec<assoc::KeyItem>, Error>>()?,
+          );
+          Ok(other)
+      }
+  }
+
+  /// Joins two containers into one. If the containers are different
+  /// types, generally the result is the variant of the first argument.
+  impl Join<Sized> for Sized {
+      type Output = Sized;
+      type Error = Error;
+
+      fn join(self, other: Sized) -> Result<Self::Output, Self::Error> {
+          Ok(match (self, other) {
+              (Sized::Associative(a), Sized::List(l)) => Sized::Associative(a.join(l)?),
+              (Sized::List(l), Sized::Associative(a)) => Sized::Associative(l.join(a)?),
+              (Sized::Associative(a), Sized::Associative(b)) => Sized::Associative(a.join(b)?),
+              (Sized::List(a), Sized::List(b)) => Sized::List(a.join(b)?),
+              (Sized::Set(a), Sized::Set(b)) => Sized::Set(a.join(b)?),
+              (Sized::List(a), Sized::Set(b)) => Sized::Set(a.join(b)?),
+              (Sized::Set(mut a), Sized::List(b)) => {
+                  let am = a.mutate();
+
+                  am.extend(
+                      b.iter()
+                          .cloned()
+                          .map(assoc::KeyItem::try_derive)
+                          .collect::<Result<Vec<assoc::KeyItem>, Error>>()?,
+                  );
+                  Sized::Set(a)
+              }
+              (Sized::String(mut a), Sized::String(b)) => {
+                  a.push_str(&b);
+                  Sized::String(a)
+              }
+              (Sized::Bytes(mut a), Sized::Bytes(b)) => {
+                  a.extend(b);
+                  Sized::Bytes(a)
+              }
+              (s, other) => {
+                  if s.is_empty() {
+                      other
+                  } else if other.is_empty() {
+                      s
+                  } else {
+                      Err(Error::expected("joinable", list!(s, other)))?
+                  }
+              }
+          })
       }
   }
   pub trait Container<T> {
@@ -1362,67 +1459,6 @@ internally, to keep track of things like the stack, program, lists etc.
               })),
               (Sized::String(_), i) => Err(Error::expected("char", i)),
           }
-      }
-
-      /// Joins two containers into one. If the containers are different
-      /// types, generally the result is the type of the first argument.
-      pub fn join(self, other: Sized) -> Result<Sized, Error> {
-          Ok(match (self, other) {
-              (Sized::Associative(a), Sized::List(l)) => {
-                  let la = assoc::Associative::Assoc(assoc::Association::try_from_iter(
-                      l.iter().cloned(),
-                  )?);
-                  Sized::Associative(a.join(la))
-              }
-              (Sized::List(l), Sized::Associative(a)) => {
-                  let la = assoc::Associative::Assoc(assoc::Association::try_from_iter(
-                      l.iter().cloned(),
-                  )?);
-                  Sized::Associative(la.join(a))
-              }
-              (Sized::Associative(a), Sized::Associative(b)) => Sized::Associative(a.join(b)),
-              (Sized::List(a), Sized::List(b)) => Sized::List(a.join(b)?),
-              (Sized::Set(a), Sized::Set(b)) => Sized::Set(a.join(b)?),
-              (Sized::List(a), Sized::Set(mut b)) => {
-                  let bm = b.mutate();
-
-                  bm.extend(
-                      a.iter()
-                          .cloned()
-                          .map(assoc::KeyItem::try_derive)
-                          .collect::<Result<Vec<assoc::KeyItem>, Error>>()?,
-                  );
-                  Sized::Set(b)
-              }
-              (Sized::Set(mut a), Sized::List(b)) => {
-                  let am = a.mutate();
-
-                  am.extend(
-                      b.iter()
-                          .cloned()
-                          .map(assoc::KeyItem::try_derive)
-                          .collect::<Result<Vec<assoc::KeyItem>, Error>>()?,
-                  );
-                  Sized::Set(a)
-              }
-              (Sized::String(mut a), Sized::String(b)) => {
-                  a.push_str(&b);
-                  Sized::String(a)
-              }
-              (Sized::Bytes(mut a), Sized::Bytes(b)) => {
-                  a.extend(b);
-                  Sized::Bytes(a)
-              }
-              (s, other) => {
-                  if s.is_empty() {
-                      other
-                  } else if other.is_empty() {
-                      s
-                  } else {
-                      Err(Error::expected("joinable", list!(s, other)))?
-                  }
-              }
-          })
       }
 
       /// Returns whether this container contains the given [Item].
@@ -1976,6 +2012,15 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  // impl coll::Join<Association> for Associative {
+  //     type Output = Associative;
+  //     type Error = Infallible;
+  //     fn join(self, other: Association) -> Result<Self::Output, Error> {
+  //         let la = Association::try_from_iter(other.iter().cloned())?;
+  //         self.join(Associative::Assoc(la))
+  //     }
+  // }
+
   impl coll::Join<Associative> for Association {
       type Output = Association;
       type Error = Infallible;
@@ -1986,12 +2031,40 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  /// The join operation is for generic containers, but we can join
+  /// two Associatives by merging them together. If both
+  /// Associatives are the same specific type, the type is
+  /// preserved. If `other` can be converted to the same specific
+  /// type as `self`, that conversion will be done and the specific
+  /// type of `self` is preserved. If they are different types and we
+  /// can't convert `other` to `self`s type, the result will be
+  /// demoted to a more generic form.
+  ///
+  /// Keys in `other` have priority over those in `self` - if a key
+  /// is in both containers, the result will have only the value
+  /// from `other`.
   impl coll::Join<Associative> for Associative {
       type Output = Associative;
       type Error = Infallible;
       fn join(self, other: Associative) -> Result<Self::Output, Error> {
-          let thisa: Association = self.fit();
-          Ok(Associative::Assoc(thisa).join(other))
+          Ok(match (self, other) {
+              // same type means 2nd one wins.
+              //TODO: a little more complex for types that can be extended
+              (Associative::DictEntry(_), Associative::DictEntry(other)) => {
+                  Associative::DictEntry(other)
+              }
+              (Associative::Dictionary(this), Associative::Dictionary(other)) => {
+                  Associative::Dictionary(this.join(other).unwrap())
+              }
+              (Associative::Dictionary(this), Associative::Assoc(other)) => this.join(other).unwrap(),
+              (Associative::Assoc(this), Associative::Dictionary(other)) => this.join(other).unwrap(),
+              (Associative::Error(_), Associative::Error(other)) => Associative::Error(other),
+              (Associative::Env(_), Associative::Env(other)) => Associative::Env(other),
+              (Associative::Nothing, Associative::Nothing) => Associative::Nothing,
+              // This is infallible so .unwrap should be safe
+              (Associative::Assoc(this), other) => Associative::Assoc(this.join(other).unwrap()),
+              (this, other) => Join::join(this, other).unwrap(),
+          })
       }
   }
 
@@ -2105,51 +2178,6 @@ internally, to keep track of things like the stack, program, lists etc.
                   let entry: (KeyItem, Item) = other.try_fit()?;
                   Ok(this.insert(entry.0, entry.1).0)
               }
-          }
-      }
-
-      /// The join operation is for generic containers, but we can join
-      /// two Associatives by merging them together. If both
-      /// Associatives are the same specific type, the type is
-      /// preserved. If `other` can be converted to the same specific
-      /// type as `self`, that conversion will be done and the specific
-      /// type of `self` is preserved. If they are different types and we
-      /// can't convert `other` to `self`s type, the result will be
-      /// demoted to a more generic form.
-      ///
-      /// Keys in `other` have priority over those in `self` - if a key
-      /// is in both containers, the result will have only the value
-      /// from `other`.
-      pub fn join(self, other: Associative) -> Associative {
-          match (self, other) {
-              // same type means 2nd one wins.
-              //TODO: a little more complex for types that can be extended
-              (Associative::DictEntry(_), Associative::DictEntry(other)) => {
-                  Associative::DictEntry(other)
-              }
-              (Associative::Dictionary(this), Associative::Dictionary(other)) => {
-                  Associative::Dictionary(this.join(other).unwrap())
-              }
-              (Associative::Dictionary(this), Associative::Assoc(other)) => this.join(other).unwrap(),
-              (Associative::Assoc(this), Associative::Dictionary(mut dict)) => {
-                  // Try to convert to dictionary type
-                  //println!("assoc + dict join");
-                  match this.convert::<Word, dict::Entry>() {
-                      Ok(d) => {
-                          let tm = dict.mutate();
-                          tm.extend(d);
-                          Associative::Dictionary(dict)
-                      }
-                      // TODO: convert the other way (to assoc) instead
-                      Err(_) => Associative::Dictionary(dict),
-                  }
-              }
-              (Associative::Error(_), Associative::Error(other)) => Associative::Error(other),
-              (Associative::Env(_), Associative::Env(other)) => Associative::Env(other),
-              (Associative::Nothing, Associative::Nothing) => Associative::Nothing,
-              // This is infallible so .unwrap should be safe
-              (Associative::Assoc(this), other) => Associative::Assoc(this.join(other).unwrap()),
-              (this, other) => Join::join(this, other).unwrap(),
           }
       }
 
@@ -3159,6 +3187,24 @@ internally, to keep track of things like the stack, program, lists etc.
                   Ok(assoc::Associative::Dictionary(self))
               }
           }
+      }
+  }
+
+  impl coll::Join<Dictionary> for assoc::Association {
+      type Output = assoc::Associative;
+      type Error = Infallible;
+      fn join(self, mut other: Dictionary) -> Result<Self::Output, Error> {
+          // Try to convert to dictionary type
+          //println!("assoc + dict join");
+          Ok(match self.convert::<Word, dict::Entry>() {
+              Ok(d) => {
+                  let tm = other.mutate();
+                  tm.extend(d.iter().map(owned));
+                  assoc::Associative::Dictionary(other)
+              }
+              // TODO: convert the other way (to assoc) instead
+              Err(_) => assoc::Associative::Dictionary(other),
+          })
       }
   }
 
@@ -4610,7 +4656,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   use crate::types::container::pipe::db;
   use crate::types::container::{
       self as coll, associative as assoc, dictionary as dict, environment::Environment, error::Error,
-      pipe, Mutey, Ordered,
+      pipe, Join, Mutey, Ordered,
   };
   use crate::types::number::{Float, Int, Number};
   use crate::types::*;
