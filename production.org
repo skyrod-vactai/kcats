@@ -973,6 +973,7 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::types::number::{Int, Number};
   use crate::types::*;
 
+  use std::convert::Infallible;
   use std::{collections::HashSet, future, sync};
   use sync::Arc;
 
@@ -1033,6 +1034,72 @@ internally, to keep track of things like the stack, program, lists etc.
   {
       fn fresh() -> Self {
           Arc::new(T::default())
+      }
+  }
+
+  pub trait Join<RHS> {
+      type Output;
+      type Error;
+      fn join(self, rhs: RHS) -> Result<Self::Output, Error>;
+  }
+
+  impl Join<&str> for String {
+      type Output = String;
+      type Error = Infallible;
+      fn join(mut self, rhs: &str) -> Result<Self::Output, Error> {
+          self.push_str(rhs);
+          Ok(self)
+      }
+  }
+
+  impl Join<char> for String {
+      type Output = String;
+      type Error = Infallible;
+      fn join(mut self, rhs: char) -> Result<Self::Output, Error> {
+          self.push(rhs);
+          Ok(self)
+      }
+  }
+
+  impl Join<List> for List {
+      type Output = List;
+      type Error = Infallible;
+      fn join(mut self, rhs: List) -> Result<Self::Output, Error> {
+          let am = self.mutate();
+          am.extend(rhs.iter().cloned());
+          Ok(self)
+      }
+  }
+
+  impl Join<Set> for Set {
+      type Output = Set;
+      type Error = Infallible;
+      fn join(mut self, rhs: Set) -> Result<Self::Output, Error> {
+          let am = self.mutate();
+          am.extend(rhs.iter().cloned());
+          Ok(self)
+      }
+  }
+  pub trait Container<T> {
+      fn len(&self) -> usize;
+      fn has(&self, item: &T) -> bool;
+  }
+
+  pub trait Take<T> {
+      fn take(&mut self) -> T;
+  }
+
+  pub trait Put<T> {
+      fn put(&mut self, item: T);
+  }
+
+  impl Container<char> for String {
+      fn len(&self) -> usize {
+          self.len()
+      }
+
+      fn has(&self, item: &char) -> bool {
+          self.contains(*item)
       }
   }
 
@@ -1192,11 +1259,11 @@ internally, to keep track of things like the stack, program, lists etc.
       /// Returns the number of items in the container.
       pub fn len(&self) -> usize {
           match self {
-              Sized::Associative(a) => a.len(),
-              Sized::List(l) => l.len(),
-              Sized::String(s) => s.len(),
-              Sized::Bytes(b) => b.len(),
-              Sized::Set(s) => s.len(),
+              Self::Associative(a) => a.len(),
+              Self::List(l) => l.len(),
+              Self::String(s) => s.len(),
+              Self::Bytes(b) => b.len(),
+              Self::Set(s) => s.len(),
           }
       }
 
@@ -1205,7 +1272,7 @@ internally, to keep track of things like the stack, program, lists etc.
       /// the front (beginning) of the container.
       pub fn take(self) -> (Self, Option<Item>) {
           match self {
-              Sized::Associative(a) => {
+              Self::Associative(a) => {
                   let (a, i) = a.take();
                   (Sized::Associative(a), i)
               }
@@ -1314,16 +1381,8 @@ internally, to keep track of things like the stack, program, lists etc.
                   Sized::Associative(la.join(a))
               }
               (Sized::Associative(a), Sized::Associative(b)) => Sized::Associative(a.join(b)),
-              (Sized::List(mut a), Sized::List(b)) => {
-                  let am = a.mutate();
-                  am.extend(b.iter().cloned());
-                  Sized::List(a)
-              }
-              (Sized::Set(mut a), Sized::Set(b)) => {
-                  let am = a.mutate();
-                  am.extend(b.iter().cloned());
-                  Sized::Set(a)
-              }
+              (Sized::List(a), Sized::List(b)) => Sized::List(a.join(b)?),
+              (Sized::Set(a), Sized::Set(b)) => Sized::Set(a.join(b)?),
               (Sized::List(a), Sized::Set(mut b)) => {
                   let bm = b.mutate();
 
@@ -1383,14 +1442,8 @@ internally, to keep track of things like the stack, program, lists etc.
                   assoc::KeyItem::try_derive(other.clone()).map_or(false, |k| s.contains(&k))
               }
               (Sized::String(container), other) => match other {
-                  Item::Char(c) => container.contains(*c),
-                  i => {
-                      let s = String::try_derive(i.clone());
-                      match s {
-                          Ok(s) => container.contains(&s),
-                          Err(_) => false,
-                      }
-                  }
+                  Item::Char(c) => container.has(c),
+                  _ => false,
               },
               _ => false,
           }
@@ -1769,9 +1822,10 @@ internally, to keep track of things like the stack, program, lists etc.
   use super::{dictionary as dict, environment as env};
   use crate::traits::*;
   use crate::types::container as coll;
-  use crate::types::container::Mutey;
+  use crate::types::container::{Join, Mutey};
   use crate::types::number::{Int, Number};
   use crate::types::*;
+  use std::convert::Infallible;
   use std::sync;
 
   pub type Associationy<K, V> = HashMap<K, V>;
@@ -1913,6 +1967,34 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  impl coll::Join<coll::List> for Association {
+      type Output = Association;
+      type Error = Error;
+      fn join(self, other: coll::List) -> Result<Self::Output, Error> {
+          let la = Association::try_from_iter(other.iter().cloned())?;
+          self.join(Associative::Assoc(la))
+      }
+  }
+
+  impl coll::Join<Associative> for Association {
+      type Output = Association;
+      type Error = Infallible;
+      fn join(mut self, other: Associative) -> Result<Self::Output, Error> {
+          let thism = self.mutate();
+          thism.extend(other.to_iter());
+          Ok(self)
+      }
+  }
+
+  impl coll::Join<Associative> for Associative {
+      type Output = Associative;
+      type Error = Infallible;
+      fn join(self, other: Associative) -> Result<Self::Output, Error> {
+          let thisa: Association = self.fit();
+          Ok(Associative::Assoc(thisa).join(other))
+      }
+  }
+
   impl Associative {
       /// Retuns the number of associations in the container
       pub fn len(&self) -> usize {
@@ -2045,31 +2127,10 @@ internally, to keep track of things like the stack, program, lists etc.
               (Associative::DictEntry(_), Associative::DictEntry(other)) => {
                   Associative::DictEntry(other)
               }
-              (Associative::Dictionary(mut this), Associative::Dictionary(other)) => {
-                  let thism = coll::Arc::mutate(&mut this);
-                  thism.extend(
-                      other
-                          .iter()
-                          .map(|(key, value)| (key.clone(), value.clone())),
-                  );
-                  Associative::Dictionary(this)
+              (Associative::Dictionary(this), Associative::Dictionary(other)) => {
+                  Associative::Dictionary(this.join(other).unwrap())
               }
-              (Associative::Dictionary(mut this), Associative::Assoc(other)) => {
-                  // Try to convert to dictionary type
-                  //println!("dict + assoc join");
-                  match other.convert::<Word, dict::Entry>() {
-                      Ok(d) => {
-                          let tm = this.mutate();
-                          tm.extend(d);
-                          Associative::Dictionary(this)
-                      }
-                      // TODO: convert the other way (to assoc) instead
-                      Err(e) => {
-                          println!("Conversion error: {:?}", e);
-                          Associative::Dictionary(this)
-                      }
-                  }
-              }
+              (Associative::Dictionary(this), Associative::Assoc(other)) => this.join(other).unwrap(),
               (Associative::Assoc(this), Associative::Dictionary(mut dict)) => {
                   // Try to convert to dictionary type
                   //println!("assoc + dict join");
@@ -2086,15 +2147,9 @@ internally, to keep track of things like the stack, program, lists etc.
               (Associative::Error(_), Associative::Error(other)) => Associative::Error(other),
               (Associative::Env(_), Associative::Env(other)) => Associative::Env(other),
               (Associative::Nothing, Associative::Nothing) => Associative::Nothing,
-              (Associative::Assoc(mut this), other) => {
-                  let thism = this.mutate();
-                  thism.extend(other.to_iter());
-                  Associative::Assoc(this)
-              }
-              (this, other) => {
-                  let thisa: Association = this.fit();
-                  (Associative::Assoc(thisa)).join(other)
-              }
+              // This is infallible so .unwrap should be safe
+              (Associative::Assoc(this), other) => Associative::Assoc(this.join(other).unwrap()),
+              (this, other) => Join::join(this, other).unwrap(),
           }
       }
 
@@ -2376,7 +2431,7 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  trait Convert<KA, VA> {
+  pub trait Convert<KA, VA> {
       /// Convert from any type of hashmap to any other, assuming the keys
       /// and values convert
       fn convert<KB, VB>(&self) -> Result<HashMap<KB, VB>, Error>
@@ -2718,10 +2773,12 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::list;
   use crate::serialize;
   use crate::traits::*;
-  use crate::types::container::{self as coll, Mutey};
+  use crate::types::container::associative::Convert;
+  use crate::types::container::{self as coll, Join, Mutey};
   use crate::types::*;
   use internment::Intern;
   use std::collections::HashSet;
+  use std::convert::Infallible;
   use std::ptr;
   use std::sync::Arc;
 
@@ -3045,6 +3102,11 @@ internally, to keep track of things like the stack, program, lists etc.
           .collect()
   }
 
+  /// Returns an owned pair given a pair of references
+  fn owned<T: Clone, U: Clone>(entry: (&T, &U)) -> (T, U) {
+      (entry.0.clone(), entry.1.clone())
+  }
+
   /// Returns the differences between two hashmaps, including the keys
   /// that have been added or changed (including the new values), and
   /// the keys that were deleted.
@@ -3060,13 +3122,44 @@ internally, to keep track of things like the stack, program, lists etc.
       let added_or_updated: Vec<(K, V)> = b
           .iter()
           .filter(|(k, v)| !a_keys.contains(k) || a.get(k) != Some(v))
-          .map(|(k, v)| (k.clone(), v.clone()))
+          .map(owned)
           .collect();
 
       // Keys that are in `a` but not in `b`
       let deleted: Vec<K> = a_keys.difference(&b_keys).cloned().collect();
 
       (added_or_updated, deleted)
+  }
+
+  impl coll::Join<Dictionary> for Dictionary {
+      type Output = Dictionary;
+      type Error = Infallible;
+      fn join(mut self, other: Dictionary) -> Result<Self::Output, Error> {
+          let sm = self.mutate();
+          sm.extend(other.iter().map(owned));
+          Ok(self)
+      }
+  }
+
+  impl coll::Join<assoc::Association> for Dictionary {
+      type Output = assoc::Associative;
+      type Error = Infallible;
+      fn join(mut self, other: assoc::Association) -> Result<Self::Output, Error> {
+          // Try to convert to dictionary type
+          //println!("dict + assoc join");
+          match other.convert::<Word, dict::Entry>() {
+              Ok(d) => {
+                  let tm = self.mutate();
+                  tm.extend(d);
+                  Ok(assoc::Associative::Dictionary(self))
+              }
+              // TODO: convert the other way (to assoc) instead
+              Err(_) => {
+                  //println!("Conversion error: {:?}", e);
+                  Ok(assoc::Associative::Dictionary(self))
+              }
+          }
+      }
   }
 
   /// The actual code for what a [Word] should do.
