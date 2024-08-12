@@ -1192,8 +1192,13 @@ internally, to keep track of things like the stack, program, lists etc.
       fn has(&self, item: &T) -> bool;
   }
 
-  pub trait Take<T> {
-      fn take(&mut self) -> T;
+  pub trait SizedTake {
+      fn take_now(self) -> (Sized, Option<Item>);
+  }
+
+  pub trait Take {
+      type Output;
+      fn take(&mut self) -> Future<(Self::Output, Result<Option<Item>, Error>)>;
   }
 
   pub trait Put<T> {
@@ -1357,6 +1362,54 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  impl SizedTake for List {
+      fn take_now(mut self) -> (Sized, Option<Item>) {
+          let lm = self.mutate();
+          let i = lm.pop_front();
+          (Sized::List(self), i)
+      }
+  }
+
+  impl SizedTake for String {
+      fn take_now(mut self) -> (Sized, Option<Item>) {
+          // TODO: this may perform badly
+          let first_char = self.chars().next();
+          self.drain(..first_char.map(|s| s.len_utf8()).unwrap_or(0));
+          let i = first_char.map(Item::Char);
+          (Sized::String(self), i)
+      }
+  }
+
+  impl SizedTake for Bytes {
+      fn take_now(mut self) -> (Sized, Option<Item>) {
+          if self.is_empty() {
+              (Sized::Bytes(self), None)
+          } else {
+              let i = Some(Item::Number(Number::Int(self[0] as Int)));
+              self.drain(..1);
+              (Sized::Bytes(self), i)
+          }
+      }
+  }
+
+  impl SizedTake for Set {
+      fn take_now(mut self) -> (Sized, Option<Item>) {
+          let i = self.iter().next().cloned();
+          let sm = self.mutate();
+          if let Some(i) = i.clone() {
+              sm.take(&i);
+          }
+          (Sized::Set(self), i.map(Item::derive))
+      }
+  }
+
+  impl SizedTake for assoc::Associative {
+      fn take_now(self) -> (Sized, Option<Item>) {
+          let (a, i) = self.take();
+          (Sized::Associative(a), i)
+      }
+  }
+
   impl Sized {
       /// Returns whether the container is empty
       pub fn is_empty(&self) -> bool {
@@ -1379,39 +1432,11 @@ internally, to keep track of things like the stack, program, lists etc.
       /// the front (beginning) of the container.
       pub fn take(self) -> (Self, Option<Item>) {
           match self {
-              Self::Associative(a) => {
-                  let (a, i) = a.take();
-                  (Sized::Associative(a), i)
-              }
-              Sized::List(mut l) => {
-                  let lm = l.mutate();
-                  let i = lm.pop_front();
-                  (Sized::List(l), i)
-              }
-              Sized::String(mut s) => {
-                  // TODO: this may perform badly
-                  let first_char = s.chars().next();
-                  s.drain(..first_char.map(|s| s.len_utf8()).unwrap_or(0));
-                  let i = first_char.map(Item::Char);
-                  (Sized::String(s), i)
-              }
-              Sized::Bytes(mut b) => {
-                  if b.is_empty() {
-                      (Sized::Bytes(b), None)
-                  } else {
-                      let i = Some(Item::Number(Number::Int(b[0] as Int)));
-                      b.drain(..1);
-                      (Sized::Bytes(b), i)
-                  }
-              }
-              Sized::Set(mut s) => {
-                  let i = s.iter().next().cloned();
-                  let sm = s.mutate();
-                  if let Some(i) = i.clone() {
-                      sm.take(&i);
-                  }
-                  (Sized::Set(s), i.map(Item::derive))
-              }
+              Self::Associative(a) => a.take_now(),
+              Sized::List(l) => l.take_now(),
+              Sized::String(s) => s.take_now(),
+              Sized::Bytes(b) => b.take_now(),
+              Sized::Set(s) => s.take_now(),
           }
       }
 
@@ -7046,6 +7071,10 @@ The basic pipe contracts.
       Time,
       /// A pipe that produces bytes from standard in.
       Standard,
+  }
+
+  trait Take {
+      fn take(&mut self) -> types::Future<Result<Option<Item>, Error>>;
   }
 
   impl PartialEq for Out {
