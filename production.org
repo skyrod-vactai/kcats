@@ -968,6 +968,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
   use futures::FutureExt;
 
+  use self::assoc::TakeDemoting;
   use self::associative as assoc;
   use crate::traits::*;
   use crate::types::number::{Int, Number};
@@ -1108,7 +1109,7 @@ internally, to keep track of things like the stack, program, lists etc.
       type Output = assoc::Associative;
       type Error = Error;
       fn join(self, other: assoc::Associative) -> Result<Self::Output, Self::Error> {
-          println!("self: {:?}, other: {:?}", self, other);
+          //println!("self: {:?}, other: {:?}", self, other);
           let sa =
               assoc::Associative::Assoc(assoc::Association::try_from_iter(self.iter().cloned())?);
           Ok(sa.join(other).unwrap())
@@ -1192,8 +1193,8 @@ internally, to keep track of things like the stack, program, lists etc.
       fn has(&self, item: &T) -> bool;
   }
 
-  pub trait SizedTake {
-      fn take_now(self) -> (Sized, Option<Item>);
+  pub trait SimpleTake {
+      fn take_simple(&mut self) -> Option<Item>;
   }
 
   pub trait Take {
@@ -1328,7 +1329,7 @@ internally, to keep track of things like the stack, program, lists etc.
       pub fn take(self) -> Future<(Dispenser, Option<Item>)> {
           match self {
               Dispenser::Sized(s) => {
-                  let (s, item) = s.take();
+                  let (item, s) = s.take();
 
                   Box::pin(future::ready((Dispenser::Sized(s), item)))
               }
@@ -1362,51 +1363,44 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  impl SizedTake for List {
-      fn take_now(mut self) -> (Sized, Option<Item>) {
-          let lm = self.mutate();
-          let i = lm.pop_front();
-          (Sized::List(self), i)
+  impl SimpleTake for List {
+      fn take_simple(&mut self) -> Option<Item> {
+          if self.is_empty() {
+              None
+          } else {
+              let lm = self.mutate();
+              let i = lm.pop_front();
+              i
+          }
       }
   }
 
-  impl SizedTake for String {
-      fn take_now(mut self) -> (Sized, Option<Item>) {
+  impl SimpleTake for String {
+      fn take_simple(&mut self) -> Option<Item> {
           // TODO: this may perform badly
           let first_char = self.chars().next();
           self.drain(..first_char.map(|s| s.len_utf8()).unwrap_or(0));
           let i = first_char.map(Item::Char);
-          (Sized::String(self), i)
+          i
       }
   }
 
-  impl SizedTake for Bytes {
-      fn take_now(mut self) -> (Sized, Option<Item>) {
+  impl SimpleTake for Bytes {
+      fn take_simple(&mut self) -> Option<Item> {
           if self.is_empty() {
-              (Sized::Bytes(self), None)
+              None
           } else {
               let i = Some(Item::Number(Number::Int(self[0] as Int)));
               self.drain(..1);
-              (Sized::Bytes(self), i)
+              i
           }
       }
   }
 
-  impl SizedTake for Set {
-      fn take_now(mut self) -> (Sized, Option<Item>) {
-          let i = self.iter().next().cloned();
+  impl SimpleTake for Set {
+      fn take_simple(&mut self) -> Option<Item> {
           let sm = self.mutate();
-          if let Some(i) = i.clone() {
-              sm.take(&i);
-          }
-          (Sized::Set(self), i.map(Item::derive))
-      }
-  }
-
-  impl SizedTake for assoc::Associative {
-      fn take_now(self) -> (Sized, Option<Item>) {
-          let (a, i) = self.take();
-          (Sized::Associative(a), i)
+          sm.iter().next().map(|v| v.clone().fit())
       }
   }
 
@@ -1430,13 +1424,17 @@ internally, to keep track of things like the stack, program, lists etc.
       /// Takes an item out of the container, returning the item and
       /// the rest of the container separately. Items are taken from
       /// the front (beginning) of the container.
-      pub fn take(self) -> (Self, Option<Item>) {
+      pub fn take(self) -> (Option<Item>, Self) {
+          //println!("Taking! {:?}", self);
           match self {
-              Self::Associative(a) => a.take_now(),
-              Sized::List(l) => l.take_now(),
-              Sized::String(s) => s.take_now(),
-              Sized::Bytes(b) => b.take_now(),
-              Sized::Set(s) => s.take_now(),
+              Self::Associative(a) => {
+                  let (a, v) = a.take_demoting();
+                  (v, Sized::Associative(a))
+              }
+              Sized::List(mut l) => (l.take_simple(), Sized::List(l)),
+              Sized::String(mut s) => (s.take_simple(), Sized::String(s)),
+              Sized::Bytes(mut b) => (b.take_simple(), Sized::Bytes(b)),
+              Sized::Set(mut s) => (s.take_simple(), Sized::Set(s)),
           }
       }
 
@@ -2100,6 +2098,17 @@ internally, to keep track of things like the stack, program, lists etc.
               (Associative::Assoc(this), other) => Associative::Assoc(this.join(other).unwrap()),
               (this, other) => Join::join(this, other).unwrap(),
           })
+      }
+  }
+
+  pub trait TakeDemoting {
+      fn take_demoting(self) -> (Associative, Option<Item>);
+  }
+
+  impl TakeDemoting for Associative {
+      fn take_demoting(self) -> (Associative, Option<Item>) {
+          println!("Take from Associative");
+          self.take()
       }
   }
 
@@ -3677,12 +3686,15 @@ internally, to keep track of things like the stack, program, lists etc.
           "read",
           "shielddown",
       ));
+      //println!("Dictionary: {:?}", env.dictionary);
       let mut new_env = futures::executor::block_on(async move { axiom::eval(env).await });
       //println!("Env: {:?}", new_env);
       let dict: dict::Dictionary = new_env.pop().try_fit().unwrap();
+
       new_env.dictionary = dict;
       new_env
   }
+
   impl Default for Environment {
       /// Returns the default environment, which is the "standard"
       /// environment. It loads some standard libraries and core
@@ -5346,7 +5358,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn first(c: coll::Sized) -> ItemResult {
-      let (_, i) = c.take();
+      let (i, _) = c.take();
       Ok(i.fit())
   }
 
@@ -5935,6 +5947,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn eval_step(mut env: Environment) -> Future<Environment> {
       //println!("{:?}", env);
+      //println!("Dictionary size: {}", env.dictionary.len());
       let next_item = env.program.front();
 
       if let Some(val) = next_item {
@@ -5975,6 +5988,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                           }
                       } else {
                           let w = word.clone();
+                          println!("Failed dict lookup: {:?} {:?}", w, env.dictionary.len());
                           env.push(Error::undefined(w));
                           env.fit()
                       }
