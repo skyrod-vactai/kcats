@@ -968,7 +968,6 @@ internally, to keep track of things like the stack, program, lists etc.
 
   use futures::FutureExt;
 
-  use self::assoc::TakeDemoting;
   use self::associative as assoc;
   use crate::traits::*;
   use crate::types::number::{Int, Number};
@@ -1428,7 +1427,7 @@ internally, to keep track of things like the stack, program, lists etc.
           //println!("Taking! {:?}", self);
           match self {
               Self::Associative(a) => {
-                  let (a, v) = a.take_demoting();
+                  let (v, a) = a.take();
                   (v, Sized::Associative(a))
               }
               Sized::List(mut l) => (l.take_simple(), Sized::List(l)),
@@ -1442,7 +1441,7 @@ internally, to keep track of things like the stack, program, lists etc.
       pub fn pop(self) -> (Self, Option<Item>) {
           match self {
               Sized::Associative(a) => {
-                  let (a, i) = a.take();
+                  let (i, a) = a.take();
                   (Sized::Associative(a), i)
               }
               Sized::List(mut l) => {
@@ -1891,7 +1890,7 @@ internally, to keep track of things like the stack, program, lists etc.
   use super::{dictionary as dict, environment as env};
   use crate::traits::*;
   use crate::types::container as coll;
-  use crate::types::container::{Join, Mutey};
+  use crate::types::container::{Join, Mutey, SimpleTake};
   use crate::types::number::{Int, Number};
   use crate::types::*;
   use std::convert::Infallible;
@@ -2101,14 +2100,15 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  pub trait TakeDemoting {
-      fn take_demoting(self) -> (Associative, Option<Item>);
-  }
+  impl coll::SimpleTake for Association {
+      fn take_simple(&mut self) -> Option<Item> {
+          let maybe_key = self.keys().next().cloned();
+          let am = self.mutate();
+          let maybe_value = maybe_key.as_ref().and_then(|key| am.remove(key));
 
-  impl TakeDemoting for Associative {
-      fn take_demoting(self) -> (Associative, Option<Item>) {
-          println!("Take from Associative");
-          self.take()
+          maybe_key.map(|key| {
+              coll::List::derive_iter(vec![Item::derive(key), maybe_value.unwrap_or_default()]).fit()
+          })
       }
   }
 
@@ -2293,29 +2293,14 @@ internally, to keep track of things like the stack, program, lists etc.
       /// The take operation is for generic containers but we can
       /// perform it on an Associative by removing an arbitrary pair and
       /// returning it.
-      pub fn take(self) -> (Self, Option<Item>) {
+      pub fn take(self) -> (Option<Item>, Self) {
           match self {
-              Associative::Assoc(mut a) => {
-                  let maybe_key = a.keys().next().cloned();
-                  let am = a.mutate();
-                  let maybe_value = maybe_key.as_ref().and_then(|key| am.remove(key));
-                  (
-                      Associative::Assoc(a),
-                      maybe_key.map(|key| {
-                          coll::List::derive_iter(vec![
-                              Item::derive(key),
-                              maybe_value.unwrap_or_default(),
-                          ])
-                          .fit()
-                      }),
-                  )
-              }
+              Associative::Assoc(mut a) => (a.take_simple(), Associative::Assoc(a)),
               Associative::Dictionary(mut d) => {
                   let maybe_key = d.keys().next().cloned();
                   let dm = d.mutate();
                   let maybe_value = maybe_key.clone().and_then(|key| dm.remove(&key));
                   (
-                      Associative::Dictionary(d),
                       maybe_key.map(|key| {
                           coll::List::derive_iter(vec![
                               Item::Word(key),
@@ -2323,11 +2308,18 @@ internally, to keep track of things like the stack, program, lists etc.
                           ])
                           .fit()
                       }),
+                      Associative::Dictionary(d),
                   )
               }
               // The remaining impls may require auto-demotion (eg,
-              // removing a required field from say, Error)
-              _ => todo!("taking from assoc Requires insert/remove impl"),
+              // removing a required field from say, Error). We'll just
+              // demote all of them whether the field that is removed is
+              // required or not, since the caller cannot know in
+              // advance which it will be.
+              a => {
+                  let mut assoc: Association = a.fit();
+                  (assoc.take_simple(), Associative::Assoc(assoc))
+              }
           }
       }
   }
