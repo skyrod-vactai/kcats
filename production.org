@@ -1193,13 +1193,82 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   pub trait SimpleTake {
-      fn take_simple(&mut self) -> Option<Item>;
+      type Item: Send;
+      fn take_simple(&mut self) -> Option<Self::Item>;
   }
 
   pub trait Take: Container<Self::Item> {
       type Output;
       type Item;
-      fn take(self) -> Future<(Self::Output, Result<Option<Item>, Error>)>;
+      fn take(self) -> Future<(Result<Option<Self::Item>, Error>, Self::Output)>;
+  }
+
+  /// A blanket impl for Take, for any type that already implements SimpleTake.
+  impl<T> Take for T
+  where
+      T: SimpleTake + Container<<T as SimpleTake>::Item> + Send + 'static,
+  {
+      type Output = T;
+      type Item = <T as SimpleTake>::Item;
+
+      fn take(mut self) -> Future<(Result<Option<Self::Item>, Error>, Self::Output)> {
+          let item = self.take_simple();
+          let result = future::ready((Ok(item), self));
+          Box::pin(result)
+      }
+  }
+
+  impl Container<Item> for Sized {
+      fn count(&self) -> usize {
+          match self {
+              Self::Associative(a) => a.len(),
+              Self::List(l) => l.count(),
+              Self::String(s) => s.len(),
+              Self::Bytes(b) => b.len(),
+              Self::Set(s) => s.len(),
+          }
+      }
+
+      fn has(&self, other: &Item) -> bool {
+          match (self, other) {
+              (Sized::Associative(a), other) => {
+                  assoc::KeyItem::try_derive(other.clone()).map_or(false, |k| a.contains_key(&k))
+              }
+              (Sized::List(l), other) => l.contains(other),
+              (Sized::Set(s), Item::Dispenser(Dispenser::Sized(Sized::Set(other)))) => {
+                  other.is_subset(s)
+              }
+              (Sized::Set(s), Item::Receptacle(Receptacle::Sized(Sized::Set(other)))) => {
+                  other.is_subset(s)
+              }
+              (Sized::Set(s), other) => {
+                  assoc::KeyItem::try_derive(other.clone()).map_or(false, |k| s.contains(&k))
+              }
+              (Sized::String(container), other) => match other {
+                  Item::Char(c) => container.has(c),
+                  _ => false,
+              },
+              _ => false,
+          }
+      }
+  }
+
+  impl Take for Sized {
+      type Output = Self;
+      type Item = Item;
+      fn take(self) -> Future<(Result<Option<Self::Item>, Error>, Self)> {
+          //println!("Taking! {:?}", self);
+          Box::pin(future::ready(match self {
+              Self::Associative(a) => {
+                  let (v, a) = a.take();
+                  (Ok(v), Sized::Associative(a))
+              }
+              Sized::List(mut l) => (Ok(l.take_simple()), Sized::List(l)),
+              Sized::String(mut s) => (Ok(s.take_simple().map(Item::derive)), Sized::String(s)),
+              Sized::Bytes(mut b) => (Ok(b.take_simple().map(Item::derive)), Sized::Bytes(b)),
+              Sized::Set(mut s) => (Ok(s.take_simple()), Sized::Set(s)),
+          }))
+      }
   }
 
   pub trait Put<T> {
@@ -1250,14 +1319,16 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  impl Take for List {
-      type Item = Item;
-      type Output = List;
-      fn take(mut self) -> Future<(Self::Output, Result<Option<Item>, Error>)> {
-          let v = self.mutate().pop_front();
-          Box::pin(future::ready((self, Ok(v))))
-      }
-  }
+  // impl Take for List {
+  //     type Item = Item;
+  //     type Output = List;
+  //     fn take(mut self) -> Future<(Self::Output, Result<Option<Item>, Error>)> {
+  //         let v = self.mutate().pop_front();
+  //         Box::pin(future::ready((self, Ok(v))))
+  //     }
+  // }
+
+  //impl Take for
 
   impl Ordered for List {
       fn prepend(&mut self, items: List) {
@@ -1383,7 +1454,8 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl SimpleTake for List {
-      fn take_simple(&mut self) -> Option<Item> {
+      type Item = Item;
+      fn take_simple(&mut self) -> Option<Self::Item> {
           if self.is_empty() {
               None
           } else {
@@ -1395,21 +1467,22 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl SimpleTake for String {
-      fn take_simple(&mut self) -> Option<Item> {
+      type Item = char;
+      fn take_simple(&mut self) -> Option<Self::Item> {
           // TODO: this may perform badly
           let first_char = self.chars().next();
           self.drain(..first_char.map(|s| s.len_utf8()).unwrap_or(0));
-          let i = first_char.map(Item::Char);
-          i
+          first_char
       }
   }
 
   impl SimpleTake for Bytes {
-      fn take_simple(&mut self) -> Option<Item> {
+      type Item = Int;
+      fn take_simple(&mut self) -> Option<Self::Item> {
           if self.is_empty() {
               None
           } else {
-              let i = Some(Item::Number(Number::Int(self[0] as Int)));
+              let i = Some(self[0] as Int);
               self.drain(..1);
               i
           }
@@ -1417,7 +1490,8 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl SimpleTake for Set {
-      fn take_simple(&mut self) -> Option<Item> {
+      type Item = Item;
+      fn take_simple(&mut self) -> Option<Self::Item> {
           let sm = self.mutate();
           sm.iter().next().map(|v| v.clone().fit())
       }
@@ -1426,18 +1500,7 @@ internally, to keep track of things like the stack, program, lists etc.
   impl Sized {
       /// Returns whether the container is empty
       pub fn is_empty(&self) -> bool {
-          self.len() == 0
-      }
-
-      /// Returns the number of items in the container.
-      pub fn len(&self) -> usize {
-          match self {
-              Self::Associative(a) => a.len(),
-              Self::List(l) => l.count(),
-              Self::String(s) => s.len(),
-              Self::Bytes(b) => b.len(),
-              Self::Set(s) => s.len(),
-          }
+          self.count() == 0
       }
 
       /// Takes an item out of the container, returning the item and
@@ -1451,8 +1514,8 @@ internally, to keep track of things like the stack, program, lists etc.
                   (v, Sized::Associative(a))
               }
               Sized::List(mut l) => (l.take_simple(), Sized::List(l)),
-              Sized::String(mut s) => (s.take_simple(), Sized::String(s)),
-              Sized::Bytes(mut b) => (b.take_simple(), Sized::Bytes(b)),
+              Sized::String(mut s) => (s.take_simple().map(Item::derive), Sized::String(s)),
+              Sized::Bytes(mut b) => (b.take_simple().map(Item::derive), Sized::Bytes(b)),
               Sized::Set(mut s) => (s.take_simple(), Sized::Set(s)),
           }
       }
@@ -1510,30 +1573,6 @@ internally, to keep track of things like the stack, program, lists etc.
                   s
               })),
               (Sized::String(_), i) => Err(Error::expected("char", i)),
-          }
-      }
-
-      /// Returns whether this container contains the given [Item].
-      pub fn contains(&self, other: &Item) -> bool {
-          match (self, other) {
-              (Sized::Associative(a), other) => {
-                  assoc::KeyItem::try_derive(other.clone()).map_or(false, |k| a.contains_key(&k))
-              }
-              (Sized::List(l), other) => l.contains(other),
-              (Sized::Set(s), Item::Dispenser(Dispenser::Sized(Sized::Set(other)))) => {
-                  other.is_subset(s)
-              }
-              (Sized::Set(s), Item::Receptacle(Receptacle::Sized(Sized::Set(other)))) => {
-                  other.is_subset(s)
-              }
-              (Sized::Set(s), other) => {
-                  assoc::KeyItem::try_derive(other.clone()).map_or(false, |k| s.contains(&k))
-              }
-              (Sized::String(container), other) => match other {
-                  Item::Char(c) => container.has(c),
-                  _ => false,
-              },
-              _ => false,
           }
       }
 
@@ -1910,7 +1949,7 @@ internally, to keep track of things like the stack, program, lists etc.
   use super::{dictionary as dict, environment as env};
   use crate::traits::*;
   use crate::types::container as coll;
-  use crate::types::container::{Join, Mutey, SimpleTake};
+  use crate::types::container::{Container, Join, Mutey, SimpleTake};
   use crate::types::number::{Int, Number};
   use crate::types::*;
   use std::convert::Infallible;
@@ -2121,14 +2160,13 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl coll::SimpleTake for Association {
-      fn take_simple(&mut self) -> Option<Item> {
+      type Item = Entry;
+      fn take_simple(&mut self) -> Option<Self::Item> {
           let maybe_key = self.keys().next().cloned();
           let am = self.mutate();
           let maybe_value = maybe_key.as_ref().and_then(|key| am.remove(key));
 
-          maybe_key.map(|key| {
-              coll::List::derive_iter(vec![Item::derive(key), maybe_value.unwrap_or_default()]).fit()
-          })
+          maybe_key.map(|key| (key, maybe_value.unwrap_or_default()))
       }
   }
 
@@ -2315,7 +2353,7 @@ internally, to keep track of things like the stack, program, lists etc.
       /// returning it.
       pub fn take(self) -> (Option<Item>, Self) {
           match self {
-              Associative::Assoc(mut a) => (a.take_simple(), Associative::Assoc(a)),
+              Associative::Assoc(mut a) => (a.take_simple().map(Item::derive), Associative::Assoc(a)),
               Associative::Dictionary(mut d) => {
                   let maybe_key = d.keys().next().cloned();
                   let dm = d.mutate();
@@ -2338,7 +2376,10 @@ internally, to keep track of things like the stack, program, lists etc.
               // advance which it will be.
               a => {
                   let mut assoc: Association = a.fit();
-                  (assoc.take_simple(), Associative::Assoc(assoc))
+                  (
+                      assoc.take_simple().map(Item::derive),
+                      Associative::Assoc(assoc),
+                  )
               }
           }
       }
@@ -2459,7 +2500,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
       fn try_derive(i: Item) -> Result<Self, Error> {
           let s = coll::Sized::try_derive(i)?;
-          if s.len() != 2 {
+          if s.count() != 2 {
               Err(Error::expected("pair", s))
           } else {
               let mut iter = s.into_iter();
@@ -2858,7 +2899,7 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::serialize;
   use crate::traits::*;
   use crate::types::container::associative::Convert;
-  use crate::types::container::{self as coll, Join, Mutey};
+  use crate::types::container::{self as coll, Container, Join, Mutey};
   use crate::types::*;
   use internment::Intern;
   use std::collections::HashSet;
@@ -3436,7 +3477,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
       fn try_derive(i: Item) -> Result<Self, Self::Error> {
           let s = coll::Sized::try_derive(i)?;
-          if s.len() != 2 {
+          if s.count() != 2 {
               Err(Error::expected("pair", s))
           } else {
               let mut iter = s.into_iter();
@@ -4715,7 +4756,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   use crate::types::container::pipe::db;
   use crate::types::container::{
       self as coll, associative as assoc, dictionary as dict, environment::Environment, error::Error,
-      pipe, Join, Mutey, Ordered,
+      pipe, Container, Join, Mutey, Ordered, Take,
   };
   use crate::types::number::{Float, Int, Number};
   use crate::types::*;
@@ -5318,7 +5359,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn count(i: coll::Sized) -> Result<Int, Infallible> {
-      Ok(i.len() as Int)
+      Ok(i.count() as Int)
   }
 
   pub fn is_string(i: Item) -> Result<bool, Infallible> {
@@ -5832,7 +5873,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn contains(c: coll::Sized, i: Item) -> Result<bool, Infallible> {
-      Ok(c.contains(&i))
+      Ok(c.has(&i))
   }
 
   pub fn or(i: Item, j: Item) -> ItemResult {
@@ -6383,10 +6424,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let mut start = Int::try_derive(start)?;
       let mut end = Int::try_derive(end)?;
       if start < 0 {
-          start += arr.len() as i64;
+          start += arr.count() as i64;
       }
       if end <= 0 {
-          end += arr.len() as i64;
+          end += arr.count() as i64;
       }
       if start < 0 {
           return Err(Error::negative(start));
