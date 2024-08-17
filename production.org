@@ -7259,20 +7259,21 @@ The basic pipe contracts.
       ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Self::Item>, Error>> + Send + 'a>>
       {
           match self {
-              Tunnel::StaticFile(f) => {
-                  let f = f.clone();
-                  Box::pin(async move {
-                      f.write()
-                          .await
-                          .take_future()
-                          .await
-                          .map(|i| Some(Item::derive(i)))
-                  })
-              }
-              Tunnel::Socket(f) => {
-                  let f = f.clone();
-                  Box::pin(async move { f.write().await.take().await })
-              }
+              Tunnel::StaticFile(f) => Box::pin(async move {
+                  f.write()
+                      .await
+                      .take_future()
+                      .await
+                      .map(|i| Some(Item::derive(i)))
+              }),
+              Tunnel::Socket(f) => Box::pin(async move {
+                  f.write()
+                      .await
+                      .take_future()
+                      .await
+                      .map(|i| Some(Item::derive(i)))
+              }),
+
               Tunnel::Handoff(ref mut h) => Box::pin(h.take()),
               Tunnel::Standard => standard::take(),
           }
@@ -7307,22 +7308,17 @@ The basic pipe contracts.
       {
           match self {
               Out::StaticFile(f) => {
-                  let f = f.clone();
-                  Box::pin(async move {
-                      f.write()
-                          .await
-                          .take_future()
-                          .await
-                          .map(|i| Some(Item::derive(i)))
-                  })
+                  Box::pin(
+                      async move { f.write().await.take_future().await.map(|bs| Some(bs.fit())) },
+                  )
               }
               Out::Socket(f) => {
-                  let f = f.clone();
-                  Box::pin(async move { f.write().await.take().await })
+                  Box::pin(
+                      async move { f.write().await.take_future().await.map(|bs| Some(bs.fit())) },
+                  )
               }
               Out::ServerSocket(f) => {
-                  let f = f.clone();
-                  Box::pin(async move { f.write().await.take().await })
+                  Box::pin(async move { f.write().await.take_future().await.map(|s| Some(s.fit())) })
               }
               Out::Handoff(ref mut h) => Box::pin(h.take()),
               Out::Timer(ref mut t) => Box::pin(t.take()),
@@ -7590,10 +7586,12 @@ How to interact with the network (TCP/IP sockets)
   use crate::axiom::ItemResult;
   use crate::list;
   use crate::traits::*;
+  use crate::types::container as cont;
   use crate::types::container::associative as assoc;
   use crate::types::container::error::Error;
+  use crate::types::container::pipe::{self, FutureTake};
   use crate::types::number::Int;
-  use crate::types::{self, Item};
+  use crate::types::{self, Bytes, Item};
   use futures::future::FutureExt;
   use std::future::{self};
   use std::net::{Ipv4Addr, SocketAddrV4};
@@ -7618,6 +7616,24 @@ How to interact with the network (TCP/IP sockets)
       }
   }
 
+  impl FutureTake for Socket {
+      type Item = Bytes;
+      fn take_future<'a>(
+          &'a mut self,
+      ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Self::Item>, Error>> + Send + 'a>>
+      {
+          let mut bs = [0u8; 1024];
+          Box::pin(async move {
+              let n = self.socket.read(&mut bs).await?;
+              if n == 0 {
+                  Ok(None)
+              } else {
+                  Ok(Some(bs[..n].to_vec()))
+              }
+          })
+      }
+  }
+
   impl Socket {
       pub fn put<'a>(
           &'a mut self,
@@ -7631,20 +7647,6 @@ How to interact with the network (TCP/IP sockets)
               }
               Err(e) => Box::pin(future::ready(Err(e))),
           }
-      }
-
-      pub fn take<'a>(
-          &'a mut self,
-      ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Item>, Error>> + Send + 'a>> {
-          let mut bs = [0u8; 1024];
-          Box::pin(async move {
-              let n = self.socket.read(&mut bs).await?;
-              if n == 0 {
-                  Ok(None)
-              } else {
-                  Ok(Some(bs[..n].to_vec().fit()))
-              }
-          })
       }
   }
 
@@ -7673,20 +7675,20 @@ How to interact with the network (TCP/IP sockets)
       }
   }
 
-  impl ServerSocket {
-      pub fn take<'a>(
+  impl FutureTake for ServerSocket {
+      type Item = Socket;
+
+      fn take_future<'a>(
           &'a mut self,
-      ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Item>, Error>> + Send + 'a>> {
+      ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Self::Item>, Error>> + Send + 'a>>
+      {
           Box::pin(async move {
               let (socket, addr) = self.socket.accept().await?;
 
-              Ok(Some(
-                  super::Tunnel::Socket(Arc::new(RwLock::new(Socket {
-                      socket,
-                      addr: (addr.ip().to_string(), addr.port()),
-                  })))
-                  .fit(),
-              ))
+              Ok(Some(Socket {
+                  socket,
+                  addr: (addr.ip().to_string(), addr.port()),
+              }))
           })
       }
   }
@@ -7758,6 +7760,14 @@ How to interact with the network (TCP/IP sockets)
   impl From<std::net::AddrParseError> for Error {
       fn from(err: std::net::AddrParseError) -> Error {
           Error::create(list!("addrparse"), &err.to_string(), Option::<Item>::None)
+      }
+  }
+
+  impl Derive<Socket> for Item {
+      fn derive(ss: Socket) -> Item {
+          Item::Dispenser(cont::Dispenser::Tunnel(pipe::Tunnel::Socket(Arc::new(
+              RwLock::new(ss),
+          ))))
       }
   }
 #+end_src
