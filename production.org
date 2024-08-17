@@ -970,6 +970,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
   use self::associative as assoc;
   use crate::traits::*;
+  use crate::types::container::pipe::FutureTake;
   use crate::types::number::{Int, Number};
   use crate::types::*;
 
@@ -1192,12 +1193,21 @@ internally, to keep track of things like the stack, program, lists etc.
       fn has(&self, item: &T) -> bool;
   }
 
+  /// A trait for containers where you can take an item out "in-place"
+  /// without blocking. The container itself is mutated and the item is
+  /// returned.
   pub trait SimpleTake {
       type Item: Send;
       fn take_simple(&mut self) -> Option<Self::Item>;
   }
 
-  pub trait Take: Container<Self::Item> {
+  // pub trait DemotingTake {
+  //     type Item;
+  //     type Output;
+  //     fn take_demoting(self) -> (Option<Self::Item>, Self::Output);
+  // }
+
+  pub trait Take {
       type Output;
       type Item;
       fn take(self) -> Future<(Result<Option<Self::Item>, Error>, Self::Output)>;
@@ -1253,21 +1263,22 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  impl Take for Sized {
-      type Output = Self;
+  impl SimpleTake for Sized {
+      //type Output = Self;
       type Item = Item;
-      fn take(self) -> Future<(Result<Option<Self::Item>, Error>, Self)> {
+      fn take_simple(&mut self) -> Option<Self::Item> {
           //println!("Taking! {:?}", self);
-          Box::pin(future::ready(match self {
-              Self::Associative(a) => {
-                  let (v, a) = a.take();
-                  (Ok(v), Sized::Associative(a))
+          match self {
+              Self::Associative(ref mut a) => {
+                  let v = a.take_simple();
+                  ,*self = Sized::Associative(a.clone());
+                  v
               }
-              Sized::List(mut l) => (Ok(l.take_simple()), Sized::List(l)),
-              Sized::String(mut s) => (Ok(s.take_simple().map(Item::derive)), Sized::String(s)),
-              Sized::Bytes(mut b) => (Ok(b.take_simple().map(Item::derive)), Sized::Bytes(b)),
-              Sized::Set(mut s) => (Ok(s.take_simple()), Sized::Set(s)),
-          }))
+              Sized::List(ref mut l) => l.take_simple(),
+              Sized::String(ref mut s) => s.take_simple().map(Item::derive),
+              Sized::Bytes(ref mut b) => b.take_simple().map(Item::derive),
+              Sized::Set(ref mut s) => s.take_simple(),
+          }
       }
   }
 
@@ -1398,59 +1409,86 @@ internally, to keep track of things like the stack, program, lists etc.
   /// Empty Sized containers are equal to each other.
   impl PartialEq for Sized {
       fn eq(&self, other: &Self) -> bool {
-          if self.is_empty() && other.is_empty() {
-              return true;
-          }
           match (self, other) {
               (Sized::Associative(a), Sized::Associative(b)) => a == b,
               (Sized::List(a), Sized::List(b)) => a == b,
               (Sized::String(a), Sized::String(b)) => a == b,
               (Sized::Bytes(a), Sized::Bytes(b)) => a == b,
               (Sized::Set(a), Sized::Set(b)) => a == b,
-              _ => false,
+              _ => self.is_empty() && other.is_empty(),
           }
       }
   }
 
-  impl Dispenser {
-      /// Takes an item out of the [Dispenser], and returns a future
-      /// that gives a new [Dispenser], and the [Item] that was removed
-      /// (if there was one).
-      pub fn take(self) -> Future<(Dispenser, Option<Item>)> {
+  /// Takes an item out of the [Dispenser], and returns a future
+  /// that gives a new [Dispenser], and the [Item] that was removed
+  /// (if there was one).
+  impl Take for Dispenser {
+      type Output = Self;
+      type Item = Item;
+      fn take(self) -> Future<(Result<Option<Self::Item>, Error>, Self::Output)> {
           match self {
-              Dispenser::Sized(s) => {
-                  let (item, s) = s.take();
+              Dispenser::Sized(mut s) => {
+                  let v = s.take_simple();
+                  //let (r, s) = s.take();
+                  // i.map(|r| {
+                  //     (Dispenser::SIzed(s), Self::result_to_option(r))
+                  // })
 
-                  Box::pin(future::ready((Dispenser::Sized(s), item)))
+                  Box::pin(future::ready((Ok(v), Dispenser::Sized(s))))
               }
-              Dispenser::Out(mut o) => Box::pin({
-                  let i = o.take();
-                  i.map(|r| {
-                      (
-                          Dispenser::Out(o),
-                          match r {
-                              Ok(Some(i)) => Some(i),
-                              Ok(None) => None,
-                              Err(e) => Some(Item::derive(e)),
-                          },
-                      )
-                  })
-              }),
-              Dispenser::Tunnel(mut t) => Box::pin({
-                  let i = t.take();
-                  i.map(|r| {
-                      (
-                          Dispenser::Tunnel(t),
-                          match r {
-                              Ok(Some(i)) => Some(i),
-                              Ok(None) => None,
-                              Err(e) => Some(Item::derive(e)),
-                          },
-                      )
-                  })
-              }),
+              Dispenser::Out(mut o) => {
+                  Box::pin(async move { (o.take_future().await, Dispenser::Out(o)) })
+              }
+              Dispenser::Tunnel(mut t) => {
+                  Box::pin(async move { (t.take_future().await, Dispenser::Tunnel(t)) })
+              }
           }
       }
+  }
+
+  pub fn result_to_option(r: Result<Option<Item>, Error>) -> Option<Item> {
+      match r {
+          Ok(Some(i)) => Some(i),
+          Ok(None) => None,
+          Err(e) => Some(Item::derive(e)),
+      }
+  }
+
+  impl Dispenser {
+      // /// Takes an item out of the [Dispenser], and returns a future
+      // /// that gives a new [Dispenser], and the [Item] that was removed
+      // /// (if there was one).
+      // pub fn take(self) -> Future<(Dispenser, Option<Item>)> {
+      //     match self {
+      //         Dispenser::Sized(mut s) => {
+      //             let v = s.take_simple();
+      //             //let (r, s) = s.take();
+      //             // i.map(|r| {
+      //             //     (Dispenser::SIzed(s), Self::result_to_option(r))
+      //             // })
+
+      //             Box::pin(future::ready((Dispenser::Sized(s), v)))
+      //         }
+      //         Dispenser::Out(mut o) => Box::pin({
+      //             let i = o.take();
+      //             i.map(|r| (Dispenser::Out(o), Self::result_to_option(r)))
+      //         }),
+      //         Dispenser::Tunnel(mut t) => Box::pin({
+      //             let i = t.take();
+      //             i.map(|r| {
+      //                 (
+      //                     Dispenser::Tunnel(t),
+      //                     match r {
+      //                         Ok(Some(i)) => Some(i),
+      //                         Ok(None) => None,
+      //                         Err(e) => Some(Item::derive(e)),
+      //                     },
+      //                 )
+      //             })
+      //         }),
+      //     }
+      // }
   }
 
   impl SimpleTake for List {
@@ -1503,29 +1541,12 @@ internally, to keep track of things like the stack, program, lists etc.
           self.count() == 0
       }
 
-      /// Takes an item out of the container, returning the item and
-      /// the rest of the container separately. Items are taken from
-      /// the front (beginning) of the container.
-      pub fn take(self) -> (Option<Item>, Self) {
-          //println!("Taking! {:?}", self);
-          match self {
-              Self::Associative(a) => {
-                  let (v, a) = a.take();
-                  (v, Sized::Associative(a))
-              }
-              Sized::List(mut l) => (l.take_simple(), Sized::List(l)),
-              Sized::String(mut s) => (s.take_simple().map(Item::derive), Sized::String(s)),
-              Sized::Bytes(mut b) => (b.take_simple().map(Item::derive), Sized::Bytes(b)),
-              Sized::Set(mut s) => (s.take_simple(), Sized::Set(s)),
-          }
-      }
-
       /// Takes an item from the back (end) of the container.
       pub fn pop(self) -> (Self, Option<Item>) {
           match self {
-              Sized::Associative(a) => {
-                  let (i, a) = a.take();
-                  (Sized::Associative(a), i)
+              Sized::Associative(mut a) => {
+                  let v = a.take_simple();
+                  (Sized::Associative(a), v)
               }
               Sized::List(mut l) => {
                   let lm = l.mutate();
@@ -2170,6 +2191,30 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  /// The take operation is for generic containers but we can
+  /// perform it on an Associative by removing an arbitrary pair and
+  /// returning it.
+  impl coll::SimpleTake for Associative {
+      type Item = Item;
+      fn take_simple(&mut self) -> Option<Self::Item> {
+          match self {
+              Associative::Assoc(ref mut a) => a.take_simple().map(Item::derive),
+              Associative::Dictionary(ref mut d) => d.take_simple().map(Item::derive),
+              // The remaining impls may require auto-demotion (eg,
+              // removing a required field from say, Error). We'll just
+              // demote all of them whether the field that is removed is
+              // required or not, since the caller cannot know in
+              // advance which it will be.
+              ref a => {
+                  let mut assoc: Association = (*a).clone().fit();
+                  let v = assoc.take_simple().map(Item::derive);
+                  ,*self = Associative::Assoc(assoc);
+                  v
+              }
+          }
+      }
+  }
+
   impl Associative {
       /// Retuns the number of associations in the container
       pub fn len(&self) -> usize {
@@ -2345,42 +2390,6 @@ internally, to keep track of things like the stack, program, lists etc.
                   Associative::Assoc(a).remove(k)
               }
               _ => todo!("Removing from other associative types"),
-          }
-      }
-
-      /// The take operation is for generic containers but we can
-      /// perform it on an Associative by removing an arbitrary pair and
-      /// returning it.
-      pub fn take(self) -> (Option<Item>, Self) {
-          match self {
-              Associative::Assoc(mut a) => (a.take_simple().map(Item::derive), Associative::Assoc(a)),
-              Associative::Dictionary(mut d) => {
-                  let maybe_key = d.keys().next().cloned();
-                  let dm = d.mutate();
-                  let maybe_value = maybe_key.clone().and_then(|key| dm.remove(&key));
-                  (
-                      maybe_key.map(|key| {
-                          coll::List::derive_iter(vec![
-                              Item::Word(key),
-                              maybe_value.map(Item::derive).unwrap_or(Item::default()),
-                          ])
-                          .fit()
-                      }),
-                      Associative::Dictionary(d),
-                  )
-              }
-              // The remaining impls may require auto-demotion (eg,
-              // removing a required field from say, Error). We'll just
-              // demote all of them whether the field that is removed is
-              // required or not, since the caller cannot know in
-              // advance which it will be.
-              a => {
-                  let mut assoc: Association = a.fit();
-                  (
-                      assoc.take_simple().map(Item::derive),
-                      Associative::Assoc(assoc),
-                  )
-              }
           }
       }
   }
@@ -3124,6 +3133,19 @@ internally, to keep track of things like the stack, program, lists etc.
       /// Merges this dictionary with the given new dictionary. The new
       /// entries are added with the given namespace.
       fn merge(&mut self, new: Dictionary, namespace: &Namespace);
+  }
+
+  impl coll::SimpleTake for Dictionary {
+      type Item = (Word, Entry);
+      fn take_simple(&mut self) -> Option<Self::Item> {
+          if let Some(ref k) = self.keys().next().cloned() {
+              let dm = self.mutate();
+              let v = dm.remove(k).unwrap();
+              Some((k.clone(), v))
+          } else {
+              None
+          }
+      }
   }
 
   impl Dict for Dictionary {
@@ -5059,7 +5081,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               Box::leak(Box::new(f_stack1(crate::types::container::pipe::fs::file_out))),
           ),
           ("finished?", Box::leak(Box::new(f_stack1(is_finished)))),
-          ("first", Box::leak(Box::new(f_stack1(first)))),
+          //("first", Box::leak(Box::new(f_stack1(first)))),
           ("float", Box::leak(Box::new(float))),
           ("floor", Box::leak(Box::new(f_stack1(floor)))),
           ("format", Box::leak(Box::new(f_stack2(format)))),
@@ -5410,10 +5432,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           .unwrap_or(false))
   }
 
-  pub fn first(c: coll::Sized) -> ItemResult {
-      let (i, _) = c.take();
-      Ok(i.fit())
-  }
+  // pub fn first(c: coll::Sized) -> ItemResult {
+  //     let (_, i) = c.take();
+  //     Ok(i.fit())
+  // }
 
   pub fn second(c: coll::List) -> ItemResult {
       Ok(c.get(1).cloned().unwrap_or_default())
@@ -5524,17 +5546,14 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let i2 = i.clone();
       let r = coll::Dispenser::try_derive(i);
       match r {
-          Ok(it) => {
-              let f = it.take();
-              Box::pin(async move {
-                  let (c, i) = f.await;
-                  env.pop_prog();
-                  let stack = Arc::make_mut(&mut env.stack);
-                  stack.push_front(c.fit());
-                  stack.push_front(i.unwrap_or_default());
-                  env
-              })
-          }
+          Ok(d) => Box::pin(async move {
+              let (i, c) = d.take().await;
+              env.pop_prog();
+              let stack = Arc::make_mut(&mut env.stack);
+              stack.push_front(c.fit());
+              stack.push_front(coll::result_to_option(i).unwrap_or_default());
+              env
+          }),
           Err(e) => {
               let stack = Arc::make_mut(&mut env.stack);
               stack.push_front(i2);
@@ -5597,7 +5616,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let p = coll::List::try_derive(env.pop()).unwrap();
       let dispenser = coll::Dispenser::try_derive(env.pop()).unwrap();
       Box::pin(async move {
-          if let (dispenser, Some(litem)) = dispenser.take().await {
+          let (r, dispenser) = dispenser.take().await;
+          if let Some(litem) = coll::result_to_option(r) {
               let prog = env.program.mutate();
               // prepare the next iteration, even if the iterator is now
               // empty. step is still the next instruction, so we don't
@@ -7079,7 +7099,8 @@ The basic pipe contracts.
   use super::error::Error;
   use crate::traits::*;
   use crate::types::container as coll;
-  use crate::types::{self, Item};
+  use crate::types::{self, Future, Item};
+  use std::pin::Pin;
   use std::sync::Arc;
   use tokio::sync::RwLock;
 
@@ -7093,6 +7114,13 @@ The basic pipe contracts.
   pub mod net;
   pub mod standard;
   pub mod time;
+
+  pub trait FutureTake {
+      type Item;
+      fn take_future<'a>(
+          &'a mut self,
+      ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Self::Item>, Error>> + Send + 'a>>;
+  }
 
   /// A pipe that accepts items.
   #[derive(Debug, Clone)]
@@ -7138,10 +7166,6 @@ The basic pipe contracts.
       Time,
       /// A pipe that produces bytes from standard in.
       Standard,
-  }
-
-  trait Take {
-      fn take(&mut self) -> types::Future<Result<Option<Item>, Error>>;
   }
 
   impl PartialEq for Out {
@@ -7225,6 +7249,36 @@ The basic pipe contracts.
       }
   }
 
+  impl FutureTake for Tunnel {
+      /// Takes an [Item] from the tunnel, blocks if the receive side of
+      /// the tunnel is empty.
+      type Item = Item;
+      /// Takes an [Item] from the pipe, blocks if the pipe is empty.
+      fn take_future<'a>(
+          &'a mut self,
+      ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Self::Item>, Error>> + Send + 'a>>
+      {
+          match self {
+              Tunnel::StaticFile(f) => {
+                  let f = f.clone();
+                  Box::pin(async move {
+                      f.write()
+                          .await
+                          .take_future()
+                          .await
+                          .map(|i| Some(Item::derive(i)))
+                  })
+              }
+              Tunnel::Socket(f) => {
+                  let f = f.clone();
+                  Box::pin(async move { f.write().await.take().await })
+              }
+              Tunnel::Handoff(ref mut h) => Box::pin(h.take()),
+              Tunnel::Standard => standard::take(),
+          }
+      }
+  }
+
   impl Tunnel {
       /// Puts the [Item] into the tunnel, blocks if the send side of
       /// the tunnel is full.
@@ -7242,32 +7296,25 @@ The basic pipe contracts.
               Tunnel::Standard => standard::put(i),
           }
       }
-
-      /// Takes an [Item] from the tunnel, blocks if the receive side of
-      /// the tunnel is empty.
-      pub fn take(&mut self) -> types::Future<Result<Option<Item>, Error>> {
-          match self {
-              Tunnel::StaticFile(f) => {
-                  let f = f.clone();
-                  Box::pin(async move { f.write().await.take().await })
-              }
-              Tunnel::Socket(f) => {
-                  let f = f.clone();
-                  Box::pin(async move { f.write().await.take().await })
-              }
-              Tunnel::Handoff(ref mut h) => Box::pin(h.take()),
-              Tunnel::Standard => standard::take(),
-          }
-      }
   }
 
-  impl Out {
+  impl FutureTake for Out {
+      type Item = Item;
       /// Takes an [Item] from the pipe, blocks if the pipe is empty.
-      pub fn take(&mut self) -> types::Future<Result<Option<Item>, Error>> {
+      fn take_future<'a>(
+          &'a mut self,
+      ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Self::Item>, Error>> + Send + 'a>>
+      {
           match self {
               Out::StaticFile(f) => {
                   let f = f.clone();
-                  Box::pin(async move { f.write().await.take().await })
+                  Box::pin(async move {
+                      f.write()
+                          .await
+                          .take_future()
+                          .await
+                          .map(|i| Some(Item::derive(i)))
+                  })
               }
               Out::Socket(f) => {
                   let f = f.clone();
@@ -7432,7 +7479,7 @@ How to interact with files on disk
   use tokio::io::{AsyncReadExt, AsyncWriteExt};
   use tokio::sync::RwLock;
 
-  use super::closed_error;
+  use super::{closed_error, FutureTake};
 
   #[derive(Debug)]
   pub struct StaticFile {
@@ -7444,6 +7491,30 @@ How to interact with files on disk
       fn eq(&self, other: &Self) -> bool {
           // Check if the 'file' fields of both structs are the same by reference
           ptr::eq(&self.file, &other.file)
+      }
+  }
+
+  impl FutureTake for StaticFile {
+      type Item = Bytes;
+      fn take_future<'a>(
+          &'a mut self,
+      ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Self::Item>, Error>> + Send + 'a>>
+      {
+          match self.file.as_mut() {
+              Some(f) => {
+                  let mut bs = [0u8; 102400];
+                  Box::pin(async move {
+                      let ct = f.read(&mut bs).await?;
+                      if ct == 0 {
+                          // EOF, no more takes since it's static
+                          Ok(None)
+                      } else {
+                          Ok(Some(bs[0..ct].to_vec().fit()))
+                      }
+                  })
+              }
+              None => Box::pin(future::ready(Err(closed_error(false)))),
+          }
       }
   }
 
@@ -7460,26 +7531,6 @@ How to interact with files on disk
                       Ok(bs) => Box::pin(async move { f.write_all(&bs).await.map_err(|e| e.into()) }),
                       Err(e) => Box::pin(future::ready(Err(e))),
                   }
-              }
-              None => Box::pin(future::ready(Err(closed_error(false)))),
-          }
-      }
-
-      pub fn take<'a>(
-          &'a mut self,
-      ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Item>, Error>> + Send + 'a>> {
-          match self.file.as_mut() {
-              Some(f) => {
-                  let mut bs = [0u8; 102400];
-                  Box::pin(async move {
-                      let ct = f.read(&mut bs).await?;
-                      if ct == 0 {
-                          // EOF, no more takes since it's static
-                          Ok(None)
-                      } else {
-                          Ok(Some(bs[0..ct].to_vec().fit()))
-                      }
-                  })
               }
               None => Box::pin(future::ready(Err(closed_error(false)))),
           }
