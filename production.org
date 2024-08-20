@@ -551,6 +551,12 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  impl Derive<()> for Item {
+      fn derive(_: ()) -> Self {
+          Item::default()
+      }
+  }
+
   impl<T> Derive<Option<T>> for Item
   where
       Item: Derive<T>,
@@ -1216,7 +1222,7 @@ internally, to keep track of things like the stack, program, lists etc.
   /// A blanket impl for Take, for any type that already implements SimpleTake.
   impl<T> Take for T
   where
-      T: SimpleTake + Container<<T as SimpleTake>::Item> + Send + 'static,
+      T: SimpleTake + Send + 'static,
   {
       type Output = T;
       type Item = <T as SimpleTake>::Item;
@@ -1280,10 +1286,6 @@ internally, to keep track of things like the stack, program, lists etc.
               Sized::Set(ref mut s) => s.take_simple(),
           }
       }
-  }
-
-  pub trait Put<T> {
-      fn put(&mut self, item: T);
   }
 
   impl Container<char> for String {
@@ -1970,7 +1972,7 @@ internally, to keep track of things like the stack, program, lists etc.
   use super::{dictionary as dict, environment as env};
   use crate::traits::*;
   use crate::types::container as coll;
-  use crate::types::container::{Container, Join, Mutey, SimpleTake};
+  use crate::types::container::{Container, Join, Mutey};
   use crate::types::number::{Int, Number};
   use crate::types::*;
   use std::convert::Infallible;
@@ -2908,7 +2910,7 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::serialize;
   use crate::traits::*;
   use crate::types::container::associative::Convert;
-  use crate::types::container::{self as coll, Container, Join, Mutey};
+  use crate::types::container::{self as coll, Container, Mutey};
   use crate::types::*;
   use internment::Intern;
   use std::collections::HashSet;
@@ -7098,13 +7100,13 @@ The basic pipe contracts.
 #+begin_src rust :tangle src/types/container/pipe.rs :mkdirp yes
   use super::error::Error;
   use crate::traits::*;
-  use crate::types::container as coll;
-  use crate::types::{self, Future, Item};
+  use crate::types::container::{self as coll, SimpleTake};
+  use crate::types::{self, Item};
   use std::pin::Pin;
   use std::sync::Arc;
   use tokio::sync::RwLock;
 
-  use futures::executor;
+  use futures::{executor, future};
   pub mod channel;
 
   #[cfg(feature = "database")]
@@ -7161,7 +7163,7 @@ The basic pipe contracts.
       /// A pipe that produces a dummy value after a given amount of
       /// time. Can be used as a timeout mechanism when waiting on
       /// multiple pipes at once.
-      Timer(channel::Timer<Item>),
+      Timer(channel::Timer),
       /// A pipe that produces timestamps of the current UNIX time
       Time,
       /// A pipe that produces bytes from standard in.
@@ -7274,8 +7276,8 @@ The basic pipe contracts.
                       .map(|i| Some(Item::derive(i)))
               }),
 
-              Tunnel::Handoff(ref mut h) => Box::pin(h.take()),
-              Tunnel::Standard => standard::take(),
+              Tunnel::Handoff(h) => Box::pin(h.take_future()),
+              Tunnel::Standard => standard::take_future(),
           }
       }
   }
@@ -7320,10 +7322,12 @@ The basic pipe contracts.
               Out::ServerSocket(f) => {
                   Box::pin(async move { f.write().await.take_future().await.map(|s| Some(s.fit())) })
               }
-              Out::Handoff(ref mut h) => Box::pin(h.take()),
-              Out::Timer(ref mut t) => Box::pin(t.take()),
-              Out::Time => Box::pin(time::take()),
-              Out::Standard => standard::take(),
+              Out::Handoff(h) => Box::pin(h.take_future()),
+              Out::Timer(ref mut t) => Box::pin(t.take_future()),
+              Out::Time => Box::pin(future::ready(Ok(time::Time::new()
+                  .take_simple()
+                  .map(Item::derive)))),
+              Out::Standard => Box::pin(standard::take_future()),
           }
       }
   }
@@ -7773,24 +7777,30 @@ How to interact with the network (TCP/IP sockets)
 #+end_src
 ***** Time
 #+begin_src rust :tangle src/types/container/pipe/time.rs :mkdirp yes
-  use crate::types::container::associative as assoc;
-  use crate::types::container::error::Error;
-  use crate::types::number::{Int, Number};
+  use crate::types::container::{associative as assoc, SimpleTake};
+  use crate::types::number::Int;
   use crate::types::*;
 
-  use std::{
-      future,
-      time::{SystemTime, UNIX_EPOCH},
-  };
+  use std::time::{SystemTime, UNIX_EPOCH};
 
-  pub fn take() -> Future<Result<Option<Item>, Error>> {
-      let t = SystemTime::now()
-          .duration_since(UNIX_EPOCH)
-          .unwrap()
-          .as_millis() as Int;
-      Box::pin(future::ready(Ok(Some(Item::Number(Number::Int(t))))))
+  pub struct Time;
+
+  impl Time {
+      pub fn new() -> Self {
+          Time
+      }
   }
 
+  impl SimpleTake for Time {
+      type Item = Int;
+      fn take_simple(&mut self) -> Option<Self::Item> {
+          let t = SystemTime::now()
+              .duration_since(UNIX_EPOCH)
+              .unwrap()
+              .as_millis() as Int;
+          Some(t)
+      }
+  }
   pub fn representation() -> Item {
       assoc::Association::derive_iter([
           ("type".fit(), "out".fit()),
@@ -7815,7 +7825,8 @@ How to interact with the network (TCP/IP sockets)
   use std::future;
   use std::io::{self, Read, Write};
 
-  pub fn take() -> Future<Result<Option<Item>, Error>> {
+  pub fn take_future<'a>(
+  ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Item>, Error>> + Send + 'a>> {
       let mut buf = [0u8];
       let n = io::stdin().read(&mut buf);
       let f = match n {
@@ -7851,12 +7862,15 @@ Implement the =handoff= type
   use crate::axiom;
   use crate::traits::*;
   use crate::types::container as coll;
+  use crate::types::container::error::Error;
+  use crate::types::container::pipe::FutureTake;
   use crate::types::container::{associative as assoc, environment::Environment, error, pipe};
   use crate::types::number::Int;
   use crate::types::{self, Item};
 
   use flume;
   use std::future;
+  use std::pin::Pin;
   use std::ptr;
   use std::sync::atomic::{AtomicUsize, Ordering};
   use std::sync::Arc;
@@ -7883,6 +7897,28 @@ Implement the =handoff= type
   }
 
   static ID: AtomicUsize = AtomicUsize::new(0);
+
+  impl FutureTake for Handoff<Item> {
+      type Item = Item;
+      fn take_future<'a>(
+          &'a mut self,
+      ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Self::Item>, Error>> + Send + 'a>>
+      {
+          // println!(
+          //     "Taking from channel: {:?} on {:?}",
+          //     self,
+          //     thread::current().id()
+          // );
+          if !self.bidirectional {
+              self.close_put();
+          }
+          if let Some(ch) = self.receiver.clone() {
+              Box::pin(async move { ch.recv_async().await.map(Some).or_else(|_| Ok(None)) })
+          } else {
+              Box::pin(future::ready(Ok(None)))
+          }
+      }
+  }
 
   impl Handoff<Item> {
       pub fn new(bidirectional: bool) -> Handoff<Item> {
@@ -7921,22 +7957,6 @@ Implement the =handoff= type
               }
           } else {
               Box::pin(future::ready(Err(pipe::closed_error(false))))
-          }
-      }
-
-      pub fn take(&mut self) -> types::Future<Result<Option<Item>, error::Error>> {
-          // println!(
-          //     "Taking from channel: {:?} on {:?}",
-          //     self,
-          //     thread::current().id()
-          // );
-          if !self.bidirectional {
-              self.close_put();
-          }
-          if let Some(ch) = self.receiver.clone() {
-              Box::pin(async move { ch.recv_async().await.map(Some).or_else(|_| Ok(None)) })
-          } else {
-              Box::pin(future::ready(Ok(None)))
           }
       }
 
@@ -8050,14 +8070,14 @@ Implement the =handoff= type
           // fetch the original item from the list.
           for (idx, item) in lr.iter().enumerate() {
               let idx_clone = idx;
-              match &item {
+              match item {
                   ChannelOp::Receive(r) => {
-                      selector = selector.recv(&**r, move |i| {
+                      selector = selector.recv(&r, move |i| {
                           (i.map(Some).map_err(error::Error::from), idx_clone)
                       });
                   }
                   ChannelOp::Send(s, i) => {
-                      selector = selector.send(&**s, i.clone(), move |i| {
+                      selector = selector.send(&s, i.clone(), move |i| {
                           (i.map(|_| None).map_err(error::Error::from), idx)
                       });
                   }
@@ -8106,14 +8126,14 @@ Implement the =handoff= type
   }
 
   #[derive(Debug)]
-  pub struct Timer<T> {
-      receiver: Option<flume::Receiver<T>>,
+  pub struct Timer {
+      receiver: Option<flume::Receiver<Item>>,
       handle: Option<JoinHandle<()>>,
       duration: Duration,
   }
 
   // Cloning a timeout makes a new one, clears state
-  impl Clone for Timer<Item> {
+  impl Clone for Timer {
       fn clone(&self) -> Self {
           Self {
               receiver: None,
@@ -8122,9 +8142,23 @@ Implement the =handoff= type
           }
       }
   }
+  impl FutureTake for Timer {
+      type Item = Item;
+      fn take_future<'a>(
+          &'a mut self,
+      ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Self::Item>, Error>> + Send + 'a>>
+      {
+          self.start();
+          let receiver = self.receiver.clone().unwrap();
+          Box::pin(async move {
+              //println!("Receiving");
+              receiver.recv_async().await.map(Some).or_else(|_| Ok(None))
+          })
+      }
+  }
 
-  impl Timer<Item> {
-      fn new(duration: Duration) -> Timer<Item> {
+  impl Timer {
+      fn new(duration: Duration) -> Timer {
           Timer {
               receiver: None,
               handle: None,
@@ -8144,24 +8178,15 @@ Implement the =handoff= type
               }));
           }
       }
-
-      pub fn take(&mut self) -> types::Future<Result<Option<Item>, error::Error>> {
-          self.start();
-          let receiver = self.receiver.clone().unwrap();
-          Box::pin(async move {
-              //println!("Receiving");
-              receiver.recv_async().await.map(Some).or_else(|_| Ok(None))
-          })
-      }
   }
 
-  impl Derive<Timer<Item>> for Item {
-      fn derive(t: Timer<Item>) -> Self {
+  impl Derive<Timer> for Item {
+      fn derive(t: Timer) -> Self {
           Item::Dispenser(coll::Dispenser::Out(pipe::Out::Timer(t)))
       }
   }
 
-  impl crate::serialize::Display for Timer<Item> {
+  impl crate::serialize::Display for Timer {
       fn representation(&self) -> Item {
           assoc::Association::derive_iter([
               ("type".fit(), "pipe".fit()),
