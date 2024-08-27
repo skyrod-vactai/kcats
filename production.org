@@ -500,6 +500,16 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  impl TryDerive<Item> for char {
+      type Error = Error;
+      fn try_derive(i: Item) -> Result<Self, Self::Error> {
+          match i {
+              Item::Char(c) => Ok(c),
+              b => Err(Error::expected("char", b)),
+          }
+      }
+  }
+
   /// As there are no real booleans, we use the word 'yes' but literally
   /// any value except empty containers is truthy. If we read a value
   /// 'false', that's not actually a boolean, it's just the [Word]
@@ -1026,14 +1036,27 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  impl DeriveIterator<assoc::KeyItem> for Set {
+  impl DeriveIterator<Char> for List {
       fn derive_iter<I>(iter: I) -> Self
       where
-          I: IntoIterator<Item = assoc::KeyItem>,
+          I: IntoIterator<Item = Char>,
       {
-          sync::Arc::new(iter.into_iter().collect::<HashSet<assoc::KeyItem>>())
+          Arc::new(
+              iter.into_iter()
+                  .map(Item::derive)
+                  .collect::<VecDeque<Item>>(),
+          )
       }
   }
+
+  // impl DeriveIterator<assoc::KeyItem> for Set {
+  //     fn derive_iter<I>(iter: I) -> Self
+  //     where
+  //         I: IntoIterator<Item = assoc::KeyItem>,
+  //     {
+  //         sync::Arc::new(iter.into_iter().collect::<HashSet<assoc::KeyItem>>())
+  //     }
+  // }
 
   impl<T> Fresh for Arc<T>
   where
@@ -1098,6 +1121,65 @@ internally, to keep track of things like the stack, program, lists etc.
           let am = self.mutate();
           am.extend(rhs.iter().cloned());
           Ok(self)
+      }
+  }
+
+  /// When joining a List with a String, which type we get back depends
+  /// on the contents of the list. If the list has non-char items in it,
+  /// we get a List. Otherwise, a string.
+  impl Join<String> for List {
+      type Output = Sized;
+      type Error = Infallible;
+      fn join(mut self, rhs: String) -> Result<Self::Output, Self::Error> {
+          match self
+              .iter()
+              .cloned()
+              .map(|i| Char::try_derive(i))
+              .collect::<Result<Vec<Char>, Error>>()
+          {
+              Ok(vc) => {
+                  //join as string if all the list items are chars
+                  let mut x = vc.iter().collect::<String>();
+
+                  x.push_str(rhs.as_str());
+                  Ok(Sized::String(x))
+              }
+              Err(_) => {
+                  // join as list
+                  self.mutate().extend(rhs.chars().map(Item::derive));
+                  Ok(Sized::List(self))
+              }
+          }
+      }
+  }
+
+  /// When joining a String with a List, which type we get back depends
+  /// on the contents of the list. If the list has non-char items in it,
+  /// we get a List. Otherwise, a string.
+  impl Join<List> for String {
+      type Output = Sized;
+      type Error = Infallible;
+      fn join(mut self, rhs: List) -> Result<Self::Output, Self::Error> {
+          match rhs
+              .iter()
+              .cloned()
+              .map(|i| Char::try_derive(i))
+              .collect::<Result<Vec<Char>, Error>>()
+          {
+              Ok(vc) => {
+                  //join as string if all the list items are chars
+                  let x = vc.iter().collect::<String>();
+
+                  self.push_str(x.as_str());
+                  Ok(Sized::String(self))
+              }
+              Err(_) => {
+                  // join as list
+                  let mut sl: List = self.fit();
+                  sl.mutate().extend(rhs.iter().cloned());
+                  Ok(Sized::List(sl))
+              }
+          }
       }
   }
 
@@ -1182,6 +1264,8 @@ internally, to keep track of things like the stack, program, lists etc.
                   a.extend(b);
                   Sized::Bytes(a)
               }
+              (Sized::String(s), Sized::List(l)) => s.join(l).unwrap(),
+              (Sized::List(l), Sized::String(s)) => l.join(s).unwrap(),
               (s, other) => {
                   if s.is_empty() {
                       other
@@ -1633,7 +1717,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
   impl IntoIterator for Sized {
       type Item = Item;
-      type IntoIter = Box<dyn Iterator<Item = Item>>;
+      type IntoIter = Box<dyn Iterator<Item = Self::Item>>;
 
       fn into_iter(self) -> Self::IntoIter {
           match self {
@@ -1718,6 +1802,12 @@ internally, to keep track of things like the stack, program, lists etc.
   impl Derive<Vec<Item>> for List {
       fn derive(v: Vec<Item>) -> Self {
           List::derive_iter(v)
+      }
+  }
+
+  impl Derive<String> for List {
+      fn derive(s: String) -> Self {
+          List::derive_iter(s.chars())
       }
   }
 
@@ -1866,7 +1956,7 @@ internally, to keep track of things like the stack, program, lists etc.
           let hs: HashSet<assoc::KeyItem> = s
               .into_iter()
               .map(|i| i.try_fit())
-              .collect::<Result<HashSet<assoc::KeyItem>, Error>>()?;
+              .collect::<Result<_, Error>>()?;
           Ok(Set::derive(hs))
       }
   }
@@ -1886,6 +1976,15 @@ internally, to keep track of things like the stack, program, lists etc.
   impl Default for Receptacle {
       fn default() -> Self {
           Receptacle::Sized(Sized::default())
+      }
+  }
+
+  impl ToIterator for Sized {
+      type Item = Item;
+      type IntoIter = Box<dyn Iterator<Item = Item>>;
+
+      fn to_iter<'a>(self) -> Self::IntoIter {
+          self.into_iter()
       }
   }
 
@@ -1975,8 +2074,9 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::types::container::{Container, Join, Mutey};
   use crate::types::number::{Int, Number};
   use crate::types::*;
+  use std::collections::HashSet;
   use std::convert::Infallible;
-  use std::sync;
+  use std::sync::{self, Arc};
 
   pub type Associationy<K, V> = HashMap<K, V>;
   pub type AssociationContent = Associationy<KeyItem, Item>;
@@ -2546,6 +2646,19 @@ internally, to keep track of things like the stack, program, lists etc.
   impl Derive<Associative> for Item {
       fn derive(a: Associative) -> Item {
           coll::Sized::Associative(a).fit()
+      }
+  }
+
+  impl Derive<(KeyItem, Item)> for KeyItem {
+      fn derive((k, _): (KeyItem, Item)) -> KeyItem {
+          k
+      }
+  }
+
+  /// Converting Associative to Set just returns the keys.
+  impl Derive<Associative> for coll::Set {
+      fn derive(a: Associative) -> coll::Set {
+          Arc::new(HashSet::from_iter(a.to_iter().map(|(k, _)| k)))
       }
   }
 
@@ -3754,6 +3867,7 @@ internally, to keep track of things like the stack, program, lists etc.
   /// existing env, loads the given module and returns the new env with
   /// the dictionary that the module built on the stack.
   fn load_module(mut env: Environment, module: &&str) -> Environment {
+      println!("Loading module {}", *module);
       env.push(Word::derive(*module));
       env.program.prepend(list!(
           "dictionary",
@@ -5894,8 +6008,11 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }
   }
 
-  pub fn contains(c: coll::Sized, i: Item) -> Result<bool, Infallible> {
-      Ok(c.has(&i))
+  pub fn contains(c: Item, i: Item) -> Result<bool, Infallible> {
+      match coll::Sized::try_derive(c) {
+          Ok(c) => Ok(c.has(&i)),
+          Err(_) => Ok(false),
+      }
   }
 
   pub fn or(i: Item, j: Item) -> ItemResult {
@@ -6433,8 +6550,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       Ok((j, k))
   }
 
-  pub fn sort_by_key(l: coll::List) -> Result<coll::List, Error> {
-      let it = l.iter().cloned().map(as_pair);
+  pub fn sort_by_key(l: coll::Sized) -> Result<coll::List, Error> {
+      let it = l.into_iter().map(as_pair);
       let mut it = it.collect::<Result<Vec<(Item, assoc::KeyItem)>, Error>>()?;
       it.sort_unstable_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Less));
       Ok(coll::List::derive_iter(it.into_iter().map(|(k, _)| k)))
@@ -6831,10 +6948,8 @@ We'll also define how to run unit tests.
 
       use test_case::test_case;
 
-      pub fn get_item(i: Item, index: usize) -> Option<Item> {
-          coll::List::try_derive(i)
-              .ok()
-              .and_then(|l| l.get(index).cloned())
+      pub fn get_item(i: &coll::List, index: usize) -> Option<Item> {
+          i.get(index).cloned()
       }
 
       #[tokio::main]
@@ -6842,6 +6957,7 @@ We'll also define how to run unit tests.
           mut prog_env: Environment,
           program: coll::List,
           expected: coll::List,
+          description: Option<String>,
       ) -> Option<Error> {
           let mut exp_env = prog_env.clone();
           prog_env.program.prepend(program.clone());
@@ -6855,15 +6971,20 @@ We'll also define how to run unit tests.
           let exp_env = exp_env.unwrap();
 
           if prog_env.stack == exp_env.stack {
-              println!(
-                  "Nice expected {} got {}",
-                  (exp_env.stack.iter().emit()),
-                  (prog_env.stack.iter().emit())
-              );
+              if let Some(description) = description {
+                  println!("PASSED: '{}'", description);
+              } else {
+                  println!(
+                      "PASSED: expected {} got {}",
+                      (exp_env.stack.iter().emit()),
+                      (prog_env.stack.iter().emit())
+                  );
+              }
               None
           } else {
               println!(
-                  "uh oh expected {} got {}",
+                  "\nFAILED: '{}'\nEXPECTED: {}\nACTUAL:   {}\n",
+                  description.unwrap_or_default(),
                   (exp_env.stack.iter().emit()),
                   (prog_env.stack.iter().emit())
               );
@@ -6882,10 +7003,12 @@ We'll also define how to run unit tests.
                   .unwrap()
                   .iter()
                   .filter_map(|ex| {
-                      let p = coll::List::try_derive(get_item(ex.clone(), 0).unwrap());
-                      let exp = coll::List::try_derive(get_item(ex.clone(), 1).unwrap());
+                      let l = coll::List::try_derive(ex.clone()).unwrap();
+                      let p = coll::List::try_derive(get_item(&l, 0).unwrap());
+                      let exp = coll::List::try_derive(get_item(&l, 1).unwrap());
+                      let description = get_item(&l, 2).and_then(|i| String::try_derive(i).ok());
                       match (p, exp) {
-                          (Ok(p), Ok(exp)) => test_example(standard_env.clone(), p, exp),
+                          (Ok(p), Ok(exp)) => test_example(standard_env.clone(), p, exp, description),
                           (Err(e), _) => Some(e),
                           (_, Err(e)) => Some(e),
                       }
@@ -9609,6 +9732,14 @@ debugger we can go step by step, but if the function composition is
 bundled up, we can only "step over" that function and not "into" it. I
 am not sure if it's possible to build this such that we preserve
 stepping ability and increase performance substantially.
+
+I've tried various approaches to this problem and honestly I can't
+find anything remotely simple that I'm confident would be a
+significant performance improvement. I'm not even sure something
+complex would be fast, short of a full blown compiler. And then
+whatever compiler that is would have to be available at runtime on all
+platforms - so I can't just compile to C source because I would then
+have to ship a C compiler too.
 *** TODO Programs as their own immutable type
 Programs executing in a loop are generally not modified (exception -
 the =recur= word, which can modify but usually just calls =execute=)- so
