@@ -1028,14 +1028,27 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  impl DeriveIterator<assoc::KeyItem> for Set {
+  impl DeriveIterator<Char> for List {
       fn derive_iter<I>(iter: I) -> Self
       where
-          I: IntoIterator<Item = assoc::KeyItem>,
+          I: IntoIterator<Item = Char>,
       {
-          sync::Arc::new(iter.into_iter().collect::<HashSet<assoc::KeyItem>>())
+          Arc::new(
+              iter.into_iter()
+                  .map(Item::derive)
+                  .collect::<VecDeque<Item>>(),
+          )
       }
   }
+
+  // impl DeriveIterator<assoc::KeyItem> for Set {
+  //     fn derive_iter<I>(iter: I) -> Self
+  //     where
+  //         I: IntoIterator<Item = assoc::KeyItem>,
+  //     {
+  //         sync::Arc::new(iter.into_iter().collect::<HashSet<assoc::KeyItem>>())
+  //     }
+  // }
 
   impl<T> Fresh for Arc<T>
   where
@@ -1361,33 +1374,46 @@ internally, to keep track of things like the stack, program, lists etc.
                   Sized::String(a)
               }
               (Sized::String(mut s), Sized::List(l)) => {
-                  //if it's a list of chars, do the join
-                  if s.is_empty() {
-                      Sized::List(l)
-                  } else {
-                      let vc = l
-                          .iter()
-                          .cloned()
-                          .map(|i| Char::try_derive(i))
-                          .collect::<Result<Vec<Char>, Error>>()?;
-                      s.extend(vc.iter());
-                      Sized::String(s)
+                  match l
+                      .iter()
+                      .cloned()
+                      .map(|i| Char::try_derive(i))
+                      .collect::<Result<Vec<Char>, Error>>()
+                  {
+                      Ok(vc) => {
+                          //join as string if all the list items are chars
+                          let x = vc.iter().collect::<String>();
+
+                          s.push_str(x.as_str());
+                          Sized::String(s)
+                      }
+                      Err(_) => {
+                          // join as list
+                          let mut sl: List = s.fit();
+                          sl.mutate().extend(l.iter().cloned());
+                          Sized::List(sl)
+                      }
                   }
               }
-              (Sized::List(l), Sized::String(s)) => {
-                  //if it's a list of chars, do the join
-                  if s.is_empty() {
-                      Sized::List(l)
-                  } else {
-                      let vc = l
-                          .iter()
-                          .cloned()
-                          .map(|i| Char::try_derive(i))
-                          .collect::<Result<Vec<Char>, Error>>()?;
-                      let mut x = vc.iter().collect::<String>();
+              (Sized::List(mut l), Sized::String(s)) => {
+                  match l
+                      .iter()
+                      .cloned()
+                      .map(|i| Char::try_derive(i))
+                      .collect::<Result<Vec<Char>, Error>>()
+                  {
+                      Ok(vc) => {
+                          //join as string if all the list items are chars
+                          let mut x = vc.iter().collect::<String>();
 
-                      x.push_str(s.as_str());
-                      Sized::String(x)
+                          x.push_str(s.as_str());
+                          Sized::String(x)
+                      }
+                      Err(_) => {
+                          // join as list
+                          l.mutate().extend(s.chars().map(Item::derive));
+                          Sized::List(l)
+                      }
                   }
               }
               (Sized::Bytes(mut a), Sized::Bytes(b)) => {
@@ -1470,7 +1496,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
   impl IntoIterator for Sized {
       type Item = Item;
-      type IntoIter = Box<dyn Iterator<Item = Item>>;
+      type IntoIter = Box<dyn Iterator<Item = Self::Item>>;
 
       fn into_iter(self) -> Self::IntoIter {
           match self {
@@ -1555,6 +1581,12 @@ internally, to keep track of things like the stack, program, lists etc.
   impl Derive<Vec<Item>> for List {
       fn derive(v: Vec<Item>) -> Self {
           List::derive_iter(v)
+      }
+  }
+
+  impl Derive<String> for List {
+      fn derive(s: String) -> Self {
+          List::derive_iter(s.chars())
       }
   }
 
@@ -1703,7 +1735,7 @@ internally, to keep track of things like the stack, program, lists etc.
           let hs: HashSet<assoc::KeyItem> = s
               .into_iter()
               .map(|i| i.try_fit())
-              .collect::<Result<HashSet<assoc::KeyItem>, Error>>()?;
+              .collect::<Result<_, Error>>()?;
           Ok(Set::derive(hs))
       }
   }
@@ -1723,6 +1755,15 @@ internally, to keep track of things like the stack, program, lists etc.
   impl Default for Receptacle {
       fn default() -> Self {
           Receptacle::Sized(Sized::default())
+      }
+  }
+
+  impl ToIterator for Sized {
+      type Item = Item;
+      type IntoIter = Box<dyn Iterator<Item = Item>>;
+
+      fn to_iter<'a>(self) -> Self::IntoIter {
+          self.into_iter()
       }
   }
 
@@ -1812,7 +1853,8 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::types::container::Mutey;
   use crate::types::number::{Int, Number};
   use crate::types::*;
-  use std::sync;
+  use std::collections::HashSet;
+  use std::sync::{self, Arc};
 
   pub type Associationy<K, V> = HashMap<K, V>;
   pub type AssociationContent = Associationy<KeyItem, Item>;
@@ -2395,6 +2437,19 @@ internally, to keep track of things like the stack, program, lists etc.
   impl Derive<Associative> for Item {
       fn derive(a: Associative) -> Item {
           coll::Sized::Associative(a).fit()
+      }
+  }
+
+  impl Derive<(KeyItem, Item)> for KeyItem {
+      fn derive((k, _): (KeyItem, Item)) -> KeyItem {
+          k
+      }
+  }
+
+  /// Converting Associative to Set just returns the keys.
+  impl Derive<Associative> for coll::Set {
+      fn derive(a: Associative) -> coll::Set {
+          Arc::new(HashSet::from_iter(a.to_iter().map(|(k, _)| k)))
       }
   }
 
@@ -5673,8 +5728,11 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }
   }
 
-  pub fn contains(c: coll::Sized, i: Item) -> Result<bool, Infallible> {
-      Ok(c.contains(&i))
+  pub fn contains(c: Item, i: Item) -> Result<bool, Infallible> {
+      match coll::Sized::try_derive(c) {
+          Ok(c) => Ok(c.contains(&i)),
+          Err(_) => Ok(false),
+      }
   }
 
   pub fn or(i: Item, j: Item) -> ItemResult {
