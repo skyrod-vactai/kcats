@@ -3044,6 +3044,7 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::types::container::associative::Convert;
   use crate::types::container::{self as coll, Count, Mutey};
   use crate::types::*;
+  use cache::cache;
   use internment::Intern;
   use std::collections::HashSet;
   use std::convert::Infallible;
@@ -3221,6 +3222,10 @@ internally, to keep track of things like the stack, program, lists etc.
           match i {
               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(b))) => Ok(bytes_to_ns(b)),
               Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(b))) => Ok(bytes_to_ns(b)),
+              Item::Word(w) => Ok(cache::Key::Alias(String::derive(w.clone()))
+                  .deref()
+                  .map(bytes_to_ns)?),
+
               i => {
                   let s = coll::Sized::try_derive(i)?;
                   if s.is_empty() {
@@ -3931,6 +3936,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   "methods",
                   "generators",
                   "more-generators",
+                  "database",
                   //"template",
                   "debug", // END default namespace // another good candidate for lib
               ]
@@ -4171,29 +4177,46 @@ crate so we can use it at both build time and runtime.
       }
 
       impl Key {
-          pub fn get(&self) -> Result<Bytes, Error> {
-              if let Some(proj_dirs) = ProjectDirs::from("org", "skyrod", "kcats") {
-                  let data_dir = proj_dirs.data_dir();
+          fn path(&self) -> Result<PathBuf, Error> {
+              {
+                  if let Some(proj_dirs) = ProjectDirs::from("org", "skyrod", "kcats") {
+                      let data_dir = proj_dirs.data_dir();
 
-                  let cache_path = data_dir.join("cache");
+                      let cache_path = data_dir.join("cache");
 
-                  // Look up the file
-                  if cache_path.exists() && cache_path.is_dir() {
-                      let filename = match self {
-                          Key::Hash(hash) => base64::encode_config(hash, base64::URL_SAFE_NO_PAD),
-                          Key::Alias(word) => word.to_string(),
-                      };
+                      // Look up the file
+                      if cache_path.exists() && cache_path.is_dir() {
+                          let filename = match self {
+                              Key::Hash(hash) => base64::encode_config(hash, base64::URL_SAFE_NO_PAD),
+                              Key::Alias(word) => word.to_string(),
+                          };
 
-                      let file = cache_path.join(filename);
-                      //println!("Reading cache file {:?}", file);
-                      let mut content = Bytes::new();
-                      fetch_link(file.as_path())?.read_to_end(&mut content)?;
-                      Ok(content)
+                          let file = cache_path.join(filename);
+
+                          Ok(file)
+                      } else {
+                          Err(Error::new(io::ErrorKind::Other, "Cache dir not found"))
+                      }
                   } else {
-                      Err(Error::new(io::ErrorKind::Other, "Cache dir not found"))
+                      Err(Error::new(io::ErrorKind::Other, "Cache data dir not found"))
                   }
-              } else {
-                  Err(Error::new(io::ErrorKind::Other, "Cache data dir not found"))
+              }
+          }
+
+          pub fn get(&self) -> Result<Bytes, Error> {
+              let mut content = Bytes::new();
+              self.path()
+                  .and_then(|pb| fetch_link(pb.as_path()))
+                  .and_then(|mut f| f.read_to_end(&mut content))?;
+
+              Ok(content)
+          }
+
+          pub fn deref(&self) -> Result<Bytes, io::Error> {
+              match self {
+                  Key::Hash(h) => Ok(h.clone()),
+                  Key::Alias(a) => target(a.clone())
+                      .and_then(|t| Ok(base64::decode_config(t, base64::URL_SAFE_NO_PAD).unwrap())),
               }
           }
       }
@@ -4354,6 +4377,21 @@ crate so we can use it at both build time and runtime.
                   let mut target_path = String::new();
                   link_file.read_to_string(&mut target_path)?;
                   File::open(target_path)
+              }
+          }
+      }
+
+      fn target(alias: String) -> Result<String, io::Error> {
+          let path = Key::Alias(alias).path()?;
+          match get_link_type() {
+              Link::Symlink => {
+                  fs::read_link(path).map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+              }
+              Link::Manual => {
+                  let mut link_file = File::open(path)?;
+                  let mut target_path = String::new();
+                  link_file.read_to_string(&mut target_path)?;
+                  Ok(target_path)
               }
           }
       }
@@ -12955,7 +12993,68 @@ Hm even with the rust impl of =finished?= it's 1500ms vs 66ms, about 25x slower.
    [execute] every?]
   keep
 #+end_src
-*** EAVTO (entity, attribute, value, time, observer)
+
+Insert some data
+
+#+begin_src kcats
+  [[[author-first "George"] [author-last "Orwell"] [title "1984"] [year 1949] [subjects [government dystopia surveillance totalitarianism freedom]]]
+   [[author-first "Aldous"] [author-last "Huxley"] [title "Brave New World"] [year 1932] [subjects [society technology dystopia happiness drugs]]]
+   [[author-first "F. Scott"] [author-last "Fitzgerald"] [title "The Great Gatsby"] [year 1925] [subjects [wealth love obsession american-dream tragedy]]]
+   [[author-first "J.D."] [author-last "Salinger"] [title "The Catcher in the Rye"] [year 1951] [subjects [adolescence alienation innocence society adulthood]]]
+   [[author-first "Jane"] [author-last "Austen"] [title "Pride and Prejudice"] [year 1813] [subjects [love marriage society class reputation]]]
+   [[author-first "Mary"] [author-last "Shelley"] [title "Frankenstein"] [year 1818] [subjects [creation science responsibility monster humanity]]]
+   [[author-first "John"] [author-last "Steinbeck"] [title "Of Mice and Men"] [year 1937] [subjects [friendship dream loneliness society tragedy]]]
+   [[author-first "Ernest"] [author-last "Hemingway"] [title "The Old Man and the Sea"] [year 1952] [subjects [endurance nature old-age fisherman sea]]]
+   [[author-first "Harper"] [author-last "Lee"] [title "To Kill a Mockingbird"] [year 1960] [subjects [racism innocence morality law childhood]]]
+   [[author-first "J.R.R."] [author-last "Tolkien"] [title "The Lord of the Rings"] [year 1954] [subjects [adventure elf dwarf hobbit ring journey magic evil]]]
+   [[author-first "Joseph"] [author-last "Conrad"] [title "Heart of Darkness"] [year 1899] [subjects [colonization africa journey morality darkness europeans]]]
+   [[author-first "Leo"] [author-last "Tolstoy"] [title "War and Peace"] [year 1869] [subjects [war peace society history love aristocracy]]]
+   [[author-first "Homer"] [title "The Odyssey"] [year -800] [subjects [journey odyssey homecoming gods heroism adventure]]]
+   [[author-first "Charlotte"] [author-last "Bronte"] [title "Jane Eyre"] [year 1847] [subjects [love morality society class womanhood independence]]]
+   [[author-first "Mark"] [author-last "Twain"] [title "Adventures of Huckleberry Finn"] [year 1884] [subjects [adventure racism slavery morality friendship river]]]
+   [[author-first "Ray"] [author-last "Bradbury"] [title "Fahrenheit 451"] [year 1953] [subjects [censorship knowledge books society dystopia future]]]
+   [[author-first "Charles"] [author-last "Dickens"] [title "A Tale of Two Cities"] [year 1859] [subjects [revolution love sacrifice resurrection society history]]]
+   [[author-first "William"] [author-last "Golding"] [title "Lord of the Flies"] [year 1954] [subjects [society civilization savagery childhood morality island]]]
+   [[author-first "Miguel de"] [author-last "Cervantes"] [title "Don Quixote"] [year 1605] [subjects [adventure idealism reality knight insanity literature]]]
+   [[author-first "H.G."] [author-last "Wells"] [title "The War of the Worlds"] [year 1898] [subjects [invasion aliens society technology war humanity]]]]
+  [[subjects] [set] update persist] step
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[] [] [] [] [] [] [] [] [] [] [] [] [] [] [] [] [] [] [] []
+#+end_src
+
+#+begin_src kcats
+  [[[first-name "George"] [last-name "Orwell"] [country "United Kingdom"] [birth-year 1903] [death-year 1950] [sex m] [awards ["Nobel Prize in Literature"]]]
+   [[first-name "Aldous"] [last-name "Huxley"] [country "United Kingdom"] [birth-year 1894] [death-year 1963] [sex m] [awards ["Humanitarian Award"]]]
+   [[first-name "F. Scott"] [last-name "Fitzgerald"] [country "United States"] [birth-year 1896] [death-year 1940] [sex m] [awards ["Pulitzer Prize"]]]
+   [[first-name "J.D."] [last-name "Salinger"] [country "United States"] [birth-year 1919] [death-year 2010] [sex m] [awards []]]
+   [[first-name "Jane"] [last-name "Austen"] [country "United Kingdom"] [birth-year 1775] [death-year 1817] [sex f] [awards []]]
+   [[first-name "Mary"] [last-name "Shelley"] [country "United Kingdom"] [birth-year 1797] [death-year 1851] [sex f] [awards []]]
+   [[first-name "John"] [last-name "Steinbeck"] [country "United States"] [birth-year 1902] [death-year 1968] [sex m] [awards ["Nobel Prize in Literature"]]]
+   [[first-name "Ernest"] [last-name "Hemingway"] [country "United States"] [birth-year 1899] [death-year 1961] [sex m] [awards ["Nobel Prize in Literature"]]]
+   [[first-name "Harper"] [last-name "Lee"] [country "United States"] [birth-year 1926] [death-year 2016] [sex f] [awards ["Pulitzer Prize"]]]
+   [[first-name "J.R.R."] [last-name "Tolkien"] [country "United Kingdom"] [birth-year 1892] [death-year 1973] [sex m] [awards []]]
+   [[first-name "Joseph"] [last-name "Conrad"] [country "Poland"] [birth-year 1857] [death-year 1924] [sex m] [awards []]]
+   [[first-name "Leo"] [last-name "Tolstoy"] [country "Russia"] [birth-year 1828] [death-year 1910] [sex m] [awards []]]
+   [[first-name "Homer"] [last-name ""] [country "Greece"] [birth-year -800] [death-year -701] [sex m] [awards []]]
+   [[first-name "Charlotte"] [last-name "Bronte"] [country "United Kingdom"] [birth-year 1816] [death-year 1855] [sex f] [awards []]]
+   [[first-name "Mark"] [last-name "Twain"] [country "United States"] [birth-year 1835] [death-year 1910] [sex m] [awards []]]
+   [[first-name "Ray"] [last-name "Bradbury"] [country "United States"] [birth-year 1920] [death-year 2012] [sex m] [awards []]]
+   [[first-name "Charles"] [last-name "Dickens"] [country "United Kingdom"] [birth-year 1812] [death-year 1870] [sex m] [awards []]]
+   [[first-name "William"] [last-name "Golding"] [country "United Kingdom"] [birth-year 1911] [death-year 1993] [sex m] [awards ["Nobel Prize in Literature"]]]
+   [[first-name "Miguel de"] [last-name "Cervantes"] [country "Spain"] [birth-year 1547] [death-year 1616] [sex m] [awards []]]
+   [[first-name "H.G."] [last-name "Wells"] [country "United Kingdom"] [birth-year 1866] [death-year 1946] [sex m] [awards []]]]
+  [[awards] [set] update persist] step
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[] [] [] [] [] [] [] [] [] [] [] [] [] [] [] [] [] [] [] []
+#+end_src
+
+*** Schema
 Here's a database of the most basic and abstract observations
 (ignoring time and observer for now - those are all "now" and "me").
 
@@ -13044,65 +13143,8 @@ CREATE INDEX idx_valuestring ON EAV (ValueString);
   [Attribute name]]]
 #+end_src
 
-Insert some data
+*** Implementation and experiments
 
-#+begin_src kcats
-  [[[author-first "George"] [author-last "Orwell"] [title "1984"] [year 1949] [subjects [government dystopia surveillance totalitarianism freedom]]]
-   [[author-first "Aldous"] [author-last "Huxley"] [title "Brave New World"] [year 1932] [subjects [society technology dystopia happiness drugs]]]
-   [[author-first "F. Scott"] [author-last "Fitzgerald"] [title "The Great Gatsby"] [year 1925] [subjects [wealth love obsession american-dream tragedy]]]
-   [[author-first "J.D."] [author-last "Salinger"] [title "The Catcher in the Rye"] [year 1951] [subjects [adolescence alienation innocence society adulthood]]]
-   [[author-first "Jane"] [author-last "Austen"] [title "Pride and Prejudice"] [year 1813] [subjects [love marriage society class reputation]]]
-   [[author-first "Mary"] [author-last "Shelley"] [title "Frankenstein"] [year 1818] [subjects [creation science responsibility monster humanity]]]
-   [[author-first "John"] [author-last "Steinbeck"] [title "Of Mice and Men"] [year 1937] [subjects [friendship dream loneliness society tragedy]]]
-   [[author-first "Ernest"] [author-last "Hemingway"] [title "The Old Man and the Sea"] [year 1952] [subjects [endurance nature old-age fisherman sea]]]
-   [[author-first "Harper"] [author-last "Lee"] [title "To Kill a Mockingbird"] [year 1960] [subjects [racism innocence morality law childhood]]]
-   [[author-first "J.R.R."] [author-last "Tolkien"] [title "The Lord of the Rings"] [year 1954] [subjects [adventure elf dwarf hobbit ring journey magic evil]]]
-   [[author-first "Joseph"] [author-last "Conrad"] [title "Heart of Darkness"] [year 1899] [subjects [colonization africa journey morality darkness europeans]]]
-   [[author-first "Leo"] [author-last "Tolstoy"] [title "War and Peace"] [year 1869] [subjects [war peace society history love aristocracy]]]
-   [[author-first "Homer"] [title "The Odyssey"] [year -800] [subjects [journey odyssey homecoming gods heroism adventure]]]
-   [[author-first "Charlotte"] [author-last "Bronte"] [title "Jane Eyre"] [year 1847] [subjects [love morality society class womanhood independence]]]
-   [[author-first "Mark"] [author-last "Twain"] [title "Adventures of Huckleberry Finn"] [year 1884] [subjects [adventure racism slavery morality friendship river]]]
-   [[author-first "Ray"] [author-last "Bradbury"] [title "Fahrenheit 451"] [year 1953] [subjects [censorship knowledge books society dystopia future]]]
-   [[author-first "Charles"] [author-last "Dickens"] [title "A Tale of Two Cities"] [year 1859] [subjects [revolution love sacrifice resurrection society history]]]
-   [[author-first "William"] [author-last "Golding"] [title "Lord of the Flies"] [year 1954] [subjects [society civilization savagery childhood morality island]]]
-   [[author-first "Miguel de"] [author-last "Cervantes"] [title "Don Quixote"] [year 1605] [subjects [adventure idealism reality knight insanity literature]]]
-   [[author-first "H.G."] [author-last "Wells"] [title "The War of the Worlds"] [year 1898] [subjects [invasion aliens society technology war humanity]]]]
-  [[subjects] [set] update persist] step
-#+end_src
-
-#+RESULTS:
-#+begin_src kcats
-[] [] [] [] [] [] [] [] [] [] [] [] [] [] [] [] [] [] [] []
-#+end_src
-
-#+begin_src kcats
-  [[[first-name "George"] [last-name "Orwell"] [country "United Kingdom"] [birth-year 1903] [death-year 1950] [sex m] [awards ["Nobel Prize in Literature"]]]
-   [[first-name "Aldous"] [last-name "Huxley"] [country "United Kingdom"] [birth-year 1894] [death-year 1963] [sex m] [awards ["Humanitarian Award"]]]
-   [[first-name "F. Scott"] [last-name "Fitzgerald"] [country "United States"] [birth-year 1896] [death-year 1940] [sex m] [awards ["Pulitzer Prize"]]]
-   [[first-name "J.D."] [last-name "Salinger"] [country "United States"] [birth-year 1919] [death-year 2010] [sex m] [awards []]]
-   [[first-name "Jane"] [last-name "Austen"] [country "United Kingdom"] [birth-year 1775] [death-year 1817] [sex f] [awards []]]
-   [[first-name "Mary"] [last-name "Shelley"] [country "United Kingdom"] [birth-year 1797] [death-year 1851] [sex f] [awards []]]
-   [[first-name "John"] [last-name "Steinbeck"] [country "United States"] [birth-year 1902] [death-year 1968] [sex m] [awards ["Nobel Prize in Literature"]]]
-   [[first-name "Ernest"] [last-name "Hemingway"] [country "United States"] [birth-year 1899] [death-year 1961] [sex m] [awards ["Nobel Prize in Literature"]]]
-   [[first-name "Harper"] [last-name "Lee"] [country "United States"] [birth-year 1926] [death-year 2016] [sex f] [awards ["Pulitzer Prize"]]]
-   [[first-name "J.R.R."] [last-name "Tolkien"] [country "United Kingdom"] [birth-year 1892] [death-year 1973] [sex m] [awards []]]
-   [[first-name "Joseph"] [last-name "Conrad"] [country "Poland"] [birth-year 1857] [death-year 1924] [sex m] [awards []]]
-   [[first-name "Leo"] [last-name "Tolstoy"] [country "Russia"] [birth-year 1828] [death-year 1910] [sex m] [awards []]]
-   [[first-name "Homer"] [last-name ""] [country "Greece"] [birth-year -800] [death-year -701] [sex m] [awards []]]
-   [[first-name "Charlotte"] [last-name "Bronte"] [country "United Kingdom"] [birth-year 1816] [death-year 1855] [sex f] [awards []]]
-   [[first-name "Mark"] [last-name "Twain"] [country "United States"] [birth-year 1835] [death-year 1910] [sex m] [awards []]]
-   [[first-name "Ray"] [last-name "Bradbury"] [country "United States"] [birth-year 1920] [death-year 2012] [sex m] [awards []]]
-   [[first-name "Charles"] [last-name "Dickens"] [country "United Kingdom"] [birth-year 1812] [death-year 1870] [sex m] [awards []]]
-   [[first-name "William"] [last-name "Golding"] [country "United Kingdom"] [birth-year 1911] [death-year 1993] [sex m] [awards ["Nobel Prize in Literature"]]]
-   [[first-name "Miguel de"] [last-name "Cervantes"] [country "Spain"] [birth-year 1547] [death-year 1616] [sex m] [awards []]]
-   [[first-name "H.G."] [last-name "Wells"] [country "United Kingdom"] [birth-year 1866] [death-year 1946] [sex m] [awards []]]]
-  [[awards] [set] update persist] step
-#+end_src
-
-#+RESULTS:
-#+begin_src kcats
-[] [] [] [] [] [] [] [] [] [] [] [] [] [] [] [] [] [] [] []
-#+end_src
 
 Find book title/author that are about "adventure".
 #+begin_src kcats
@@ -13221,204 +13263,158 @@ it? (May need to add some set-based words here).
 #+end_src
 
 #+begin_src kcats
-    ;; Module to operate on generic data, that are used throughout
-    [[fork [[execute] map]]
-     [triangle [[[] [[take] dip swap [[put] shield sink swap pair] bail] collect] shielddown]]
-     [indexed-as-property [swap indexed
-                           [unwrap sink assign] map dropdown]]
-     [join-all [[first empty] shield swap [join] step]]
-     [selectkeys [set swap [first contains?] filter]]
-     [invert [[reverse] map association]]
+  ;; Module to operate on generic data, that are used throughout
+  [[fork [[execute] map]]
+   [triangle [[[] [[take] dip swap [[put] shield sink swap pair] bail] collect] shielddown]]
+   [indexed-as-property [swap indexed
+                         [unwrap sink assign] map dropdown]]
+   [join-all [[first empty] shield swap [join] step]]
+   [selectkeys [set swap [first contains?] filter]]
+   [invert [[reverse] map association]]
 
-     ;; datalog variables
-     [variable? [[[word?]
-                  [string last \? =]] [execute] every?]]
-     [variable= [[[pair [variable?] every?] [=]] [execute] every?]] 
+   ;; datalog variables
+   [variable? [[[word?]
+                [string last \? =]] [execute] every?]]
+   [variable= [[[pair [variable?] every?] [=]] [execute] every?]] 
 
-     ;; datalog constraints
-     [slots [[entity attribute value]]]
-     [slot-combos [slots [slots [pair] map] map join-all]]
-     [constraint [unwrap slots reverse label]] 
+   ;; datalog constraints
+   [slots [[entity attribute value]]]
+   [slot-combos [slots [slots [pair] map] map join-all]]
+   [constraint [unwrap slots reverse label]] 
 
-     ;; links between datalog constraints
-     [links [slot-combos
-             [[wrap] map unwrap swapdown 
-              [[[lookup] inject] both] pairwise 
-              variable=]
-             filter    
-             [unwrap pair sink pair
-              [[index] lookup] map swap zip]
-             map]]
-     [all-links [[] sink
-                 [[[[index] lookup] shield] both ;; lookup the indices of both constraints
-                  [swapdown] dip sink ;; move the indices under the constraints
-                  [links] shielddown
-                  swap [dropdown dropdown join] dip] 
+   ;; links between datalog constraints
+   [links [slot-combos
+           [[wrap] map unwrap swapdown 
+            [[[lookup] inject] both] pairwise 
+            variable=]
+           filter    
+           [unwrap pair sink pair
+            [[index] lookup] map swap zip]
+           map]]
+   [all-links [[] sink
+               [[[[index] lookup] shield] both ;; lookup the indices of both constraints
+                [swapdown] dip sink ;; move the indices under the constraints
+                [links] shielddown
+                swap [dropdown dropdown join] dip] 
 
-                 step drop]]
-     [format-link [[join] inject unwrap [string] map
-                   "c{0}.{1} = c{2}.{3}" swap format]] 
+               step drop]]
+   [format-link [[join] inject unwrap [string] map
+                 "c{0}.{1} = c{2}.{3}" swap format]] 
 
-     ;; formatting pieces of query data into text
-     [anded-together [" AND " interpose join-all]]
+   ;; formatting pieces of query data into text
+   [anded-together [" AND " interpose join-all]]
 
-     ;; where clause data processing
-     [where-data [[[index] lookup] shield swap 
-                  [[[second variable? not]
-                    [first [index] unwrap = not]] [execute] every?] filter 
-                  [swap prepend] map dropdown]]
-     [format-where [[string] map 
-                    "c{0}.{1} = :c{0}{1}" swap format]]
-     [make-where [first [where] lookup anded-together]]
-     [format-join [[[[on] lookup]
-                    [[where] lookup]
-                    [[index] lookup string]] [execute] map
-                   [join anded-together] inject 
-                   "JOIN EAV c{1} ON {0}" swap format]]
-     [make-query [rest [[on]
-                        [[format-link] map] update
-                        [format-join] shield [join] swap assign] map]]
+   ;; where clause data processing
+   [where-data [[[index] lookup] shield swap 
+                [[[second variable? not]
+                  [first [index] unwrap = not]] [execute] every?] filter 
+                [swap prepend] map dropdown]]
+   [format-where [[string] map 
+                  "c{0}.{1} = :c{0}{1}" swap format]]
+   [make-where [first [where] lookup anded-together]]
+   [format-join [[[[on] lookup]
+                  [[where] lookup]
+                  [[index] lookup string]] [execute] map
+                 [join anded-together] inject 
+                 "JOIN EAV c{1} ON {0}" swap format]]
+   [make-query [rest [[on]
+                      [[format-link] map] update
+                      [format-join] shield [join] swap assign] map]]
 
-     ;; SQL parameters for rusqlite
-     [param-name [[string] map ":c{0}{1}" swap format]]
-     [extract-params [[] association swap [[params] lookup join] step]]
+   ;; SQL parameters for rusqlite
+   [param-name [[string] map ":c{0}{1}" swap format]]
+   [extract-params [[] association swap [[params] lookup join] step]]
 
 
-     ;; SELECT clause
-     [wordval? [second word?]]
-     [invert [[reverse] map association]]
-     [validate [[[second not]
-                 [first "All selected query variables must appear somewhere in constraints"
-                  [reason variable] label fail]
-                 when] map]]
-     [select-data [swap
-                   [[slots selectkeys invert] shield
-                    [wordval?] filter join association] map
-                   swap
-                   [[[index] swap put ;; make a list of the variable and 'index'
-                     wrap [selectkeys] join ;; make the program to cut down
-                      map [count 2 =] filter first [second] map
-                     [first number?] [reverse] when] ;; items are in random order due to coming from association, fix the order
-                    map]
-                   shield dropdeep zip
-                   validate]]
+   ;; SELECT clause
+   [wordval? [second word?]]
+   [invert [[reverse] map association]]
+   [validate [[[second not]
+               [first "All selected query variables must appear somewhere in constraints"
+                [reason variable] label fail]
+               when] map]]
+   [select-data [swap
+                 [[slots selectkeys invert] shield
+                  [wordval?] filter join association] map
+                 swap
+                 [[[index] swap put ;; make a list of the variable and 'index'
+                   wrap [selectkeys] join ;; make the program to cut down
+                    map [count 2 =] filter first [second] map
+                   [first number?] [reverse] when] ;; items are in random order due to coming from association, fix the order
+                  map]
+                 shield dropdeep zip
+                 validate]]
 
-     ;; query 
-     [extract-data [[[[unwrap all-links]
-                      [first where-data   ; [join] inject unwrap
-                       ;; build the query param map
-                       [[[] swap
-                         [[param-name] shield [last] dip wrap swap assign]
-                         step]
-                        ;; build the actual query where clauses
-                        [[format-where] map]]
-                       fork]]
-                     fork] shield
-                    ;; combine extracted items
+   ;; query 
+   [extract-data [[[[unwrap all-links]
+                    [first where-data   ; [join] inject unwrap
+                     ;; build the query param map
+                     [[[] swap
+                       [[param-name] shield [last] dip wrap swap assign]
+                       step]
+                      ;; build the actual query where clauses
+                      [[format-where] map]]
+                     fork]]
+                   fork] shield
+                  ;; combine extracted items
 
-                    [first] dip ;; keep the original constraint to add properties to
-                    unwrap unwrap [where params on] label join]]
-     [format-select [[unwrap swap
-                      string butlast ;; remove the ? from the variable name for result column
-                      put
-                      [string] map
-                      "c{1}.{0} as {2}" swap format] map ", " interpose join-all]]
-     [time [timestamps take emit print drop]]]
+                  [first] dip ;; keep the original constraint to add properties to
+                  unwrap unwrap [where params on] label join]]
+   [format-select [[unwrap swap
+                    string butlast ;; remove the ? from the variable name for result column
+                    put
+                    [string] map
+                    "c{1}.{0} as {2}" swap format] map ", " interpose join-all]]
+   [time [timestamps take emit print drop]]]
 
-    ;; This is the program we need to modify that is `query`
+  ;; This is the program we need to modify that is `query`
 
-    [swap
-     ;; expand all combinations of constraints
-     [constraint] map
-     ;;[] prepend ;; an empty constraint to represent the orignal EAV table we're joining with
-     [index] indexed-as-property
-     triangle
-     ;; for each pair of constraints, build the "ON" clause data for the JOIN
-     [extract-data] map
-     [[extract-params]
-      [make-query]
-      [make-where]
-      [swap select-data]] fork 
-     dropdown ;; don't need original anymore
-     unwrap float
-     [[join] lookup] map  
-     swap format-select 
-     [" " interpose join-all] dip triplet reverse
-     "SELECT {0} from EAV as c0 {1} WHERE {2}" swap format
-     swap dropdeep]
+  [swap
+   ;; expand all combinations of constraints
+   [constraint] map
+   ;;[] prepend ;; an empty constraint to represent the orignal EAV table we're joining with
+   [index] indexed-as-property
+   triangle
+   ;; for each pair of constraints, build the "ON" clause data for the JOIN
+   [extract-data] map
+   [[extract-params]
+    [make-query]
+    [make-where]
+    [swap select-data]] fork 
+   dropdown ;; don't need original anymore
+   unwrap float
+   [[join] lookup] map  
+   swap format-select 
+   [" " interpose join-all] dip triplet reverse
+   "SELECT {0} from EAV as c0 {1} WHERE {2}" swap format
+   swap dropdeep]
 
-    let
-    [query] label draft
+  let
+  [query] label  ;; the above program is the definition of `query`
 
-    dictionary swap [emit encode hashbytes] shield [shield] dip sink [dictmerge] shielddeep
+  [[[book? subjects love]
+    ;[book? subjects subjects?]
+    [book? title book-title?]
+    [book? author-last author-last?]
+    [book? author-first author-first?]
+    [author? first-name author-first?]
+    [author? last-name author-last?]
+    [author? sex m]
+    [author? country "United States"]
 
-    [wrap] dip
-
-    [[[book? subjects love]
-      [book? title title?]
-      [book? author-last author-last?]
-      [book? author-first author-first?]
-      [author? first-name author-first?]
-      [author? last-name author-last?]
-      [author? sex f]
-      [author? birth-year birth-year?]]
-     [title? author-first? author-last? birth-year?]
-     query
-     ;database
-    ]
-
-    [program dictionary] label environment
-    swap using evaluate [stack] lookup restore
+    [author? birth-year author-birth-year?]]
+   [book-title? author-first? author-last? author-birth-year?]
+   query
+   database
+  ] let execute  
 #+end_src
 
 #+RESULTS:
 #+begin_src kcats
-  [[":c0attribute" subjects]
-   [":c0value" love]
-   [":c1attribute" title]
-   [":c2attribute" author-last]
-   [":c3attribute" author-first]
-   [":c4attribute" first-name]
-   [":c5attribute" last-name]
-   [":c6attribute" sex]
-   [":c6value" f]
-   [":c7attribute" birth-year]]
-  "SELECT c1.value as \"title\",
-    c3.value as \"author-first\",
-    c2.value as \"author-last\",
-    c7.value as \"birth-year\"
-   from EAV as c0
-  JOIN EAV c1 ON
-     c1.attribute = :c1attribute AND
-     c0.entity = c1.entity
-  JOIN EAV c2 ON
-     c2.attribute = :c2attribute AND
-     c0.entity = c2.entity AND
-     c1.entity = c2.entity
-  JOIN EAV c3 ON
-    c3.attribute = :c3attribute AND
-    c0.entity = c3.entity AND
-    c1.entity = c3.entity AND
-    c2.entity = c3.entity
-  JOIN EAV c4 ON
-    c4.attribute = :c4attribute AND
-    c3.value = c4.value
-  JOIN EAV c5 ON
-    c5.attribute = :c5attribute AND
-    c2.value = c5.value AND
-    c4.entity = c5.entity
-  JOIN EAV c6 ON
-    c6.value = :c6value AND
-    c6.attribute = :c6attribute AND
-    c4.entity = c6.entity AND
-    c5.entity = c6.entity
-  JOIN EAV c7 ON
-    c7.attribute = :c7attribute AND
-    c4.entity = c7.entity AND
-    c5.entity = c7.entity AND
-    c6.entity = c7.entity
-  WHERE c0.value = :c0value AND
-        c0.attribute = :c0attribute"
+[[[author-birth-year 1896]
+  [author-first "F. Scott"]
+  [author-last "Fitzgerald"]
+  [book-title "The Great Gatsby"]]]
 #+end_src
 
 We need to rewrite the link-finding logic so that it does everything in one pass
@@ -13458,52 +13454,52 @@ We need to rewrite the link-finding logic so that it does everything in one pass
 
 #+RESULTS:
 #+begin_src kcats
-[[[book? [[0 0]
-          [1 0]
-          [2 0]
-          [3 0]]]
-  [subjects [[0 1]]]
-  [love [[0 2]]]]
- [[title [[1 1]]]
-  [title? [[1 2]]]
+[[[love [[0 2]]]
   [book? [[0 0]
           [1 0]
           [2 0]
-          [3 0]]]]
+          [3 0]]]
+  [subjects [[0 1]]]]
+ [[book? [[0 0]
+          [1 0]
+          [2 0]
+          [3 0]]]
+  [title? [[1 2]]]
+  [title [[1 1]]]]
  [[author-last? [[2 2]
                  [5 2]]]
-  [book? [[0 0]
-          [1 0]
-          [2 0]
-          [3 0]]]
-  [author-last [[2 1]]]]
- [[author-first [[3 1]]]
-  [author-first? [[3 2]
-                  [4 2]]]
+  [author-last [[2 1]]]
   [book? [[0 0]
           [1 0]
           [2 0]
           [3 0]]]]
- [[author? [[4 0]
-            [5 0]
-            [6 0]
-            [7 0]]]
-  [first-name [[4 1]]]
+ [[book? [[0 0]
+          [1 0]
+          [2 0]
+          [3 0]]]
   [author-first? [[3 2]
-                  [4 2]]]]
+                  [4 2]]]
+  [author-first [[3 1]]]]
  [[author? [[4 0]
             [5 0]
             [6 0]
             [7 0]]]
-  [author-last? [[2 2]
+  [author-first? [[3 2]
+                  [4 2]]]
+  [first-name [[4 1]]]]
+ [[author-last? [[2 2]
                  [5 2]]]
-  [last-name [[5 1]]]]
- [[author? [[4 0]
+  [last-name [[5 1]]]
+  [author? [[4 0]
             [5 0]
             [6 0]
-            [7 0]]]
-  [f [[6 2]]]
-  [sex [[6 1]]]]
+            [7 0]]]]
+ [[f [[6 2]]]
+  [sex [[6 1]]]
+  [author? [[4 0]
+            [5 0]
+            [6 0]
+            [7 0]]]]
  [[author? [[4 0]
             [5 0]
             [6 0]
@@ -13674,6 +13670,163 @@ We need to rewrite the link-finding logic so that it does everything in one pass
 [[title? [value 2]]
  [author? [value 3]]]
 #+end_src
+
+*** Tests database module
+#+begin_src kcats
+  [[book? title title?]
+   [book? author author?]
+   [author? first-name author-first?]
+   [author? country "United States"]]
+  [title? author-first?]
+  [database] [query database]
+
+  [program] label environment swap ;; lm env
+  [[stack] [snapshot] divedown assign] dip ;; capture the stack at runtime
+  
+  using ;; set up the resolver 
+  evaluate ;; execute the program in the inner environment
+  ;[stack] lookup restore ;; replace the stack with the result from the inner env
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+  [[dictionary dictionary_redacted]
+   [program []]
+   [resolver [#b64 "qyKhcjHmD5kJNFA6/M0EkQOrh/j2zANmwrQFL1T1w7A="]]
+   [stack [[[actual [[lookup] inject]]
+            [asked [string]]
+            [handled yes]
+            [reason "type mismatch"]
+            [type error]
+            [unwound [database]]]
+           [[asked [consume]]
+            [handled yes]
+            [reason "not enough items on stack"]
+            [type error]
+            [unwound [both [] evert [joiner] assemble unwrap [] swap evert drop variable= [[entity
+                                                                                            entity]
+                                                                                           [[attribute title]
+                                                                                            [entity book?]
+                                                                                            [index 0]
+                                                                                            [value title?]]
+                                                                                           [[attribute author]
+                                                                                            [entity book?]
+                                                                                            [index 1]
+                                                                                            [value author?]]
+                                                                                           0 1 [] [title? author-first?]]
+                      evert first [] swap [] [drop swap put] [drop dropdown]
+                      if
+                      [[entity attribute]
+                       [entity value]
+                       [attribute entity]
+                       [attribute attribute]
+                       [attribute value]
+                       [value entity]
+                       [value attribute]
+                       [value value]]
+                      [swap [[[wrap] map unwrap swapdown [[[lookup] inject]
+                                                          both]
+                              pairwise variable=]
+                             shield]
+                       dip swap [] [drop swap put] [drop dropdown]
+                       if]
+                      step [unwrap pair sink pair [[index] lookup]
+                            map swap zip]
+                      map [[[attribute title]
+                            [entity book?]
+                            [index 0]
+                            [value title?]]
+                           [[attribute author]
+                            [entity book?]
+                            [index 1]
+                            [value author?]]
+                           0 1 [] [title? author-first?]]
+                      evert first dropdown swap [dropdown dropdown join] dip [] [[[[index] lookup]
+                                                                                  shield]
+                                                                                 both [swapdown] dip sink [links] shielddown swap [dropdown dropdown join] dip]
+                      step drop [[unwrap all-links]
+                                 [[[attribute author]
+                                   [entity book?]
+                                   [index 1]
+                                   [value author?]]
+                                  [[[attribute title]
+                                    [entity book?]
+                                    [index 0]
+                                    [value title?]]]]
+                                 [title? author-first?]]
+                      evert first dropdown
+                      [] swap put [[first where-data [[[] swap [[param-name] shield [last] dip wrap swap
+                                                                assign]
+                                                       step]
+                                                      [[format-where] map]]
+                                    fork]] [swap [[execute] shielddown]
+                                            dip swap put]
+                      step [[[[attribute author]
+                              [entity book?]
+                              [index 1]
+                              [value author?]]
+                             [[[attribute title]
+                               [entity book?]
+                               [index 0]
+                               [value title?]]]]
+                            [title? author-first?]]
+                      evert first [first] dip unwrap unwrap [where params on] label join [[[[attribute
+                                                                                             author]
+                                                                                            [entity book?]
+                                                                                            [index 1]
+                                                                                            [value author?]]
+                                                                                           [[[attribute title]
+                                                                                             [entity book?]
+                                                                                             [index 0]
+                                                                                             [value title?]]]]
+                                                                                          [title? author-first?]]
+                      evert first dropdown
+                      [[[attribute title]
+                        [entity book?]
+                        [index 0]
+                        [on []]
+                        [params [[":c0attribute" title]]]
+                        [value title?]
+                        [where ["c0.attribute = :c0attribute"]]]] swap put [[[[attribute first-name]
+                                                                              [entity author?]
+                                                                              [index 2]
+                                                                              [value author-first?]]
+                                                                             [[[attribute title]
+                                                                               [entity book?]
+                                                                               [index 0]
+                                                                               [value title?]]
+                                                                              [[attribute author]
+                                                                               [entity book?]
+                                                                               [index 1]
+                                                                               [value author?]]]]
+                                                                            [[[attribute country]
+                                                                              [entity author?]
+                                                                              [index 3]
+                                                                              [value "United States"]]
+                                                                             [[[attribute title]
+                                                                               [entity book?]
+                                                                               [index 0]
+                                                                               [value title?]]
+                                                                              [[attribute author]
+                                                                               [entity book?]
+                                                                               [index 1]
+                                                                               [value author?]]
+                                                                              [[attribute first-name]
+                                                                               [entity author?]
+                                                                               [index 2]
+                                                                               [value author-first?]]]]]
+                      [swap [[extract-data] shielddown]
+                       dip swap put]
+                      step [[extract-params] [make-query] [make-where] [swap select-data]] fork dropdown
+                      unwrap float [[join] lookup]
+                      map swap format-select [" " interpose join-all] dip triplet reverse "SELECT {0} from EAV as c0 {1} WHERE {2}"
+                      swap format swap dropdeep]]]
+           [[lookup] inject]]]]
+  [title? author-first?]
+  [[book? title title?] [book? author author?] [author? first-name author-first?]
+   [author? country "United States"]]
+#+end_src
+
 ** TODO Reduce CPU cost of `shield` :optimization:
 #+begin_src kcats
 [[program [1 2 3 [+] shield]]] environment stepper 0 [drop inc] cram
