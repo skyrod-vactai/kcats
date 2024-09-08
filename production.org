@@ -286,7 +286,6 @@ internally, to keep track of things like the stack, program, lists etc.
   use lazy_static::lazy_static;
   use std::collections::{HashMap, VecDeque};
 
-  use std::fmt;
   use std::hash::{Hash, Hasher};
   use std::marker::Sync;
 
@@ -2378,7 +2377,7 @@ internally, to keep track of things like the stack, program, lists etc.
                       let e2 = e.clone();
                       if let Ok(e) = dict::Entry::try_derive(e) {
                           let dm = coll::Arc::mutate(&mut d);
-                          let e = dm.insert(w, e).map(Item::derive);
+                          let e = dm.insert(w.fit(), e).map(Item::derive);
                           (Associative::Dictionary(d), e)
                       } else {
                           // TODO silently failing to insert here is bad
@@ -2437,7 +2436,7 @@ internally, to keep track of things like the stack, program, lists etc.
       pub fn put(self, other: Item) -> Result<Associative, Error> {
           match (self, other) {
               (Associative::Dictionary(mut this), other) => {
-                  let (word, entry) = <(Word, dict::Entry)>::try_derive(other)?;
+                  let (word, entry) = <(dict::Word, dict::Entry)>::try_derive(other)?;
                   let thismut = this.mutate();
                   thismut.insert(word.fit(), entry.fit());
                   Ok(Associative::Dictionary(this))
@@ -2464,7 +2463,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   _ => None,
               },
               Associative::Dictionary(d) => match k {
-                  KeyItem::Word(w) => d.get(w).map(|x| x.clone().fit()),
+                  KeyItem::Word(w) => d.get(&w.clone().fit()).map(|x| x.clone().fit()),
                   _ => None,
               },
               &Associative::Nothing => None,
@@ -2479,7 +2478,7 @@ internally, to keep track of things like the stack, program, lists etc.
               Associative::Env(e) => e.contains_key(k),
               Associative::DictEntry(d) => d.contains_key(k),
               Associative::Dictionary(d) => match k {
-                  KeyItem::Word(w) => d.contains_key(w),
+                  KeyItem::Word(w) => d.contains_key(&w.clone().fit()),
                   _ => false,
               },
               &Associative::Nothing => false,
@@ -2498,7 +2497,7 @@ internally, to keep track of things like the stack, program, lists etc.
               }
               Associative::Dictionary(mut d) => {
                   let dm = coll::Arc::mutate(&mut d);
-                  let v = dm.remove(&Word::try_derive(k.clone()).unwrap_or_default());
+                  let v = dm.remove(&dict::Word::try_derive(k.clone()).unwrap_or_default());
                   (Associative::Dictionary(d), v.map(|v| v.fit()))
               }
               Associative::Error(mut e) => {
@@ -2529,7 +2528,7 @@ internally, to keep track of things like the stack, program, lists etc.
               Associative::Dictionary(d) => {
                   let items: Vec<_> = d
                       .iter()
-                      .map(|(k, v)| (k.clone().fit(), v.clone().fit()))
+                      .map(|(k, v)| (KeyItem::Word(k.clone().fit()), v.clone().fit()))
                       .collect();
                   Box::new(items.into_iter())
               }
@@ -3043,13 +3042,41 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::traits::*;
   use crate::types::container::associative::Convert;
   use crate::types::container::{self as coll, Count, Mutey};
-  use crate::types::*;
+  use crate::types::{self, Bytes, Error, Item};
   use cache::cache;
+  use core::fmt;
   use internment::Intern;
+  use std::collections::HashMap;
   use std::collections::HashSet;
   use std::convert::Infallible;
+  use std::hash::Hash;
   use std::ptr;
   use std::sync::Arc;
+
+  /// A word in a dictionary is slightly different than a 'word' piece
+  /// of data: when looking up words in the dictionary, the namespace is
+  /// used for comparison.
+  #[derive(Eq, Hash, PartialEq, Debug, Clone, Default)]
+  pub struct Word(types::Word);
+
+  impl Derive<Word> for types::Word {
+      fn derive(w: Word) -> Self {
+          w.0
+      }
+  }
+
+  impl Derive<types::Word> for Word {
+      fn derive(w: types::Word) -> Self {
+          Word(w)
+      }
+  }
+
+  impl TryDerive<assoc::KeyItem> for Word {
+      type Error = Error;
+      fn try_derive(k: assoc::KeyItem) -> Result<Self, Self::Error> {
+          Ok(types::Word::try_derive(k)?.fit())
+      }
+  }
 
   /// The definition of a [Word], contains its actual code (the
   /// definition), and also documentation like specs and examples.
@@ -3065,8 +3092,8 @@ internally, to keep track of things like the stack, program, lists etc.
   /// type and optional name of the input/output.
   #[derive(Debug, Clone, PartialEq)]
   pub struct SpecElement {
-      pub elemtype: Word,
-      pub name: Option<Word>,
+      pub elemtype: types::Word,
+      pub name: Option<types::Word>,
   }
 
   pub type StackSpec = Vec<SpecElement>;
@@ -3089,8 +3116,8 @@ internally, to keep track of things like the stack, program, lists etc.
                   if s.len() != 2 {
                       Err(Error::list_count(2))
                   } else {
-                      let t = Word::try_derive(s.front().unwrap().clone())?;
-                      let n = Word::try_derive(s.get(1).unwrap().clone())?;
+                      let t = types::Word::try_derive(s.front().unwrap().clone())?;
+                      let n = types::Word::try_derive(s.get(1).unwrap().clone())?;
                       Ok(SpecElement {
                           elemtype: t,
                           name: Some(n),
@@ -3191,15 +3218,15 @@ internally, to keep track of things like the stack, program, lists etc.
               "spec" => self.spec.clone().map(|x| x.fit()),
               "examples" => self.examples.clone().map(|x| x.fit()),
               "definition" => Some(match self.definition.clone() {
-                  dict::Definition::Axiom(_) => "builtin".fit(),
-                  dict::Definition::Derived(d) => d.fit(),
+                  Definition::Axiom(_) => "builtin".fit(),
+                  Definition::Derived(d) => d.fit(),
               }),
               _ => None,
           }
       }
 
       pub fn contains_key(&self, key: &assoc::KeyItem) -> bool {
-          Word::try_derive(key.clone()).map_or(false, |ref w| {
+          types::Word::try_derive(key.clone()).map_or(false, |ref w| {
               matches!(w.fit(), "examples" | "spec" | "definition")
           })
       }
@@ -3267,7 +3294,7 @@ internally, to keep track of things like the stack, program, lists etc.
       /// Find the word in the dictionary in one of the given
       /// namespaces. The first match is applied to the word, or None if
       /// no matches.
-      fn resolve_word(&self, w: &mut Word, namespaces: &[dict::Namespace]);
+      fn resolve_word(&self, w: &mut Word, namespaces: &[Namespace]);
 
       /// Merges this dictionary with the given new dictionary. The new
       /// entries are added with the given namespace.
@@ -3298,14 +3325,14 @@ internally, to keep track of things like the stack, program, lists etc.
           let adds: Vec<_> = adds
               .into_iter()
               .map(|(mut w, e)| {
-                  w.namespace = *namespace;
+                  w.0.namespace = *namespace;
                   (w, e)
               })
               .collect();
           let deletes: Vec<_> = deletes
               .into_iter()
               .map(|mut w| {
-                  w.namespace = *namespace;
+                  w.0.namespace = *namespace;
                   w
               })
               .collect();
@@ -3323,7 +3350,7 @@ internally, to keep track of things like the stack, program, lists etc.
               let word: Word = k.try_fit().unwrap();
 
               let iter: Box<dyn Iterator<Item = Item>> = def.try_fit().unwrap();
-              let new_entry: dict::Entry = iter.try_fit().unwrap();
+              let new_entry: Entry = iter.try_fit().unwrap();
               let new_entry2 = new_entry.clone();
               let dict = self.mutate();
               dict.entry(word)
@@ -3340,7 +3367,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn add_builtins(&mut self) {
           let dm = self.mutate();
           for (bw, bd) in BUILTIN_FUNCTIONS.iter() {
-              dm.entry(bw.clone()).and_modify(|d| {
+              dm.entry(bw.clone().fit()).and_modify(|d| {
                   if let Definition::Derived(dd) = &d.definition {
                       if dd.is_empty() {
                           d.definition = bd.clone();
@@ -3350,17 +3377,17 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
-      fn resolve_word(&self, w: &mut Word, namespaces: &[dict::Namespace]) {
+      fn resolve_word(&self, w: &mut Word, namespaces: &[Namespace]) {
           // if the word is already namespaced we're done
-          if w.namespace.is_none() {
+          if w.0.namespace.is_none() {
               for namespace in namespaces.iter() {
-                  w.namespace = *namespace;
+                  w.0.namespace = *namespace;
                   if self.contains_key(w) {
                       return;
                   }
               }
               // no match found, clear the namespace
-              w.namespace = Default::default();
+              w.0.namespace = Default::default();
           }
       }
   }
@@ -3368,20 +3395,20 @@ internally, to keep track of things like the stack, program, lists etc.
   /// Each word should run a program that calls fail (already namespaced
   /// to the stdlib so that the word acts like it isn't in the dictionary
   /// even though it is.)
-  fn make_deletes(words: Vec<Word>) -> Vec<(Word, dict::Entry)> {
+  fn make_deletes(words: Vec<Word>) -> Vec<(Word, Entry)> {
       words
           .into_iter()
           .map(|word| {
               println!("Shadowing word: {:?}", word);
               let err = Error::create(
-                  list!(word.clone()),
+                  list!(types::Word::derive(word.clone())),
                   "word removed by module",
                   Some("access-denied"),
               );
-              let entry = dict::Entry {
+              let entry = Entry {
                   examples: None,
                   spec: None,
-                  definition: dict::Definition::Derived(list!(err, "fail")),
+                  definition: Definition::Derived(list!(err, "fail")),
               };
               (word, entry)
           })
@@ -3433,7 +3460,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn join(mut self, other: assoc::Association) -> Result<Self::Output, Self::Error> {
           // Try to convert to dictionary type
           //println!("dict + assoc join");
-          match other.convert::<Word, dict::Entry>() {
+          match other.convert::<Word, Entry>() {
               Ok(d) => {
                   let tm = self.mutate();
                   tm.extend(d);
@@ -3454,7 +3481,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn join(self, mut other: Dictionary) -> Result<Self::Output, Self::Error> {
           // Try to convert to dictionary type
           //println!("assoc + dict join");
-          Ok(match self.convert::<Word, dict::Entry>() {
+          Ok(match self.convert::<Word, Entry>() {
               Ok(d) => {
                   let tm = other.mutate();
                   tm.extend(d.iter().map(owned));
@@ -3471,7 +3498,7 @@ internally, to keep track of things like the stack, program, lists etc.
   pub enum Definition {
       /// A definition in the base language - a rust function that
       /// modifies the environment.
-      Axiom(&'static StepFn),
+      Axiom(&'static types::StepFn),
       /// A definition in terms of other [Word]s - a kcats program
       Derived(coll::List),
   }
@@ -3516,8 +3543,8 @@ internally, to keep track of things like the stack, program, lists etc.
       fn into_iter(self) -> Self::IntoIter {
           let mut v: Vec<(assoc::KeyItem, Item)> = vec![("definition".fit(), {
               match self.definition {
-                  dict::Definition::Derived(l) => l.fit(),
-                  dict::Definition::Axiom(_) => "builtin-function".fit(),
+                  Definition::Derived(l) => l.fit(),
+                  Definition::Axiom(_) => "builtin-function".fit(),
               }
           })];
           if let Some(e) = self.examples {
@@ -3629,7 +3656,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
   impl Derive<(Word, Entry)> for Item {
       fn derive((k, v): (Word, Entry)) -> Item {
-          coll::List::derive_iter([Item::Word(k), Item::derive(v.clone())]).fit()
+          coll::List::derive_iter([Item::Word(k.fit()), Item::derive(v.clone())]).fit()
       }
   }
 
@@ -3642,9 +3669,9 @@ internally, to keep track of things like the stack, program, lists etc.
               Err(Error::expected("pair", s))
           } else {
               let mut iter = s.into_iter();
-              let key: Word = iter.next().unwrap().try_fit()?;
+              let key: types::Word = iter.next().unwrap().try_fit()?;
               let value: Entry = iter.next().unwrap().try_fit()?;
-              Ok((key, value))
+              Ok((key.fit(), value))
           }
       }
   }
@@ -6042,10 +6069,11 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn resolve(env: &mut Environment) -> Result<(), Error> {
-      let mut w: Word = env.pop().try_fit()?;
-      env.dictionary.resolve_word(&mut w, &env.resolver);
+      let w: Word = env.pop().try_fit()?;
+      let mut dw: dict::Word = w.fit();
+      env.dictionary.resolve_word(&mut dw, &env.resolver);
       env.pop_prog();
-      env.push(w);
+      env.push(Word::derive(dw));
       Ok(())
   }
 
@@ -6221,7 +6249,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       env.push(w);
                       env.fit()
                   } else {
-                      let mut word = word.clone();
+                      let mut word: dict::Word = word.clone().fit();
                       env.dictionary.resolve_word(&mut word, &env.resolver);
                       if let Some(dfn) = env.dictionary.get(&word) {
                           {
@@ -6245,9 +6273,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                               }
                           }
                       } else {
-                          let w = word.clone();
+                          //let w = word.clone();
                           //println!("Failed dict lookup: {:?} {:?}", w, env.dictionary.len());
-                          env.push(Error::undefined(w));
+                          env.push(Error::undefined(word.fit()));
                           env.fit()
                       }
                   }
@@ -7064,7 +7092,7 @@ We'll also define how to run unit tests.
       }
 
       fn test_word(standard_env: Environment, w: Word) -> Vec<Error> {
-          if let Some(d) = standard_env.dictionary.get(&w) {
+          if let Some(d) = standard_env.dictionary.get(&w.clone().fit()) {
               d.examples
                   .clone()
                   .unwrap()
