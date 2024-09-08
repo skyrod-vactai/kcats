@@ -3346,6 +3346,7 @@ internally, to keep track of things like the stack, program, lists etc.
               .into_iter()
               .map(|(mut w, e)| {
                   w.0.namespace = *namespace;
+                  //println!("Adding {:?}", w);
                   (w, e)
               })
               .collect();
@@ -3402,6 +3403,7 @@ internally, to keep track of things like the stack, program, lists etc.
           if w.0.namespace.is_none() {
               for namespace in namespaces.iter() {
                   w.0.namespace = *namespace;
+                  //println!("Resolve {:?}", w);
                   if self.contains_key(w) {
                       return;
                   }
@@ -3419,7 +3421,7 @@ internally, to keep track of things like the stack, program, lists etc.
       words
           .into_iter()
           .map(|word| {
-              println!("Shadowing word: {:?}", word);
+              //println!("Shadowing word: {:?}", word);
               let err = Error::create(
                   list!(types::Word::derive(word.clone())),
                   "word removed by module",
@@ -5305,7 +5307,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("float", Box::leak(Box::new(float))),
           ("floor", Box::leak(Box::new(f_stack1(floor)))),
           ("format", Box::leak(Box::new(f_stack2(format)))),
-          ("handle", Box::leak(Box::new(f_stack1(handle)))),
+          ("handle", Box::leak(Box::new(handle))),
           (
               "handoff",
               Box::leak(Box::new(crate::types::container::pipe::channel::handoff)),
@@ -6483,16 +6485,29 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       Ok(i.abs())
   }
 
-  fn handle(i: Item) -> ItemResult {
-      match i {
-          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
-              assoc::Associative::Error(mut e),
-          ))) => Ok({
-              e.is_handled = true;
-              e.fit()
-          }),
-          i => Ok(i),
-      }
+  /// If there's an unhandled error on the stack, handle it, otherwise
+  /// no-op.
+  fn handle(mut env: Environment) -> Future<Environment> {
+      env.pop_prog();
+      match env.stack.mutate().pop_front() {
+          None => {}
+          Some(i) => match i {
+              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
+                  assoc::Associative::Error(mut e),
+              ))) => {
+                  e.is_handled = true;
+                  env.push(e);
+              }
+              Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(
+                  assoc::Associative::Error(mut e),
+              ))) => {
+                  e.is_handled = true;
+                  env.push(e);
+              }
+              i => env.push(i),
+          },
+      };
+      env.fit()
   }
 
   /// Makes 'yes' a word that doesn't have to be quoted, just pushes
@@ -6960,7 +6975,10 @@ We'll also define how to run unit tests.
       let mut env = Environment::default();
 
       loop {
-          if let Some(program) = read_input().await {
+          if let Some(mut program) = read_input().await {
+              // to ensure errors are handled by the repl- so that the
+              // user can continue with more input.
+              program.push_str(" handle");
               match parse_input(env, program) {
                   Ok(parsed_env) => {
                       env = axiom::eval(parsed_env).await;
@@ -7010,7 +7028,6 @@ We'll also define how to run unit tests.
   }
 
   async fn read_eval_print(program: String) {
-      // otherwise, read from stdin
       match parse_input(Environment::default(), program) {
           Ok(env) => {
               print_result(axiom::eval(env).await);
@@ -13731,37 +13748,106 @@ We need to rewrite the link-finding logic so that it does everything in one pass
 
 *** Tests database module
 #+begin_src kcats
-
-  [database debug-step]
+  dictionary [debug-step] [decache inscribe] step 
+  [database debug-step] swap
 
   [[[book? title title?]
     [book? author author?]
     [author? first-name author-first?]
     [author? country "United States"]]
-   [title? author-first?] dictionary [evaluate] unwrap resolve inspect]
+   [title? author-first?] query]
 
-  [program] label environment swap ;; lm env
-  [[stack] [snapshot] divedown assign] dip ;; capture the stack at runtime
+  [program dictionary] label environment swap ;; lm env
+  ;[[stack] [snapshot] divedown assign] dip ;; capture the stack at runtime
 
   using ;; set up the resolver 
-  ;eval-step eval-step eval-step eval-step advance advance advance ;; execute the program in the inner environment
-  ;advance 
-  evaluate
+  eval-step eval-step eval-step eval-step advance advance advance ;; execute the program in the inner environment
+  advance 
+  ;evaluate
   ;[stack] lookup restore ;; replace the stack with the result from the inner env
 #+end_src
 
 #+RESULTS:
 #+begin_src kcats
-Evaluate: Word { data: 0x55d32bfce840 : "evaluate", quoted: false, namespace: None }
 [[dictionary dictionary_redacted]
- [program []]
+ [program [evaluate [stack] lookup restore]]
  [resolver [#b64 "qyKhcjHmD5kJNFA6/M0EkQOrh/j2zANmwrQFL1T1w7A=" #b64 "BD6O7rckGISnnk+5AXZaa3/2qY/72dX3O68AED3pG64="]]
- [stack ["Word(Word { data: 0x55d32bfce840 : \"evaluate\", quoted: false, namespace: None })"
-         dictionary_redacted [title? author-first?]
+ [stack [[[dictionary dictionary_redacted]
+          [program [swap [constraint] map [index] indexed-as-property triangle [extract-data]
+                    map [[extract-params] [make-query] [make-where] [swap select-data]] fork dropdown
+                    unwrap float [[join] lookup]
+                    map swap format-select [" " interpose join-all] dip triplet
+                    reverse "SELECT {0} from EAV as c0 {1} WHERE {2}" swap format swap dropdeep]]
+          [resolver [#b64 "nBeUBXUEzoR2f1PRlrc9UaOCrtcrgU+Bfkz87TTApQ0="]]
+          [stack [[title? author-first?]
+                  [[book? title title?] [book? author author?] [author? first-name author-first?]
+                   [author? country "United States"]]]]]
+         [title? author-first?]
          [[book? title title?] [book? author author?] [author? first-name author-first?]
           [author? country "United States"]]]]]
 #+end_src
 
+Debug what's wrong with inner evaluate
+#+begin_src kcats
+  [1 2 +] stage [finished? not] [eval-step] while
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[dictionary dictionary_redacted]
+ [program []]
+ [resolver []]
+ [stack [3]]]
+#+end_src
+
+write unnest-envs, so we can execute nested envs serially
+#+begin_src kcats
+  [3] stage wrap [2] join stage wrap [1] join stage
+  [] swap
+  [environment? not] []
+  [[stack first]]
+  [execute]
+  recur
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[asked [environment?]]
+ [handled []]
+ [reason "word is not defined"]
+ [type error]
+ [unwound [environment? not [[[dictionary dictionary_redacted]
+                              [program [[[dictionary dictionary_redacted]
+                                         [program [[[dictionary dictionary_redacted]
+                                                    [program [3]]
+                                                    [resolver []]
+                                                    [stack []]]
+                                                   2]]
+                                         [resolver []]
+                                         [stack []]]
+                                        1]]
+                              [resolver []]
+                              [stack []]]
+                             []]
+           evert first [] [[stack first]
+                           [[environment? not]
+                            [] [[stack first]] [execute] recur]
+                           execute]
+           branch]]]
+[[dictionary dictionary_redacted]
+ [program [[[dictionary dictionary_redacted]
+            [program [[[dictionary dictionary_redacted]
+                       [program [3]]
+                       [resolver []]
+                       [stack []]]
+                      2]]
+            [resolver []]
+            [stack []]]
+           1]]
+ [resolver []]
+ [stack []]]
+[]
+#+end_src
 
 ** TODO Reduce CPU cost of `shield` :optimization:
 #+begin_src kcats
