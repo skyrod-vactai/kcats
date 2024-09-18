@@ -5922,123 +5922,79 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       env.fit()
   }
 
-  fn assoc_vec(mut l: coll::List, ks: &[assoc::KeyItem], k: Int, v: Item) -> Result<Item, Error> {
-      let lm = Arc::make_mut(&mut l);
-      let idx = k as usize;
-      // extend the size of the vector to be big enough to set
-      // the given index, pad with 'nothing' values.
-      if lm.len() <= idx {
-          lm.resize(idx + 1, Item::default());
-      }
-      let inner = &lm[idx];
+  fn assoc_in(i: Option<Item>, ks: &[assoc::KeyItem], v: Item) -> Result<Item, Error> {
+      fn assoc_vec(mut l: coll::List, ks: &[assoc::KeyItem], k: Int, v: Item) -> Result<Item, Error> {
+          let lm = Arc::make_mut(&mut l);
+          let idx = k as usize;
+          // extend the size of the vector to be big enough
+          if lm.len() <= idx {
+              lm.resize(idx + 1, Item::default());
+          }
 
-      lm[k as usize] = if let [nextk, ..] = ks {
-          let i: Item = match (inner, nextk) {
-              (
-                  Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(l))),
-                  assoc::KeyItem::Int(_),
-              ) => l.clone().fit(),
-              (
-                  Item::Receptacle(coll::Receptacle::Sized(coll::Sized::List(l))),
-                  assoc::KeyItem::Int(_),
-              ) => l.clone().fit(),
-              (_, assoc::KeyItem::Int(_)) => coll::List::default().fit(),
-              _ => assoc::Association::fresh().fit(),
-          };
-          assoc_in(i, ks, v)?
-      } else {
-          v
-      };
-
-      //if the inner value isn't a list, overwrite it
-      Ok(l.fit())
-  }
-
-  fn assoc_in(i: Item, ks: &[assoc::KeyItem], v: Item) -> Result<Item, Error> {
-      if let [k, ks @ ..] = ks {
-          if ks.is_empty() {
-              match (i, k) {
-                  (
-                      Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(mut l))),
-                      assoc::KeyItem::Int(k),
-                  ) => {
-                      // vector set by index
-                      let lm = Arc::make_mut(&mut l);
-                      let idx = *k as usize;
-                      // extend the size of the vector to be big enough to set
-                      // the given index, pad with 'nothing' values.
-                      if lm.len() <= idx {
-                          lm.resize(idx + 1, Item::default());
-                      }
-                      lm[*k as usize] = v;
-                      Ok(l.fit())
-                  }
-                  (
-                      Item::Receptacle(coll::Receptacle::Sized(coll::Sized::List(mut l))),
-                      assoc::KeyItem::Int(k),
-                  ) => {
-                      // vector set by index
-                      let lm = Arc::make_mut(&mut l);
-                      let idx = *k as usize;
-                      // extend the size of the vector to be big enough to set
-                      // the given index, pad with 'nothing' values.
-                      if lm.len() <= idx {
-                          lm.resize(idx + 1, Item::default());
-                      }
-                      lm[*k as usize] = v;
-                      Ok(l.fit())
-                  }
-                  (i, k) => {
-                      let a = assoc::Associative::try_derive(i)?;
-                      Ok(a.insert(k.clone(), v).0.fit())
-                  }
-              }
-              //hm.insert(k.clone(), v);
+          lm[idx] = if ks.is_empty() {
+              v
           } else {
-              match (i, k) {
-                  (
-                      Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(l))),
-                      assoc::KeyItem::Int(k),
-                  ) => assoc_vec(l, ks, *k, v),
+              assoc_in(lm.get(idx).cloned(), ks, v)?
+          };
 
-                  (
-                      Item::Receptacle(coll::Receptacle::Sized(coll::Sized::List(l))),
-                      assoc::KeyItem::Int(k),
-                  ) => assoc_vec(l, ks, *k, v),
+          Ok(l.fit())
+      }
 
-                  (i, k) => {
-                      let a = assoc::Associative::try_derive(i)?;
-                      let inner = a.get(k).unwrap_or_default().clone();
+      fn assoc_map(
+          a: assoc::Associative,
+          ks: &[assoc::KeyItem],
+          k: &assoc::KeyItem,
+          v: Item,
+      ) -> Result<Item, Error> {
+          let inner = a.get(&k).clone();
+          if ks.is_empty() {
+              Ok(a.insert(k.clone(), v).0.fit())
+          } else {
+              Ok(a.insert(k.clone(), assoc_in(inner, ks, v)?).0.fit())
+          }
+      }
 
-                      // if the inner value is a map, recurse. If it's a
-                      // list and the next key is a number,
-                      // recurse. Otherwise, overwrite the value with a new map.
-                      let next_key = ks[0].clone();
-                      let i = match (next_key, inner) {
-                          (
-                              assoc::KeyItem::Int(_),
-                              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(l))),
-                          ) => l.clone().fit(),
-                          (
-                              assoc::KeyItem::Int(_),
-                              Item::Receptacle(coll::Receptacle::Sized(coll::Sized::List(l))),
-                          ) => l.clone().fit(),
-                          (
-                              _,
-                              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(a))),
-                          ) => a.clone().fit(),
-                          (
-                              _,
-                              Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(a))),
-                          ) => a.clone().fit(),
-                          _ => assoc::Association::fresh().fit(),
-                      };
-                      Ok(a.insert(k.clone(), assoc_in(i, ks, v)?).0.fit())
-                  }
+      if let [k, ks @ ..] = ks {
+          match (i, k) {
+              // An int key for a list means update that index
+              (
+                  Some(Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(l)))),
+                  assoc::KeyItem::Int(k),
+              ) => assoc_vec(l, ks, *k, v),
+
+              (
+                  Some(Item::Receptacle(coll::Receptacle::Sized(coll::Sized::List(l)))),
+                  assoc::KeyItem::Int(k),
+              ) => assoc_vec(l, ks, *k, v),
+
+              // An int key for an associative means an integer key, which is uncommon
+              // but we'll support it
+              (
+                  Some(Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(a)))),
+                  assoc::KeyItem::Int(k),
+              ) => assoc_map(a, ks, &assoc::KeyItem::Int(*k), v),
+              (
+                  Some(Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(a)))),
+                  assoc::KeyItem::Int(k),
+              ) => assoc_map(a, ks, &assoc::KeyItem::Int(*k), v),
+
+              // An int key for a non-sized type means we're overwriting
+              // whatever it is with a list, with the value at that index
+              (_, assoc::KeyItem::Int(k)) => assoc_vec(coll::List::fresh(), ks, *k, v),
+
+              (None, k) => assoc_map(
+                  assoc::Associative::Assoc(assoc::Association::fresh()),
+                  ks,
+                  k,
+                  v,
+              ),
+              (Some(i), k) => {
+                  let a = assoc::Associative::try_derive(i)?;
+                  assoc_map(a, ks, k, v)
               }
           }
       } else {
-          Ok(i)
+          Ok(i.unwrap())
       }
   }
 
@@ -6091,7 +6047,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let mut ksvec: assoc::KeyList = assoc::KeyList::try_from_iter(kit.iter().cloned())?;
       ksvec.mutate().make_contiguous();
       let (ks, _) = ksvec.as_slices();
-      assoc_in(m, ks, v)
+      assoc_in(Some(m), ks, v)
   }
 
   pub fn unassign(m: Item, ks: Item) -> ItemResult {
@@ -14154,24 +14110,22 @@ fixed we'll comment out the relevant test in the word =intersection=
 The problem is if we have this
 
 #+begin_src kcats
-  [1 2 +] stage wrap [evaluate] join stage wrap [evaluate] join stage
-  
+  [1 2 +] stage wrap [evaluate] [program stack] label environment
+  wrap [evaluate] [program stack] label environment
 #+end_src
 
 #+RESULTS:
 #+begin_src kcats
 [[dictionary dictionary_redacted]
- [program [[[dictionary dictionary_redacted]
-            [program [[[dictionary dictionary_redacted]
-                       [program [1 2 +]]
-                       [resolver []]
-                       [stack []]]
-                      evaluate]]
-            [resolver []]
-            [stack []]]
-           evaluate]]
+ [program [evaluate]]
  [resolver []]
- [stack []]]
+ [stack [[[dictionary dictionary_redacted]
+          [program [evaluate]]
+          [resolver []]
+          [stack [[[dictionary dictionary_redacted]
+                   [program [1 2 +]]
+                   [resolver []]
+                   [stack []]]]]]]]]
 #+end_src
 
 How do we step through the execution? I think perhaps we need to do this:
@@ -14181,6 +14135,70 @@ fail anyway). If *that* env is executing =evaluate= we recur down the envs
 until we hit one that's not, and run eval-step there.
 
 The question is, do we have to unnest everything and then re-nest?
+
+I think we can just build a path to pass to update. And then afterward
+recur again to drop evaluate from programs that are already done.
+#+begin_src kcats
+   [1 2 +] stage wrap [evaluate] [program stack] label environment
+   wrap [evaluate] [program stack] label environment
+   [] swap
+   [[[program] lookup [evaluate] starts?]
+   [[stack 0] clone [lookup] dip swap [join] dip ] ;; append the next part of the path to the accumulator
+   while swap] shield update
+   
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[actual [[dictionary dictionary_redacted]
+          [program [evaluate]]
+          [resolver []]
+          [stack [[[dictionary dictionary_redacted]
+                   [program [evaluate]]
+                   [resolver []]
+                   [stack [[[dictionary dictionary_redacted]
+                            [program [1 2 +]]
+                            [resolver []]
+                            [stack []]]]]]]]]]
+ [asked [list]]
+ [handled []]
+ [reason "type mismatch"]
+ [type error]
+ [unwound [update]]]
+[stack 0 stack 0] [[dictionary dictionary_redacted]
+                   [program [evaluate]]
+                   [resolver []]
+                   [stack [[[dictionary dictionary_redacted]
+                            [program [evaluate]]
+                            [resolver []]
+                            [stack [[[dictionary dictionary_redacted]
+                                     [program [1 2 +]]
+                                     [resolver []]
+                                     [stack []]]]]]]]]
+[]
+#+end_src
+
+#+begin_src kcats
+[1 2 +] stage wrap [0] [eval-step] update
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[[dictionary dictionary_redacted]
+  [program [2 +]]
+  [resolver []]
+  [stack [1]]]]
+#+end_src
+
+#+begin_src kcats
+[1 2 [3 4 [5 6 [7 8]]]] [2 2 0] [inc] update
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[1 2 [3 4 [6 6 [7 8]]]]
+#+end_src
+
 *** DONE write environment? word
 - State "DONE"       from "INPROGRESS" [2024-09-08 Sun 11:21]
 - State "INPROGRESS" from "TODO"       [2024-09-08 Sun 10:37]
