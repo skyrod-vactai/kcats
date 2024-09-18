@@ -286,7 +286,6 @@ internally, to keep track of things like the stack, program, lists etc.
   use lazy_static::lazy_static;
   use std::collections::{HashMap, VecDeque};
 
-  use std::fmt;
   use std::hash::{Hash, Hasher};
   use std::marker::Sync;
 
@@ -308,10 +307,10 @@ internally, to keep track of things like the stack, program, lists etc.
   /// Two words are equal if their data are equal, even if they're not
   /// in the same namespace. The rationale for this is that comparisons
   /// are only when we're using a word as data, and namespace only
-  /// matters when using a word to perform an action (ie as a verb)
+  /// matters when using a word to access a dictionary.
   impl PartialEq for Word {
       fn eq(&self, other: &Self) -> bool {
-          self.data == other.data
+          self.data == other.data && self.quoted == other.quoted
       }
   }
 
@@ -500,6 +499,16 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  impl TryDerive<Item> for char {
+      type Error = Error;
+      fn try_derive(i: Item) -> Result<Self, Self::Error> {
+          match i {
+              Item::Char(c) => Ok(c),
+              b => Err(Error::expected("char", b)),
+          }
+      }
+  }
+
   /// As there are no real booleans, we use the word 'yes' but literally
   /// any value except empty containers is truthy. If we read a value
   /// 'false', that's not actually a boolean, it's just the [Word]
@@ -548,6 +557,12 @@ internally, to keep track of things like the stack, program, lists etc.
   impl Derive<Char> for Item {
       fn derive(c: Char) -> Self {
           Item::Char(c)
+      }
+  }
+
+  impl Derive<()> for Item {
+      fn derive(_: ()) -> Self {
+          Item::default()
       }
   }
 
@@ -970,9 +985,11 @@ internally, to keep track of things like the stack, program, lists etc.
 
   use self::associative as assoc;
   use crate::traits::*;
+  use crate::types::container::pipe::FutureTake;
   use crate::types::number::{Int, Number};
   use crate::types::*;
 
+  use std::convert::Infallible;
   use std::{collections::HashSet, future, sync};
   use sync::Arc;
 
@@ -1018,14 +1035,27 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  impl DeriveIterator<assoc::KeyItem> for Set {
+  impl DeriveIterator<Char> for List {
       fn derive_iter<I>(iter: I) -> Self
       where
-          I: IntoIterator<Item = assoc::KeyItem>,
+          I: IntoIterator<Item = Char>,
       {
-          sync::Arc::new(iter.into_iter().collect::<HashSet<assoc::KeyItem>>())
+          Arc::new(
+              iter.into_iter()
+                  .map(Item::derive)
+                  .collect::<VecDeque<Item>>(),
+          )
       }
   }
+
+  // impl DeriveIterator<assoc::KeyItem> for Set {
+  //     fn derive_iter<I>(iter: I) -> Self
+  //     where
+  //         I: IntoIterator<Item = assoc::KeyItem>,
+  //     {
+  //         sync::Arc::new(iter.into_iter().collect::<HashSet<assoc::KeyItem>>())
+  //     }
+  // }
 
   impl<T> Fresh for Arc<T>
   where
@@ -1033,6 +1063,337 @@ internally, to keep track of things like the stack, program, lists etc.
   {
       fn fresh() -> Self {
           Arc::new(T::default())
+      }
+  }
+
+  /// A trait for joining two values together. There are some precedence rules:
+  ///
+  /// 1. If there are two different types being joined, the type that is
+  /// returned is either the most specialized types of the two being
+  /// joined, or the most specialized type that's possible to construct
+  /// given the two values. (For example, joining a Set with a List, or
+  /// vice versa, will always be a Set. Joining an Association with a
+  /// Dictionary will be an Associative enum but the variant will depend
+  /// on whether the Association data fits the schema of a
+  /// Dictionary. If so, it will be Dictionary, otherwise Assoc.)
+  ///
+  /// 2. If the result type is keyed, (eg, Map or Set or struct types),
+  /// the RHS argument's keys take precedence over self's.
+  pub trait Join<RHS> {
+      type Output;
+      type Error;
+      fn join(self, rhs: RHS) -> Result<Self::Output, Self::Error>;
+  }
+
+  impl Join<&str> for String {
+      type Output = String;
+      type Error = Infallible;
+      fn join(mut self, rhs: &str) -> Result<Self::Output, Self::Error> {
+          self.push_str(rhs);
+          Ok(self)
+      }
+  }
+
+  impl Join<char> for String {
+      type Output = String;
+      type Error = Infallible;
+      fn join(mut self, rhs: char) -> Result<Self::Output, Self::Error> {
+          self.push(rhs);
+          Ok(self)
+      }
+  }
+
+  impl Join<List> for List {
+      type Output = List;
+      type Error = Infallible;
+      fn join(mut self, rhs: List) -> Result<Self::Output, Self::Error> {
+          let am = self.mutate();
+          am.extend(rhs.iter().cloned());
+          Ok(self)
+      }
+  }
+
+  impl Join<Set> for Set {
+      type Output = Set;
+      type Error = Infallible;
+      fn join(mut self, rhs: Set) -> Result<Self::Output, Self::Error> {
+          let am = self.mutate();
+          am.extend(rhs.iter().cloned());
+          Ok(self)
+      }
+  }
+
+  /// When joining a List with a String, which type we get back depends
+  /// on the contents of the list. If the list has non-char items in it,
+  /// we get a List. Otherwise, a string.
+  impl Join<String> for List {
+      type Output = Sized;
+      type Error = Infallible;
+      fn join(mut self, rhs: String) -> Result<Self::Output, Self::Error> {
+          match self
+              .iter()
+              .cloned()
+              .map(|i| Char::try_derive(i))
+              .collect::<Result<Vec<Char>, Error>>()
+          {
+              Ok(vc) => {
+                  //join as string if all the list items are chars
+                  let mut x = vc.iter().collect::<String>();
+
+                  x.push_str(rhs.as_str());
+                  Ok(Sized::String(x))
+              }
+              Err(_) => {
+                  // join as list
+                  self.mutate().extend(rhs.chars().map(Item::derive));
+                  Ok(Sized::List(self))
+              }
+          }
+      }
+  }
+
+  /// When joining a String with a List, which type we get back depends
+  /// on the contents of the list. If the list has non-char items in it,
+  /// we get a List. Otherwise, a string.
+  impl Join<List> for String {
+      type Output = Sized;
+      type Error = Infallible;
+      fn join(mut self, rhs: List) -> Result<Self::Output, Self::Error> {
+          match rhs
+              .iter()
+              .cloned()
+              .map(|i| Char::try_derive(i))
+              .collect::<Result<Vec<Char>, Error>>()
+          {
+              Ok(vc) => {
+                  //join as string if all the list items are chars
+                  let x = vc.iter().collect::<String>();
+
+                  self.push_str(x.as_str());
+                  Ok(Sized::String(self))
+              }
+              Err(_) => {
+                  // join as list
+                  let mut sl: List = self.fit();
+                  sl.mutate().extend(rhs.iter().cloned());
+                  Ok(Sized::List(sl))
+              }
+          }
+      }
+  }
+
+  impl Join<List> for assoc::Associative {
+      type Output = assoc::Associative;
+      type Error = Error;
+      fn join(self, other: List) -> Result<Self::Output, <Self as Join<List>>::Error> {
+          let la =
+              assoc::Associative::Assoc(assoc::Association::try_from_iter(other.iter().cloned())?);
+          Ok(self.join(la).unwrap())
+      }
+  }
+
+  impl Join<assoc::Associative> for List {
+      type Output = assoc::Associative;
+      type Error = Error;
+      fn join(self, other: assoc::Associative) -> Result<Self::Output, Self::Error> {
+          //println!("self: {:?}, other: {:?}", self, other);
+          let sa =
+              assoc::Associative::Assoc(assoc::Association::try_from_iter(self.iter().cloned())?);
+          Ok(sa.join(other).unwrap())
+      }
+  }
+
+  /// Joining a List with a Set will be a set.
+  impl Join<Set> for List {
+      type Output = Set;
+      type Error = Error;
+      fn join(self, mut other: Set) -> Result<Self::Output, Self::Error> {
+          let bm = other.mutate();
+
+          bm.extend(
+              self.iter()
+                  .cloned()
+                  .map(assoc::KeyItem::try_derive)
+                  .collect::<Result<Vec<assoc::KeyItem>, Error>>()?,
+          );
+          Ok(other)
+      }
+  }
+
+  impl Join<String> for String {
+      type Output = String;
+      type Error = Infallible;
+      fn join(mut self, other: String) -> Result<Self::Output, Self::Error> {
+          self.push_str(&other);
+          Ok(self)
+      }
+  }
+
+  /// Joins two containers into one.
+  impl Join<Sized> for Sized {
+      type Output = Sized;
+      type Error = Error;
+
+      fn join(self, other: Sized) -> Result<Self::Output, Self::Error> {
+          Ok(match (self, other) {
+              (Sized::Associative(a), Sized::List(l)) => Sized::Associative(a.join(l)?),
+              (Sized::List(l), Sized::Associative(a)) => Sized::Associative(l.join(a)?),
+              (Sized::Associative(a), Sized::Associative(b)) => {
+                  Sized::Associative(a.join(b).unwrap())
+              }
+              (Sized::List(a), Sized::List(b)) => Sized::List(a.join(b).unwrap()),
+              (Sized::Set(a), Sized::Set(b)) => Sized::Set(a.join(b).unwrap()),
+              (Sized::List(a), Sized::Set(b)) => Sized::Set(a.join(b)?),
+              (Sized::Set(mut a), Sized::List(b)) => {
+                  let am = a.mutate();
+
+                  am.extend(
+                      b.iter()
+                          .cloned()
+                          .map(assoc::KeyItem::try_derive)
+                          .collect::<Result<Vec<assoc::KeyItem>, Error>>()?,
+                  );
+                  Sized::Set(a)
+              }
+              (Sized::String(mut a), Sized::String(b)) => {
+                  a.push_str(&b);
+                  Sized::String(a)
+              }
+              (Sized::Bytes(mut a), Sized::Bytes(b)) => {
+                  a.extend(b);
+                  Sized::Bytes(a)
+              }
+              (Sized::String(s), Sized::List(l)) => s.join(l).unwrap(),
+              (Sized::List(l), Sized::String(s)) => l.join(s).unwrap(),
+              (s, other) => {
+                  if s.is_empty() {
+                      other
+                  } else if other.is_empty() {
+                      s
+                  } else {
+                      Err(Error::expected("joinable", list!(s, other)))?
+                  }
+              }
+          })
+      }
+  }
+  pub trait Container<T> {
+      fn has(&self, item: &T) -> bool;
+  }
+
+  pub trait Count {
+      fn count(&self) -> usize;
+  }
+
+  /// A trait for containers where you can take an item out "in-place"
+  /// without blocking. The container itself is mutated and the item is
+  /// returned.
+  pub trait SimpleTake {
+      type Item: Send + Fit<Item>;
+      fn take_simple(&mut self) -> Option<Self::Item>;
+  }
+
+  // pub trait DemotingTake {
+  //     type Item;
+  //     type Output;
+  //     fn take_demoting(self) -> (Option<Self::Item>, Self::Output);
+  // }
+
+  pub trait Take {
+      type Output;
+      type Item;
+      fn take(self) -> Future<(Result<Option<Self::Item>, Error>, Self::Output)>;
+  }
+
+  /// A blanket impl for Take, for any type that already implements SimpleTake.
+  impl<T> Take for T
+  where
+      T: SimpleTake + Send + 'static,
+  {
+      type Output = T;
+      type Item = Item;
+
+      fn take(mut self) -> Future<(Result<Option<Self::Item>, Error>, Self::Output)> {
+          let item = self.take_simple();
+          let result = future::ready((Ok(item.map(|i| i.fit())), self));
+          Box::pin(result)
+      }
+  }
+
+  impl Count for Sized {
+      fn count(&self) -> usize {
+          match self {
+              Self::Associative(a) => a.len(),
+              Self::List(l) => l.count(),
+              Self::String(s) => s.len(),
+              Self::Bytes(b) => b.len(),
+              Self::Set(s) => s.len(),
+          }
+      }
+  }
+
+  impl Container<Item> for Sized {
+      fn has(&self, other: &Item) -> bool {
+          match (self, other) {
+              (Sized::Associative(a), other) => {
+                  assoc::KeyItem::try_derive(other.clone()).map_or(false, |k| a.contains_key(&k))
+              }
+              (Sized::List(l), other) => l.contains(other),
+              (Sized::Set(s), Item::Dispenser(Dispenser::Sized(Sized::Set(other)))) => {
+                  other.is_subset(s)
+              }
+              (Sized::Set(s), Item::Receptacle(Receptacle::Sized(Sized::Set(other)))) => {
+                  other.is_subset(s)
+              }
+              (Sized::Set(s), other) => {
+                  assoc::KeyItem::try_derive(other.clone()).map_or(false, |k| s.contains(&k))
+              }
+              (Sized::String(container), other) => match other {
+                  Item::Char(c) => container.has(c),
+                  i => match String::try_derive(i.clone()) {
+                      Ok(ref s) => container.has(s),
+                      Err(_) => false,
+                  },
+              },
+              _ => false,
+          }
+      }
+  }
+
+  impl SimpleTake for Sized {
+      //type Output = Self;
+      type Item = Item;
+      fn take_simple(&mut self) -> Option<Self::Item> {
+          //println!("Taking! {:?}", self);
+          match self {
+              Self::Associative(ref mut a) => {
+                  let v = a.take_simple();
+                  ,*self = Sized::Associative(a.clone());
+                  v
+              }
+              Sized::List(ref mut l) => l.take_simple(),
+              Sized::String(ref mut s) => s.take_simple().map(Item::derive),
+              Sized::Bytes(ref mut b) => b.take_simple().map(Item::derive),
+              Sized::Set(ref mut s) => s.take_simple(),
+          }
+      }
+  }
+
+  impl Count for String {
+      fn count(&self) -> usize {
+          self.len()
+      }
+  }
+
+  impl Container<char> for String {
+      fn has(&self, item: &char) -> bool {
+          self.contains(*item)
+      }
+  }
+
+  impl Container<String> for String {
+      fn has(&self, item: &String) -> bool {
+          self.contains(item.as_str())
       }
   }
 
@@ -1059,6 +1420,29 @@ internally, to keep track of things like the stack, program, lists etc.
           Arc::make_mut(self)
       }
   }
+
+  impl Count for List {
+      fn count(&self) -> usize {
+          self.len()
+      }
+  }
+
+  impl Container<Item> for List {
+      fn has(&self, i: &Item) -> bool {
+          self.contains(i)
+      }
+  }
+
+  // impl Take for List {
+  //     type Item = Item;
+  //     type Output = List;
+  //     fn take(mut self) -> Future<(Self::Output, Result<Option<Item>, Error>)> {
+  //         let v = self.mutate().pop_front();
+  //         Box::pin(future::ready((self, Ok(v))))
+  //     }
+  // }
+
+  //impl Take for
 
   impl Ordered for List {
       fn prepend(&mut self, items: List) {
@@ -1128,125 +1512,144 @@ internally, to keep track of things like the stack, program, lists etc.
   /// Empty Sized containers are equal to each other.
   impl PartialEq for Sized {
       fn eq(&self, other: &Self) -> bool {
-          if self.is_empty() && other.is_empty() {
-              return true;
-          }
           match (self, other) {
               (Sized::Associative(a), Sized::Associative(b)) => a == b,
               (Sized::List(a), Sized::List(b)) => a == b,
               (Sized::String(a), Sized::String(b)) => a == b,
               (Sized::Bytes(a), Sized::Bytes(b)) => a == b,
               (Sized::Set(a), Sized::Set(b)) => a == b,
-              _ => false,
+              _ => self.is_empty() && other.is_empty(),
           }
       }
   }
 
-  impl Dispenser {
-      /// Takes an item out of the [Dispenser], and returns a future
-      /// that gives a new [Dispenser], and the [Item] that was removed
-      /// (if there was one).
-      pub fn take(self) -> Future<(Dispenser, Option<Item>)> {
+  /// Takes an item out of the [Dispenser], and returns a future
+  /// that gives a new [Dispenser], and the [Item] that was removed
+  /// (if there was one).
+  impl Take for Dispenser {
+      type Output = Self;
+      type Item = Item;
+      fn take(self) -> Future<(Result<Option<Self::Item>, Error>, Self::Output)> {
           match self {
-              Dispenser::Sized(s) => {
-                  let (s, item) = s.take();
+              Dispenser::Sized(mut s) => {
+                  let v = s.take_simple();
+                  //let (r, s) = s.take();
+                  // i.map(|r| {
+                  //     (Dispenser::SIzed(s), Self::result_to_option(r))
+                  // })
 
-                  Box::pin(future::ready((Dispenser::Sized(s), item)))
+                  Box::pin(future::ready((Ok(v), Dispenser::Sized(s))))
               }
-              Dispenser::Out(mut o) => Box::pin({
-                  let i = o.take();
-                  i.map(|r| {
-                      (
-                          Dispenser::Out(o),
-                          match r {
-                              Ok(Some(i)) => Some(i),
-                              Ok(None) => None,
-                              Err(e) => Some(Item::derive(e)),
-                          },
-                      )
-                  })
-              }),
-              Dispenser::Tunnel(mut t) => Box::pin({
-                  let i = t.take();
-                  i.map(|r| {
-                      (
-                          Dispenser::Tunnel(t),
-                          match r {
-                              Ok(Some(i)) => Some(i),
-                              Ok(None) => None,
-                              Err(e) => Some(Item::derive(e)),
-                          },
-                      )
-                  })
-              }),
+              Dispenser::Out(mut o) => {
+                  Box::pin(async move { (o.take_future().await, Dispenser::Out(o)) })
+              }
+              Dispenser::Tunnel(mut t) => {
+                  Box::pin(async move { (t.take_future().await, Dispenser::Tunnel(t)) })
+              }
           }
+      }
+  }
+
+  pub fn result_to_option(r: Result<Option<Item>, Error>) -> Option<Item> {
+      match r {
+          Ok(Some(i)) => Some(i),
+          Ok(None) => None,
+          Err(e) => Some(Item::derive(e)),
+      }
+  }
+
+  impl Dispenser {
+      // /// Takes an item out of the [Dispenser], and returns a future
+      // /// that gives a new [Dispenser], and the [Item] that was removed
+      // /// (if there was one).
+      // pub fn take(self) -> Future<(Dispenser, Option<Item>)> {
+      //     match self {
+      //         Dispenser::Sized(mut s) => {
+      //             let v = s.take_simple();
+      //             //let (r, s) = s.take();
+      //             // i.map(|r| {
+      //             //     (Dispenser::SIzed(s), Self::result_to_option(r))
+      //             // })
+
+      //             Box::pin(future::ready((Dispenser::Sized(s), v)))
+      //         }
+      //         Dispenser::Out(mut o) => Box::pin({
+      //             let i = o.take();
+      //             i.map(|r| (Dispenser::Out(o), Self::result_to_option(r)))
+      //         }),
+      //         Dispenser::Tunnel(mut t) => Box::pin({
+      //             let i = t.take();
+      //             i.map(|r| {
+      //                 (
+      //                     Dispenser::Tunnel(t),
+      //                     match r {
+      //                         Ok(Some(i)) => Some(i),
+      //                         Ok(None) => None,
+      //                         Err(e) => Some(Item::derive(e)),
+      //                     },
+      //                 )
+      //             })
+      //         }),
+      //     }
+      // }
+  }
+
+  impl SimpleTake for List {
+      type Item = Item;
+      fn take_simple(&mut self) -> Option<Self::Item> {
+          if self.is_empty() {
+              None
+          } else {
+              let lm = self.mutate();
+              let i = lm.pop_front();
+              i
+          }
+      }
+  }
+
+  impl SimpleTake for String {
+      type Item = char;
+      fn take_simple(&mut self) -> Option<Self::Item> {
+          // TODO: this may perform badly
+          let first_char = self.chars().next();
+          self.drain(..first_char.map(|s| s.len_utf8()).unwrap_or(0));
+          first_char
+      }
+  }
+
+  impl SimpleTake for Bytes {
+      type Item = Int;
+      fn take_simple(&mut self) -> Option<Self::Item> {
+          if self.is_empty() {
+              None
+          } else {
+              let i = Some(self[0] as Int);
+              self.drain(..1);
+              i
+          }
+      }
+  }
+
+  impl SimpleTake for Set {
+      type Item = Item;
+      fn take_simple(&mut self) -> Option<Self::Item> {
+          let sm = self.mutate();
+          sm.iter().next().map(|v| v.clone().fit())
       }
   }
 
   impl Sized {
       /// Returns whether the container is empty
       pub fn is_empty(&self) -> bool {
-          self.len() == 0
-      }
-
-      /// Returns the number of items in the container.
-      pub fn len(&self) -> usize {
-          match self {
-              Sized::Associative(a) => a.len(),
-              Sized::List(l) => l.len(),
-              Sized::String(s) => s.len(),
-              Sized::Bytes(b) => b.len(),
-              Sized::Set(s) => s.len(),
-          }
-      }
-
-      /// Takes an item out of the container, returning the item and
-      /// the rest of the container separately. Items are taken from
-      /// the front (beginning) of the container.
-      pub fn take(self) -> (Self, Option<Item>) {
-          match self {
-              Sized::Associative(a) => {
-                  let (a, i) = a.take();
-                  (Sized::Associative(a), i)
-              }
-              Sized::List(mut l) => {
-                  let lm = l.mutate();
-                  let i = lm.pop_front();
-                  (Sized::List(l), i)
-              }
-              Sized::String(mut s) => {
-                  // TODO: this may perform badly
-                  let first_char = s.chars().next();
-                  s.drain(..first_char.map(|s| s.len_utf8()).unwrap_or(0));
-                  let i = first_char.map(Item::Char);
-                  (Sized::String(s), i)
-              }
-              Sized::Bytes(mut b) => {
-                  if b.is_empty() {
-                      (Sized::Bytes(b), None)
-                  } else {
-                      let i = Some(Item::Number(Number::Int(b[0] as Int)));
-                      b.drain(..1);
-                      (Sized::Bytes(b), i)
-                  }
-              }
-              Sized::Set(mut s) => {
-                  let i = s.iter().next().cloned();
-                  let sm = s.mutate();
-                  if let Some(i) = i.clone() {
-                      sm.take(&i);
-                  }
-                  (Sized::Set(s), i.map(Item::derive))
-              }
-          }
+          self.count() == 0
       }
 
       /// Takes an item from the back (end) of the container.
       pub fn pop(self) -> (Self, Option<Item>) {
           match self {
-              Sized::Associative(a) => {
-                  let (a, i) = a.take();
-                  (Sized::Associative(a), i)
+              Sized::Associative(mut a) => {
+                  let v = a.take_simple();
+                  (Sized::Associative(a), v)
               }
               Sized::List(mut l) => {
                   let lm = l.mutate();
@@ -1297,105 +1700,6 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
-      /// Joins two containers into one. If the containers are different
-      /// types, generally the result is the type of the first argument.
-      pub fn join(self, other: Sized) -> Result<Sized, Error> {
-          Ok(match (self, other) {
-              (Sized::Associative(a), Sized::List(l)) => {
-                  let la = assoc::Associative::Assoc(assoc::Association::try_from_iter(
-                      l.iter().cloned(),
-                  )?);
-                  Sized::Associative(a.join(la))
-              }
-              (Sized::List(l), Sized::Associative(a)) => {
-                  let la = assoc::Associative::Assoc(assoc::Association::try_from_iter(
-                      l.iter().cloned(),
-                  )?);
-                  Sized::Associative(la.join(a))
-              }
-              (Sized::Associative(a), Sized::Associative(b)) => Sized::Associative(a.join(b)),
-              (Sized::List(mut a), Sized::List(b)) => {
-                  let am = a.mutate();
-                  am.extend(b.iter().cloned());
-                  Sized::List(a)
-              }
-              (Sized::Set(mut a), Sized::Set(b)) => {
-                  let am = a.mutate();
-                  am.extend(b.iter().cloned());
-                  Sized::Set(a)
-              }
-              (Sized::List(a), Sized::Set(mut b)) => {
-                  let bm = b.mutate();
-
-                  bm.extend(
-                      a.iter()
-                          .cloned()
-                          .map(assoc::KeyItem::try_derive)
-                          .collect::<Result<Vec<assoc::KeyItem>, Error>>()?,
-                  );
-                  Sized::Set(b)
-              }
-              (Sized::Set(mut a), Sized::List(b)) => {
-                  let am = a.mutate();
-
-                  am.extend(
-                      b.iter()
-                          .cloned()
-                          .map(assoc::KeyItem::try_derive)
-                          .collect::<Result<Vec<assoc::KeyItem>, Error>>()?,
-                  );
-                  Sized::Set(a)
-              }
-              (Sized::String(mut a), Sized::String(b)) => {
-                  a.push_str(&b);
-                  Sized::String(a)
-              }
-              (Sized::Bytes(mut a), Sized::Bytes(b)) => {
-                  a.extend(b);
-                  Sized::Bytes(a)
-              }
-              (s, other) => {
-                  if s.is_empty() {
-                      other
-                  } else if other.is_empty() {
-                      s
-                  } else {
-                      Err(Error::expected("joinable", list!(s, other)))?
-                  }
-              }
-          })
-      }
-
-      /// Returns whether this container contains the given [Item].
-      pub fn contains(&self, other: &Item) -> bool {
-          match (self, other) {
-              (Sized::Associative(a), other) => {
-                  assoc::KeyItem::try_derive(other.clone()).map_or(false, |k| a.contains_key(&k))
-              }
-              (Sized::List(l), other) => l.contains(other),
-              (Sized::Set(s), Item::Dispenser(Dispenser::Sized(Sized::Set(other)))) => {
-                  other.is_subset(s)
-              }
-              (Sized::Set(s), Item::Receptacle(Receptacle::Sized(Sized::Set(other)))) => {
-                  other.is_subset(s)
-              }
-              (Sized::Set(s), other) => {
-                  assoc::KeyItem::try_derive(other.clone()).map_or(false, |k| s.contains(&k))
-              }
-              (Sized::String(container), other) => match other {
-                  Item::Char(c) => container.contains(*c),
-                  i => {
-                      let s = String::try_derive(i.clone());
-                      match s {
-                          Ok(s) => container.contains(&s),
-                          Err(_) => false,
-                      }
-                  }
-              },
-              _ => false,
-          }
-      }
-
       /// Returns a new empty version of this container. Does not
       /// modify this container. The new container will be the same
       /// type as this one (if this is a [Sized::String], you'll get an empty
@@ -1430,7 +1734,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
   impl IntoIterator for Sized {
       type Item = Item;
-      type IntoIter = Box<dyn Iterator<Item = Item>>;
+      type IntoIter = Box<dyn Iterator<Item = Self::Item>>;
 
       fn into_iter(self) -> Self::IntoIter {
           match self {
@@ -1492,6 +1796,7 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
   }
+
   // Implement Derive for Item where T is an Iterator
   impl<T, I> Derive<T> for Item
   where
@@ -1499,7 +1804,7 @@ internally, to keep track of things like the stack, program, lists etc.
       I: Fit<Item>,
   {
       fn derive(iter: T) -> Self {
-          let l: List = iter.to_iter().map(|t| t.fit()).my_collect();
+          let l: List = iter.to_iter().map(Fit::fit).my_collect();
           Item::derive(l)
       }
   }
@@ -1515,6 +1820,12 @@ internally, to keep track of things like the stack, program, lists etc.
   impl Derive<Vec<Item>> for List {
       fn derive(v: Vec<Item>) -> Self {
           List::derive_iter(v)
+      }
+  }
+
+  impl Derive<String> for List {
+      fn derive(s: String) -> Self {
+          List::derive_iter(s.chars())
       }
   }
 
@@ -1663,7 +1974,7 @@ internally, to keep track of things like the stack, program, lists etc.
           let hs: HashSet<assoc::KeyItem> = s
               .into_iter()
               .map(|i| i.try_fit())
-              .collect::<Result<HashSet<assoc::KeyItem>, Error>>()?;
+              .collect::<Result<_, Error>>()?;
           Ok(Set::derive(hs))
       }
   }
@@ -1683,6 +1994,15 @@ internally, to keep track of things like the stack, program, lists etc.
   impl Default for Receptacle {
       fn default() -> Self {
           Receptacle::Sized(Sized::default())
+      }
+  }
+
+  impl ToIterator for Sized {
+      type Item = Item;
+      type IntoIter = Box<dyn Iterator<Item = Item>>;
+
+      fn to_iter<'a>(self) -> Self::IntoIter {
+          self.into_iter()
       }
   }
 
@@ -1769,10 +2089,12 @@ internally, to keep track of things like the stack, program, lists etc.
   use super::{dictionary as dict, environment as env};
   use crate::traits::*;
   use crate::types::container as coll;
-  use crate::types::container::Mutey;
+  use crate::types::container::{Count, Join, Mutey};
   use crate::types::number::{Int, Number};
   use crate::types::*;
-  use std::sync;
+  use std::collections::HashSet;
+  use std::convert::Infallible;
+  use std::sync::{self, Arc};
 
   pub type Associationy<K, V> = HashMap<K, V>;
   pub type AssociationContent = Associationy<KeyItem, Item>;
@@ -1913,6 +2235,106 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  impl coll::Join<coll::List> for Association {
+      type Output = Association;
+      type Error = Error;
+      fn join(self, other: coll::List) -> Result<Self::Output, Self::Error> {
+          let la = Association::try_from_iter(other.iter().cloned())?;
+          Ok(self.join(Associative::Assoc(la)).unwrap())
+      }
+  }
+
+  // impl coll::Join<Association> for Associative {
+  //     type Output = Associative;
+  //     type Error = Infallible;
+  //     fn join(self, other: Association) -> Result<Self::Output, Error> {
+  //         let la = Association::try_from_iter(other.iter().cloned())?;
+  //         self.join(Associative::Assoc(la))
+  //     }
+  // }
+
+  impl coll::Join<Associative> for Association {
+      type Output = Association;
+      type Error = Infallible;
+      fn join(mut self, other: Associative) -> Result<Self::Output, Self::Error> {
+          let thism = self.mutate();
+          thism.extend(other.to_iter());
+          Ok(self)
+      }
+  }
+
+  /// The join operation is for generic containers, but we can join
+  /// two Associatives by merging them together. If both
+  /// Associatives are the same specific type, the type is
+  /// preserved. If `other` can be converted to the same specific
+  /// type as `self`, that conversion will be done and the specific
+  /// type of `self` is preserved. If they are different types and we
+  /// can't convert `other` to `self`s type, the result will be
+  /// demoted to a more generic form.
+  ///
+  /// Keys in `other` have priority over those in `self` - if a key
+  /// is in both containers, the result will have only the value
+  /// from `other`.
+  impl coll::Join<Associative> for Associative {
+      type Output = Associative;
+      type Error = Infallible;
+      fn join(self, other: Associative) -> Result<Self::Output, <Self as Join<Associative>>::Error> {
+          Ok(match (self, other) {
+              // same type means 2nd one wins.
+              //TODO: a little more complex for types that can be extended
+              (Associative::DictEntry(_), Associative::DictEntry(other)) => {
+                  Associative::DictEntry(other)
+              }
+              (Associative::Dictionary(this), Associative::Dictionary(other)) => {
+                  Associative::Dictionary(this.join(other).unwrap())
+              }
+              (Associative::Dictionary(this), Associative::Assoc(other)) => this.join(other).unwrap(),
+              (Associative::Assoc(this), Associative::Dictionary(other)) => this.join(other).unwrap(),
+              (Associative::Error(_), Associative::Error(other)) => Associative::Error(other),
+              (Associative::Env(_), Associative::Env(other)) => Associative::Env(other),
+              (Associative::Nothing, Associative::Nothing) => Associative::Nothing,
+              // This is infallible so .unwrap should be safe
+              (Associative::Assoc(this), other) => Associative::Assoc(this.join(other).unwrap()),
+              (this, other) => Join::join(this, other).unwrap(),
+          })
+      }
+  }
+
+  impl coll::SimpleTake for Association {
+      type Item = Entry;
+      fn take_simple(&mut self) -> Option<Self::Item> {
+          let maybe_key = self.keys().next().cloned();
+          let am = self.mutate();
+          let maybe_value = maybe_key.as_ref().and_then(|key| am.remove(key));
+
+          maybe_key.map(|key| (key, maybe_value.unwrap_or_default()))
+      }
+  }
+
+  /// The take operation is for generic containers but we can
+  /// perform it on an Associative by removing an arbitrary pair and
+  /// returning it.
+  impl coll::SimpleTake for Associative {
+      type Item = Item;
+      fn take_simple(&mut self) -> Option<Self::Item> {
+          match self {
+              Associative::Assoc(ref mut a) => a.take_simple().map(Item::derive),
+              Associative::Dictionary(ref mut d) => d.take_simple().map(Item::derive),
+              // The remaining impls may require auto-demotion (eg,
+              // removing a required field from say, Error). We'll just
+              // demote all of them whether the field that is removed is
+              // required or not, since the caller cannot know in
+              // advance which it will be.
+              ref a => {
+                  let mut assoc: Association = (*a).clone().fit();
+                  let v = assoc.take_simple().map(Item::derive);
+                  ,*self = Associative::Assoc(assoc);
+                  v
+              }
+          }
+      }
+  }
+
   impl Associative {
       /// Retuns the number of associations in the container
       pub fn len(&self) -> usize {
@@ -1955,7 +2377,7 @@ internally, to keep track of things like the stack, program, lists etc.
                       let e2 = e.clone();
                       if let Ok(e) = dict::Entry::try_derive(e) {
                           let dm = coll::Arc::mutate(&mut d);
-                          let e = dm.insert(w, e).map(Item::derive);
+                          let e = dm.insert(w.fit(), e).map(Item::derive);
                           (Associative::Dictionary(d), e)
                       } else {
                           // TODO silently failing to insert here is bad
@@ -2014,7 +2436,7 @@ internally, to keep track of things like the stack, program, lists etc.
       pub fn put(self, other: Item) -> Result<Associative, Error> {
           match (self, other) {
               (Associative::Dictionary(mut this), other) => {
-                  let (word, entry) = <(Word, dict::Entry)>::try_derive(other)?;
+                  let (word, entry) = <(dict::Word, dict::Entry)>::try_derive(other)?;
                   let thismut = this.mutate();
                   thismut.insert(word.fit(), entry.fit());
                   Ok(Associative::Dictionary(this))
@@ -2022,78 +2444,6 @@ internally, to keep track of things like the stack, program, lists etc.
               (this, other) => {
                   let entry: (KeyItem, Item) = other.try_fit()?;
                   Ok(this.insert(entry.0, entry.1).0)
-              }
-          }
-      }
-
-      /// The join operation is for generic containers, but we can join
-      /// two Associatives by merging them together. If both
-      /// Associatives are the same specific type, the type is
-      /// preserved. If `other` can be converted to the same specific
-      /// type as `self`, that conversion will be done and the specific
-      /// type of `self` is preserved. If they are different types and we
-      /// can't convert `other` to `self`s type, the result will be
-      /// demoted to a more generic form.
-      ///
-      /// Keys in `other` have priority over those in `self` - if a key
-      /// is in both containers, the result will have only the value
-      /// from `other`.
-      pub fn join(self, other: Associative) -> Associative {
-          match (self, other) {
-              // same type means 2nd one wins.
-              //TODO: a little more complex for types that can be extended
-              (Associative::DictEntry(_), Associative::DictEntry(other)) => {
-                  Associative::DictEntry(other)
-              }
-              (Associative::Dictionary(mut this), Associative::Dictionary(other)) => {
-                  let thism = coll::Arc::mutate(&mut this);
-                  thism.extend(
-                      other
-                          .iter()
-                          .map(|(key, value)| (key.clone(), value.clone())),
-                  );
-                  Associative::Dictionary(this)
-              }
-              (Associative::Dictionary(mut this), Associative::Assoc(other)) => {
-                  // Try to convert to dictionary type
-                  //println!("dict + assoc join");
-                  match other.convert::<Word, dict::Entry>() {
-                      Ok(d) => {
-                          let tm = this.mutate();
-                          tm.extend(d);
-                          Associative::Dictionary(this)
-                      }
-                      // TODO: convert the other way (to assoc) instead
-                      Err(e) => {
-                          println!("Conversion error: {:?}", e);
-                          Associative::Dictionary(this)
-                      }
-                  }
-              }
-              (Associative::Assoc(this), Associative::Dictionary(mut dict)) => {
-                  // Try to convert to dictionary type
-                  //println!("assoc + dict join");
-                  match this.convert::<Word, dict::Entry>() {
-                      Ok(d) => {
-                          let tm = dict.mutate();
-                          tm.extend(d);
-                          Associative::Dictionary(dict)
-                      }
-                      // TODO: convert the other way (to assoc) instead
-                      Err(_) => Associative::Dictionary(dict),
-                  }
-              }
-              (Associative::Error(_), Associative::Error(other)) => Associative::Error(other),
-              (Associative::Env(_), Associative::Env(other)) => Associative::Env(other),
-              (Associative::Nothing, Associative::Nothing) => Associative::Nothing,
-              (Associative::Assoc(mut this), other) => {
-                  let thism = this.mutate();
-                  thism.extend(other.to_iter());
-                  Associative::Assoc(this)
-              }
-              (this, other) => {
-                  let thisa: Association = this.fit();
-                  (Associative::Assoc(thisa)).join(other)
               }
           }
       }
@@ -2113,7 +2463,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   _ => None,
               },
               Associative::Dictionary(d) => match k {
-                  KeyItem::Word(w) => d.get(w).map(|x| x.clone().fit()),
+                  KeyItem::Word(w) => d.get(&w.clone().fit()).map(|x| x.clone().fit()),
                   _ => None,
               },
               &Associative::Nothing => None,
@@ -2128,7 +2478,7 @@ internally, to keep track of things like the stack, program, lists etc.
               Associative::Env(e) => e.contains_key(k),
               Associative::DictEntry(d) => d.contains_key(k),
               Associative::Dictionary(d) => match k {
-                  KeyItem::Word(w) => d.contains_key(w),
+                  KeyItem::Word(w) => d.contains_key(&w.clone().fit()),
                   _ => false,
               },
               &Associative::Nothing => false,
@@ -2147,7 +2497,7 @@ internally, to keep track of things like the stack, program, lists etc.
               }
               Associative::Dictionary(mut d) => {
                   let dm = coll::Arc::mutate(&mut d);
-                  let v = dm.remove(&Word::try_derive(k.clone()).unwrap_or_default());
+                  let v = dm.remove(&dict::Word::try_derive(k.clone()).unwrap_or_default());
                   (Associative::Dictionary(d), v.map(|v| v.fit()))
               }
               Associative::Error(mut e) => {
@@ -2160,47 +2510,6 @@ internally, to keep track of things like the stack, program, lists etc.
                   Associative::Assoc(a).remove(k)
               }
               _ => todo!("Removing from other associative types"),
-          }
-      }
-
-      /// The take operation is for generic containers but we can
-      /// perform it on an Associative by removing an arbitrary pair and
-      /// returning it.
-      pub fn take(self) -> (Self, Option<Item>) {
-          match self {
-              Associative::Assoc(mut a) => {
-                  let maybe_key = a.keys().next().cloned();
-                  let am = a.mutate();
-                  let maybe_value = maybe_key.as_ref().and_then(|key| am.remove(key));
-                  (
-                      Associative::Assoc(a),
-                      maybe_key.map(|key| {
-                          coll::List::derive_iter(vec![
-                              Item::derive(key),
-                              maybe_value.unwrap_or_default(),
-                          ])
-                          .fit()
-                      }),
-                  )
-              }
-              Associative::Dictionary(mut d) => {
-                  let maybe_key = d.keys().next().cloned();
-                  let dm = d.mutate();
-                  let maybe_value = maybe_key.clone().and_then(|key| dm.remove(&key));
-                  (
-                      Associative::Dictionary(d),
-                      maybe_key.map(|key| {
-                          coll::List::derive_iter(vec![
-                              Item::Word(key),
-                              maybe_value.map(Item::derive).unwrap_or(Item::default()),
-                          ])
-                          .fit()
-                      }),
-                  )
-              }
-              // The remaining impls may require auto-demotion (eg,
-              // removing a required field from say, Error)
-              _ => todo!("taking from assoc Requires insert/remove impl"),
           }
       }
   }
@@ -2219,7 +2528,7 @@ internally, to keep track of things like the stack, program, lists etc.
               Associative::Dictionary(d) => {
                   let items: Vec<_> = d
                       .iter()
-                      .map(|(k, v)| (k.clone().fit(), v.clone().fit()))
+                      .map(|(k, v)| (KeyItem::Word(k.clone().fit()), v.clone().fit()))
                       .collect();
                   Box::new(items.into_iter())
               }
@@ -2320,7 +2629,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
       fn try_derive(i: Item) -> Result<Self, Error> {
           let s = coll::Sized::try_derive(i)?;
-          if s.len() != 2 {
+          if s.count() != 2 {
               Err(Error::expected("pair", s))
           } else {
               let mut iter = s.into_iter();
@@ -2358,6 +2667,19 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  impl Derive<(KeyItem, Item)> for KeyItem {
+      fn derive((k, _): (KeyItem, Item)) -> KeyItem {
+          k
+      }
+  }
+
+  /// Converting Associative to Set just returns the keys.
+  impl Derive<Associative> for coll::Set {
+      fn derive(a: Associative) -> coll::Set {
+          Arc::new(HashSet::from_iter(a.to_iter().map(|(k, _)| k)))
+      }
+  }
+
   impl<T, E, C> DeriveIterator<Result<T, E>> for Result<C, E>
   where
       C: DeriveIterator<T>,
@@ -2376,7 +2698,7 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  trait Convert<KA, VA> {
+  pub trait Convert<KA, VA> {
       /// Convert from any type of hashmap to any other, assuming the keys
       /// and values convert
       fn convert<KB, VB>(&self) -> Result<HashMap<KB, VB>, Error>
@@ -2718,12 +3040,63 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::list;
   use crate::serialize;
   use crate::traits::*;
-  use crate::types::container::{self as coll, Mutey};
-  use crate::types::*;
+  use crate::types::container::associative::Convert;
+  use crate::types::container::{self as coll, Count, Mutey};
+  use crate::types::{self, Bytes, Error, Item};
+  use cache::cache;
+  use core::fmt;
   use internment::Intern;
+  use std::collections::HashMap;
   use std::collections::HashSet;
+  use std::convert::Infallible;
+  use std::hash::Hash;
+  use std::hash::Hasher;
   use std::ptr;
   use std::sync::Arc;
+
+  /// A word in a dictionary is slightly different than a 'word' piece
+  /// of data: when looking up words in the dictionary, the namespace is
+  /// used for comparison. Due to differences in equality and hashing
+  /// behavior, we use a wrapper type here so we can distinguish the
+  /// behavior.
+  #[derive(Eq, Debug, Clone, Default)]
+  pub struct Word(types::Word);
+
+  /// The hash of a dictionary Word uses all the fields
+  impl Hash for Word {
+      fn hash<H: Hasher>(&self, state: &mut H) {
+          self.0.data.hash(state);
+          self.0.namespace.hash(state);
+          self.0.quoted.hash(state);
+      }
+  }
+
+  impl PartialEq for Word {
+      fn eq(&self, other: &Self) -> bool {
+          self.0.data == other.0.data
+              && self.0.namespace == other.0.namespace
+              && self.0.quoted == other.0.quoted
+      }
+  }
+
+  impl Derive<Word> for types::Word {
+      fn derive(w: Word) -> Self {
+          w.0
+      }
+  }
+
+  impl Derive<types::Word> for Word {
+      fn derive(w: types::Word) -> Self {
+          Word(w)
+      }
+  }
+
+  impl TryDerive<assoc::KeyItem> for Word {
+      type Error = Error;
+      fn try_derive(k: assoc::KeyItem) -> Result<Self, Self::Error> {
+          Ok(types::Word::try_derive(k)?.fit())
+      }
+  }
 
   /// The definition of a [Word], contains its actual code (the
   /// definition), and also documentation like specs and examples.
@@ -2739,8 +3112,8 @@ internally, to keep track of things like the stack, program, lists etc.
   /// type and optional name of the input/output.
   #[derive(Debug, Clone, PartialEq)]
   pub struct SpecElement {
-      pub elemtype: Word,
-      pub name: Option<Word>,
+      pub elemtype: types::Word,
+      pub name: Option<types::Word>,
   }
 
   pub type StackSpec = Vec<SpecElement>;
@@ -2763,8 +3136,8 @@ internally, to keep track of things like the stack, program, lists etc.
                   if s.len() != 2 {
                       Err(Error::list_count(2))
                   } else {
-                      let t = Word::try_derive(s.front().unwrap().clone())?;
-                      let n = Word::try_derive(s.get(1).unwrap().clone())?;
+                      let t = types::Word::try_derive(s.front().unwrap().clone())?;
+                      let n = types::Word::try_derive(s.get(1).unwrap().clone())?;
                       Ok(SpecElement {
                           elemtype: t,
                           name: Some(n),
@@ -2865,15 +3238,15 @@ internally, to keep track of things like the stack, program, lists etc.
               "spec" => self.spec.clone().map(|x| x.fit()),
               "examples" => self.examples.clone().map(|x| x.fit()),
               "definition" => Some(match self.definition.clone() {
-                  dict::Definition::Axiom(_) => "builtin".fit(),
-                  dict::Definition::Derived(d) => d.fit(),
+                  Definition::Axiom(_) => "builtin".fit(),
+                  Definition::Derived(d) => d.fit(),
               }),
               _ => None,
           }
       }
 
       pub fn contains_key(&self, key: &assoc::KeyItem) -> bool {
-          Word::try_derive(key.clone()).map_or(false, |ref w| {
+          types::Word::try_derive(key.clone()).map_or(false, |ref w| {
               matches!(w.fit(), "examples" | "spec" | "definition")
           })
       }
@@ -2896,6 +3269,10 @@ internally, to keep track of things like the stack, program, lists etc.
           match i {
               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(b))) => Ok(bytes_to_ns(b)),
               Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(b))) => Ok(bytes_to_ns(b)),
+              Item::Word(w) => Ok(cache::Key::Alias(String::derive(w.clone()))
+                  .deref()
+                  .map(bytes_to_ns)?),
+
               i => {
                   let s = coll::Sized::try_derive(i)?;
                   if s.is_empty() {
@@ -2937,11 +3314,24 @@ internally, to keep track of things like the stack, program, lists etc.
       /// Find the word in the dictionary in one of the given
       /// namespaces. The first match is applied to the word, or None if
       /// no matches.
-      fn resolve_word(&self, w: &mut Word, namespaces: &[dict::Namespace]);
+      fn resolve_word(&self, w: &mut Word, namespaces: &[Namespace]);
 
       /// Merges this dictionary with the given new dictionary. The new
       /// entries are added with the given namespace.
       fn merge(&mut self, new: Dictionary, namespace: &Namespace);
+  }
+
+  impl coll::SimpleTake for Dictionary {
+      type Item = (Word, Entry);
+      fn take_simple(&mut self) -> Option<Self::Item> {
+          if let Some(ref k) = self.keys().next().cloned() {
+              let dm = self.mutate();
+              let v = dm.remove(k).unwrap();
+              Some((k.clone(), v))
+          } else {
+              None
+          }
+      }
   }
 
   impl Dict for Dictionary {
@@ -2955,14 +3345,15 @@ internally, to keep track of things like the stack, program, lists etc.
           let adds: Vec<_> = adds
               .into_iter()
               .map(|(mut w, e)| {
-                  w.namespace = *namespace;
+                  w.0.namespace = *namespace;
+                  //println!("Adding {:?}", w);
                   (w, e)
               })
               .collect();
           let deletes: Vec<_> = deletes
               .into_iter()
               .map(|mut w| {
-                  w.namespace = *namespace;
+                  w.0.namespace = *namespace;
                   w
               })
               .collect();
@@ -2980,7 +3371,7 @@ internally, to keep track of things like the stack, program, lists etc.
               let word: Word = k.try_fit().unwrap();
 
               let iter: Box<dyn Iterator<Item = Item>> = def.try_fit().unwrap();
-              let new_entry: dict::Entry = iter.try_fit().unwrap();
+              let new_entry: Entry = iter.try_fit().unwrap();
               let new_entry2 = new_entry.clone();
               let dict = self.mutate();
               dict.entry(word)
@@ -2997,7 +3388,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn add_builtins(&mut self) {
           let dm = self.mutate();
           for (bw, bd) in BUILTIN_FUNCTIONS.iter() {
-              dm.entry(bw.clone()).and_modify(|d| {
+              dm.entry(bw.clone().fit()).and_modify(|d| {
                   if let Definition::Derived(dd) = &d.definition {
                       if dd.is_empty() {
                           d.definition = bd.clone();
@@ -3007,17 +3398,18 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
-      fn resolve_word(&self, w: &mut Word, namespaces: &[dict::Namespace]) {
+      fn resolve_word(&self, w: &mut Word, namespaces: &[Namespace]) {
           // if the word is already namespaced we're done
-          if w.namespace.is_none() {
+          if w.0.namespace.is_none() {
               for namespace in namespaces.iter() {
-                  w.namespace = *namespace;
+                  w.0.namespace = *namespace;
+                  //println!("Resolve {:?}", w);
                   if self.contains_key(w) {
                       return;
                   }
               }
               // no match found, clear the namespace
-              w.namespace = Default::default();
+              w.0.namespace = Default::default();
           }
       }
   }
@@ -3025,24 +3417,29 @@ internally, to keep track of things like the stack, program, lists etc.
   /// Each word should run a program that calls fail (already namespaced
   /// to the stdlib so that the word acts like it isn't in the dictionary
   /// even though it is.)
-  fn make_deletes(words: Vec<Word>) -> Vec<(Word, dict::Entry)> {
+  fn make_deletes(words: Vec<Word>) -> Vec<(Word, Entry)> {
       words
           .into_iter()
           .map(|word| {
-              println!("Shadowing word: {:?}", word);
+              //println!("Shadowing word: {:?}", word);
               let err = Error::create(
-                  list!(word.clone()),
+                  list!(types::Word::derive(word.clone())),
                   "word removed by module",
                   Some("access-denied"),
               );
-              let entry = dict::Entry {
+              let entry = Entry {
                   examples: None,
                   spec: None,
-                  definition: dict::Definition::Derived(list!(err, "fail")),
+                  definition: Definition::Derived(list!(err, "fail")),
               };
               (word, entry)
           })
           .collect()
+  }
+
+  /// Returns an owned pair given a pair of references
+  fn owned<T: Clone, U: Clone>(entry: (&T, &U)) -> (T, U) {
+      (entry.0.clone(), entry.1.clone())
   }
 
   /// Returns the differences between two hashmaps, including the keys
@@ -3060,7 +3457,7 @@ internally, to keep track of things like the stack, program, lists etc.
       let added_or_updated: Vec<(K, V)> = b
           .iter()
           .filter(|(k, v)| !a_keys.contains(k) || a.get(k) != Some(v))
-          .map(|(k, v)| (k.clone(), v.clone()))
+          .map(owned)
           .collect();
 
       // Keys that are in `a` but not in `b`
@@ -3069,12 +3466,61 @@ internally, to keep track of things like the stack, program, lists etc.
       (added_or_updated, deleted)
   }
 
+  impl coll::Join<Dictionary> for Dictionary {
+      type Output = Dictionary;
+      type Error = Infallible;
+      fn join(mut self, other: Dictionary) -> Result<Self::Output, Self::Error> {
+          let sm = self.mutate();
+          sm.extend(other.iter().map(owned));
+          Ok(self)
+      }
+  }
+
+  impl coll::Join<assoc::Association> for Dictionary {
+      type Output = assoc::Associative;
+      type Error = Infallible;
+      fn join(mut self, other: assoc::Association) -> Result<Self::Output, Self::Error> {
+          // Try to convert to dictionary type
+          //println!("dict + assoc join");
+          match other.convert::<Word, Entry>() {
+              Ok(d) => {
+                  let tm = self.mutate();
+                  tm.extend(d);
+                  Ok(assoc::Associative::Dictionary(self))
+              }
+              // TODO: convert the other way (to assoc) instead
+              Err(_) => {
+                  //println!("Conversion error: {:?}", e);
+                  Ok(assoc::Associative::Dictionary(self))
+              }
+          }
+      }
+  }
+
+  impl coll::Join<Dictionary> for assoc::Association {
+      type Output = assoc::Associative;
+      type Error = Infallible;
+      fn join(self, mut other: Dictionary) -> Result<Self::Output, Self::Error> {
+          // Try to convert to dictionary type
+          //println!("assoc + dict join");
+          Ok(match self.convert::<Word, Entry>() {
+              Ok(d) => {
+                  let tm = other.mutate();
+                  tm.extend(d.iter().map(owned));
+                  assoc::Associative::Dictionary(other)
+              }
+              // TODO: convert the other way (to assoc) instead
+              Err(_) => assoc::Associative::Dictionary(other),
+          })
+      }
+  }
+
   /// The actual code for what a [Word] should do.
   #[derive(Clone)]
   pub enum Definition {
       /// A definition in the base language - a rust function that
       /// modifies the environment.
-      Axiom(&'static StepFn),
+      Axiom(&'static types::StepFn),
       /// A definition in terms of other [Word]s - a kcats program
       Derived(coll::List),
   }
@@ -3119,8 +3565,8 @@ internally, to keep track of things like the stack, program, lists etc.
       fn into_iter(self) -> Self::IntoIter {
           let mut v: Vec<(assoc::KeyItem, Item)> = vec![("definition".fit(), {
               match self.definition {
-                  dict::Definition::Derived(l) => l.fit(),
-                  dict::Definition::Axiom(_) => "builtin-function".fit(),
+                  Definition::Derived(l) => l.fit(),
+                  Definition::Axiom(_) => "builtin-function".fit(),
               }
           })];
           if let Some(e) = self.examples {
@@ -3232,7 +3678,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
   impl Derive<(Word, Entry)> for Item {
       fn derive((k, v): (Word, Entry)) -> Item {
-          coll::List::derive_iter([Item::Word(k), Item::derive(v.clone())]).fit()
+          coll::List::derive_iter([Item::Word(k.fit()), Item::derive(v.clone())]).fit()
       }
   }
 
@@ -3241,13 +3687,13 @@ internally, to keep track of things like the stack, program, lists etc.
 
       fn try_derive(i: Item) -> Result<Self, Self::Error> {
           let s = coll::Sized::try_derive(i)?;
-          if s.len() != 2 {
+          if s.count() != 2 {
               Err(Error::expected("pair", s))
           } else {
               let mut iter = s.into_iter();
-              let key: Word = iter.next().unwrap().try_fit()?;
+              let key: types::Word = iter.next().unwrap().try_fit()?;
               let value: Entry = iter.next().unwrap().try_fit()?;
-              Ok((key, value))
+              Ok((key.fit(), value))
           }
       }
   }
@@ -3494,6 +3940,7 @@ internally, to keep track of things like the stack, program, lists etc.
   /// existing env, loads the given module and returns the new env with
   /// the dictionary that the module built on the stack.
   fn load_module(mut env: Environment, module: &&str) -> Environment {
+      //println!("Loading module {}", *module);
       env.push(Word::derive(*module));
       env.program.prepend(list!(
           "dictionary",
@@ -3503,12 +3950,15 @@ internally, to keep track of things like the stack, program, lists etc.
           "read",
           "shielddown",
       ));
+      //println!("Dictionary: {:?}", env.dictionary);
       let mut new_env = futures::executor::block_on(async move { axiom::eval(env).await });
       //println!("Env: {:?}", new_env);
       let dict: dict::Dictionary = new_env.pop().try_fit().unwrap();
+
       new_env.dictionary = dict;
       new_env
   }
+
   impl Default for Environment {
       /// Returns the default environment, which is the "standard"
       /// environment. It loads some standard libraries and core
@@ -3535,6 +3985,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   "methods",
                   "generators",
                   "more-generators",
+                  "database",
                   //"template",
                   "debug", // END default namespace // another good candidate for lib
               ]
@@ -3775,29 +4226,46 @@ crate so we can use it at both build time and runtime.
       }
 
       impl Key {
-          pub fn get(&self) -> Result<Bytes, Error> {
-              if let Some(proj_dirs) = ProjectDirs::from("org", "skyrod", "kcats") {
-                  let data_dir = proj_dirs.data_dir();
+          fn path(&self) -> Result<PathBuf, Error> {
+              {
+                  if let Some(proj_dirs) = ProjectDirs::from("org", "skyrod", "kcats") {
+                      let data_dir = proj_dirs.data_dir();
 
-                  let cache_path = data_dir.join("cache");
+                      let cache_path = data_dir.join("cache");
 
-                  // Look up the file
-                  if cache_path.exists() && cache_path.is_dir() {
-                      let filename = match self {
-                          Key::Hash(hash) => base64::encode_config(hash, base64::URL_SAFE_NO_PAD),
-                          Key::Alias(word) => word.to_string(),
-                      };
+                      // Look up the file
+                      if cache_path.exists() && cache_path.is_dir() {
+                          let filename = match self {
+                              Key::Hash(hash) => base64::encode_config(hash, base64::URL_SAFE_NO_PAD),
+                              Key::Alias(word) => word.to_string(),
+                          };
 
-                      let file = cache_path.join(filename);
-                      //println!("Reading cache file {:?}", file);
-                      let mut content = Bytes::new();
-                      fetch_link(file.as_path())?.read_to_end(&mut content)?;
-                      Ok(content)
+                          let file = cache_path.join(filename);
+
+                          Ok(file)
+                      } else {
+                          Err(Error::new(io::ErrorKind::Other, "Cache dir not found"))
+                      }
                   } else {
-                      Err(Error::new(io::ErrorKind::Other, "Cache dir not found"))
+                      Err(Error::new(io::ErrorKind::Other, "Cache data dir not found"))
                   }
-              } else {
-                  Err(Error::new(io::ErrorKind::Other, "Cache data dir not found"))
+              }
+          }
+
+          pub fn get(&self) -> Result<Bytes, Error> {
+              let mut content = Bytes::new();
+              self.path()
+                  .and_then(|pb| fetch_link(pb.as_path()))
+                  .and_then(|mut f| f.read_to_end(&mut content))?;
+
+              Ok(content)
+          }
+
+          pub fn deref(&self) -> Result<Bytes, io::Error> {
+              match self {
+                  Key::Hash(h) => Ok(h.clone()),
+                  Key::Alias(a) => target(a.clone())
+                      .and_then(|t| Ok(base64::decode_config(t, base64::URL_SAFE_NO_PAD).unwrap())),
               }
           }
       }
@@ -3958,6 +4426,21 @@ crate so we can use it at both build time and runtime.
                   let mut target_path = String::new();
                   link_file.read_to_string(&mut target_path)?;
                   File::open(target_path)
+              }
+          }
+      }
+
+      fn target(alias: String) -> Result<String, io::Error> {
+          let path = Key::Alias(alias).path()?;
+          match get_link_type() {
+              Link::Symlink => {
+                  fs::read_link(path).map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+              }
+              Link::Manual => {
+                  let mut link_file = File::open(path)?;
+                  let mut target_path = String::new();
+                  link_file.read_to_string(&mut target_path)?;
+                  Ok(target_path)
               }
           }
       }
@@ -4517,7 +5000,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   use crate::types::container::pipe::db;
   use crate::types::container::{
       self as coll, associative as assoc, dictionary as dict, environment::Environment, error::Error,
-      pipe, Mutey, Ordered,
+      pipe, Container, Count, Join, Mutey, Ordered, Take,
   };
   use crate::types::number::{Float, Int, Number};
   use crate::types::*;
@@ -4803,6 +5286,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   Environment::try_derive,
               ))),
           ),
+          ("environment?", Box::leak(Box::new(f_stack1(is_environment)))),
           ("error?", Box::leak(Box::new(f_stack1(is_error)))),
           ("eval-step", Box::leak(Box::new(eval_step_outer))),
           ("evaluate", Box::leak(Box::new(evaluate))),
@@ -4820,11 +5304,11 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               Box::leak(Box::new(f_stack1(crate::types::container::pipe::fs::file_out))),
           ),
           ("finished?", Box::leak(Box::new(f_stack1(is_finished)))),
-          ("first", Box::leak(Box::new(f_stack1(first)))),
+          //("first", Box::leak(Box::new(f_stack1(first)))),
           ("float", Box::leak(Box::new(float))),
           ("floor", Box::leak(Box::new(f_stack1(floor)))),
           ("format", Box::leak(Box::new(f_stack2(format)))),
-          ("handle", Box::leak(Box::new(f_stack1(handle)))),
+          ("handle", Box::leak(Box::new(handle))),
           (
               "handoff",
               Box::leak(Box::new(crate::types::container::pipe::channel::handoff)),
@@ -4865,6 +5349,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               Box::leak(Box::new(f_stack1(crate::types::container::pipe::channel::receiver))),
           ),
           ("recur", Box::leak(Box::new(recur))),
+          ("resolve", Box::leak(Box::new(f_result(resolve)))),
           ("resume", Box::leak(Box::new(identity))),
           ("reverse", Box::leak(Box::new(f_stack1(reverse)))),
           ("round", Box::leak(Box::new(f_stack1(round)))),
@@ -5120,7 +5605,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn count(i: coll::Sized) -> Result<Int, Infallible> {
-      Ok(i.len() as Int)
+      Ok(i.count() as Int)
   }
 
   pub fn is_string(i: Item) -> Result<bool, Infallible> {
@@ -5152,6 +5637,17 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       Ok(matches!(i, Item::Word(_)))
   }
 
+  pub fn is_environment(i: Item) -> Result<bool, Infallible> {
+      Ok(matches!(
+          i,
+          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
+              assoc::Associative::Env(_)
+          ))) | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(
+              assoc::Associative::Env(_)
+          )))
+      ))
+  }
+
   pub fn is_pipe(i: Item) -> Result<bool, Infallible> {
       Ok(matches!(
           i,
@@ -5171,10 +5667,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           .unwrap_or(false))
   }
 
-  pub fn first(c: coll::Sized) -> ItemResult {
-      let (_, i) = c.take();
-      Ok(i.fit())
-  }
+  // pub fn first(c: coll::Sized) -> ItemResult {
+  //     let (_, i) = c.take();
+  //     Ok(i.fit())
+  // }
 
   pub fn second(c: coll::List) -> ItemResult {
       Ok(c.get(1).cloned().unwrap_or_default())
@@ -5285,17 +5781,14 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let i2 = i.clone();
       let r = coll::Dispenser::try_derive(i);
       match r {
-          Ok(it) => {
-              let f = it.take();
-              Box::pin(async move {
-                  let (c, i) = f.await;
-                  env.pop_prog();
-                  let stack = Arc::make_mut(&mut env.stack);
-                  stack.push_front(c.fit());
-                  stack.push_front(i.unwrap_or_default());
-                  env
-              })
-          }
+          Ok(d) => Box::pin(async move {
+              let (i, c) = d.take().await;
+              env.pop_prog();
+              let stack = Arc::make_mut(&mut env.stack);
+              stack.push_front(c.fit());
+              stack.push_front(coll::result_to_option(i).unwrap_or_default());
+              env
+          }),
           Err(e) => {
               let stack = Arc::make_mut(&mut env.stack);
               stack.push_front(i2);
@@ -5358,7 +5851,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let p = coll::List::try_derive(env.pop()).unwrap();
       let dispenser = coll::Dispenser::try_derive(env.pop()).unwrap();
       Box::pin(async move {
-          if let (dispenser, Some(litem)) = dispenser.take().await {
+          let (r, dispenser) = dispenser.take().await;
+          if let Some(litem) = coll::result_to_option(r) {
               let prog = env.program.mutate();
               // prepare the next iteration, even if the iterator is now
               // empty. step is still the next instruction, so we don't
@@ -5428,123 +5922,79 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       env.fit()
   }
 
-  fn assoc_vec(mut l: coll::List, ks: &[assoc::KeyItem], k: Int, v: Item) -> Result<Item, Error> {
-      let lm = Arc::make_mut(&mut l);
-      let idx = k as usize;
-      // extend the size of the vector to be big enough to set
-      // the given index, pad with 'nothing' values.
-      if lm.len() <= idx {
-          lm.resize(idx + 1, Item::default());
-      }
-      let inner = &lm[idx];
+  fn assoc_in(i: Option<Item>, ks: &[assoc::KeyItem], v: Item) -> Result<Item, Error> {
+      fn assoc_vec(mut l: coll::List, ks: &[assoc::KeyItem], k: Int, v: Item) -> Result<Item, Error> {
+          let lm = Arc::make_mut(&mut l);
+          let idx = k as usize;
+          // extend the size of the vector to be big enough
+          if lm.len() <= idx {
+              lm.resize(idx + 1, Item::default());
+          }
 
-      lm[k as usize] = if let [nextk, ..] = ks {
-          let i: Item = match (inner, nextk) {
-              (
-                  Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(l))),
-                  assoc::KeyItem::Int(_),
-              ) => l.clone().fit(),
-              (
-                  Item::Receptacle(coll::Receptacle::Sized(coll::Sized::List(l))),
-                  assoc::KeyItem::Int(_),
-              ) => l.clone().fit(),
-              (_, assoc::KeyItem::Int(_)) => coll::List::default().fit(),
-              _ => assoc::Association::fresh().fit(),
-          };
-          assoc_in(i, ks, v)?
-      } else {
-          v
-      };
-
-      //if the inner value isn't a list, overwrite it
-      Ok(l.fit())
-  }
-
-  fn assoc_in(i: Item, ks: &[assoc::KeyItem], v: Item) -> Result<Item, Error> {
-      if let [k, ks @ ..] = ks {
-          if ks.is_empty() {
-              match (i, k) {
-                  (
-                      Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(mut l))),
-                      assoc::KeyItem::Int(k),
-                  ) => {
-                      // vector set by index
-                      let lm = Arc::make_mut(&mut l);
-                      let idx = *k as usize;
-                      // extend the size of the vector to be big enough to set
-                      // the given index, pad with 'nothing' values.
-                      if lm.len() <= idx {
-                          lm.resize(idx + 1, Item::default());
-                      }
-                      lm[*k as usize] = v;
-                      Ok(l.fit())
-                  }
-                  (
-                      Item::Receptacle(coll::Receptacle::Sized(coll::Sized::List(mut l))),
-                      assoc::KeyItem::Int(k),
-                  ) => {
-                      // vector set by index
-                      let lm = Arc::make_mut(&mut l);
-                      let idx = *k as usize;
-                      // extend the size of the vector to be big enough to set
-                      // the given index, pad with 'nothing' values.
-                      if lm.len() <= idx {
-                          lm.resize(idx + 1, Item::default());
-                      }
-                      lm[*k as usize] = v;
-                      Ok(l.fit())
-                  }
-                  (i, k) => {
-                      let a = assoc::Associative::try_derive(i)?;
-                      Ok(a.insert(k.clone(), v).0.fit())
-                  }
-              }
-              //hm.insert(k.clone(), v);
+          lm[idx] = if ks.is_empty() {
+              v
           } else {
-              match (i, k) {
-                  (
-                      Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(l))),
-                      assoc::KeyItem::Int(k),
-                  ) => assoc_vec(l, ks, *k, v),
+              assoc_in(lm.get(idx).cloned(), ks, v)?
+          };
 
-                  (
-                      Item::Receptacle(coll::Receptacle::Sized(coll::Sized::List(l))),
-                      assoc::KeyItem::Int(k),
-                  ) => assoc_vec(l, ks, *k, v),
+          Ok(l.fit())
+      }
 
-                  (i, k) => {
-                      let a = assoc::Associative::try_derive(i)?;
-                      let inner = a.get(k).unwrap_or_default().clone();
+      fn assoc_map(
+          a: assoc::Associative,
+          ks: &[assoc::KeyItem],
+          k: &assoc::KeyItem,
+          v: Item,
+      ) -> Result<Item, Error> {
+          let inner = a.get(&k).clone();
+          if ks.is_empty() {
+              Ok(a.insert(k.clone(), v).0.fit())
+          } else {
+              Ok(a.insert(k.clone(), assoc_in(inner, ks, v)?).0.fit())
+          }
+      }
 
-                      // if the inner value is a map, recurse. If it's a
-                      // list and the next key is a number,
-                      // recurse. Otherwise, overwrite the value with a new map.
-                      let next_key = ks[0].clone();
-                      let i = match (next_key, inner) {
-                          (
-                              assoc::KeyItem::Int(_),
-                              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(l))),
-                          ) => l.clone().fit(),
-                          (
-                              assoc::KeyItem::Int(_),
-                              Item::Receptacle(coll::Receptacle::Sized(coll::Sized::List(l))),
-                          ) => l.clone().fit(),
-                          (
-                              _,
-                              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(a))),
-                          ) => a.clone().fit(),
-                          (
-                              _,
-                              Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(a))),
-                          ) => a.clone().fit(),
-                          _ => assoc::Association::fresh().fit(),
-                      };
-                      Ok(a.insert(k.clone(), assoc_in(i, ks, v)?).0.fit())
-                  }
+      if let [k, ks @ ..] = ks {
+          match (i, k) {
+              // An int key for a list means update that index
+              (
+                  Some(Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(l)))),
+                  assoc::KeyItem::Int(k),
+              ) => assoc_vec(l, ks, *k, v),
+
+              (
+                  Some(Item::Receptacle(coll::Receptacle::Sized(coll::Sized::List(l)))),
+                  assoc::KeyItem::Int(k),
+              ) => assoc_vec(l, ks, *k, v),
+
+              // An int key for an associative means an integer key, which is uncommon
+              // but we'll support it
+              (
+                  Some(Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(a)))),
+                  assoc::KeyItem::Int(k),
+              ) => assoc_map(a, ks, &assoc::KeyItem::Int(*k), v),
+              (
+                  Some(Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(a)))),
+                  assoc::KeyItem::Int(k),
+              ) => assoc_map(a, ks, &assoc::KeyItem::Int(*k), v),
+
+              // An int key for a non-sized type means we're overwriting
+              // whatever it is with a list, with the value at that index
+              (_, assoc::KeyItem::Int(k)) => assoc_vec(coll::List::fresh(), ks, *k, v),
+
+              (None, k) => assoc_map(
+                  assoc::Associative::Assoc(assoc::Association::fresh()),
+                  ks,
+                  k,
+                  v,
+              ),
+              (Some(i), k) => {
+                  let a = assoc::Associative::try_derive(i)?;
+                  assoc_map(a, ks, k, v)
               }
           }
       } else {
-          Ok(i)
+          Ok(i.unwrap())
       }
   }
 
@@ -5597,7 +6047,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let mut ksvec: assoc::KeyList = assoc::KeyList::try_from_iter(kit.iter().cloned())?;
       ksvec.mutate().make_contiguous();
       let (ks, _) = ksvec.as_slices();
-      assoc_in(m, ks, v)
+      assoc_in(Some(m), ks, v)
   }
 
   pub fn unassign(m: Item, ks: Item) -> ItemResult {
@@ -5606,6 +6056,15 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       ksvec.mutate().make_contiguous();
       let (ks, _) = ksvec.as_slices();
       unassoc_in(m, ks)
+  }
+
+  pub fn resolve(env: &mut Environment) -> Result<(), Error> {
+      let w: Word = env.pop().try_fit()?;
+      let mut dw: dict::Word = w.fit();
+      env.dictionary.resolve_word(&mut dw, &env.resolver);
+      env.pop_prog();
+      env.push(Word::derive(dw));
+      Ok(())
   }
 
   pub fn lookup(i: coll::Sized, k: assoc::KeyItem) -> ItemResult {
@@ -5633,8 +6092,11 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }
   }
 
-  pub fn contains(c: coll::Sized, i: Item) -> Result<bool, Infallible> {
-      Ok(c.contains(&i))
+  pub fn contains(c: Item, i: Item) -> Result<bool, Infallible> {
+      match coll::Sized::try_derive(c) {
+          Ok(c) => Ok(c.has(&i)),
+          Err(_) => Ok(false),
+      }
   }
 
   pub fn or(i: Item, j: Item) -> ItemResult {
@@ -5761,6 +6223,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn eval_step(mut env: Environment) -> Future<Environment> {
       //println!("{:?}", env);
+      //println!("Dictionary size: {}", env.dictionary.len());
       let next_item = env.program.front();
 
       if let Some(val) = next_item {
@@ -5776,7 +6239,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       env.push(w);
                       env.fit()
                   } else {
-                      let mut word = word.clone();
+                      let mut word: dict::Word = word.clone().fit();
                       env.dictionary.resolve_word(&mut word, &env.resolver);
                       if let Some(dfn) = env.dictionary.get(&word) {
                           {
@@ -5800,8 +6263,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                               }
                           }
                       } else {
-                          let w = word.clone();
-                          env.push(Error::undefined(w));
+                          //let w = word.clone();
+                          //println!("Failed dict lookup: {:?} {:?}", w, env.dictionary.len());
+                          env.push(Error::undefined(word.fit()));
                           env.fit()
                       }
                   }
@@ -5882,7 +6346,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   fn unwind(mut env: Environment) -> Environment {
       let err = env.pop();
-      let w: &Item = &"handle".fit();
+      let handle: &Item = &"handle".fit();
 
       let err = match err {
           Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
@@ -5890,16 +6354,17 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ))) => {
               let mut next = env.program.front();
               let mut unwound = Vec::<Item>::new();
-              while next.is_some() && next.unwrap() != w {
+              while next.is_some() && next.unwrap() != handle {
                   let i = env.pop_prog();
                   unwound.push(i);
                   next = env.program.front();
               }
               if next.is_some() {
+                  // didn't unwind the whole program, handled error
                   env.pop_prog();
+                  // set the is_handled bit
+                  e.is_handled = true;
               }
-              // set the is_handled bit
-              e.is_handled = true;
               let em = Arc::make_mut(&mut e.data);
               em.insert("unwound".fit(), coll::List::derive_iter(unwound).fit());
               e.fit()
@@ -5988,16 +6453,29 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       Ok(i.abs())
   }
 
-  fn handle(i: Item) -> ItemResult {
-      match i {
-          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
-              assoc::Associative::Error(mut e),
-          ))) => Ok({
-              e.is_handled = true;
-              e.fit()
-          }),
-          i => Ok(i),
-      }
+  /// If there's an unhandled error on the stack, handle it, otherwise
+  /// no-op.
+  fn handle(mut env: Environment) -> Future<Environment> {
+      env.pop_prog();
+      match env.stack.mutate().pop_front() {
+          None => {}
+          Some(i) => match i {
+              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
+                  assoc::Associative::Error(mut e),
+              ))) => {
+                  e.is_handled = true;
+                  env.push(e);
+              }
+              Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(
+                  assoc::Associative::Error(mut e),
+              ))) => {
+                  e.is_handled = true;
+                  env.push(e);
+              }
+              i => env.push(i),
+          },
+      };
+      env.fit()
   }
 
   /// Makes 'yes' a word that doesn't have to be quoted, just pushes
@@ -6170,8 +6648,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       Ok((j, k))
   }
 
-  pub fn sort_by_key(l: coll::List) -> Result<coll::List, Error> {
-      let it = l.iter().cloned().map(as_pair);
+  pub fn sort_by_key(l: coll::Sized) -> Result<coll::List, Error> {
+      let it = l.into_iter().map(as_pair);
       let mut it = it.collect::<Result<Vec<(Item, assoc::KeyItem)>, Error>>()?;
       it.sort_unstable_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Less));
       Ok(coll::List::derive_iter(it.into_iter().map(|(k, _)| k)))
@@ -6183,10 +6661,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let mut start = Int::try_derive(start)?;
       let mut end = Int::try_derive(end)?;
       if start < 0 {
-          start += arr.len() as i64;
+          start += arr.count() as i64;
       }
       if end <= 0 {
-          end += arr.len() as i64;
+          end += arr.count() as i64;
       }
       if start < 0 {
           return Err(Error::negative(start));
@@ -6465,7 +6943,10 @@ We'll also define how to run unit tests.
       let mut env = Environment::default();
 
       loop {
-          if let Some(program) = read_input().await {
+          if let Some(mut program) = read_input().await {
+              // to ensure errors are handled by the repl- so that the
+              // user can continue with more input.
+              program.push_str(" handle");
               match parse_input(env, program) {
                   Ok(parsed_env) => {
                       env = axiom::eval(parsed_env).await;
@@ -6515,7 +6996,6 @@ We'll also define how to run unit tests.
   }
 
   async fn read_eval_print(program: String) {
-      // otherwise, read from stdin
       match parse_input(Environment::default(), program) {
           Ok(env) => {
               print_result(axiom::eval(env).await);
@@ -6568,10 +7048,8 @@ We'll also define how to run unit tests.
 
       use test_case::test_case;
 
-      pub fn get_item(i: Item, index: usize) -> Option<Item> {
-          coll::List::try_derive(i)
-              .ok()
-              .and_then(|l| l.get(index).cloned())
+      pub fn get_item(i: &coll::List, index: usize) -> Option<Item> {
+          i.get(index).cloned()
       }
 
       #[tokio::main]
@@ -6579,6 +7057,7 @@ We'll also define how to run unit tests.
           mut prog_env: Environment,
           program: coll::List,
           expected: coll::List,
+          description: Option<String>,
       ) -> Option<Error> {
           let mut exp_env = prog_env.clone();
           prog_env.program.prepend(program.clone());
@@ -6592,15 +7071,20 @@ We'll also define how to run unit tests.
           let exp_env = exp_env.unwrap();
 
           if prog_env.stack == exp_env.stack {
-              println!(
-                  "Nice expected {} got {}",
-                  (exp_env.stack.iter().emit()),
-                  (prog_env.stack.iter().emit())
-              );
+              if let Some(description) = description {
+                  println!("PASSED: '{}'", description);
+              } else {
+                  println!(
+                      "PASSED: expected {} got {}",
+                      (exp_env.stack.iter().emit()),
+                      (prog_env.stack.iter().emit())
+                  );
+              }
               None
           } else {
               println!(
-                  "uh oh expected {} got {}",
+                  "\nFAILED: '{}'\nEXPECTED: {}\nACTUAL:   {}\n",
+                  description.unwrap_or_default(),
                   (exp_env.stack.iter().emit()),
                   (prog_env.stack.iter().emit())
               );
@@ -6613,16 +7097,18 @@ We'll also define how to run unit tests.
       }
 
       fn test_word(standard_env: Environment, w: Word) -> Vec<Error> {
-          if let Some(d) = standard_env.dictionary.get(&w) {
+          if let Some(d) = standard_env.dictionary.get(&w.clone().fit()) {
               d.examples
                   .clone()
                   .unwrap()
                   .iter()
                   .filter_map(|ex| {
-                      let p = coll::List::try_derive(get_item(ex.clone(), 0).unwrap());
-                      let exp = coll::List::try_derive(get_item(ex.clone(), 1).unwrap());
+                      let l = coll::List::try_derive(ex.clone()).unwrap();
+                      let p = coll::List::try_derive(get_item(&l, 0).unwrap());
+                      let exp = coll::List::try_derive(get_item(&l, 1).unwrap());
+                      let description = get_item(&l, 2).and_then(|i| String::try_derive(i).ok());
                       match (p, exp) {
-                          (Ok(p), Ok(exp)) => test_example(standard_env.clone(), p, exp),
+                          (Ok(p), Ok(exp)) => test_example(standard_env.clone(), p, exp, description),
                           (Err(e), _) => Some(e),
                           (_, Err(e)) => Some(e),
                       }
@@ -6696,6 +7182,7 @@ We'll also define how to run unit tests.
       #[test_case("encodestring")]
       #[test_case("encodenumber")]
       #[test_case("environment")]
+      #[test_case("environment?" ; "is_environment")]
       #[test_case("evaluate")]
       #[test_case("eval-step")]
       #[test_case("even?" ; "is_even")]
@@ -6740,6 +7227,7 @@ We'll also define how to run unit tests.
       #[test_case("max")]
       #[test_case("min")]
       #[test_case("mod")]
+      //#[test_case("module")]
       #[test_case("not")]
       #[test_case("empty?" ; "is_empty")]
       #[test_case("number")]
@@ -6837,12 +7325,13 @@ The basic pipe contracts.
 #+begin_src rust :tangle src/types/container/pipe.rs :mkdirp yes
   use super::error::Error;
   use crate::traits::*;
-  use crate::types::container as coll;
+  use crate::types::container::{self as coll, SimpleTake};
   use crate::types::{self, Item};
+  use std::pin::Pin;
   use std::sync::Arc;
   use tokio::sync::RwLock;
 
-  use futures::executor;
+  use futures::{executor, future};
   pub mod channel;
 
   #[cfg(feature = "database")]
@@ -6852,6 +7341,13 @@ The basic pipe contracts.
   pub mod net;
   pub mod standard;
   pub mod time;
+
+  pub trait FutureTake {
+      type Item;
+      fn take_future<'a>(
+          &'a mut self,
+      ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Self::Item>, Error>> + Send + 'a>>;
+  }
 
   /// A pipe that accepts items.
   #[derive(Debug, Clone)]
@@ -6892,7 +7388,7 @@ The basic pipe contracts.
       /// A pipe that produces a dummy value after a given amount of
       /// time. Can be used as a timeout mechanism when waiting on
       /// multiple pipes at once.
-      Timer(channel::Timer<Item>),
+      Timer(channel::Timer),
       /// A pipe that produces timestamps of the current UNIX time
       Time,
       /// A pipe that produces bytes from standard in.
@@ -6980,6 +7476,37 @@ The basic pipe contracts.
       }
   }
 
+  impl FutureTake for Tunnel {
+      /// Takes an [Item] from the tunnel, blocks if the receive side of
+      /// the tunnel is empty.
+      type Item = Item;
+      /// Takes an [Item] from the pipe, blocks if the pipe is empty.
+      fn take_future<'a>(
+          &'a mut self,
+      ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Self::Item>, Error>> + Send + 'a>>
+      {
+          match self {
+              Tunnel::StaticFile(f) => Box::pin(async move {
+                  f.write()
+                      .await
+                      .take_future()
+                      .await
+                      .map(|i| Some(Item::derive(i)))
+              }),
+              Tunnel::Socket(f) => Box::pin(async move {
+                  f.write()
+                      .await
+                      .take_future()
+                      .await
+                      .map(|i| Some(Item::derive(i)))
+              }),
+
+              Tunnel::Handoff(h) => Box::pin(h.take_future()),
+              Tunnel::Standard => standard::take_future(),
+          }
+      }
+  }
+
   impl Tunnel {
       /// Puts the [Item] into the tunnel, blocks if the send side of
       /// the tunnel is full.
@@ -6997,45 +7524,35 @@ The basic pipe contracts.
               Tunnel::Standard => standard::put(i),
           }
       }
-
-      /// Takes an [Item] from the tunnel, blocks if the receive side of
-      /// the tunnel is empty.
-      pub fn take(&mut self) -> types::Future<Result<Option<Item>, Error>> {
-          match self {
-              Tunnel::StaticFile(f) => {
-                  let f = f.clone();
-                  Box::pin(async move { f.write().await.take().await })
-              }
-              Tunnel::Socket(f) => {
-                  let f = f.clone();
-                  Box::pin(async move { f.write().await.take().await })
-              }
-              Tunnel::Handoff(ref mut h) => Box::pin(h.take()),
-              Tunnel::Standard => standard::take(),
-          }
-      }
   }
 
-  impl Out {
+  impl FutureTake for Out {
+      type Item = Item;
       /// Takes an [Item] from the pipe, blocks if the pipe is empty.
-      pub fn take(&mut self) -> types::Future<Result<Option<Item>, Error>> {
+      fn take_future<'a>(
+          &'a mut self,
+      ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Self::Item>, Error>> + Send + 'a>>
+      {
           match self {
               Out::StaticFile(f) => {
-                  let f = f.clone();
-                  Box::pin(async move { f.write().await.take().await })
+                  Box::pin(
+                      async move { f.write().await.take_future().await.map(|bs| Some(bs.fit())) },
+                  )
               }
               Out::Socket(f) => {
-                  let f = f.clone();
-                  Box::pin(async move { f.write().await.take().await })
+                  Box::pin(
+                      async move { f.write().await.take_future().await.map(|bs| Some(bs.fit())) },
+                  )
               }
               Out::ServerSocket(f) => {
-                  let f = f.clone();
-                  Box::pin(async move { f.write().await.take().await })
+                  Box::pin(async move { f.write().await.take_future().await.map(|s| Some(s.fit())) })
               }
-              Out::Handoff(ref mut h) => Box::pin(h.take()),
-              Out::Timer(ref mut t) => Box::pin(t.take()),
-              Out::Time => Box::pin(time::take()),
-              Out::Standard => standard::take(),
+              Out::Handoff(h) => Box::pin(h.take_future()),
+              Out::Timer(ref mut t) => Box::pin(t.take_future()),
+              Out::Time => Box::pin(future::ready(Ok(time::Time::new()
+                  .take_simple()
+                  .map(Item::derive)))),
+              Out::Standard => Box::pin(standard::take_future()),
           }
       }
   }
@@ -7187,7 +7704,7 @@ How to interact with files on disk
   use tokio::io::{AsyncReadExt, AsyncWriteExt};
   use tokio::sync::RwLock;
 
-  use super::closed_error;
+  use super::{closed_error, FutureTake};
 
   #[derive(Debug)]
   pub struct StaticFile {
@@ -7199,6 +7716,30 @@ How to interact with files on disk
       fn eq(&self, other: &Self) -> bool {
           // Check if the 'file' fields of both structs are the same by reference
           ptr::eq(&self.file, &other.file)
+      }
+  }
+
+  impl FutureTake for StaticFile {
+      type Item = Bytes;
+      fn take_future<'a>(
+          &'a mut self,
+      ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Self::Item>, Error>> + Send + 'a>>
+      {
+          match self.file.as_mut() {
+              Some(f) => {
+                  let mut bs = [0u8; 102400];
+                  Box::pin(async move {
+                      let ct = f.read(&mut bs).await?;
+                      if ct == 0 {
+                          // EOF, no more takes since it's static
+                          Ok(None)
+                      } else {
+                          Ok(Some(bs[0..ct].to_vec().fit()))
+                      }
+                  })
+              }
+              None => Box::pin(future::ready(Err(closed_error(false)))),
+          }
       }
   }
 
@@ -7215,26 +7756,6 @@ How to interact with files on disk
                       Ok(bs) => Box::pin(async move { f.write_all(&bs).await.map_err(|e| e.into()) }),
                       Err(e) => Box::pin(future::ready(Err(e))),
                   }
-              }
-              None => Box::pin(future::ready(Err(closed_error(false)))),
-          }
-      }
-
-      pub fn take<'a>(
-          &'a mut self,
-      ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Item>, Error>> + Send + 'a>> {
-          match self.file.as_mut() {
-              Some(f) => {
-                  let mut bs = [0u8; 102400];
-                  Box::pin(async move {
-                      let ct = f.read(&mut bs).await?;
-                      if ct == 0 {
-                          // EOF, no more takes since it's static
-                          Ok(None)
-                      } else {
-                          Ok(Some(bs[0..ct].to_vec().fit()))
-                      }
-                  })
               }
               None => Box::pin(future::ready(Err(closed_error(false)))),
           }
@@ -7294,10 +7815,12 @@ How to interact with the network (TCP/IP sockets)
   use crate::axiom::ItemResult;
   use crate::list;
   use crate::traits::*;
+  use crate::types::container as cont;
   use crate::types::container::associative as assoc;
   use crate::types::container::error::Error;
+  use crate::types::container::pipe::{self, FutureTake};
   use crate::types::number::Int;
-  use crate::types::{self, Item};
+  use crate::types::{self, Bytes, Item};
   use futures::future::FutureExt;
   use std::future::{self};
   use std::net::{Ipv4Addr, SocketAddrV4};
@@ -7322,6 +7845,24 @@ How to interact with the network (TCP/IP sockets)
       }
   }
 
+  impl FutureTake for Socket {
+      type Item = Bytes;
+      fn take_future<'a>(
+          &'a mut self,
+      ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Self::Item>, Error>> + Send + 'a>>
+      {
+          let mut bs = [0u8; 1024];
+          Box::pin(async move {
+              let n = self.socket.read(&mut bs).await?;
+              if n == 0 {
+                  Ok(None)
+              } else {
+                  Ok(Some(bs[..n].to_vec()))
+              }
+          })
+      }
+  }
+
   impl Socket {
       pub fn put<'a>(
           &'a mut self,
@@ -7335,20 +7876,6 @@ How to interact with the network (TCP/IP sockets)
               }
               Err(e) => Box::pin(future::ready(Err(e))),
           }
-      }
-
-      pub fn take<'a>(
-          &'a mut self,
-      ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Item>, Error>> + Send + 'a>> {
-          let mut bs = [0u8; 1024];
-          Box::pin(async move {
-              let n = self.socket.read(&mut bs).await?;
-              if n == 0 {
-                  Ok(None)
-              } else {
-                  Ok(Some(bs[..n].to_vec().fit()))
-              }
-          })
       }
   }
 
@@ -7377,20 +7904,20 @@ How to interact with the network (TCP/IP sockets)
       }
   }
 
-  impl ServerSocket {
-      pub fn take<'a>(
+  impl FutureTake for ServerSocket {
+      type Item = Socket;
+
+      fn take_future<'a>(
           &'a mut self,
-      ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Item>, Error>> + Send + 'a>> {
+      ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Self::Item>, Error>> + Send + 'a>>
+      {
           Box::pin(async move {
               let (socket, addr) = self.socket.accept().await?;
 
-              Ok(Some(
-                  super::Tunnel::Socket(Arc::new(RwLock::new(Socket {
-                      socket,
-                      addr: (addr.ip().to_string(), addr.port()),
-                  })))
-                  .fit(),
-              ))
+              Ok(Some(Socket {
+                  socket,
+                  addr: (addr.ip().to_string(), addr.port()),
+              }))
           })
       }
   }
@@ -7464,27 +7991,41 @@ How to interact with the network (TCP/IP sockets)
           Error::create(list!("addrparse"), &err.to_string(), Option::<Item>::None)
       }
   }
+
+  impl Derive<Socket> for Item {
+      fn derive(ss: Socket) -> Item {
+          Item::Dispenser(cont::Dispenser::Tunnel(pipe::Tunnel::Socket(Arc::new(
+              RwLock::new(ss),
+          ))))
+      }
+  }
 #+end_src
 ***** Time
 #+begin_src rust :tangle src/types/container/pipe/time.rs :mkdirp yes
-  use crate::types::container::associative as assoc;
-  use crate::types::container::error::Error;
-  use crate::types::number::{Int, Number};
+  use crate::types::container::{associative as assoc, SimpleTake};
+  use crate::types::number::Int;
   use crate::types::*;
 
-  use std::{
-      future,
-      time::{SystemTime, UNIX_EPOCH},
-  };
+  use std::time::{SystemTime, UNIX_EPOCH};
 
-  pub fn take() -> Future<Result<Option<Item>, Error>> {
-      let t = SystemTime::now()
-          .duration_since(UNIX_EPOCH)
-          .unwrap()
-          .as_millis() as Int;
-      Box::pin(future::ready(Ok(Some(Item::Number(Number::Int(t))))))
+  pub struct Time;
+
+  impl Time {
+      pub fn new() -> Self {
+          Time
+      }
   }
 
+  impl SimpleTake for Time {
+      type Item = Int;
+      fn take_simple(&mut self) -> Option<Self::Item> {
+          let t = SystemTime::now()
+              .duration_since(UNIX_EPOCH)
+              .unwrap()
+              .as_millis() as Int;
+          Some(t)
+      }
+  }
   pub fn representation() -> Item {
       assoc::Association::derive_iter([
           ("type".fit(), "out".fit()),
@@ -7509,7 +8050,8 @@ How to interact with the network (TCP/IP sockets)
   use std::future;
   use std::io::{self, Read, Write};
 
-  pub fn take() -> Future<Result<Option<Item>, Error>> {
+  pub fn take_future<'a>(
+  ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Item>, Error>> + Send + 'a>> {
       let mut buf = [0u8];
       let n = io::stdin().read(&mut buf);
       let f = match n {
@@ -7545,12 +8087,15 @@ Implement the =handoff= type
   use crate::axiom;
   use crate::traits::*;
   use crate::types::container as coll;
+  use crate::types::container::error::Error;
+  use crate::types::container::pipe::FutureTake;
   use crate::types::container::{associative as assoc, environment::Environment, error, pipe};
   use crate::types::number::Int;
   use crate::types::{self, Item};
 
   use flume;
   use std::future;
+  use std::pin::Pin;
   use std::ptr;
   use std::sync::atomic::{AtomicUsize, Ordering};
   use std::sync::Arc;
@@ -7577,6 +8122,28 @@ Implement the =handoff= type
   }
 
   static ID: AtomicUsize = AtomicUsize::new(0);
+
+  impl FutureTake for Handoff<Item> {
+      type Item = Item;
+      fn take_future<'a>(
+          &'a mut self,
+      ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Self::Item>, Error>> + Send + 'a>>
+      {
+          // println!(
+          //     "Taking from channel: {:?} on {:?}",
+          //     self,
+          //     thread::current().id()
+          // );
+          if !self.bidirectional {
+              self.close_put();
+          }
+          if let Some(ch) = self.receiver.clone() {
+              Box::pin(async move { ch.recv_async().await.map(Some).or_else(|_| Ok(None)) })
+          } else {
+              Box::pin(future::ready(Ok(None)))
+          }
+      }
+  }
 
   impl Handoff<Item> {
       pub fn new(bidirectional: bool) -> Handoff<Item> {
@@ -7615,22 +8182,6 @@ Implement the =handoff= type
               }
           } else {
               Box::pin(future::ready(Err(pipe::closed_error(false))))
-          }
-      }
-
-      pub fn take(&mut self) -> types::Future<Result<Option<Item>, error::Error>> {
-          // println!(
-          //     "Taking from channel: {:?} on {:?}",
-          //     self,
-          //     thread::current().id()
-          // );
-          if !self.bidirectional {
-              self.close_put();
-          }
-          if let Some(ch) = self.receiver.clone() {
-              Box::pin(async move { ch.recv_async().await.map(Some).or_else(|_| Ok(None)) })
-          } else {
-              Box::pin(future::ready(Ok(None)))
           }
       }
 
@@ -7744,14 +8295,14 @@ Implement the =handoff= type
           // fetch the original item from the list.
           for (idx, item) in lr.iter().enumerate() {
               let idx_clone = idx;
-              match &item {
+              match item {
                   ChannelOp::Receive(r) => {
-                      selector = selector.recv(&**r, move |i| {
+                      selector = selector.recv(&r, move |i| {
                           (i.map(Some).map_err(error::Error::from), idx_clone)
                       });
                   }
                   ChannelOp::Send(s, i) => {
-                      selector = selector.send(&**s, i.clone(), move |i| {
+                      selector = selector.send(&s, i.clone(), move |i| {
                           (i.map(|_| None).map_err(error::Error::from), idx)
                       });
                   }
@@ -7800,14 +8351,14 @@ Implement the =handoff= type
   }
 
   #[derive(Debug)]
-  pub struct Timer<T> {
-      receiver: Option<flume::Receiver<T>>,
+  pub struct Timer {
+      receiver: Option<flume::Receiver<Item>>,
       handle: Option<JoinHandle<()>>,
       duration: Duration,
   }
 
   // Cloning a timeout makes a new one, clears state
-  impl Clone for Timer<Item> {
+  impl Clone for Timer {
       fn clone(&self) -> Self {
           Self {
               receiver: None,
@@ -7816,9 +8367,23 @@ Implement the =handoff= type
           }
       }
   }
+  impl FutureTake for Timer {
+      type Item = Item;
+      fn take_future<'a>(
+          &'a mut self,
+      ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Self::Item>, Error>> + Send + 'a>>
+      {
+          self.start();
+          let receiver = self.receiver.clone().unwrap();
+          Box::pin(async move {
+              //println!("Receiving");
+              receiver.recv_async().await.map(Some).or_else(|_| Ok(None))
+          })
+      }
+  }
 
-  impl Timer<Item> {
-      fn new(duration: Duration) -> Timer<Item> {
+  impl Timer {
+      fn new(duration: Duration) -> Timer {
           Timer {
               receiver: None,
               handle: None,
@@ -7838,24 +8403,15 @@ Implement the =handoff= type
               }));
           }
       }
-
-      pub fn take(&mut self) -> types::Future<Result<Option<Item>, error::Error>> {
-          self.start();
-          let receiver = self.receiver.clone().unwrap();
-          Box::pin(async move {
-              //println!("Receiving");
-              receiver.recv_async().await.map(Some).or_else(|_| Ok(None))
-          })
-      }
   }
 
-  impl Derive<Timer<Item>> for Item {
-      fn derive(t: Timer<Item>) -> Self {
+  impl Derive<Timer> for Item {
+      fn derive(t: Timer) -> Self {
           Item::Dispenser(coll::Dispenser::Out(pipe::Out::Timer(t)))
       }
   }
 
-  impl crate::serialize::Display for Timer<Item> {
+  impl crate::serialize::Display for Timer {
       fn representation(&self) -> Item {
           assoc::Association::derive_iter([
               ("type".fit(), "pipe".fit()),
@@ -12482,7 +13038,68 @@ Hm even with the rust impl of =finished?= it's 1500ms vs 66ms, about 25x slower.
    [execute] every?]
   keep
 #+end_src
-*** EAVTO (entity, attribute, value, time, observer)
+
+Insert some data
+
+#+begin_src kcats
+  [[[author-first "George"] [author-last "Orwell"] [title "1984"] [year 1949] [subjects [government dystopia surveillance totalitarianism freedom]]]
+   [[author-first "Aldous"] [author-last "Huxley"] [title "Brave New World"] [year 1932] [subjects [society technology dystopia happiness drugs]]]
+   [[author-first "F. Scott"] [author-last "Fitzgerald"] [title "The Great Gatsby"] [year 1925] [subjects [wealth love obsession american-dream tragedy]]]
+   [[author-first "J.D."] [author-last "Salinger"] [title "The Catcher in the Rye"] [year 1951] [subjects [adolescence alienation innocence society adulthood]]]
+   [[author-first "Jane"] [author-last "Austen"] [title "Pride and Prejudice"] [year 1813] [subjects [love marriage society class reputation]]]
+   [[author-first "Mary"] [author-last "Shelley"] [title "Frankenstein"] [year 1818] [subjects [creation science responsibility monster humanity]]]
+   [[author-first "John"] [author-last "Steinbeck"] [title "Of Mice and Men"] [year 1937] [subjects [friendship dream loneliness society tragedy]]]
+   [[author-first "Ernest"] [author-last "Hemingway"] [title "The Old Man and the Sea"] [year 1952] [subjects [endurance nature old-age fisherman sea]]]
+   [[author-first "Harper"] [author-last "Lee"] [title "To Kill a Mockingbird"] [year 1960] [subjects [racism innocence morality law childhood]]]
+   [[author-first "J.R.R."] [author-last "Tolkien"] [title "The Lord of the Rings"] [year 1954] [subjects [adventure elf dwarf hobbit ring journey magic evil]]]
+   [[author-first "Joseph"] [author-last "Conrad"] [title "Heart of Darkness"] [year 1899] [subjects [colonization africa journey morality darkness europeans]]]
+   [[author-first "Leo"] [author-last "Tolstoy"] [title "War and Peace"] [year 1869] [subjects [war peace society history love aristocracy]]]
+   [[author-first "Homer"] [title "The Odyssey"] [year -800] [subjects [journey odyssey homecoming gods heroism adventure]]]
+   [[author-first "Charlotte"] [author-last "Bronte"] [title "Jane Eyre"] [year 1847] [subjects [love morality society class womanhood independence]]]
+   [[author-first "Mark"] [author-last "Twain"] [title "Adventures of Huckleberry Finn"] [year 1884] [subjects [adventure racism slavery morality friendship river]]]
+   [[author-first "Ray"] [author-last "Bradbury"] [title "Fahrenheit 451"] [year 1953] [subjects [censorship knowledge books society dystopia future]]]
+   [[author-first "Charles"] [author-last "Dickens"] [title "A Tale of Two Cities"] [year 1859] [subjects [revolution love sacrifice resurrection society history]]]
+   [[author-first "William"] [author-last "Golding"] [title "Lord of the Flies"] [year 1954] [subjects [society civilization savagery childhood morality island]]]
+   [[author-first "Miguel de"] [author-last "Cervantes"] [title "Don Quixote"] [year 1605] [subjects [adventure idealism reality knight insanity literature]]]
+   [[author-first "H.G."] [author-last "Wells"] [title "The War of the Worlds"] [year 1898] [subjects [invasion aliens society technology war humanity]]]]
+  [[subjects] [set] update persist] step
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[] [] [] [] [] [] [] [] [] [] [] [] [] [] [] [] [] [] [] []
+#+end_src
+
+#+begin_src kcats
+  [[[first-name "George"] [last-name "Orwell"] [country "United Kingdom"] [birth-year 1903] [death-year 1950] [sex m] [awards ["Nobel Prize in Literature"]]]
+   [[first-name "Aldous"] [last-name "Huxley"] [country "United Kingdom"] [birth-year 1894] [death-year 1963] [sex m] [awards ["Humanitarian Award"]]]
+   [[first-name "F. Scott"] [last-name "Fitzgerald"] [country "United States"] [birth-year 1896] [death-year 1940] [sex m] [awards ["Pulitzer Prize"]]]
+   [[first-name "J.D."] [last-name "Salinger"] [country "United States"] [birth-year 1919] [death-year 2010] [sex m] [awards []]]
+   [[first-name "Jane"] [last-name "Austen"] [country "United Kingdom"] [birth-year 1775] [death-year 1817] [sex f] [awards []]]
+   [[first-name "Mary"] [last-name "Shelley"] [country "United Kingdom"] [birth-year 1797] [death-year 1851] [sex f] [awards []]]
+   [[first-name "John"] [last-name "Steinbeck"] [country "United States"] [birth-year 1902] [death-year 1968] [sex m] [awards ["Nobel Prize in Literature"]]]
+   [[first-name "Ernest"] [last-name "Hemingway"] [country "United States"] [birth-year 1899] [death-year 1961] [sex m] [awards ["Nobel Prize in Literature"]]]
+   [[first-name "Harper"] [last-name "Lee"] [country "United States"] [birth-year 1926] [death-year 2016] [sex f] [awards ["Pulitzer Prize"]]]
+   [[first-name "J.R.R."] [last-name "Tolkien"] [country "United Kingdom"] [birth-year 1892] [death-year 1973] [sex m] [awards []]]
+   [[first-name "Joseph"] [last-name "Conrad"] [country "Poland"] [birth-year 1857] [death-year 1924] [sex m] [awards []]]
+   [[first-name "Leo"] [last-name "Tolstoy"] [country "Russia"] [birth-year 1828] [death-year 1910] [sex m] [awards []]]
+   [[first-name "Homer"] [last-name ""] [country "Greece"] [birth-year -800] [death-year -701] [sex m] [awards []]]
+   [[first-name "Charlotte"] [last-name "Bronte"] [country "United Kingdom"] [birth-year 1816] [death-year 1855] [sex f] [awards []]]
+   [[first-name "Mark"] [last-name "Twain"] [country "United States"] [birth-year 1835] [death-year 1910] [sex m] [awards []]]
+   [[first-name "Ray"] [last-name "Bradbury"] [country "United States"] [birth-year 1920] [death-year 2012] [sex m] [awards []]]
+   [[first-name "Charles"] [last-name "Dickens"] [country "United Kingdom"] [birth-year 1812] [death-year 1870] [sex m] [awards []]]
+   [[first-name "William"] [last-name "Golding"] [country "United Kingdom"] [birth-year 1911] [death-year 1993] [sex m] [awards ["Nobel Prize in Literature"]]]
+   [[first-name "Miguel de"] [last-name "Cervantes"] [country "Spain"] [birth-year 1547] [death-year 1616] [sex m] [awards []]]
+   [[first-name "H.G."] [last-name "Wells"] [country "United Kingdom"] [birth-year 1866] [death-year 1946] [sex m] [awards []]]]
+  [[awards] [set] update persist] step
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[] [] [] [] [] [] [] [] [] [] [] [] [] [] [] [] [] [] [] []
+#+end_src
+
+*** Schema
 Here's a database of the most basic and abstract observations
 (ignoring time and observer for now - those are all "now" and "me").
 
@@ -12571,65 +13188,8 @@ CREATE INDEX idx_valuestring ON EAV (ValueString);
   [Attribute name]]]
 #+end_src
 
-Insert some data
+*** Implementation and experiments
 
-#+begin_src kcats
-  [[[author-first "George"] [author-last "Orwell"] [title "1984"] [year 1949] [subjects [government dystopia surveillance totalitarianism freedom]]]
-   [[author-first "Aldous"] [author-last "Huxley"] [title "Brave New World"] [year 1932] [subjects [society technology dystopia happiness drugs]]]
-   [[author-first "F. Scott"] [author-last "Fitzgerald"] [title "The Great Gatsby"] [year 1925] [subjects [wealth love obsession american-dream tragedy]]]
-   [[author-first "J.D."] [author-last "Salinger"] [title "The Catcher in the Rye"] [year 1951] [subjects [adolescence alienation innocence society adulthood]]]
-   [[author-first "Jane"] [author-last "Austen"] [title "Pride and Prejudice"] [year 1813] [subjects [love marriage society class reputation]]]
-   [[author-first "Mary"] [author-last "Shelley"] [title "Frankenstein"] [year 1818] [subjects [creation science responsibility monster humanity]]]
-   [[author-first "John"] [author-last "Steinbeck"] [title "Of Mice and Men"] [year 1937] [subjects [friendship dream loneliness society tragedy]]]
-   [[author-first "Ernest"] [author-last "Hemingway"] [title "The Old Man and the Sea"] [year 1952] [subjects [endurance nature old-age fisherman sea]]]
-   [[author-first "Harper"] [author-last "Lee"] [title "To Kill a Mockingbird"] [year 1960] [subjects [racism innocence morality law childhood]]]
-   [[author-first "J.R.R."] [author-last "Tolkien"] [title "The Lord of the Rings"] [year 1954] [subjects [adventure elf dwarf hobbit ring journey magic evil]]]
-   [[author-first "Joseph"] [author-last "Conrad"] [title "Heart of Darkness"] [year 1899] [subjects [colonization africa journey morality darkness europeans]]]
-   [[author-first "Leo"] [author-last "Tolstoy"] [title "War and Peace"] [year 1869] [subjects [war peace society history love aristocracy]]]
-   [[author-first "Homer"] [title "The Odyssey"] [year -800] [subjects [journey odyssey homecoming gods heroism adventure]]]
-   [[author-first "Charlotte"] [author-last "Bronte"] [title "Jane Eyre"] [year 1847] [subjects [love morality society class womanhood independence]]]
-   [[author-first "Mark"] [author-last "Twain"] [title "Adventures of Huckleberry Finn"] [year 1884] [subjects [adventure racism slavery morality friendship river]]]
-   [[author-first "Ray"] [author-last "Bradbury"] [title "Fahrenheit 451"] [year 1953] [subjects [censorship knowledge books society dystopia future]]]
-   [[author-first "Charles"] [author-last "Dickens"] [title "A Tale of Two Cities"] [year 1859] [subjects [revolution love sacrifice resurrection society history]]]
-   [[author-first "William"] [author-last "Golding"] [title "Lord of the Flies"] [year 1954] [subjects [society civilization savagery childhood morality island]]]
-   [[author-first "Miguel de"] [author-last "Cervantes"] [title "Don Quixote"] [year 1605] [subjects [adventure idealism reality knight insanity literature]]]
-   [[author-first "H.G."] [author-last "Wells"] [title "The War of the Worlds"] [year 1898] [subjects [invasion aliens society technology war humanity]]]]
-  [[subjects] [set] update persist] step
-#+end_src
-
-#+RESULTS:
-#+begin_src kcats
-[] [] [] [] [] [] [] [] [] [] [] [] [] [] [] [] [] [] [] []
-#+end_src
-
-#+begin_src kcats
-  [[[first-name "George"] [last-name "Orwell"] [country "United Kingdom"] [birth-year 1903] [death-year 1950] [sex m] [awards ["Nobel Prize in Literature"]]]
-   [[first-name "Aldous"] [last-name "Huxley"] [country "United Kingdom"] [birth-year 1894] [death-year 1963] [sex m] [awards ["Humanitarian Award"]]]
-   [[first-name "F. Scott"] [last-name "Fitzgerald"] [country "United States"] [birth-year 1896] [death-year 1940] [sex m] [awards ["Pulitzer Prize"]]]
-   [[first-name "J.D."] [last-name "Salinger"] [country "United States"] [birth-year 1919] [death-year 2010] [sex m] [awards []]]
-   [[first-name "Jane"] [last-name "Austen"] [country "United Kingdom"] [birth-year 1775] [death-year 1817] [sex f] [awards []]]
-   [[first-name "Mary"] [last-name "Shelley"] [country "United Kingdom"] [birth-year 1797] [death-year 1851] [sex f] [awards []]]
-   [[first-name "John"] [last-name "Steinbeck"] [country "United States"] [birth-year 1902] [death-year 1968] [sex m] [awards ["Nobel Prize in Literature"]]]
-   [[first-name "Ernest"] [last-name "Hemingway"] [country "United States"] [birth-year 1899] [death-year 1961] [sex m] [awards ["Nobel Prize in Literature"]]]
-   [[first-name "Harper"] [last-name "Lee"] [country "United States"] [birth-year 1926] [death-year 2016] [sex f] [awards ["Pulitzer Prize"]]]
-   [[first-name "J.R.R."] [last-name "Tolkien"] [country "United Kingdom"] [birth-year 1892] [death-year 1973] [sex m] [awards []]]
-   [[first-name "Joseph"] [last-name "Conrad"] [country "Poland"] [birth-year 1857] [death-year 1924] [sex m] [awards []]]
-   [[first-name "Leo"] [last-name "Tolstoy"] [country "Russia"] [birth-year 1828] [death-year 1910] [sex m] [awards []]]
-   [[first-name "Homer"] [last-name ""] [country "Greece"] [birth-year -800] [death-year -701] [sex m] [awards []]]
-   [[first-name "Charlotte"] [last-name "Bronte"] [country "United Kingdom"] [birth-year 1816] [death-year 1855] [sex f] [awards []]]
-   [[first-name "Mark"] [last-name "Twain"] [country "United States"] [birth-year 1835] [death-year 1910] [sex m] [awards []]]
-   [[first-name "Ray"] [last-name "Bradbury"] [country "United States"] [birth-year 1920] [death-year 2012] [sex m] [awards []]]
-   [[first-name "Charles"] [last-name "Dickens"] [country "United Kingdom"] [birth-year 1812] [death-year 1870] [sex m] [awards []]]
-   [[first-name "William"] [last-name "Golding"] [country "United Kingdom"] [birth-year 1911] [death-year 1993] [sex m] [awards ["Nobel Prize in Literature"]]]
-   [[first-name "Miguel de"] [last-name "Cervantes"] [country "Spain"] [birth-year 1547] [death-year 1616] [sex m] [awards []]]
-   [[first-name "H.G."] [last-name "Wells"] [country "United Kingdom"] [birth-year 1866] [death-year 1946] [sex m] [awards []]]]
-  [[awards] [set] update persist] step
-#+end_src
-
-#+RESULTS:
-#+begin_src kcats
-[] [] [] [] [] [] [] [] [] [] [] [] [] [] [] [] [] [] [] []
-#+end_src
 
 Find book title/author that are about "adventure".
 #+begin_src kcats
@@ -12748,204 +13308,158 @@ it? (May need to add some set-based words here).
 #+end_src
 
 #+begin_src kcats
-    ;; Module to operate on generic data, that are used throughout
-    [[fork [[execute] map]]
-     [triangle [[[] [[take] dip swap [[put] shield sink swap pair] bail] collect] shielddown]]
-     [indexed-as-property [swap indexed
-                           [unwrap sink assign] map dropdown]]
-     [join-all [[first empty] shield swap [join] step]]
-     [selectkeys [set swap [first contains?] filter]]
-     [invert [[reverse] map association]]
+  ;; Module to operate on generic data, that are used throughout
+  [[fork [[execute] map]]
+   [triangle [[[] [[take] dip swap [[put] shield sink swap pair] bail] collect] shielddown]]
+   [indexed-as-property [swap indexed
+                         [unwrap sink assign] map dropdown]]
+   [join-all [[first empty] shield swap [join] step]]
+   [selectkeys [set swap [first contains?] filter]]
+   [invert [[reverse] map association]]
 
-     ;; datalog variables
-     [variable? [[[word?]
-                  [string last \? =]] [execute] every?]]
-     [variable= [[[pair [variable?] every?] [=]] [execute] every?]] 
+   ;; datalog variables
+   [variable? [[[word?]
+                [string last \? =]] [execute] every?]]
+   [variable= [[[pair [variable?] every?] [=]] [execute] every?]] 
 
-     ;; datalog constraints
-     [slots [[entity attribute value]]]
-     [slot-combos [slots [slots [pair] map] map join-all]]
-     [constraint [unwrap slots reverse label]] 
+   ;; datalog constraints
+   [slots [[entity attribute value]]]
+   [slot-combos [slots [slots [pair] map] map join-all]]
+   [constraint [unwrap slots reverse label]] 
 
-     ;; links between datalog constraints
-     [links [slot-combos
-             [[wrap] map unwrap swapdown 
-              [[[lookup] inject] both] pairwise 
-              variable=]
-             filter    
-             [unwrap pair sink pair
-              [[index] lookup] map swap zip]
-             map]]
-     [all-links [[] sink
-                 [[[[index] lookup] shield] both ;; lookup the indices of both constraints
-                  [swapdown] dip sink ;; move the indices under the constraints
-                  [links] shielddown
-                  swap [dropdown dropdown join] dip] 
+   ;; links between datalog constraints
+   [links [slot-combos
+           [[wrap] map unwrap swapdown 
+            [[[lookup] inject] both] pairwise 
+            variable=]
+           filter    
+           [unwrap pair sink pair
+            [[index] lookup] map swap zip]
+           map]]
+   [all-links [[] sink
+               [[[[index] lookup] shield] both ;; lookup the indices of both constraints
+                [swapdown] dip sink ;; move the indices under the constraints
+                [links] shielddown
+                swap [dropdown dropdown join] dip] 
 
-                 step drop]]
-     [format-link [[join] inject unwrap [string] map
-                   "c{0}.{1} = c{2}.{3}" swap format]] 
+               step drop]]
+   [format-link [[join] inject unwrap [string] map
+                 "c{0}.{1} = c{2}.{3}" swap format]] 
 
-     ;; formatting pieces of query data into text
-     [anded-together [" AND " interpose join-all]]
+   ;; formatting pieces of query data into text
+   [anded-together [" AND " interpose join-all]]
 
-     ;; where clause data processing
-     [where-data [[[index] lookup] shield swap 
-                  [[[second variable? not]
-                    [first [index] unwrap = not]] [execute] every?] filter 
-                  [swap prepend] map dropdown]]
-     [format-where [[string] map 
-                    "c{0}.{1} = :c{0}{1}" swap format]]
-     [make-where [first [where] lookup anded-together]]
-     [format-join [[[[on] lookup]
-                    [[where] lookup]
-                    [[index] lookup string]] [execute] map
-                   [join anded-together] inject 
-                   "JOIN EAV c{1} ON {0}" swap format]]
-     [make-query [rest [[on]
-                        [[format-link] map] update
-                        [format-join] shield [join] swap assign] map]]
+   ;; where clause data processing
+   [where-data [[[index] lookup] shield swap 
+                [[[second variable? not]
+                  [first [index] unwrap = not]] [execute] every?] filter 
+                [swap prepend] map dropdown]]
+   [format-where [[string] map 
+                  "c{0}.{1} = :c{0}{1}" swap format]]
+   [make-where [first [where] lookup anded-together]]
+   [format-join [[[[on] lookup]
+                  [[where] lookup]
+                  [[index] lookup string]] [execute] map
+                 [join anded-together] inject 
+                 "JOIN EAV c{1} ON {0}" swap format]]
+   [make-query [rest [[on]
+                      [[format-link] map] update
+                      [format-join] shield [join] swap assign] map]]
 
-     ;; SQL parameters for rusqlite
-     [param-name [[string] map ":c{0}{1}" swap format]]
-     [extract-params [[] association swap [[params] lookup join] step]]
+   ;; SQL parameters for rusqlite
+   [param-name [[string] map ":c{0}{1}" swap format]]
+   [extract-params [[] association swap [[params] lookup join] step]]
 
 
-     ;; SELECT clause
-     [wordval? [second word?]]
-     [invert [[reverse] map association]]
-     [validate [[[second not]
-                 [first "All selected query variables must appear somewhere in constraints"
-                  [reason variable] label fail]
-                 when] map]]
-     [select-data [swap
-                   [[slots selectkeys invert] shield
-                    [wordval?] filter join association] map
-                   swap
-                   [[[index] swap put ;; make a list of the variable and 'index'
-                     wrap [selectkeys] join ;; make the program to cut down
-                      map [count 2 =] filter first [second] map
-                     [first number?] [reverse] when] ;; items are in random order due to coming from association, fix the order
-                    map]
-                   shield dropdeep zip
-                   validate]]
+   ;; SELECT clause
+   [wordval? [second word?]]
+   [invert [[reverse] map association]]
+   [validate [[[second not]
+               [first "All selected query variables must appear somewhere in constraints"
+                [reason variable] label fail]
+               when] map]]
+   [select-data [swap
+                 [[slots selectkeys invert] shield
+                  [wordval?] filter join association] map
+                 swap
+                 [[[index] swap put ;; make a list of the variable and 'index'
+                   wrap [selectkeys] join ;; make the program to cut down
+                    map [count 2 =] filter first [second] map
+                   [first number?] [reverse] when] ;; items are in random order due to coming from association, fix the order
+                  map]
+                 shield dropdeep zip
+                 validate]]
 
-     ;; query 
-     [extract-data [[[[unwrap all-links]
-                      [first where-data   ; [join] inject unwrap
-                       ;; build the query param map
-                       [[[] swap
-                         [[param-name] shield [last] dip wrap swap assign]
-                         step]
-                        ;; build the actual query where clauses
-                        [[format-where] map]]
-                       fork]]
-                     fork] shield
-                    ;; combine extracted items
+   ;; query 
+   [extract-data [[[[unwrap all-links]
+                    [first where-data   ; [join] inject unwrap
+                     ;; build the query param map
+                     [[[] swap
+                       [[param-name] shield [last] dip wrap swap assign]
+                       step]
+                      ;; build the actual query where clauses
+                      [[format-where] map]]
+                     fork]]
+                   fork] shield
+                  ;; combine extracted items
 
-                    [first] dip ;; keep the original constraint to add properties to
-                    unwrap unwrap [where params on] label join]]
-     [format-select [[unwrap swap
-                      string butlast ;; remove the ? from the variable name for result column
-                      put
-                      [string] map
-                      "c{1}.{0} as {2}" swap format] map ", " interpose join-all]]
-     [time [timestamps take emit print drop]]]
+                  [first] dip ;; keep the original constraint to add properties to
+                  unwrap unwrap [where params on] label join]]
+   [format-select [[unwrap swap
+                    string butlast ;; remove the ? from the variable name for result column
+                    put
+                    [string] map
+                    "c{1}.{0} as {2}" swap format] map ", " interpose join-all]]
+   [time [timestamps take emit print drop]]]
 
-    ;; This is the program we need to modify that is `query`
+  ;; This is the program we need to modify that is `query`
 
-    [swap
-     ;; expand all combinations of constraints
-     [constraint] map
-     ;;[] prepend ;; an empty constraint to represent the orignal EAV table we're joining with
-     [index] indexed-as-property
-     triangle
-     ;; for each pair of constraints, build the "ON" clause data for the JOIN
-     [extract-data] map
-     [[extract-params]
-      [make-query]
-      [make-where]
-      [swap select-data]] fork 
-     dropdown ;; don't need original anymore
-     unwrap float
-     [[join] lookup] map  
-     swap format-select 
-     [" " interpose join-all] dip triplet reverse
-     "SELECT {0} from EAV as c0 {1} WHERE {2}" swap format
-     swap dropdeep]
+  [swap
+   ;; expand all combinations of constraints
+   [constraint] map
+   ;;[] prepend ;; an empty constraint to represent the orignal EAV table we're joining with
+   [index] indexed-as-property
+   triangle
+   ;; for each pair of constraints, build the "ON" clause data for the JOIN
+   [extract-data] map
+   [[extract-params]
+    [make-query]
+    [make-where]
+    [swap select-data]] fork 
+   dropdown ;; don't need original anymore
+   unwrap float
+   [[join] lookup] map  
+   swap format-select 
+   [" " interpose join-all] dip triplet reverse
+   "SELECT {0} from EAV as c0 {1} WHERE {2}" swap format
+   swap dropdeep]
 
-    let
-    [query] label draft
+  let
+  [query] label  ;; the above program is the definition of `query`
 
-    dictionary swap [emit encode hashbytes] shield [shield] dip sink [dictmerge] shielddeep
+  [[[book? subjects love]
+    ;[book? subjects subjects?]
+    [book? title book-title?]
+    [book? author-last author-last?]
+    [book? author-first author-first?]
+    [author? first-name author-first?]
+    [author? last-name author-last?]
+    [author? sex m]
+    [author? country "United States"]
 
-    [wrap] dip
-
-    [[[book? subjects love]
-      [book? title title?]
-      [book? author-last author-last?]
-      [book? author-first author-first?]
-      [author? first-name author-first?]
-      [author? last-name author-last?]
-      [author? sex f]
-      [author? birth-year birth-year?]]
-     [title? author-first? author-last? birth-year?]
-     query
-     ;database
-    ]
-
-    [program dictionary] label environment
-    swap using evaluate [stack] lookup restore
+    [author? birth-year author-birth-year?]]
+   [book-title? author-first? author-last? author-birth-year?]
+   query
+   database
+  ] let execute  
 #+end_src
 
 #+RESULTS:
 #+begin_src kcats
-  [[":c0attribute" subjects]
-   [":c0value" love]
-   [":c1attribute" title]
-   [":c2attribute" author-last]
-   [":c3attribute" author-first]
-   [":c4attribute" first-name]
-   [":c5attribute" last-name]
-   [":c6attribute" sex]
-   [":c6value" f]
-   [":c7attribute" birth-year]]
-  "SELECT c1.value as \"title\",
-    c3.value as \"author-first\",
-    c2.value as \"author-last\",
-    c7.value as \"birth-year\"
-   from EAV as c0
-  JOIN EAV c1 ON
-     c1.attribute = :c1attribute AND
-     c0.entity = c1.entity
-  JOIN EAV c2 ON
-     c2.attribute = :c2attribute AND
-     c0.entity = c2.entity AND
-     c1.entity = c2.entity
-  JOIN EAV c3 ON
-    c3.attribute = :c3attribute AND
-    c0.entity = c3.entity AND
-    c1.entity = c3.entity AND
-    c2.entity = c3.entity
-  JOIN EAV c4 ON
-    c4.attribute = :c4attribute AND
-    c3.value = c4.value
-  JOIN EAV c5 ON
-    c5.attribute = :c5attribute AND
-    c2.value = c5.value AND
-    c4.entity = c5.entity
-  JOIN EAV c6 ON
-    c6.value = :c6value AND
-    c6.attribute = :c6attribute AND
-    c4.entity = c6.entity AND
-    c5.entity = c6.entity
-  JOIN EAV c7 ON
-    c7.attribute = :c7attribute AND
-    c4.entity = c7.entity AND
-    c5.entity = c7.entity AND
-    c6.entity = c7.entity
-  WHERE c0.value = :c0value AND
-        c0.attribute = :c0attribute"
+[[[author-birth-year 1896]
+  [author-first "F. Scott"]
+  [author-last "Fitzgerald"]
+  [book-title "The Great Gatsby"]]]
 #+end_src
 
 We need to rewrite the link-finding logic so that it does everything in one pass
@@ -12985,52 +13499,52 @@ We need to rewrite the link-finding logic so that it does everything in one pass
 
 #+RESULTS:
 #+begin_src kcats
-[[[book? [[0 0]
-          [1 0]
-          [2 0]
-          [3 0]]]
-  [subjects [[0 1]]]
-  [love [[0 2]]]]
- [[title [[1 1]]]
-  [title? [[1 2]]]
+[[[love [[0 2]]]
   [book? [[0 0]
           [1 0]
           [2 0]
-          [3 0]]]]
+          [3 0]]]
+  [subjects [[0 1]]]]
+ [[book? [[0 0]
+          [1 0]
+          [2 0]
+          [3 0]]]
+  [title? [[1 2]]]
+  [title [[1 1]]]]
  [[author-last? [[2 2]
                  [5 2]]]
-  [book? [[0 0]
-          [1 0]
-          [2 0]
-          [3 0]]]
-  [author-last [[2 1]]]]
- [[author-first [[3 1]]]
-  [author-first? [[3 2]
-                  [4 2]]]
+  [author-last [[2 1]]]
   [book? [[0 0]
           [1 0]
           [2 0]
           [3 0]]]]
- [[author? [[4 0]
-            [5 0]
-            [6 0]
-            [7 0]]]
-  [first-name [[4 1]]]
+ [[book? [[0 0]
+          [1 0]
+          [2 0]
+          [3 0]]]
   [author-first? [[3 2]
-                  [4 2]]]]
+                  [4 2]]]
+  [author-first [[3 1]]]]
  [[author? [[4 0]
             [5 0]
             [6 0]
             [7 0]]]
-  [author-last? [[2 2]
+  [author-first? [[3 2]
+                  [4 2]]]
+  [first-name [[4 1]]]]
+ [[author-last? [[2 2]
                  [5 2]]]
-  [last-name [[5 1]]]]
- [[author? [[4 0]
+  [last-name [[5 1]]]
+  [author? [[4 0]
             [5 0]
             [6 0]
-            [7 0]]]
-  [f [[6 2]]]
-  [sex [[6 1]]]]
+            [7 0]]]]
+ [[f [[6 2]]]
+  [sex [[6 1]]]
+  [author? [[4 0]
+            [5 0]
+            [6 0]
+            [7 0]]]]
  [[author? [[4 0]
             [5 0]
             [6 0]
@@ -13201,6 +13715,110 @@ We need to rewrite the link-finding logic so that it does everything in one pass
 [[title? [value 2]]
  [author? [value 3]]]
 #+end_src
+
+*** Tests database module
+#+begin_src kcats
+  dictionary [debug-step] [decache inscribe] step 
+  [database debug-step] swap
+
+  [[[book? title title?]
+    [book? author author?]
+    [author? first-name author-first?]
+    [author? country "United States"]]
+   [title? author-first?] query]
+
+  [program dictionary] label environment swap ;; lm env
+  ;[[stack] [snapshot] divedown assign] dip ;; capture the stack at runtime
+
+  using ;; set up the resolver 
+  eval-step eval-step eval-step eval-step advance advance advance ;; execute the program in the inner environment
+  advance 
+  ;evaluate
+  ;[stack] lookup restore ;; replace the stack with the result from the inner env
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[dictionary dictionary_redacted]
+ [program [evaluate [stack] lookup restore]]
+ [resolver [#b64 "qyKhcjHmD5kJNFA6/M0EkQOrh/j2zANmwrQFL1T1w7A=" #b64 "BD6O7rckGISnnk+5AXZaa3/2qY/72dX3O68AED3pG64="]]
+ [stack [[[dictionary dictionary_redacted]
+          [program [swap [constraint] map [index] indexed-as-property triangle [extract-data]
+                    map [[extract-params] [make-query] [make-where] [swap select-data]] fork dropdown
+                    unwrap float [[join] lookup]
+                    map swap format-select [" " interpose join-all] dip triplet
+                    reverse "SELECT {0} from EAV as c0 {1} WHERE {2}" swap format swap dropdeep]]
+          [resolver [#b64 "nBeUBXUEzoR2f1PRlrc9UaOCrtcrgU+Bfkz87TTApQ0="]]
+          [stack [[title? author-first?]
+                  [[book? title title?] [book? author author?] [author? first-name author-first?]
+                   [author? country "United States"]]]]]
+         [title? author-first?]
+         [[book? title title?] [book? author author?] [author? first-name author-first?]
+          [author? country "United States"]]]]]
+#+end_src
+
+Debug what's wrong with inner evaluate
+#+begin_src kcats
+  [1 2 +] stage [finished? not] [eval-step] while
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[dictionary dictionary_redacted]
+ [program []]
+ [resolver []]
+ [stack [3]]]
+#+end_src
+
+write unnest-envs, so we can execute nested envs serially
+#+begin_src kcats
+  [3] stage wrap [2] join stage wrap [1] join stage
+  [] swap
+  [environment? not] []
+  [[stack first]]
+  [execute]
+  recur
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[asked [environment?]]
+ [handled []]
+ [reason "word is not defined"]
+ [type error]
+ [unwound [environment? not [[[dictionary dictionary_redacted]
+                              [program [[[dictionary dictionary_redacted]
+                                         [program [[[dictionary dictionary_redacted]
+                                                    [program [3]]
+                                                    [resolver []]
+                                                    [stack []]]
+                                                   2]]
+                                         [resolver []]
+                                         [stack []]]
+                                        1]]
+                              [resolver []]
+                              [stack []]]
+                             []]
+           evert first [] [[stack first]
+                           [[environment? not]
+                            [] [[stack first]] [execute] recur]
+                           execute]
+           branch]]]
+[[dictionary dictionary_redacted]
+ [program [[[dictionary dictionary_redacted]
+            [program [[[dictionary dictionary_redacted]
+                       [program [3]]
+                       [resolver []]
+                       [stack []]]
+                      2]]
+            [resolver []]
+            [stack []]]
+           1]]
+ [resolver []]
+ [stack []]]
+[]
+#+end_src
+
 ** TODO Reduce CPU cost of `shield` :optimization:
 #+begin_src kcats
 [[program [1 2 3 [+] shield]]] environment stepper 0 [drop inc] cram
@@ -13477,3 +14095,111 @@ it.
 : Size of instance_with_intern: 8
 : Size of interned_value_none: 8
 : Size of interned_value_some: 8
+** TODO Support converting Association to Set
+This should probably return a set of keys, but the issue is the way
+Derive works, we can't choose a different conversion based on the
+final type we want. So we end up with a list of pairs because the
+first step in the conversion is to a Iterator<Entry>. Until this is
+fixed we'll comment out the relevant test in the word =intersection=
+#+begin_src kcats
+  [[[[a b] [c d] [e f]] association
+    [[c x] [e y]] association intersection] [[c e] set] "Intersection of two associations expressed as set of common keys"]
+#+end_src
+** INPROGRESS Debug nested envs
+- State "INPROGRESS" from "TODO"       [2024-09-08 Sun 10:36]
+The problem is if we have this
+
+#+begin_src kcats
+  [1 2 +] stage wrap [evaluate] [program stack] label environment
+  wrap [evaluate] [program stack] label environment
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[dictionary dictionary_redacted]
+ [program [evaluate]]
+ [resolver []]
+ [stack [[[dictionary dictionary_redacted]
+          [program [evaluate]]
+          [resolver []]
+          [stack [[[dictionary dictionary_redacted]
+                   [program [1 2 +]]
+                   [resolver []]
+                   [stack []]]]]]]]]
+#+end_src
+
+How do we step through the execution? I think perhaps we need to do this:
+
+Let's say we want to =eval-step=. The ToS is an env (or eval-step would
+fail anyway). If *that* env is executing =evaluate= we recur down the envs
+until we hit one that's not, and run eval-step there.
+
+The question is, do we have to unnest everything and then re-nest?
+
+I think we can just build a path to pass to update. And then afterward
+recur again to drop evaluate from programs that are already done.
+#+begin_src kcats
+   [1 2 +] stage wrap [evaluate] [program stack] label environment
+   wrap [evaluate] [program stack] label environment
+   [] swap
+   [[[program] lookup [evaluate] starts?]
+   [[stack 0] clone [lookup] dip swap [join] dip ] ;; append the next part of the path to the accumulator
+   while swap] shield update
+   
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[actual [[dictionary dictionary_redacted]
+          [program [evaluate]]
+          [resolver []]
+          [stack [[[dictionary dictionary_redacted]
+                   [program [evaluate]]
+                   [resolver []]
+                   [stack [[[dictionary dictionary_redacted]
+                            [program [1 2 +]]
+                            [resolver []]
+                            [stack []]]]]]]]]]
+ [asked [list]]
+ [handled []]
+ [reason "type mismatch"]
+ [type error]
+ [unwound [update]]]
+[stack 0 stack 0] [[dictionary dictionary_redacted]
+                   [program [evaluate]]
+                   [resolver []]
+                   [stack [[[dictionary dictionary_redacted]
+                            [program [evaluate]]
+                            [resolver []]
+                            [stack [[[dictionary dictionary_redacted]
+                                     [program [1 2 +]]
+                                     [resolver []]
+                                     [stack []]]]]]]]]
+[]
+#+end_src
+
+#+begin_src kcats
+[1 2 +] stage wrap [0] [eval-step] update
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[[dictionary dictionary_redacted]
+  [program [2 +]]
+  [resolver []]
+  [stack [1]]]]
+#+end_src
+
+#+begin_src kcats
+[1 2 [3 4 [5 6 [7 8]]]] [2 2 0] [inc] update
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[1 2 [3 4 [6 6 [7 8]]]]
+#+end_src
+
+*** DONE write environment? word
+- State "DONE"       from "INPROGRESS" [2024-09-08 Sun 11:21]
+- State "INPROGRESS" from "TODO"       [2024-09-08 Sun 10:37]
+Will be an axiom word.
