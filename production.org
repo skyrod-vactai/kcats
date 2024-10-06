@@ -287,7 +287,7 @@ internally, to keep track of things like the stack, program, lists etc.
   use lazy_static::lazy_static;
   use std::collections::{HashMap, VecDeque};
 
-  use std::hash::{Hash, Hasher};
+  use std::hash::Hash;
   use std::marker::Sync;
 
   use std::pin::Pin;
@@ -298,40 +298,19 @@ internally, to keep track of things like the stack, program, lists etc.
   /// A Word causes a kcats program to do something, usually taking some
   /// items derive the top of the stack, and using them to create new
   /// stack items. (examples: `swap`, `+`, `dip`).
-  #[derive(Clone, Eq, PartialOrd, Ord, Default)]
+  #[derive(Clone, Eq, PartialOrd, Ord, Default, Hash, PartialEq)]
   pub struct Word {
       pub data: Intern<String>,
       pub quoted: bool,
-      pub namespace: dict::Namespace,
   }
 
   impl fmt::Debug for Word {
       fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-          let ns = match self.namespace {
-              Some(ns) => format!(
-                  "{}/",
-                  base64::encode_config(ns.as_ref(), base64::URL_SAFE_NO_PAD)
-              ),
-              None => "".to_string(),
-          };
-          write!(f, "{}{}", ns, self.data.as_str())
-      }
-  }
-
-  /// Two words are equal if their data are equal, even if they're not
-  /// in the same namespace. The rationale for this is that comparisons
-  /// are only when we're using a word as data, and namespace only
-  /// matters when using a word to access a dictionary.
-  impl PartialEq for Word {
-      fn eq(&self, other: &Self) -> bool {
-          self.data == other.data && self.quoted == other.quoted
-      }
-  }
-
-  impl Hash for Word {
-      fn hash<H: Hasher>(&self, state: &mut H) {
-          self.data.hash(state);
-          self.quoted.hash(state);
+          if self.quoted {
+              write!(f, "[{}]", self.data.as_str())
+          } else {
+              write!(f, "{}", self.data.as_str())
+          }
       }
   }
 
@@ -345,7 +324,6 @@ internally, to keep track of things like the stack, program, lists etc.
       fn derive(s: &str) -> Self {
           Word {
               data: Intern::<String>::from(s),
-              namespace: Default::default(),
               quoted: false,
           }
       }
@@ -3174,7 +3152,6 @@ internally, to keep track of things like the stack, program, lists etc.
   use std::collections::HashSet;
   use std::convert::Infallible;
   use std::hash::Hash;
-  use std::hash::Hasher;
   use std::ptr;
   use std::sync::Arc;
 
@@ -3182,8 +3159,8 @@ internally, to keep track of things like the stack, program, lists etc.
   /// of data: when looking up words in the dictionary, the namespace is
   /// used for comparison. Due to differences in equality checking, we
   /// use a wrapper type here so we can distinguish the behavior.
-  #[derive(Eq, Debug, Clone, Default)]
-  pub struct Word(pub types::Word);
+  #[derive(Eq, Debug, Clone, Default, PartialEq, Hash)]
+  pub struct Word(pub types::Word, pub Namespace);
 
   /// Easily convert from [Word]
   impl Derive<Word> for types::Word {
@@ -3195,24 +3172,7 @@ internally, to keep track of things like the stack, program, lists etc.
   /// Easily convert from [types::Word]
   impl Derive<types::Word> for Word {
       fn derive(w: types::Word) -> Self {
-          Word(w)
-      }
-  }
-
-  impl PartialEq for Word {
-      fn eq(&self, other: &Self) -> bool {
-          self.0.data == other.0.data
-              && self.0.namespace == other.0.namespace
-              && self.0.quoted == other.0.quoted
-      }
-  }
-
-  /// The hash of a dictionary Word uses all the fields
-  impl Hash for Word {
-      fn hash<H: Hasher>(&self, state: &mut H) {
-          self.0.data.hash(state);
-          self.0.namespace.hash(state);
-          self.0.quoted.hash(state);
+          Word(w, None)
       }
   }
 
@@ -3417,6 +3377,9 @@ internally, to keep track of things like the stack, program, lists etc.
 
   /// Holds [Word]s and their definitions.
   pub type Entries = coll::Arc<HashMap<Word, Entry>>;
+  /// Words are looked up from the Cache, which takes modules into
+  /// account.
+  pub type Cache = HashMap<types::Word, Entry>;
 
   /// One of the main components of an
   /// [crate::types::container::environment::Environment]. Provides
@@ -3426,6 +3389,7 @@ internally, to keep track of things like the stack, program, lists etc.
   #[derive(Clone, PartialEq)]
   pub struct Dictionary {
       pub entries: Entries,
+      pub cache: Cache,
       pub modules: Vec<Namespace>,
   }
 
@@ -3458,63 +3422,58 @@ internally, to keep track of things like the stack, program, lists etc.
       }
 
       /// Get an [Entry] from the dictionary, doing namespace
-      /// resolution. This lookup is not very efficient, as it requires
-      /// up to n lookups, where n is the number of modules currently
-      /// selected.
+      /// resolution.
       pub fn get_entry(&self, key: &types::Word) -> Option<Entry> {
-          let mut w = key.clone();
-
-          for ns in self.modules.iter() {
-              w.namespace = *ns;
-              if let Some(e) = self.entries.get(&Word(w.clone())) {
-                  return Some(e.clone());
-              }
-          }
-          //w.namespace = None;
-          self.entries.get(&Word(key.clone())).cloned()
-      }
-
-      pub fn resolve(&self, word: &mut types::Word) {
-          self.entries.get(&(word.clone().fit())).map(|entry| {
-              word.namespace = entry.namespace;
-          });
+          self.cache.get(key).cloned()
       }
 
       pub fn len(&self) -> usize {
           2
       }
 
-      fn diff(&self, newer: &Self) -> (Vec<(Word, Entry)>, Vec<Word>) {
-          diff_hashmaps(&*self.entries, &*newer.entries)
-      }
-
       pub fn merge(&mut self, new: Self, namespace: &Namespace) {
-          let (adds, deletes) = self.diff(&new);
-          // add namepaces to the adds and deletes
-          let adds: Vec<_> = adds
-              .into_iter()
-              .map(|(mut w, e)| {
-                  w.0.namespace = *namespace;
-                  //println!("Adding {:?}", w);
-                  (w, e)
-              })
-              .collect();
-          let deletes: Vec<_> = deletes
-              .into_iter()
-              .map(|mut w| {
-                  w.0.namespace = *namespace;
-                  w
-              })
-              .collect();
-          let d = self.entries.mutate();
-
-          d.extend(adds);
-          d.extend(make_deletes(deletes));
+          self.entries.merge(new.entries, namespace);
+          //self.resolve();
       }
 
       pub fn contains_key(&self, key: &assoc::KeyItem) -> bool {
           types::Word::try_derive(key.clone())
               .map_or(false, |ref w| matches!(w.fit(), "modules" | "entries"))
+      }
+
+      /// Produce an [Entries] map that is pre-resolved using the
+      /// modules from this dictionary. Saves computation at runtime
+      /// because resolution is already done.
+      pub fn resolve(&mut self) {
+          fn group_by_namespace(entries: &Entries) -> HashMap<Namespace, Vec<(types::Word, Entry)>> {
+              let mut grouped: HashMap<Namespace, Vec<(types::Word, Entry)>> = HashMap::new();
+
+              for (k, v) in entries.iter() {
+                  grouped
+                      .entry(k.1)
+                      .or_insert_with(Vec::new)
+                      .push((k.0.clone(), v.clone()));
+              }
+
+              grouped
+          }
+          let by_ns = group_by_namespace(&self.entries);
+          //println!("by namespace: {:?}", by_ns);
+          let mut cache = Cache::new();
+          // first all the non-namespaced core words that can be overridden
+          cache.extend(by_ns.get(&None).cloned().unwrap_or_default());
+          for module in self.modules.iter() {
+              cache.extend(by_ns.get(module).cloned().unwrap_or_default())
+          }
+
+          // println!(
+          //     "Cache now selected {} words. modules: {:?}",
+          //     cache.len(),
+          //     by_ns.keys()
+          // );
+          //println!("times5? {:?}", cache.get(&"times5".fit()));
+          self.cache = cache;
+          //println!("After resolve: {:?}", self);
       }
   }
 
@@ -3565,10 +3524,12 @@ internally, to keep track of things like the stack, program, lists etc.
       fn merge(&mut self, new: Entries, namespace: &Namespace) {
           let (adds, deletes) = self.diff(new);
           // add namepaces to the adds and deletes
+          //println!("Merge {} adds, {} deletes", adds.len(), deletes.len());
+
           let adds: Vec<_> = adds
               .into_iter()
               .map(|(mut w, e)| {
-                  w.0.namespace = *namespace;
+                  w.1 = *namespace;
                   //println!("Adding {:?}", w);
                   (w, e)
               })
@@ -3576,12 +3537,16 @@ internally, to keep track of things like the stack, program, lists etc.
           let deletes: Vec<_> = deletes
               .into_iter()
               .map(|mut w| {
-                  w.0.namespace = *namespace;
+                  w.1 = *namespace;
                   w
               })
               .collect();
           let d = self.mutate();
-
+          // println!(
+          //     "Dictmerge: found {:?} adds, {} deletes",
+          //     adds,
+          //     deletes.len()
+          // );
           d.extend(adds);
           d.extend(make_deletes(deletes));
       }
@@ -3639,7 +3604,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   examples: None,
                   spec: None,
                   definition: Definition::Derived(list!(err, "fail")),
-                  namespace: word.0.namespace,
+                  namespace: word.1,
               };
               (word, entry)
           })
@@ -3720,7 +3685,7 @@ internally, to keep track of things like the stack, program, lists etc.
       type Error = Infallible;
       fn join(self, mut other: Entries) -> Result<Self::Output, Self::Error> {
           // Try to convert to dictionary type
-          println!("assoc + dict join");
+          //println!("assoc + dict join");
           Ok(match self.convert::<Word, Entry>() {
               Ok(d) => {
                   let tm = other.mutate();
@@ -3860,7 +3825,11 @@ internally, to keep track of things like the stack, program, lists etc.
                   continue;
               }
           }
-          Ok(Dictionary { entries, modules })
+          Ok(Dictionary {
+              entries,
+              modules,
+              cache: HashMap::new(),
+          })
       }
   }
 
@@ -3911,10 +3880,11 @@ internally, to keep track of things like the stack, program, lists etc.
   impl TryDerive<Item> for Dictionary {
       type Error = Error;
       fn try_derive(i: Item) -> Result<Self, Self::Error> {
-          let s = coll::Sized::try_derive(i)?;
+          let s = assoc::Associative::try_derive(i)?;
           match s {
-              coll::Sized::Associative(assoc::Associative::Dictionary(d)) => Ok(d),
-              c => c.into_iter().try_fit(),
+              assoc::Associative::Dictionary(d) => Ok(d),
+              //assoc::Associative::Assoc(a) => a.into_iter().try_fit(),
+              a => Err(Error::expected("dictionary", a)),
           }
       }
   }
@@ -4156,6 +4126,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   }
               }
           }
+          self.dictionary.resolve();
           Ok(())
       }
 
@@ -4212,9 +4183,10 @@ internally, to keep track of things like the stack, program, lists etc.
       //println!("Dictionary: {:?}", env.dictionary);
       let mut new_env = futures::executor::block_on(async move { axiom::eval(env).await });
       //println!("Env: {:?}", new_env);
-      let dict: dict::Dictionary = new_env.pop().try_fit().unwrap();
-
+      let mut dict: dict::Dictionary = new_env.pop().try_fit().unwrap();
+      dict.resolve();
       new_env.dictionary = dict;
+      //println!("loaded module {}: {:?}", module, new_env.dictionary);
       new_env
   }
 
@@ -4228,6 +4200,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   dictionary: dict::Dictionary {
                       entries: sync::Arc::new(HashMap::new()),
                       modules: Default::default(),
+                      cache: HashMap::new(),
                   },
                   stack: Default::default(),
                   program: Default::default(),
@@ -4235,6 +4208,7 @@ internally, to keep track of things like the stack, program, lists etc.
               env.load_core_modules()
                   .expect("failed to load core modules");
               env.dictionary.entries.add_builtins();
+              env.dictionary.resolve();
               //println!("Dict has {} words", env.dictionary.entries.len());
               let mut env = [
                   "errors",
@@ -4261,6 +4235,7 @@ internally, to keep track of things like the stack, program, lists etc.
               // above, need to add the rust definitions back that got
               // overwritten.
               env.dictionary.entries.add_builtins();
+              env.dictionary.resolve();
               //print!("Env: {:?}", env);
 
               env
@@ -4369,7 +4344,9 @@ internally, to keep track of things like the stack, program, lists etc.
               } else if k == "program".fit() {
                   program = Some(v.try_fit()?)
               } else if k == "dictionary".fit() {
-                  dictionary = Some(v.try_fit()?)
+                  let mut d = dict::Dictionary::try_derive(v)?;
+                  d.resolve();
+                  dictionary = Some(d);
               } else {
                   continue;
               }
@@ -5267,7 +5244,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   use crate::types::*;
 
   use cache::cache;
-  use dict::Dict;
   use dynfmt::{Format, SimpleCurlyFormat};
   use futures::future::FutureExt;
   use lazy_static::lazy_static;
@@ -5610,7 +5586,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               Box::leak(Box::new(f_stack1(crate::types::container::pipe::channel::receiver))),
           ),
           ("recur", Box::leak(Box::new(recur))),
-          ("resolve", Box::leak(Box::new(f_result(resolve)))),
           ("resume", Box::leak(Box::new(identity))),
           ("reverse", Box::leak(Box::new(f_stack1(reverse)))),
           ("round", Box::leak(Box::new(f_stack1(round)))),
@@ -6324,15 +6299,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       unassoc_in(m, ks)
   }
 
-  pub fn resolve(env: &mut Environment) -> Result<(), Error> {
-      let mut w: Word = env.pop().try_fit()?;
-      //let mut dw: dict::Word = w.fit();
-      env.dictionary.resolve(&mut w);
-      env.pop_prog();
-      env.push(w);
-      Ok(())
-  }
-
   pub fn lookup(i: coll::Sized, k: assoc::KeyItem) -> ItemResult {
       //println!("lookup {:?} \n {:?}", i, k);
       //let k = assoc::KeyItem::try_derive(k)?;
@@ -6505,9 +6471,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       env.push(w);
                       env.fit()
                   } else {
-                      let mut word = word.clone();
-                      env.dictionary.resolve(&mut word);
-                      if let Some(dfn) = env.dictionary.get_entry(&word) {
+                      if let Some(dfn) = env.dictionary.cache.get(&word) {
                           {
                               if let Some(spec) = &dfn.spec {
                                   //println!("Checking spec for {:?}: {:?}", word, spec.0);
@@ -6518,6 +6482,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                               } else {
                                   //  println!("No spec for {}!", word);
                               }
+
                               match &dfn.definition {
                                   dict::Definition::Axiom(a) => (*a)(env),
                                   dict::Definition::Derived(d) => {
@@ -6530,8 +6495,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                           }
                       } else {
                           //let w = word.clone();
-                          //println!("Failed dict lookup: {:?} {:?}", w, env.dictionary.len());
-                          env.push(Error::undefined(word.fit()));
+                          if *word == Word::derive("times5") {
+                              println!("Failed dict lookup: {:?} ", env.dictionary.cache);
+                          }
+                          env.push(Error::undefined(word.clone().fit()));
                           env.fit()
                       }
                   }
@@ -6705,6 +6672,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn dictionary(mut env: Environment) -> Future<Environment> {
+      //println!("adding dictionary");
       let d = env.dictionary.clone();
       env.pop_prog();
       env.push(d);
@@ -6770,7 +6738,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let ns = env.pop();
       let namespace = dict::Namespace::try_derive(ns)?;
 
-      existing.entries.merge(modified.entries, &namespace);
+      existing.merge(modified, &namespace);
       // not sure if this is really needed - was here for use during
       // bootstrapping when some builtins are not yet loaded but need to
       // be
