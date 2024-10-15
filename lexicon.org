@@ -1178,6 +1178,46 @@ Better zip implementation
     join
 #+end_src
 
+#+begin_src kcats
+  [[] [program]] ;; the spec
+  ;; construct the dynamic definition for partition
+
+  [[take-chunk [[taker collect
+                 dropdown dropdown] ; drop the used-up taker generator
+                join divedeep]]
+   [shift [[[count <=]
+            [swap 0 slice]
+            [[]] if] shield swap]]]
+  [[]
+   [over wrap take-chunk [join shift] bail]
+   [[over] dive wrap take-chunk swap drop shift]
+   if]
+
+  [draft dictionary swap [emit encode hashbytes] shield
+   [[[words] swap update] shield dropdown] dip
+   sink [dictmerge] shielddeep] dip
+  float wrap [put] join
+  swapdown [modules] swap update
+  ;; TODO try using confine here
+  [*1 *2 confine] pack
+  join dump
+
+
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[[] [program] [[modules [#b64 "yO3LwN0ITlhqAj8T1IKcUqNoiQmEAyrBwbFpGixDtQ8"]]
+                [words 249_entries]]
+  [[] [over wrap take-chunk [join shift]
+       bail]
+   [[over] dive wrap take-chunk swap drop shift]
+   if]
+  confine]
+ 247_entries [words] [[modules []]
+                      [words 247_entries]]]
+#+end_src
+
 ** Dictionary modules
 #+begin_src kcats :tangle src/kcats/core/dictionary-builtins.kcats :mkdirp yes
   [dictionary [[spec [[] [list]]]]]
@@ -1235,12 +1275,8 @@ Better zip implementation
                      float wrap [put] join
                      swapdown [modules] swap update
                      [dictionary program] label environment
-                     wrap [[snapshot] dive ;; grab a snapshot
-                           [stack] swap assign ;; set the env's stack to that value
-                           environment ;; TODO this shouldn't be needed - investigate why sometimes it is
-                           evaluate
-                           [stack] lookup restore] ;; promote the result
-                     join ]] 
+                     ;; TODO try using confine here
+                     [*1 capture evaluate [stack] lookup restore] pack]] 
         [examples [[[[[times5 [5 *]]
                       [doubledec [dec dec]]]
                      [3 times5 doubledec] let execute] [13]]
@@ -1267,8 +1303,8 @@ Better zip implementation
   float wrap [put] join
   swapdown [modules] swap update 
   [dictionary program] label environment
-  wrap [[snapshot] dive ;; grab a snapshot
-        [stack] swap assign ;; set the env's stack to that value
+  wrap [[snapshot] dive ;; grab a snapshot 
+       [stack] swap assign ;; set the env's stack to that value
         evaluate
         [stack] lookup restore] ;; promote the result
   join 
@@ -1732,7 +1768,139 @@ another argument: a program to combine the item and the existing list
                           every?]]]]]
   join
 #+end_src
+** Database
+#+begin_src kcats :tangle src/kcats/stdlib/database.kcats :mkdirp yes
+  [[[list selection] [list constraints]]
+   [string]]
 
+  [[fork [[execute] map]]
+   [triangle [[[] [[take] dip swap [[put] shield sink swap pair] bail] collect] shielddown]]
+   [indexed-as-property [swap indexed
+                         [unwrap sink assign] map dropdown]]
+   [join-all [[first empty] shield swap [join] step]]
+   [selectkeys [set [*1 first contains?] pack filter dropdown]]
+   [invert [[reverse] map association]]
+
+   ;; datalog variables
+   [variable? [[[word?]
+                [string last \? =]] [execute] every?]]
+   [variable= [[[pair [variable?] every?] [=]] [execute] every?]] 
+
+   ;; datalog constraints
+   [slots [[entity attribute value]]]
+   [slot-combos [slots [slots [pair] map] map join-all]]
+   [constraint [unwrap slots reverse label]] 
+
+   ;; links between datalog constraints
+   [links [slot-combos
+           [[wrap] map unwrap swapdown 
+            [[[lookup] inject] both] pairwise 
+            variable=]
+           filter    
+           [unwrap pair sink pair
+            [[index] lookup] map swap zip]
+           map]]
+   [all-links [[] sink
+               [[[[index] lookup] shield] both ;; lookup the indices of both constraints
+                [swapdown] dip sink ;; move the indices under the constraints
+                [links] shielddown
+                swap [dropdown dropdown join] dip] 
+
+               step drop]]
+   [format-link [[join] inject unwrap [string] map
+                 "c{0}.{1} = c{2}.{3}" swap format]] 
+
+   ;; formatting pieces of query data into text
+   [anded-together [" AND " interpose join-all]]
+
+   ;; where clause data processing
+   [where-data [[[index] lookup] shield swap 
+                [[[second variable? not]
+                  [first [index] unwrap = not]] [execute] every?] filter 
+                [swap prepend] map dropdown]]
+   [format-where [[string] map 
+                  "c{0}.{1} = :c{0}{1}" swap format]]
+   [make-where [first [where] lookup anded-together]]
+   [format-join [[[[on] lookup]
+                  [[where] lookup]
+                  [[index] lookup string]] [execute] map
+                 [join anded-together] inject 
+                 "JOIN EAV c{1} ON {0}" swap format]]
+   [make-query [rest [[on]
+                      [[format-link] map] update
+                      [format-join] shield [join] swap assign] map]]
+
+   ;; SQL parameters for rusqlite
+   [param-name [[string] map ":c{0}{1}" swap format]]
+   [extract-params [[] association swap [[params] lookup join] step]]
+
+
+   ;; SELECT clause
+   [wordval? [second word?]]
+   [invert [[reverse] map association]]
+   [validate [[[second not]
+               [first "All selected query variables must appear somewhere in constraints"
+                [reason variable] label fail]
+               when] map]]
+   [select-data [swap
+                 [[slots selectkeys invert] shield
+                  [wordval?] filter join association] map
+                 swap
+                 [[[index] swap put ;; make a list of the variable and 'index'
+                   wrap [selectkeys] join ;; make the program to cut down
+                    map [count 2 =] filter first [second] map
+                   [first number?] [reverse] when] ;; items are in random order due to coming from association, fix the order
+                  map]
+                 shield dropdeep zip
+                 validate]]
+
+   ;; query 
+   [extract-data [[[[unwrap all-links]
+                    [first where-data   ; [join] inject unwrap
+                     ;; build the query param map
+                     [[[] swap
+                       [[param-name] shield [last] dip wrap swap assign]
+                       step]
+                      ;; build the actual query where clauses
+                      [[format-where] map]]
+                     fork]]
+                   fork] shield
+                  ;; combine extracted items
+
+                  [first] dip ;; keep the original constraint to add properties to
+                  unwrap unwrap [where params on] label join]]
+   [format-select [[unwrap swap
+                    string butlast ;; remove the ? from the variable name for result column
+                    put
+                    [string] map
+                    "c{1}.{0} as {2}" swap format] map ", " interpose join-all]]]
+
+  ;; This is the program we need to modify that is `query`
+
+  [swap
+   ;; expand all combinations of constraints
+   [constraint] map
+   ;;[] prepend ;; an empty constraint to represent the orignal EAV table we're joining with
+   [index] indexed-as-property
+   triangle
+   ;; for each pair of constraints, build the "ON" clause data for the JOIN
+   [extract-data] map
+   [[extract-params]
+    [make-query]
+    [make-where]
+    [swap select-data]] fork 
+   dropdown ;; don't need original anymore
+   unwrap float
+   [[join] lookup] map  
+   swap format-select 
+   [" " interpose join-all] dip triplet reverse
+   "SELECT {0} from EAV as c0 {1} WHERE {2}" swap format
+   swap dropdeep]
+
+  let
+  [definition spec] label
+  [query] swap assign
+#+end_src
 ** Pipes
 #+begin_src kcats :tangle src/kcats/core/pipes-builtins.kcats :mkdirp yes
   [pipe? [[spec [[item] [boolean]]]
@@ -1925,7 +2093,7 @@ another argument: a program to combine the item and the existing list
                            [stack] lookup]
                           [[2]]]]]]]
 
-  [evaluate [[spec [[environment] [environment]]]
+  [evaluate [[spec [[item] [environment]]]
              [examples [[[[[program [1 2 3 4 + *]]] environment
                           evaluate
                           [stack] lookup]
@@ -1959,7 +2127,6 @@ another argument: a program to combine the item and the existing list
                      tos]
                     [1]]]]]]
 
-  ;; TODO we don't use the term 'expression' anymore so this needs renaming
   [top [[spec [[environment] [item]]]
         [definition [[program] lookup first]]
         [examples [[[[[stack [1 2 3]]
@@ -1969,6 +2136,12 @@ another argument: a program to combine the item and the existing list
 
   [stage [[spec [[program] [environment]]]
           [definition [[program] label environment]]]]
+
+  [capture [[spec [[environment] [environment]]]
+            [doc "Capture the outer stack and assign it to the inner env's stack"]
+            [definition [[stack]
+                         [snapshot] divedown
+                         assign]]]]
 
   [spawn [[spec [[program dictionary] [environment]]]
           [definition [[snapshot] dipdown ;; p d s

@@ -1344,6 +1344,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
   impl Container<Item> for Sized {
       fn has(&self, other: &Item) -> bool {
+          //println!("Has: {:?}\n{:?}", self, other);
           match (self, other) {
               (Sized::Associative(a), other) => {
                   assoc::KeyItem::try_derive(other.clone()).map_or(false, |k| a.contains_key(&k))
@@ -2240,23 +2241,21 @@ internally, to keep track of things like the stack, program, lists etc.
       fn try_derive(i: Item) -> Result<Self, Error> {
           match i {
               Item::Number(Number::Int(i)) => Ok(KeyItem::Int(i)),
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(i))) => {
-                  Ok(KeyItem::String(i))
-              }
-              Item::Receptacle(coll::Receptacle::Sized(coll::Sized::String(i))) => {
-                  Ok(KeyItem::String(i))
-              }
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(i))) => Ok(KeyItem::Bytes(i)),
-              Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(i))) => {
-                  Ok(KeyItem::Bytes(i))
-              }
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(l))) => {
-                  Ok(KeyItem::List(KeyList::try_from_iter(l.iter().cloned())?))
-              }
               Item::Word(w) => Ok(KeyItem::Word(w)),
               Item::Char(c) => Ok(KeyItem::Char(c)),
+              i => match coll::Sized::try_derive(i)? {
+                  coll::Sized::String(i) => Ok(KeyItem::String(i)),
 
-              i => Err(Error::expected("KeyItem", i)),
+                  coll::Sized::Bytes(i) => Ok(KeyItem::Bytes(i)),
+
+                  coll::Sized::List(l) => {
+                      Ok(KeyItem::List(KeyList::try_from_iter(l.iter().cloned())?))
+                  }
+                  s => {
+                      println!("Bad keyitem {:?}", s);
+                      Err(Error::expected("KeyItem", s))
+                  }
+              },
           }
       }
   }
@@ -3176,6 +3175,12 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  impl Derive<&str> for Word {
+      fn derive(w: &str) -> Self {
+          Word::derive(types::Word::derive(w))
+      }
+  }
+
   impl TryDerive<assoc::KeyItem> for Word {
       type Error = Error;
       fn try_derive(k: assoc::KeyItem) -> Result<Self, Self::Error> {
@@ -3468,7 +3473,7 @@ internally, to keep track of things like the stack, program, lists etc.
           //     cache.len(),
           //     by_ns.keys()
           // );
-          //println!("times5? {:?}", cache.get(&"times5".fit()));
+          //println!("resolve: contains? {:?}", cache.get(&"contains?".fit()));
           self.cache = cache;
           //println!("After resolve: {:?}", self);
       }
@@ -3539,13 +3544,11 @@ internally, to keep track of things like the stack, program, lists etc.
               })
               .collect();
           let d = self.mutate();
-          // println!(
-          //     "Dictmerge: found {:?} adds, {} deletes",
-          //     adds,
-          //     deletes.len()
-          // );
+
           d.extend(adds);
           d.extend(make_deletes(deletes));
+
+          //println!("Contains: {:?}", d.get(&"contains?".fit()))
       }
 
       fn insert_core_module(&mut self, lexicon: String) -> Result<(), Error> {
@@ -4123,7 +4126,6 @@ internally, to keep track of things like the stack, program, lists etc.
                   }
               }
           }
-          self.dictionary.resolve();
           Ok(())
       }
 
@@ -4193,6 +4195,7 @@ internally, to keep track of things like the stack, program, lists etc.
       /// functions. The environment is only built once and memoized.
       fn default() -> Self {
           static INST: Lazy<Environment> = Lazy::new(|| {
+              //println!("Env::default");
               let mut env = Environment {
                   dictionary: dict::Dictionary {
                       words: sync::Arc::new(HashMap::new()),
@@ -4209,7 +4212,6 @@ internally, to keep track of things like the stack, program, lists etc.
               //println!("Dict has {} words", env.dictionary.entries.len());
               let mut env = [
                   "errors",
-                  "environment-builtins",
                   "encode",
                   "sets-builtins",
                   "time", // good candidate for lib
@@ -4218,7 +4220,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   "generators",
                   "debug",
                   "more-generators",
-                  //"database",
+                  "database",
                   //"template",
                   //"debug", // END default namespace // another good candidate for lib
               ]
@@ -4234,7 +4236,6 @@ internally, to keep track of things like the stack, program, lists etc.
               env.dictionary.words.add_builtins();
               env.dictionary.resolve();
               //print!("Env: {:?}", env);
-
               env
           });
           INST.clone()
@@ -4322,8 +4323,9 @@ internally, to keep track of things like the stack, program, lists etc.
               ))),
           ) if *w == *S_ENVIRONMENT => Ok(()),
           (w, i) => {
-              //println!("Type check failed! wanted {} got {:?}", w, i);
-              Err(Error::expected(w.fit(), i.clone()))
+              //println!("Type check failed! wanted {} got {:?}", w.data, i);
+              let expected = format!("{}?", w.data);
+              Err(Error::expected(expected.as_str(), i.clone()))
           }
       }
   }
@@ -5239,6 +5241,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   use crate::list;
   use crate::serialize::{self, Emit};
   use crate::traits::*;
+  use crate::types::container::dictionary::Dict;
   #[cfg(feature = "database")]
   use crate::types::container::pipe::db;
   use crate::types::container::{
@@ -5259,6 +5262,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   use std::default::Default;
   use std::mem;
   use std::sync::Arc;
+  #[cfg(feature = "httpclient")]
+  use surf;
 
   pub type ItemResult = Result<Item, Error>;
 
@@ -6591,10 +6596,16 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               assoc::Associative::Error(mut e),
           ))) => {
               let mut next = env.program.front();
-              let mut unwound = Vec::<Item>::new();
+              let data = e.data.mutate();
+              let mut unwound_arc: coll::List = data
+                  .remove(&"unwound".fit())
+                  .unwrap_or_default()
+                  .try_fit()
+                  .unwrap_or_else(|_| list!());
+              let unwound = unwound_arc.mutate();
               while next.is_some() && next.unwrap() != handle {
                   let i = env.pop_prog();
-                  unwound.push(i);
+                  unwound.push_back(i);
                   next = env.program.front();
               }
               if next.is_some() {
@@ -6604,7 +6615,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   e.is_handled = true;
               }
               let em = Arc::make_mut(&mut e.data);
-              em.insert("unwound".fit(), coll::List::derive_iter(unwound).fit());
+              em.insert("unwound".fit(), unwound_arc.fit());
               e.fit()
           }
           i => i,
@@ -6747,9 +6758,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       // not sure if this is really needed - was here for use during
       // bootstrapping when some builtins are not yet loaded but need to
       // be
-      //if namespace.is_none() {
-      //    env.dictionary.add_builtins();
-      //}
+      // if namespace.is_none() {
+      //     env.dictionary.words.add_builtins();
+      // }
       // pop the word dictmerge
       env.pop_prog();
       env.push(existing);
@@ -13592,7 +13603,7 @@ it? (May need to add some set-based words here).
    [indexed-as-property [swap indexed
                          [unwrap sink assign] map dropdown]]
    [join-all [[first empty] shield swap [join] step]]
-   [selectkeys [set swap [first contains?] filter]]
+   [selectkeys [set swap [first contains?] filter dropdown]]
    [invert [[reverse] map association]]
 
    ;; datalog variables
@@ -13657,7 +13668,7 @@ it? (May need to add some set-based words here).
                 [reason variable] label fail]
                when] map]]
    [select-data [swap
-                 [[slots selectkeys invert] shield
+                 [[slots selectkeys dump invert] shield
                   [wordval?] filter join association] map
                  swap
                  [[[index] swap put ;; make a list of the variable and 'index'
@@ -13734,10 +13745,511 @@ it? (May need to add some set-based words here).
 
 #+RESULTS:
 #+begin_src kcats
+evaluate: Some(Entry { examples: Some([[[[[program, [Int(1), Int(2), Int(3), Int(4), +, *]]], environment, evaluate, [stack], lookup], [[Int(14), Int(1)]]]]), spec: Some(([SpecElement { elemtype: item, name: None }], [SpecElement { elemtype: environment, name: None }])), definition: [], namespace: None })
+[[[entity book?]
+  [value love]
+  [attribute subjects]]
+ [book-title? author-first? author-last? author-birth-year?]]
+[[[attribute title]
+  [value book-title?]
+  [entity book?]]
+ [book-title? author-first? author-last? author-birth-year?]]
+[[[attribute author-last]
+  [value author-last?]
+  [entity book?]]
+ [book-title? author-first? author-last? author-birth-year?]]
+[[[value author-first?]
+  [entity book?]
+  [attribute author-first]]
+ [book-title? author-first? author-last? author-birth-year?]]
+[[[entity author?]
+  [attribute first-name]
+  [value author-first?]]
+ [book-title? author-first? author-last? author-birth-year?]]
+[[[entity author?]
+  [attribute last-name]
+  [value author-last?]]
+ [book-title? author-first? author-last? author-birth-year?]]
+[[[value m]
+  [entity author?]
+  [attribute sex]]
+ [book-title? author-first? author-last? author-birth-year?]]
+[[[attribute country]
+  [value "United States"]
+  [entity author?]]
+ [book-title? author-first? author-last? author-birth-year?]]
+[[[value author-birth-year?]
+  [entity author?]
+  [attribute birth-year]]
+ [book-title? author-first? author-last? author-birth-year?]]
 [[[author-birth-year 1896]
   [author-first "F. Scott"]
   [author-last "Fitzgerald"]
   [book-title "The Great Gatsby"]]]
+#+end_src
+
+#+begin_src kcats
+[[a b] [c d] [e f] [g h]] [a e] set  [*1 first contains?] pack filter 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+Env::default
+evaluate: Some(Entry { examples: Some([[[[[program, [Int(1), Int(2), Int(3), Int(4), +, *]]], environment, evaluate, [stack], lookup], [[Int(14), Int(1)]]]]), spec: Some(([SpecElement { elemtype: item, name: None }], [SpecElement { elemtype: environment, name: None }])), definition: [], namespace: None })
+Loading module errors
+Loading module encode
+Loading module sets-builtins
+Loading module time
+Loading module pipes
+Loading module methods
+Loading module generators
+Loading module debug
+Loading module more-generators
+Loading module database
+Contains: Some(Entry { examples: Some([[[[Int(1), Int(2), Int(3)], Int(3), contains?], [yes], "List contains a number"], [[[Int(1), Int(2), Int(3), Int(3), Int(5)], set, Int(3), contains?], [yes], "A set contains a number"], [[[Int(1), Int(2), Int(3)], Int(4), contains?], [[]], "A list doesn't contain a number"], [[Int(5), Int(3), contains?], [[]], "A number is atomic and doesn't contain anything"], [[[foo], unwrap, Char'o', contains?], [[]], "A word is atomic and doesn't contain anything"], [["food", "foo", contains?], [yes], "A string contains a sub-string"], [[[a, b, c, d], [b, c], contains?], [[]], "A list doesn't contain a sub-list (due to ambiguity with what 'contains' means with lists)"], [[[a, [b, c], d], [b, c], contains?], [yes], "A list contains another list"], [[[a, [b, c], d], set, [b, c], contains?], [yes], "A set contains a list"], [["food", Char'o', contains?], [yes], "A string contains a character"]]), spec: Some(([SpecElement { elemtype: item, name: None }, SpecElement { elemtype: item, name: Some(container) }], [SpecElement { elemtype: boolean, name: None }])), definition: Builtin, namespace: None })
+Has: [a, b]
+a
+Has: [c, d]
+a
+Has: [e, f]
+a
+Has: [g, h]
+a
+[[a b]]
+#+end_src
+#+begin_src kcats
+  [[times5 [5 *]]] [6 times5]
+  [draft dictionary swap [emit encode hashbytes] shield
+   [[[words] swap update] shield dropdown] dip
+   sink [dictmerge] shielddeep] dip
+  float wrap [put] join
+  swapdown [modules] swap update
+  [dictionary program] label environment
+  ;; TODO try using confine here
+  [*1 capture evaluate [stack] lookup restore] pack execute
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+evaluate: Some(Entry { examples: Some([[[[[program, [Int(1), Int(2), Int(3), Int(4), +, *]]], environment, evaluate, [stack], lookup], [[Int(14), Int(1)]]]]), spec: Some(([SpecElement { elemtype: item, name: None }], [SpecElement { elemtype: environment, name: None }])), definition: [], namespace: None })
+Loading module errors
+Loading module encode
+Loading module sets-builtins
+Loading module time
+Loading module pipes
+Loading module methods
+Loading module generators
+Loading module debug
+Loading module more-generators
+Loading module database
+Contains: Some(Entry { examples: Some([[[[Int(1), Int(2), Int(3)], Int(3), contains?], [yes], "List contains a number"], [[[Int(1), Int(2), Int(3), Int(3), Int(5)], set, Int(3), contains?], [yes], "A set contains a number"], [[[Int(1), Int(2), Int(3)], Int(4), contains?], [[]], "A list doesn't contain a number"], [[Int(5), Int(3), contains?], [[]], "A number is atomic and doesn't contain anything"], [[[foo], unwrap, Char'o', contains?], [[]], "A word is atomic and doesn't contain anything"], [["food", "foo", contains?], [yes], "A string contains a sub-string"], [[[a, b, c, d], [b, c], contains?], [[]], "A list doesn't contain a sub-list (due to ambiguity with what 'contains' means with lists)"], [[[a, [b, c], d], [b, c], contains?], [yes], "A list contains another list"], [[[a, [b, c], d], set, [b, c], contains?], [yes], "A set contains a list"], [["food", Char'o', contains?], [yes], "A string contains a character"]]), spec: Some(([SpecElement { elemtype: item, name: None }, SpecElement { elemtype: item, name: Some(container) }], [SpecElement { elemtype: boolean, name: None }])), definition: Builtin, namespace: None })
+30
+#+end_src
+
+#+begin_src kcats
+  ;[[book? subjects love] [book? author-last author-last?]] [author-last?] query
+ [[book? subjects love]
+    ;[book? subjects subjects?]
+    [book? title book-title?]
+    [book? author-last author-last?]
+    [book? author-first author-first?]
+    [author? first-name author-first?]
+    [author? last-name author-last?]
+    [author? sex m]
+    [author? country "United States"]
+
+    [author? birth-year author-birth-year?]]
+   [book-title? author-first? author-last? author-birth-year?]
+   query
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+evaluate: Some(Entry { examples: Some([[[[[program, [Int(1), Int(2), Int(3), Int(4), +, *]]], environment, evaluate, [stack], lookup], [[Int(14), Int(1)]]]]), spec: Some(([SpecElement { elemtype: item, name: None }], [SpecElement { elemtype: environment, name: None }])), definition: [], namespace: None })
+Loading module errors
+Loading module encode
+Loading module sets-builtins
+Loading module time
+Loading module pipes
+Loading module methods
+Loading module generators
+Loading module debug
+Loading module more-generators
+Loading module database
+Contains: Some(Entry { examples: Some([[[[Int(1), Int(2), Int(3)], Int(3), contains?], [yes], "List contains a number"], [[[Int(1), Int(2), Int(3), Int(3), Int(5)], set, Int(3), contains?], [yes], "A set contains a number"], [[[Int(1), Int(2), Int(3)], Int(4), contains?], [[]], "A list doesn't contain a number"], [[Int(5), Int(3), contains?], [[]], "A number is atomic and doesn't contain anything"], [[[foo], unwrap, Char'o', contains?], [[]], "A word is atomic and doesn't contain anything"], [["food", "foo", contains?], [yes], "A string contains a sub-string"], [[[a, b, c, d], [b, c], contains?], [[]], "A list doesn't contain a sub-list (due to ambiguity with what 'contains' means with lists)"], [[[a, [b, c], d], [b, c], contains?], [yes], "A list contains another list"], [[[a, [b, c], d], set, [b, c], contains?], [yes], "A set contains a list"], [["food", Char'o', contains?], [yes], "A string contains a character"]]), spec: Some(([SpecElement { elemtype: item, name: None }, SpecElement { elemtype: item, name: Some(container) }], [SpecElement { elemtype: boolean, name: None }])), definition: Builtin, namespace: None })
+Bad keyitem Assoc({String(":c0attribute"): subjects, String(":c0value"): love})
+[[actual [[":c0attribute" subjects]
+          [":c0value" love]]]
+ [asked [KeyItem]]
+ [handled []]
+ [reason "type mismatch"]
+ [type error]
+ [unwound [association [[[attribute subjects]
+                         [entity book?]
+                         [index 0]
+                         [on []]
+                         [params [[":c0attribute" subjects]
+                                  [":c0value" love]]]
+                         [value love]
+                         [where ["c0.value = :c0value" "c0.attribute = :c0attribute"]]]
+                        [book-title? author-first? author-last? author-birth-year?]]
+           evert first [wordval?] filter join association [[[attribute subjects]
+                                                            [entity book?]
+                                                            [index 0]
+                                                            [on []]
+                                                            [params [[":c0attribute" subjects]
+                                                                     [":c0value" love]]]
+                                                            [value love]
+                                                            [where ["c0.value = :c0value" "c0.attribute = :c0attribute"]]]
+                                                           [book-title? author-first? author-last? author-birth-year?]]
+           evert first dropdown [] swap put [[[attribute title]
+                                              [entity book?]
+                                              [index 1]
+                                              [on [[[1 entity]
+                                                    [0 entity]]]]
+                                              [params [[":c1attribute" title]]]
+                                              [value book-title?]
+                                              [where ["c1.attribute = :c1attribute"]]]
+                                             [[attribute author-last]
+                                              [entity book?]
+                                              [index 2]
+                                              [on [[[2 entity]
+                                                    [0 entity]]
+                                                   [[2 entity]
+                                                    [1 entity]]]]
+                                              [params [[":c2attribute" author-last]]]
+                                              [value author-last?]
+                                              [where ["c2.attribute = :c2attribute"]]]
+                                             [[attribute author-first]
+                                              [entity book?]
+                                              [index 3]
+                                              [on [[[3 entity]
+                                                    [0 entity]]
+                                                   [[3 entity]
+                                                    [1 entity]]
+                                                   [[3 entity]
+                                                    [2 entity]]]]
+                                              [params [[":c3attribute" author-first]]]
+                                              [value author-first?]
+                                              [where ["c3.attribute = :c3attribute"]]]
+                                             [[attribute first-name]
+                                              [entity author?]
+                                              [index 4]
+                                              [on [[[4 value]
+                                                    [3 value]]]]
+                                              [params [[":c4attribute" first-name]]]
+                                              [value author-first?]
+                                              [where ["c4.attribute = :c4attribute"]]]
+                                             [[attribute last-name]
+                                              [entity author?]
+                                              [index 5]
+                                              [on [[[5 value]
+                                                    [2 value]]
+                                                   [[5 entity]
+                                                    [4 entity]]]]
+                                              [params [[":c5attribute" last-name]]]
+                                              [value author-last?]
+                                              [where ["c5.attribute = :c5attribute"]]]
+                                             [[attribute sex]
+                                              [entity author?]
+                                              [index 6]
+                                              [on [[[6 entity]
+                                                    [4 entity]]
+                                                   [[6 entity]
+                                                    [5 entity]]]]
+                                              [params [[":c6attribute" sex]
+                                                       [":c6value" m]]]
+                                              [value m]
+                                              [where ["c6.value = :c6value" "c6.attribute = :c6attribute"]]]
+                                             [[attribute country]
+                                              [entity author?]
+                                              [index 7]
+                                              [on [[[7 entity]
+                                                    [4 entity]]
+                                                   [[7 entity]
+                                                    [5 entity]]
+                                                   [[7 entity]
+                                                    [6 entity]]]]
+                                              [params [[":c7attribute" country]
+                                                       [":c7value" "United States"]]]
+                                              [value "United States"]
+                                              [where ["c7.attribute = :c7attribute" "c7.value = :c7value"]]]
+                                             [[attribute birth-year]
+                                              [entity author?]
+                                              [index 8]
+                                              [on [[[8 entity]
+                                                    [4 entity]]
+                                                   [[8 entity]
+                                                    [5 entity]]
+                                                   [[8 entity]
+                                                    [6 entity]]
+                                                   [[8 entity]
+                                                    [7 entity]]]]
+                                              [params [[":c8attribute" birth-year]]]
+                                              [value author-birth-year?]
+                                              [where ["c8.attribute = :c8attribute"]]]]
+           [swap [[[slots selectkeys invert] shield [wordval?] filter join association] shielddown]
+            dip swap put]
+           step swap [[[index] swap put wrap [selectkeys] join map [count 2 =] filter first
+                       [second] map [first number?]
+                       [reverse] when]
+                      map]
+           
+           shield dropdeep zip validate [[swap select-data]
+                                         [[[attribute subjects]
+                                           [entity book?]
+                                           [index 0]
+                                           [on []]
+                                           [params [[":c0attribute" subjects]
+                                                    [":c0value" love]]]
+                                           [value love]
+                                           [where ["c0.value = :c0value" "c0.attribute = :c0attribute"]]]
+                                          [[attribute title]
+                                           [entity book?]
+                                           [index 1]
+                                           [on [[[1 entity]
+                                                 [0 entity]]]]
+                                           [params [[":c1attribute" title]]]
+                                           [value book-title?]
+                                           [where ["c1.attribute = :c1attribute"]]]
+                                          [[attribute author-last]
+                                           [entity book?]
+                                           [index 2]
+                                           [on [[[2 entity]
+                                                 [0 entity]]
+                                                [[2 entity]
+                                                 [1 entity]]]]
+                                           [params [[":c2attribute" author-last]]]
+                                           [value author-last?]
+                                           [where ["c2.attribute = :c2attribute"]]]
+                                          [[attribute author-first]
+                                           [entity book?]
+                                           [index 3]
+                                           [on [[[3 entity]
+                                                 [0 entity]]
+                                                [[3 entity]
+                                                 [1 entity]]
+                                                [[3 entity]
+                                                 [2 entity]]]]
+                                           [params [[":c3attribute" author-first]]]
+                                           [value author-first?]
+                                           [where ["c3.attribute = :c3attribute"]]]
+                                          [[attribute first-name]
+                                           [entity author?]
+                                           [index 4]
+                                           [on [[[4 value]
+                                                 [3 value]]]]
+                                           [params [[":c4attribute" first-name]]]
+                                           [value author-first?]
+                                           [where ["c4.attribute = :c4attribute"]]]
+                                          [[attribute last-name]
+                                           [entity author?]
+                                           [index 5]
+                                           [on [[[5 value]
+                                                 [2 value]]
+                                                [[5 entity]
+                                                 [4 entity]]]]
+                                           [params [[":c5attribute" last-name]]]
+                                           [value author-last?]
+                                           [where ["c5.attribute = :c5attribute"]]]
+                                          [[attribute sex]
+                                           [entity author?]
+                                           [index 6]
+                                           [on [[[6 entity]
+                                                 [4 entity]]
+                                                [[6 entity]
+                                                 [5 entity]]]]
+                                           [params [[":c6attribute" sex]
+                                                    [":c6value" m]]]
+                                           [value m]
+                                           [where ["c6.value = :c6value" "c6.attribute = :c6attribute"]]]
+                                          [[attribute country]
+                                           [entity author?]
+                                           [index 7]
+                                           [on [[[7 entity]
+                                                 [4 entity]]
+                                                [[7 entity]
+                                                 [5 entity]]
+                                                [[7 entity]
+                                                 [6 entity]]]]
+                                           [params [[":c7attribute" country]
+                                                    [":c7value" "United States"]]]
+                                           [value "United States"]
+                                           [where ["c7.attribute = :c7attribute" "c7.value = :c7value"]]]
+                                          [[attribute birth-year]
+                                           [entity author?]
+                                           [index 8]
+                                           [on [[[8 entity]
+                                                 [4 entity]]
+                                                [[8 entity]
+                                                 [5 entity]]
+                                                [[8 entity]
+                                                 [6 entity]]
+                                                [[8 entity]
+                                                 [7 entity]]]]
+                                           [params [[":c8attribute" birth-year]]]
+                                           [value author-birth-year?]
+                                           [where ["c8.attribute = :c8attribute"]]]]
+                                         [book-title? author-first? author-last? author-birth-year?]]
+           evert first dropdown [[[":c0attribute" subjects]
+                                  [":c0value" love]
+                                  [":c1attribute" title]
+                                  [":c2attribute" author-last]
+                                  [":c3attribute" author-first]
+                                  [":c4attribute" first-name]
+                                  [":c5attribute" last-name]
+                                  [":c6attribute" sex]
+                                  [":c6value" m]
+                                  [":c7attribute" country]
+                                  [":c7value" "United States"]
+                                  [":c8attribute" birth-year]]
+                                 [[[attribute title]
+                                   [entity book?]
+                                   [index 1]
+                                   [join "JOIN EAV c1 ON c1.attribute = :c1attribute AND c0.entity = c1.entity"]
+                                   [on ["c0.entity = c1.entity"]]
+                                   [params [[":c1attribute" title]]]
+                                   [value book-title?]
+                                   [where ["c1.attribute = :c1attribute"]]]
+                                  [[attribute author-last]
+                                   [entity book?]
+                                   [index 2]
+                                   [join "JOIN EAV c2 ON c2.attribute = :c2attribute AND c0.entity = c2.entity AND c1.entity = c2.entity"]
+                                   [on ["c0.entity = c2.entity" "c1.entity = c2.entity"]]
+                                   [params [[":c2attribute" author-last]]]
+                                   [value author-last?]
+                                   [where ["c2.attribute = :c2attribute"]]]
+                                  [[attribute author-first]
+                                   [entity book?]
+                                   [index 3]
+                                   [join "JOIN EAV c3 ON c3.attribute = :c3attribute AND c0.entity = c3.entity AND c1.entity = c3.entity AND c2.entity = c3.entity"]
+                                   [on ["c0.entity = c3.entity" "c1.entity = c3.entity" "c2.entity = c3.entity"]]
+                                   [params [[":c3attribute" author-first]]]
+                                   [value author-first?]
+                                   [where ["c3.attribute = :c3attribute"]]]
+                                  [[attribute first-name]
+                                   [entity author?]
+                                   [index 4]
+                                   [join "JOIN EAV c4 ON c4.attribute = :c4attribute AND c3.value = c4.value"]
+                                   [on ["c3.value = c4.value"]]
+                                   [params [[":c4attribute" first-name]]]
+                                   [value author-first?]
+                                   [where ["c4.attribute = :c4attribute"]]]
+                                  [[attribute last-name]
+                                   [entity author?]
+                                   [index 5]
+                                   [join "JOIN EAV c5 ON c5.attribute = :c5attribute AND c2.value = c5.value AND c4.entity = c5.entity"]
+                                   [on ["c2.value = c5.value" "c4.entity = c5.entity"]]
+                                   [params [[":c5attribute" last-name]]]
+                                   [value author-last?]
+                                   [where ["c5.attribute = :c5attribute"]]]
+                                  [[attribute sex]
+                                   [entity author?]
+                                   [index 6]
+                                   [join "JOIN EAV c6 ON c6.value = :c6value AND c6.attribute = :c6attribute AND c4.entity = c6.entity AND c5.entity = c6.entity"]
+                                   [on ["c4.entity = c6.entity" "c5.entity = c6.entity"]]
+                                   [params [[":c6attribute" sex]
+                                            [":c6value" m]]]
+                                   [value m]
+                                   [where ["c6.value = :c6value" "c6.attribute = :c6attribute"]]]
+                                  [[attribute country]
+                                   [entity author?]
+                                   [index 7]
+                                   [join "JOIN EAV c7 ON c7.attribute = :c7attribute AND c7.value = :c7value AND c4.entity = c7.entity AND c5.entity = c7.entity AND c6.entity = c7.entity"]
+                                   [on ["c4.entity = c7.entity" "c5.entity = c7.entity" "c6.entity = c7.entity"]]
+                                   [params [[":c7attribute" country]
+                                            [":c7value" "United States"]]]
+                                   [value "United States"]
+                                   [where ["c7.attribute = :c7attribute" "c7.value = :c7value"]]]
+                                  [[attribute birth-year]
+                                   [entity author?]
+                                   [index 8]
+                                   [join "JOIN EAV c8 ON c8.attribute = :c8attribute AND c4.entity = c8.entity AND c5.entity = c8.entity AND c6.entity = c8.entity AND c7.entity = c8.entity"]
+                                   [on ["c4.entity = c8.entity" "c5.entity = c8.entity" "c6.entity = c8.entity" "c7.entity = c8.entity"]]
+                                   [params [[":c8attribute" birth-year]]]
+                                   [value author-birth-year?]
+                                   [where ["c8.attribute = :c8attribute"]]]]
+                                 "c0.value = :c0value AND c0.attribute = :c0attribute"]
+           swap put [] [swap [[execute] shielddown]
+                        dip swap put]
+           step dropdown unwrap float [[join] lookup]
+           map swap
+           format-select [" " interpose join-all] dip triplet reverse "SELECT {0} from EAV as c0 {1} WHERE {2}"
+           swap format swap dropdeep]]]
+[[book? entity]
+ [love value]
+ [subjects attribute]
+ [[] on]
+ [[[":c0attribute" subjects]
+   [":c0value" love]]
+  params]
+ [0 index]
+ [["c0.value = :c0value" "c0.attribute = :c0attribute"]
+  where]]
+#+end_src
+
+
+#+begin_src kcats
+[[book? subjects love]
+  ;[book? subjects subjects?]
+  [book? title book-title?]
+  [book? author-last author-last?]
+  [book? author-first author-first?]
+  [author? first-name author-first?]
+  [author? last-name author-last?]
+  [author? sex m]
+  [author? country "United States"]
+
+  [author? birth-year author-birth-year?]]
+ [book-title? author-first? author-last? author-birth-year?] query ;database
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[actual [[dictionary [[modules [#b64 "yO3LwN0ITlhqAj8T1IKcUqNoiQmEAyrBwbFpGixDtQ8"]]
+                       [words 249_entries]]]
+          [program [[] [over wrap take-chunk [join shift]
+                        bail]
+                    [[over] dive wrap take-chunk swap drop shift]
+                    if]]
+          [stack [[] 2 2 [take] [[entity] [[attribute subjects]
+                                           [entity book?]
+                                           [index 0]
+                                           [value love]]
+                                 [entity] [[attribute title]
+                                           [entity book?]
+                                           [index 1]
+                                           [value book-title?]]
+                                 0 1 [] [book-title? author-first? author-last? author-birth-year?]]]]]]
+ [asked [environment]]
+ [handled []]
+ [reason "type mismatch"]
+ [type error]
+ [unwound []]]
+[[dictionary [[modules [#b64 "yO3LwN0ITlhqAj8T1IKcUqNoiQmEAyrBwbFpGixDtQ8"]]
+              [words 249_entries]]]
+ [program [[] [over wrap take-chunk [join shift]
+               bail]
+           [[over] dive wrap take-chunk swap drop shift]
+           if]]
+ [stack [[] 2 2 [take] [[entity] [[attribute subjects]
+                                  [entity book?]
+                                  [index 0]
+                                  [value love]]
+                        [entity] [[attribute title]
+                                  [entity book?]
+                                  [index 1]
+                                  [value book-title?]]
+                        0 1 [] [book-title? author-first? author-last? author-birth-year?]]]]]
+[] 2 2 [take] [[entity] [[attribute subjects]
+                         [entity book?]
+                         [index 0]
+                         [value love]]
+               [entity] [[attribute title]
+                         [entity book?]
+                         [index 1]
+                         [value book-title?]]
+               0 1 [] [book-title? author-first? author-last? author-birth-year?]]
 #+end_src
 
 We need to rewrite the link-finding logic so that it does everything in one pass
