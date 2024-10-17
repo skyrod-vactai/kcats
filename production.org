@@ -471,22 +471,27 @@ internally, to keep track of things like the stack, program, lists etc.
       fn try_derive(i: Item) -> Result<Self, Self::Error> {
           match i {
               Item::Word(i) => Ok(i),
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(s))) => Ok(s.fit()),
               i => {
-                  let i2 = i.clone();
-                  let l = coll::List::try_derive(i);
-                  match l {
-                      Ok(mut l) => {
-                          if l.len() == 1 {
-                              let lm = l.mutate();
+                  let s = coll::Sized::try_derive(i)?;
+                  match s {
+                      coll::Sized::String(s) => Ok(s.fit()),
+                      s => {
+                          let i2 = s.clone();
+                          let l = coll::List::try_derive(s);
+                          match l {
+                              Ok(mut l) => {
+                                  if l.len() == 1 {
+                                      let lm = l.mutate();
 
-                              let i = lm.pop_front().unwrap();
-                              i.try_fit()
-                          } else {
-                              Err(Error::expected("word", l))
+                                      let i = lm.pop_front().unwrap();
+                                      i.try_fit()
+                                  } else {
+                                      Err(Error::expected("word", l))
+                                  }
+                              }
+                              Err(_) => Err(Error::expected("word", i2)),
                           }
                       }
-                      Err(_) => Err(Error::expected("word", i2)),
                   }
               }
           }
@@ -2265,6 +2270,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn try_derive(k: KeyItem) -> Result<Self, Self::Error> {
           match k {
               KeyItem::Word(w) => Ok(w),
+              KeyItem::String(s) => Ok(s.fit()),
               i => Err(Error::expected("word", i)),
           }
       }
@@ -4716,7 +4722,7 @@ words for them (hashing, encryption, signing)
 
   pub fn hash(i: Item) -> ItemResult {
       let b = Bytes::try_derive(i).unwrap();
-      Ok(sha2::Sha256::digest(b).deref().to_vec().fit())
+      Ok(sha2::Sha256::digest(&b).deref().to_vec().fit())
   }
 
   type Value = Vec<u8>;
@@ -8733,37 +8739,82 @@ Implement the =handoff= type
           let q = "INSERT INTO EAV (entity, attribute, value) VALUES (?, ?, ?)";
 
           match value {
-              //TODO: differentiate between strings and words as values
-              // by prefixing with something like s: or w:
               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(a))) => {
-                  let id = uuid::Uuid::new_v4();
-                  self.insert_item(a.fit(), id)?;
-                  self.conn.execute(q, params![id, attribute, id])?;
+                  let sub_id = uuid::Uuid::new_v4();
+                  self.insert_item(a.fit(), sub_id)?;
+                  self.conn.execute(q, params![id, attribute, sub_id])?;
               }
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Set(s))) => {
-                  for v in s.iter() {
-                      self.insert_attribute(id, attribute.clone(), v.clone().fit())?;
-                  }
+              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Set(s))) => self.insert_iter(
+                  Some((id, attribute)),
+                  s.iter().map(|i| Item::derive(i.clone())),
+              )?,
+              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(l))) => {
+                  self.insert_iter(Some((id, attribute)), (*l).clone())?
               }
               i => {
                   self.conn.execute(q, params![id, attribute, i])?;
-              } //_ => todo!("Other item types as values in db"),
+              }
           }
           Ok(Item::default())
       }
 
-      pub fn insert_item(&self, i: Item, id: uuid::Uuid) -> axiom::ItemResult {
-          let obj = assoc::Associative::try_derive(i)?;
-
-          for (k, v) in obj.to_iter() {
-              match k {
-                  assoc::KeyItem::Word(w) => {
-                      self.insert_attribute(id, Item::Word(w), v)?;
+      pub fn insert_iter<I>(&self, parent_link: Option<(uuid::Uuid, Item)>, l: I) -> Result<(), Error>
+      where
+          I: IntoIterator<Item = Item>,
+      {
+          for v in l {
+              if is_value(&v) {
+                  match parent_link {
+                      Some(parent_link) => {
+                          self.insert_attribute(parent_link.0, parent_link.1.clone(), v.clone())?;
+                          return Ok(());
+                      }
+                      None => {
+                          return Err(Error::expected("parent-link", v.clone()));
+                      }
                   }
-                  other => return Err(Error::expected("word", other)),
+              } else {
+                  let sub_id = uuid::Uuid::new_v4();
+                  self.insert_item(v.clone(), sub_id)?;
+                  if let Some(parent_link) = parent_link.clone() {
+                      self.insert_attribute(
+                          parent_link.0,
+                          parent_link.1.clone(),
+                          sub_id.into_bytes().to_vec().fit(),
+                      )?;
+                  }
               }
           }
+          Ok(())
+      }
+
+      pub fn insert_item(&self, i: Item, id: uuid::Uuid) -> axiom::ItemResult {
+          let s = coll::Sized::try_derive(i)?;
+          match s {
+              coll::Sized::Associative(a) => {
+                  for (k, v) in a.to_iter() {
+                      //println!("Insert! {:?} {:?}", k, v);
+                      let w: types::Word = k.try_fit()?;
+                      self.insert_attribute(id, Item::Word(w), v)?;
+                  }
+              }
+              coll::Sized::List(l) => {
+                  self.insert_iter(None, (*l).clone())?;
+              }
+              s => return Err(Error::expected("db-object", s)),
+          }
           Ok(Item::default())
+      }
+  }
+
+  pub fn is_value(i: &Item) -> bool {
+      match i {
+          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(_))) => true,
+          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(_))) => true,
+          Item::Number(_) => true,
+          Item::Word(_) => true,
+          Item::Char(_) => true,
+          _ => false,
       }
   }
 
