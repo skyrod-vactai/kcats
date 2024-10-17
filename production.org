@@ -7262,6 +7262,44 @@ We'll also define how to run unit tests.
       }
   }
 
+  use std::ffi::{CStr, CString};
+  use std::os::raw::c_char;
+
+  pub extern "C" fn eval(env: *mut Environment, program: *const c_char) -> *mut c_char {
+      unsafe {
+          if env.is_null() {
+              return CString::new("Invalid environment pointer")
+                  .unwrap()
+                  .into_raw();
+          }
+
+          // Take ownership of the Environment
+          let mut env_val = std::ptr::read(env);
+
+          // Convert the input C string to a Rust string
+          let c_str = CStr::from_ptr(program);
+          let program_str = match c_str.to_str() {
+              Ok(s) => s,
+              Err(_) => return CString::new("Invalid input string").unwrap().into_raw(),
+          };
+
+          match parse_input(env_val, program_str.to_string()) {
+              Ok(parsed_env) => {
+                  // Execute the eval and re-assign the result back to the env pointer
+                  env_val = futures::executor::block_on(async move { axiom::eval(parsed_env).await });
+
+                  let result = serialize::auto_format(env_val.stack.iter().emit().as_str(), 20, 80);
+                  // Write the updated environment back to the pointer
+                  std::ptr::write(env, env_val);
+
+                  // Convert the evaluation result back to a C string
+                  CString::new(result).unwrap().into_raw()
+              }
+              Err(e) => CString::new(format!("Error: {:?}", e)).unwrap().into_raw(),
+          }
+      }
+  }
+
   /// The main intepreter entry function that can start the interpreter
   /// in several different modes.
   #[tokio::main]
