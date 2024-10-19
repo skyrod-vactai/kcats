@@ -21,6 +21,7 @@ impl std::fmt::Display for MyError {
 impl std::error::Error for MyError {}
 
 fn main() -> Result<(), Box<dyn Error>> {
+    println!("cargo:rustc-link-lib=sqlite3");
     //copy source files to the interpreter's cache, and hardcode the hashes
     if let Some(proj_dirs) = ProjectDirs::from("org", "skyrod", "kcats") {
         let data_dir = proj_dirs.data_dir();
