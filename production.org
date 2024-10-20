@@ -21,8 +21,8 @@
 Built in Rust - it's fast and modern, its memory allocation model
 seems well suited to kcats.
 ** Status
-Unstable - code written in kcats now may fail to execute with future
-versions of kcats.
+Unstable - code written in kcats now will likely require modification to work
+with future versions of the interpreter.
 ** Building
 *** Dependencies
 - rustc
@@ -123,13 +123,16 @@ the location where you installed the kcats binary.
   ## Figure out best place to store the db and stdlib files
   directories = "5"
 
-  rusqlite = { version = "0", optional = true, features = ["uuid"] }
+  rusqlite = { version = "0", optional = true, features = ["uuid", "bundled"] }
 
   # memoized functions
   once_cell = "1"
 
   # The blob cache
   cache = {path = "./cache"}
+
+  # android logging
+  libc = "0.2"
 
   [dependencies.uuid]
   version = "1"
@@ -4228,21 +4231,21 @@ internally, to keep track of things like the stack, program, lists etc.
                   .expect("failed to load core modules");
               env.dictionary.resolve();
               //println!("Dict has {} words", env.dictionary.entries.len());
-              let mut env = [
-                  "errors",
-                  "encode",
-                  "time", // good candidate for lib
-                  "pipes",
-                  "methods",
-                  "generators",
-                  "debug",
-                  "more-generators",
-                  "database",
-                  //"template",
-                  //"debug", // END default namespace // another good candidate for lib
-              ]
-              .iter()
-              .fold(env, load_module);
+              // let mut env = [
+              //     "errors",
+              //     "encode",
+              //     "time", // good candidate for lib
+              //     "pipes",
+              //     "methods",
+              //     "generators",
+              //     "debug",
+              //     "more-generators",
+              //     "database",
+              //     //"template",
+              //     //"debug", // END default namespace // another good candidate for lib
+              // ]
+              // .iter()
+              // .fold(env, load_module);
               // println!(
               //     "After loading modules Dict has {} words",
               //     env.dictionary.entries.len()
@@ -7134,30 +7137,61 @@ rust project or some other language through FFI.
   use std::ffi::{CStr, CString};
   use std::os::raw::c_char;
 
-  #[no_mangle]
-  pub extern "C" fn eval_kcats_env(env: *mut Environment, program: *const c_char) -> *mut c_char {
+  extern crate libc;
+
+  use libc::c_char as lc_char;
+
+  #[link(name = "log")]
+  extern "C" {
+      fn __android_log_print(prio: i32, tag: *const lc_char, fmt: *const lc_char, ...) -> i32;
+  }
+
+  const ANDROID_LOG_INFO: i32 = 4;
+
+  pub fn log(message: &str) {
+      let tag = CString::new("kcats").unwrap();
+      let message = CString::new(message).unwrap();
+
       unsafe {
+          __android_log_print(ANDROID_LOG_INFO, tag.as_ptr(), message.as_ptr());
+      }
+  }
+
+  #[no_mangle]
+  pub extern "C" fn Java_org_skyrod_subverse_MainActivity_kcatsEval(
+      env: *mut Environment,
+      program: *const c_char,
+  ) -> *mut c_char {
+      log("Starting eval");
+      unsafe {
+          log(format!("Got program {:?}", program).as_str());
           if env.is_null() {
               return CString::new("Invalid environment pointer")
                   .unwrap()
                   .into_raw();
           }
-
+          if program.is_null() {
+              return CString::new("Invalid input string").unwrap().into_raw();
+          }
+          log("Taking pointer ownership");
           // Take ownership of the Environment
           let mut env_val = std::ptr::read(env);
-
+          log("Converting C string to Rust");
           // Convert the input C string to a Rust string
           let c_str = CStr::from_ptr(program);
+
+          log(format!("Got program {:?}", c_str).as_str());
           let program_str = match c_str.to_str() {
               Ok(s) => s,
               Err(_) => return CString::new("Invalid input string").unwrap().into_raw(),
           };
-
+          log("Parsing input");
           match serialize::parse_input(env_val, program_str.to_string()) {
               Ok(parsed_env) => {
                   // Execute the eval and re-assign the result back to the env pointer
+                  log("Executing environment");
                   env_val = futures::executor::block_on(async move { axiom::eval(parsed_env).await });
-
+                  log("Formatting result");
                   let result = serialize::auto_format(env_val.stack.iter().emit().as_str(), 20, 80);
                   // Write the updated environment back to the pointer
                   std::ptr::write(env, env_val);
@@ -7171,20 +7205,19 @@ rust project or some other language through FFI.
   }
 
   #[no_mangle]
-  pub extern "C" fn new_kcats_env() -> *mut Environment {
+  pub extern "C" fn Java_org_skyrod_subverse_MainActivity_kcatsNew() -> *mut Environment {
       Box::into_raw(Box::new(Environment::default()))
   }
 
   #[no_mangle]
-  pub extern "C" fn free_kcats_env(env: *mut Environment) {
-      println!("FREE");
+  pub extern "C" fn Java_org_skyrod_subverse_MainActivity_katsFree(env: *mut Environment) {
+      log("FREE");
       if !env.is_null() {
           unsafe {
               drop(Box::from_raw(env));
           }
       }
   }
-
 
   #[cfg(test)]
   mod tests {
@@ -7196,14 +7229,14 @@ rust project or some other language through FFI.
       // Note this useful idiom: importing names from outer (for mod tests) scope.
       //use super::error::Error;
       //use super::*;
-      use crate::types::container as coll;
-      use crate::types::container::Ordered;
-      use crate::types::container::{error::Error, environment::Environment};
-      use crate::types::{Item, Word};
       use crate::axiom;
       use crate::list;
       use crate::serialize::Emit;
       use crate::traits::*;
+      use crate::types::container as coll;
+      use crate::types::container::Ordered;
+      use crate::types::container::{environment::Environment, error::Error};
+      use crate::types::{Item, Word};
 
       use test_case::test_case;
 
