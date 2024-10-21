@@ -131,8 +131,10 @@ the location where you installed the kcats binary.
   # The blob cache
   cache = {path = "./cache"}
 
+  # Android
   # android logging
   libc = "0.2"
+  jni = "0.21"
 
   [dependencies.uuid]
   version = "1"
@@ -7137,9 +7139,13 @@ rust project or some other language through FFI.
   use std::ffi::{CStr, CString};
   use std::os::raw::c_char;
 
-  extern crate libc;
+  use jni::objects::{JClass, JString};
+  use jni::sys::jstring;
+  use jni::JNIEnv;
 
   use libc::c_char as lc_char;
+
+  extern crate libc;
 
   #[link(name = "log")]
   extern "C" {
@@ -7158,35 +7164,35 @@ rust project or some other language through FFI.
   }
 
   #[no_mangle]
-  pub extern "C" fn Java_org_skyrod_subverse_MainActivity_kcatsEval(
+  pub extern "system" fn Java_org_skyrod_subverse_MainActivity_kcatsEval<'local>(
+      mut jnienv: JNIEnv<'local>,
+      _class: JClass<'local>,
       env: *mut Environment,
-      program: *const c_char,
-  ) -> *mut c_char {
+      program: JString,
+  ) -> jstring {
       log("Starting eval");
-      unsafe {
-          log(format!("Got program {:?}", program).as_str());
-          if env.is_null() {
-              return CString::new("Invalid environment pointer")
-                  .unwrap()
-                  .into_raw();
-          }
-          if program.is_null() {
-              return CString::new("Invalid input string").unwrap().into_raw();
-          }
-          log("Taking pointer ownership");
-          // Take ownership of the Environment
-          let mut env_val = std::ptr::read(env);
-          log("Converting C string to Rust");
-          // Convert the input C string to a Rust string
-          let c_str = CStr::from_ptr(program);
+      let mut program: String = jnienv
+          .get_string(&program)
+          .expect("Couldn't get java string!")
+          .into();
+      // to ensure errors are handled by the repl- so that the
+      // user can continue with more input.
+      program.push_str(" handle");
 
-          log(format!("Got program {:?}", c_str).as_str());
-          let program_str = match c_str.to_str() {
-              Ok(s) => s,
-              Err(_) => return CString::new("Invalid input string").unwrap().into_raw(),
-          };
+      log(format!("Got program {:?}", program).as_str());
+      if env.is_null() {
+          return jnienv
+              .new_string("Invalid environment pointer")
+              .unwrap()
+              .as_raw();
+      }
+
+      log("Taking pointer ownership");
+      // Take ownership of the Environment
+      unsafe {
+          let mut env_val = std::ptr::read(env);
           log("Parsing input");
-          match serialize::parse_input(env_val, program_str.to_string()) {
+          match serialize::parse_input(env_val, program) {
               Ok(parsed_env) => {
                   // Execute the eval and re-assign the result back to the env pointer
                   log("Executing environment");
@@ -7197,9 +7203,12 @@ rust project or some other language through FFI.
                   std::ptr::write(env, env_val);
 
                   // Convert the evaluation result back to a C string
-                  CString::new(result).unwrap().into_raw()
+                  jnienv.new_string(result).unwrap().as_raw()
               }
-              Err(e) => CString::new(format!("Error: {:?}", e)).unwrap().into_raw(),
+              Err(e) => jnienv
+                  .new_string(format!("Error: {:?}", e))
+                  .unwrap()
+                  .as_raw(),
           }
       }
   }
