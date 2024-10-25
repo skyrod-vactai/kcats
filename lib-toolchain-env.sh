@@ -1,7 +1,7 @@
 # paste these into a shell that you're using to build android libraries
 # ensure $TOOLCHAIN/bin has been added to PATH (should already be done here)
 
-export ANDROID_NDK_HOME=~/Android/Sdk/ndk/28.0.12433566
+export ANDROID_NDK_HOME=/home/v/Android/Sdk/ndk/28.0.12433566
 export TOOLCHAIN=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64
 
 export TARGET_AARCH64=aarch64-linux-android
