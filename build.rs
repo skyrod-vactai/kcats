@@ -21,7 +21,7 @@ impl std::fmt::Display for MyError {
 impl std::error::Error for MyError {}
 
 fn main() -> Result<(), Box<dyn Error>> {
-    println!("cargo:rustc-link-lib=sqlite3");
+    //println!("cargo:rustc-link-lib=sqlite3");
     let project_dirs = ProjectDirs::from("org", "skyrod", "kcats").unwrap();
     let project_dir = project_dirs.data_dir();
     std::fs::create_dir_all(project_dir).unwrap();
