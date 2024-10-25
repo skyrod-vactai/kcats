@@ -163,7 +163,7 @@ the location where you installed the kcats binary.
   path = "src/lib.rs"
 
   [[bin]]
-  name = "kcats_executable"
+  name = "kcats"
   path = "src/main.rs"
 #+END_SRC
 
@@ -3967,51 +3967,10 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::types::container::{self as coll, Mutey, Ordered};
   use crate::types::number::Number;
   use crate::types::*;
-  use cache::cache;
 
   use once_cell::sync::Lazy;
   use std::future;
   use std::ops::Range;
-  use std::path::PathBuf;
-  use std::sync::Arc;
-
-  use lazy_static::lazy_static;
-  use std::sync::RwLock;
-
-  lazy_static! {
-      /// A static variable to hold where certain paths are on the
-      /// filesystem for the platform we're executing on
-      pub static ref PLATFORM_CONFIG: RwLock<Option<PlatformConfig>> = RwLock::new(None);
-  }
-
-  /// A configuration struct for the platform we're running on,
-  /// specifies where some filesystem resources are located. On some
-  /// platforms (like android) we can't guess and will only know at
-  /// runtime.
-  #[derive(Clone)]
-  pub struct PlatformConfig {
-      pub database: Option<Arc<PathBuf>>,
-      pub cache: Arc<cache::Cache>,
-  }
-
-  impl PlatformConfig {
-      pub fn init(database: PathBuf, cache: cache::Cache) -> Result<(), Error> {
-          let mut config = PLATFORM_CONFIG.write().unwrap();
-          ,*config = Some(PlatformConfig {
-              database: Some(Arc::new(database)),
-              cache: Arc::new(cache),
-          });
-          Ok(())
-      }
-
-      pub fn get() -> Result<PlatformConfig, Error> {
-          let config = PLATFORM_CONFIG.read().unwrap();
-          config
-              .as_ref()
-              .ok_or(Error::expected("initialization", None::<Item>))
-              .map(|c| c.clone())
-      }
-  }
 
   /// A struct to hold the state of an executing kcats program. The
   /// `stack` is the data being manipulated, the `program` is program
@@ -4521,7 +4480,7 @@ crate so we can use it at both build time and runtime.
           Alias(String),
       }
 
-      #[derive(Clone, PartialEq)]
+      #[derive(Clone, PartialEq, Debug)]
       pub struct Cache {
           path: PathBuf,
       }
@@ -4640,9 +4599,13 @@ crate so we can use it at both build time and runtime.
 
       /// Determines the appropriate link type based on the operating system.
       fn get_link_type() -> Link {
-          if cfg!(target_os = "linux") || cfg!(target_os = "macos") || cfg!(target_os = "windows") {
+          if cfg!(target_os = "linux")
+              || cfg!(target_os = "macos")
+              || cfg!(target_os = "windows")
+              || cfg!(target_os = "android")
+          {
               Link::Symlink
-          } else if cfg!(target_os = "android") || cfg!(target_os = "ios") {
+          } else if cfg!(target_os = "ios") {
               Link::Manual
           } else {
               panic!("Unsupported operating system for linking");
@@ -4658,7 +4621,7 @@ crate so we can use it at both build time and runtime.
       /// # Returns
       /// A `Result` indicating success or failure.
       fn create_link(target: &Path, link_name: &Path) -> io::Result<()> {
-          println!("Creating link from {:?} to {:?}", link_name, target);
+          //println!("Creating link from {:?} to {:?}", link_name, target);
 
           if link_name.exists() {
               fs::remove_file(link_name)?;
@@ -5227,11 +5190,11 @@ example, in order to read/write to/from disk).
   /// a function that takes an env, and an input string. Parses the
   /// string, if it parses, returns the env with the input added to the
   /// program. Otherwise returns Error.
-  pub fn parse_input(mut env: Environment, input: String) -> Result<Environment, Error> {
+  pub fn parse_input(env: &mut Environment, input: String) -> Result<(), Error> {
       let mut parsed = parse(input)?;
       let expr = Arc::make_mut(&mut env.program);
       expr.extend(Arc::make_mut(&mut parsed).drain(..));
-      Ok(env)
+      Ok(())
   }
 
   #[cfg(test)]
@@ -5280,15 +5243,15 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   use crate::serialize::{self, Emit};
   use crate::traits::*;
 
+  use crate::config;
   #[cfg(feature = "database")]
   use crate::types::container::pipe::db;
   use crate::types::container::{
-      self as coll, associative as assoc, dictionary as dict, environment as env,
-      environment::Environment, error::Error, pipe, Container, Count, Join, Mutey, Ordered, Take,
+      self as coll, associative as assoc, dictionary as dict, environment::Environment, error::Error,
+      pipe, Container, Count, Join, Mutey, Ordered, Take,
   };
   use crate::types::number::{Float, Int, Number};
   use crate::types::*;
-
   use cache::cache;
   use dynfmt::{Format, SimpleCurlyFormat};
   use futures::future::FutureExt;
@@ -6809,7 +6772,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   /// either the hash of the content or its alias (a [Word]).
   pub fn read_blob(env: &mut Environment) -> Result<(), Error> {
       //println!("Env: {:?}", env);
-      let cache = env::PlatformConfig::get()?.cache;
+      let cache = config::PlatformConfig::get()?.cache;
       let contents = match env.pop() {
           Item::Word(alias) => cache.get(&cache::Key::Alias(alias.fit()))?,
           i => {
@@ -6834,7 +6797,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       };
       match env.pop() {
           Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(b))) => {
-              let cache = env::PlatformConfig::get()?.cache;
+              let cache = config::PlatformConfig::get()?.cache;
               let hash = cache.put(&b, alias)?;
               env.push(hash);
               env.pop_prog();
@@ -7136,19 +7099,22 @@ Here is the top level for using kcats as a library, either in another
 rust project or some other language through FFI.
 
 #+begin_src rust :tangle src/lib.rs :mkdirp yes
-  mod axiom;
+  pub mod axiom;
   mod crypto;
-  mod serialize;
-  mod traits;
-  mod types;
+  pub mod serialize;
+  pub mod traits;
+  pub mod types;
 
   #[cfg(target_os = "android")]
   mod android {
-      use crate::serialize::Emit;
+      use crate::axiom;
+      use crate::config::PlatformConfig;
+      use crate::serialize::{self, Emit};
       use crate::types::container::environment::Environment;
-      use std::ffi::{CStr, CString};
-      use std::os::raw::c_char;
+      use std::ffi::CString;
+      use std::path::PathBuf;
 
+      use cache::cache;
       use jni::objects::{JClass, JString};
       use jni::sys::jstring;
       use jni::JNIEnv;
@@ -7199,12 +7165,12 @@ rust project or some other language through FFI.
           unsafe {
               let mut env_val = std::ptr::read(env);
               log("Parsing input");
-              match serialize::parse_input(env_val, program) {
-                  Ok(parsed_env) => {
+              match serialize::parse_input(&mut env_val, program) {
+                  Ok(_) => {
                       // Execute the eval and re-assign the result back to the env pointer
                       log("Executing environment");
                       env_val =
-                          futures::executor::block_on(async move { axiom::eval(parsed_env).await });
+                          futures::executor::block_on(async move { axiom::eval(env_val).await });
                       log("Formatting result");
                       let result =
                           serialize::auto_format(env_val.stack.iter().emit().as_str(), 20, 80);
@@ -7223,8 +7189,45 @@ rust project or some other language through FFI.
       }
 
       #[no_mangle]
-      pub extern "C" fn Java_org_skyrod_subverse_MainActivity_kcatsNew() -> *mut Environment {
-          Box::into_raw(Box::new(Environment::default()))
+      pub extern "system" fn Java_org_skyrod_subverse_MainActivity_kcatsNew<'local>(
+          mut jnienv: JNIEnv<'local>,
+          _class: JClass<'local>,
+          cachepath: JString,
+          dbfile: JString,
+      ) -> *mut Environment {
+          //panic!("oh noes");
+          log("creating new kcats env");
+          let cacheloc: String = jnienv
+              .get_string(&cachepath)
+              .expect("Couldn't get java string!")
+              .into();
+          log("creating new cache");
+          let cache = cache::Cache::new(PathBuf::from(cacheloc)).expect("Valid cache location");
+          let dbloc: String = jnienv
+              .get_string(&dbfile)
+              .expect("Couldn't get java string!")
+              .into();
+          log("setting platform config");
+
+          let result = std::panic::catch_unwind(|| {
+              // Your potentially panicking code here
+
+              PlatformConfig::init(PathBuf::from(dbloc), cache).expect("Failed platform init");
+              Box::into_raw(Box::new(Environment::default()))
+          });
+
+          match result {
+              Ok(value) => return value,
+              Err(e) => {
+                  if let Some(s) = e.downcast_ref::<String>() {
+                      log(format!("Panic occurred: {}", s).as_str());
+                  } else if let Some(s) = e.downcast_ref::<&str>() {
+                      log(format!("Panic occurred: {}", s).as_str());
+                  }
+                  // Handle the panic
+              }
+          }
+          panic!("uh oh");
       }
 
       #[no_mangle]
@@ -7238,15 +7241,60 @@ rust project or some other language through FFI.
       }
   }
 
-  pub mod default {
-      use crate::types::container::environment as env;
+  pub mod config {
+      use crate::types::container::error::Error;
+      use crate::types::Item;
       use cache::cache;
       use directories::ProjectDirs;
       use std::path::Path;
 
+      use std::path::PathBuf;
+      use std::sync::Arc;
+
+      use lazy_static::lazy_static;
+      use std::sync::RwLock;
+
+      lazy_static! {
+          pub static ref PLATFORM_CONFIG: RwLock<Option<PlatformConfig>> = {
+              //println!("Creating PLATFORM_CONFIG at {}:{}", file!(), line!());
+              RwLock::new(None)
+          };
+      }
+
+      /// A configuration struct for the platform we're running on,
+      /// specifies where some filesystem resources are located. On some
+      /// platforms (like android) we can't guess and will only know at
+      /// runtime.
+      #[derive(Clone, Debug)]
+      pub struct PlatformConfig {
+          pub database: Option<Arc<PathBuf>>,
+          pub cache: Arc<cache::Cache>,
+      }
+
+      impl PlatformConfig {
+          pub fn init(database: PathBuf, cache: cache::Cache) -> Result<(), Error> {
+              //println!("Initializing with {:?} and {:?}", database, cache);
+              let mut config = PLATFORM_CONFIG.write().unwrap();
+              ,*config = Some(PlatformConfig {
+                  database: Some(Arc::new(database)),
+                  cache: Arc::new(cache),
+              });
+              Ok(())
+          }
+
+          pub fn get() -> Result<PlatformConfig, Error> {
+              let config = PLATFORM_CONFIG.read().unwrap();
+              //println!("Getting platform config: {:?}", config);
+              config
+                  .as_ref()
+                  .ok_or(Error::expected("initialization", None::<Item>))
+                  .map(|c| c.clone())
+          }
+      }
       /// If we call this function it's because kcats is running as a binary
       /// and we can figure out storage locations without outside input.
       pub fn configure_platform() {
+          //println!("Configure platform");
           let project_dirs = ProjectDirs::from("org", "skyrod", "kcats").unwrap();
           let project_dir = project_dirs.data_dir();
           std::fs::create_dir_all(project_dir).unwrap();
@@ -7256,7 +7304,7 @@ rust project or some other language through FFI.
               .map(|proj_dirs| proj_dirs.data_dir().join("cache"))
               .unwrap_or_else(|| Path::new(".").join("cache"));
 
-          env::PlatformConfig::init(db_file, cache::Cache::new(cache_dir).unwrap()).unwrap();
+          PlatformConfig::init(db_file, cache::Cache::new(cache_dir).unwrap()).unwrap();
       }
   }
 
@@ -7543,20 +7591,15 @@ interpreter process, and prints output.
 We'll also define how to run unit tests.
 #+begin_src rust :tangle src/main.rs :mkdirp yes
   //! The main kcats module, that executes the kcats interpreter. See [main]
-  mod axiom;
-  mod crypto;
-  mod serialize;
-  mod traits;
-  mod types;
   //mod default;
 
-  use serialize::Emit;
+  use kcats::axiom;
+  use kcats::config::configure_platform;
+  use kcats::serialize::{self, Emit};
+  pub use kcats::traits::*;
+  use kcats::types::container::environment::Environment;
+  use kcats::types::container::error::Error;
   use std::io::{self, BufRead, Read, Write};
-
-  use kcats::default::configure_platform;
-
-  pub use traits::*;
-  use types::container::environment::Environment;
 
   fn print_result(env: Environment) {
       if env.program.is_empty() {
@@ -7582,6 +7625,18 @@ We'll also define how to run unit tests.
       buf
   }
 
+  /// Evaluates the program in the context of the env, and handles any
+  /// unhandled errors. Good for interactive programming.
+  async fn repl_eval(mut env: Environment, mut program: String) -> Result<Environment, Error> {
+      // to ensure errors are handled by the repl- so that the
+      // user can continue with more input.
+      program.push_str(" handle");
+
+      match serialize::parse_input(&mut env, program) {
+          Ok(_) => Ok(axiom::eval(env).await),
+          Err(e) => Err(e),
+      }
+  }
   // A function that takes a handle to stdin. It reads a length from
   // stdin, then reads that many bytes and returns a string.
   async fn read_input() -> Option<String> {
@@ -7631,23 +7686,9 @@ We'll also define how to run unit tests.
       let mut env = Environment::default();
 
       loop {
-          if let Some(mut program) = read_input().await {
-              // to ensure errors are handled by the repl- so that the
-              // user can continue with more input.
-              program.push_str(" handle");
-              match serialize::parse_input(env, program) {
-                  Ok(parsed_env) => {
-                      env = axiom::eval(parsed_env).await;
-                      print_with_length(&env).await;
-                  }
-                  Err(e) => {
-                      println!("Error: {:?}", e);
-                      break;
-                  }
-              }
-          } else {
-              //println!("Blank input received, exiting");
-              continue;
+          if let Some(program) = read_input().await {
+              env = repl_eval(env, program).await.unwrap();
+              print_with_length(&env).await;
           }
       }
   }
@@ -7669,23 +7710,15 @@ We'll also define how to run unit tests.
               continue;
           }
 
-          // Parse and evaluate the input, then print the result
-          match serialize::parse_input(env, line) {
-              Ok(parsed_env) => {
-                  env = axiom::eval(parsed_env).await;
-                  print(&env).await;
-              }
-              Err(e) => {
-                  println!("Error: {:?}", e);
-                  break;
-              }
-          }
+          env = repl_eval(env, line).await.unwrap();
+          print(&env).await;
       }
   }
 
   async fn read_eval_print(program: String) {
-      match serialize::parse_input(Environment::default(), program) {
-          Ok(env) => {
+      let mut env = Environment::default();
+      match serialize::parse_input(&mut env, program) {
+          Ok(_) => {
               print_result(axiom::eval(env).await);
           }
           Err(e) => {
@@ -8850,17 +8883,17 @@ Implement the =handoff= type
 ***** Database
 #+begin_src rust :tangle src/types/container/pipe/db.rs :mkdirp yes
   use crate::axiom;
+  use crate::config;
   use crate::list;
   use crate::traits::*;
-  use crate::types::container::{
-      self as coll, associative as assoc, environment as env, error::Error,
-  };
+  use crate::types::container::{self as coll, associative as assoc, error::Error};
   use crate::types::number::Number;
   use crate::types::{self, Item};
 
   use rusqlite::types::{ToSql, ToSqlOutput, Value, ValueRef};
   use rusqlite::{params, Connection, Error as DBError};
   use std::path::PathBuf;
+
   use uuid;
 
   pub struct Db {
@@ -8869,7 +8902,7 @@ Implement the =handoff= type
 
   impl Db {
       pub fn new() -> Result<Self, DBError> {
-          let db_file = env::PlatformConfig::get()
+          let db_file = config::PlatformConfig::get()
               .unwrap()
               .database
               .ok_or(DBError::InvalidPath(PathBuf::from("".to_string())))?;
