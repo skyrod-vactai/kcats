@@ -1,5 +1,6 @@
 use cache::cache;
 use directories::ProjectDirs;
+use prost_build;
 use std::error::Error;
 use std::fs::{self};
 use std::path::Path;
@@ -22,6 +23,11 @@ impl std::error::Error for MyError {}
 
 fn main() -> Result<(), Box<dyn Error>> {
     //println!("cargo:rustc-link-lib=sqlite3");
+    println!("cargo:rerun-if-changed=proto/kcats.proto");
+
+    // build the protocol buffers
+    prost_build::compile_protos(&["proto/kcats.proto"], &["proto"]).unwrap();
+
     let project_dirs = ProjectDirs::from("org", "skyrod", "kcats").unwrap();
     let project_dir = project_dirs.data_dir();
     std::fs::create_dir_all(project_dir).unwrap();

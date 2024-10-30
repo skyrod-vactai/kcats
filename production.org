@@ -135,6 +135,8 @@ the location where you installed the kcats binary.
   # android logging
   libc = "0.2"
   jni = "0.21"
+  # serialization between native lib and mobile app
+  prost = "0.13"
 
   [dependencies.uuid]
   version = "1"
@@ -153,6 +155,7 @@ the location where you installed the kcats binary.
   sha2 = "0"
   base64 = "0.22"
   cache = {path = "./cache"}
+  prost-build = "0.13"
 
   [features]
   database = ["rusqlite"]
@@ -1034,6 +1037,8 @@ internally, to keep track of things like the stack, program, lists etc.
 
   pub type List = Arc<ListContent>;
   pub type Set = Arc<Setty<assoc::KeyItem>>;
+
+  impl IntoList for Set {}
 
   impl Derive<HashSet<assoc::KeyItem>> for Set {
       fn derive(h: HashSet<assoc::KeyItem>) -> Set {
@@ -7305,6 +7310,158 @@ rust project or some other language through FFI.
               .unwrap_or_else(|| Path::new(".").join("cache"));
 
           PlatformConfig::init(db_file, cache::Cache::new(cache_dir).unwrap()).unwrap();
+      }
+  }
+
+  /// Conversions to and from wire format using protocol buffers. See
+  /// the kcats.proto file.
+  pub mod proto {
+      use std::collections::HashSet;
+      use std::sync::Arc;
+
+      use crate::list;
+      use crate::traits::*;
+      use crate::types;
+      use crate::types::container as cont;
+      use crate::types::container::associative as assoc;
+      use crate::types::container::dictionary as dict;
+      use crate::types::container::error;
+      use crate::types::number;
+
+      include!(concat!(env!("OUT_DIR"), "/kcats.rs"));
+
+      impl Derive<Word> for types::Word {
+          fn derive(w: Word) -> types::Word {
+              w.value.fit()
+          }
+      }
+
+      impl Derive<types::Word> for Word {
+          fn derive(w: types::Word) -> Word {
+              Word { value: w.fit() }
+          }
+      }
+
+      impl Derive<Char> for types::Char {
+          fn derive(w: Char) -> types::Char {
+              w.value.chars().nth(0).unwrap()
+          }
+      }
+
+      impl Derive<types::Char> for Char {
+          fn derive(w: types::Char) -> Char {
+              Char {
+                  value: String::from(w).into(),
+              }
+          }
+      }
+
+      impl TryDerive<List> for cont::List {
+          type Error = error::Error;
+          fn try_derive(l: List) -> Result<Self, Self::Error> {
+              Ok(Arc::new(
+                  l.items
+                      .into_iter()
+                      .map(types::Item::try_derive)
+                      .collect::<Result<cont::ListContent, error::Error>>()?,
+              ))
+          }
+      }
+
+      impl TryDerive<Item> for types::Item {
+          type Error = error::Error;
+          fn try_derive(i: Item) -> Result<types::Item, error::Error> {
+              match i.value.unwrap() {
+                  item::Value::Integer(i) => Ok(types::Item::Number(number::Number::Int(i))),
+                  item::Value::FloatValue(f) => Ok(types::Item::Number(number::Number::Float(f))),
+                  item::Value::Word(w) => Ok(types::Item::Word(types::Word::derive(w))),
+                  item::Value::Char(c) => Ok(types::Item::Char(types::Char::derive(c))),
+                  item::Value::StringValue(s) => Ok(types::Item::derive(s)),
+                  item::Value::BytesValue(bs) => Ok(types::Item::derive(bs)),
+                  item::Value::List(l) => cont::List::try_derive(l).map(types::Item::derive),
+                  item::Value::Set(l) => Ok(types::Item::derive(Arc::new(
+                      l.items
+                          .into_iter()
+                          .map(|li| types::Item::try_derive(li).and_then(assoc::KeyItem::try_derive))
+                          .collect::<Result<HashSet<assoc::KeyItem>, error::Error>>()?,
+                  ))),
+                  item::Value::Association(a) => a
+                      .entries
+                      .into_iter()
+                      .map(assoc::Entry::try_derive)
+                      .my_collect::<Result<assoc::Association, error::Error>>()
+                      .map(types::Item::derive),
+                  item::Value::DictEntry(de) => Ok(types::Item::derive(dict::Entry {
+                      examples: de.examples.map(cont::List::try_derive).transpose()?,
+                      spec: de.spec.map(dict::Spec::try_derive).transpose()?,
+                      definition: de
+                          .definition
+                          .map(dict::Definition::try_derive)
+                          .transpose()?
+                          .ok_or_else(|| error::Error::expected("definition", None::<types::Item>)),
+                      namespace: de
+                          .namespace
+                          .map(dict::Namespace::try_derive)
+                          .transpose()?
+                          .ok_or_else(|| error::Error::expected("namespace", None::<types::Item>)),
+                  })),
+              }
+          }
+      }
+
+      impl TryDerive<Definition> for dict::Definition {
+          type Error = error::Error;
+          fn try_derive(d: Definition) -> Result<Self, Self::Error> {
+              match d
+                  .value
+                  .ok_or_else(|| error::Error::expected("definition", None::<types::Item>))?
+              {
+                  // We can't create Axiom values, so we'll just make a dummy definition.
+                  definition::Value::Axiom(_) => Ok(dict::Definition::Derived(list!("builtin"))),
+                  definition::Value::Derived(dd) => {
+                      Ok(dict::Definition::Derived(cont::List::try_derive(dd)?))
+                  }
+              }
+          }
+      }
+
+      impl TryDerive<Namespace> for dict::Namespace {
+          type Error = error::Error;
+          fn try_derive(ns: Namespace) -> Result<Self, Self::Error> {
+              ns.value
+                  .ok_or_else(|| error::Error::expected("namespace", None::<types::Item>))
+                  .map(dict::bytes_to_ns)
+          }
+      }
+
+      impl TryDerive<Item> for assoc::KeyItem {
+          type Error = error::Error;
+          fn try_derive(value: Item) -> Result<Self, Self::Error> {
+              types::Item::try_derive(value).and_then(assoc::KeyItem::try_derive)
+          }
+      }
+
+      impl TryDerive<MapEntry> for assoc::Entry {
+          type Error = error::Error;
+          fn try_derive(me: MapEntry) -> Result<Self, Self::Error> {
+              Ok((
+                  me.key
+                      .map(assoc::KeyItem::try_derive)
+                      .transpose()?
+                      .ok_or_else(|| error::Error::expected("definition", None::<types::Item>))?,
+                  me.value
+                      .map(types::Item::try_derive)
+                      .transpose()?
+                      .ok_or_else(|| error::Error::expected("definition", None::<types::Item>))?,
+              ))
+          }
+      }
+
+      impl From<assoc::KeyItem> for Item {
+          fn from(ki: assoc::KeyItem) -> Self {
+              let i = types::Item::derive(ki);
+              i.fit()
+          }
       }
   }
 
