@@ -4860,6 +4860,7 @@ example, in order to read/write to/from disk).
   //! one custom tag is used for encoding byte arrays, but this is
   //! subject to change.
   use crate::traits::*;
+  use crate::types::container::Mutey;
   use crate::types::container::{
       self as coll, associative as assoc, environment::Environment, error::Error,
   };
@@ -4868,6 +4869,7 @@ example, in order to read/write to/from disk).
 
   use base64::prelude::BASE64_URL_SAFE_NO_PAD;
   use base64::Engine;
+  use edn_format::ParserOptions;
 
   use std::collections::VecDeque;
   use std::fmt;
@@ -4986,6 +4988,51 @@ example, in order to read/write to/from disk).
               })
               .collect::<Result<Vec<Item>, Error>>()?,
       ))
+  }
+
+  /// A streaming parser function that takes the state of the parsing
+  /// off the stack and uses the edn-format crate to do the heavy
+  /// lifting. Reads all the remaining objects and returns a list of
+  /// them plus whatever string is leftover (empty string if nothing
+  /// left)
+  /// Note: This implementation is primarily designed for parsing
+  /// complete EDN data structures (lists, vectors, maps, etc).
+  /// When parsing raw tokens (symbols, numbers, etc) at chunk
+  /// boundaries, it may occasionally fail to properly join tokens
+  /// that span multiple chunks.
+  pub fn read_chunk(env: &mut Environment) -> Result<(), Error> {
+      let state: String = env.pop().try_fit()?;
+      let mut obj_buffer: coll::List = env.pop().try_fit()?;
+      let mut parser = edn_format::Parser {
+          opts: ParserOptions::default(),
+          iter: state.chars().peekable(),
+      };
+
+      // Collect items until we hit the end or can't parse anymore
+      let forms = obj_buffer.mutate();
+
+      loop {
+          // Save iterator state before attempting parse
+          let before_parse = parser.iter.clone();
+
+          match parser.next() {
+              Some(Ok(v)) => {
+                  forms.push_back(to_item(&v)?);
+              }
+              Some(Err(edn_format::ParserError::UnexpectedEndOfInput)) => {
+                  // Restore iterator to state before failed parse
+                  parser.iter = before_parse;
+                  break;
+              }
+              Some(Err(e)) => return Err(Error::from(e)),
+              None => break,
+          }
+      }
+      env.pop_prog();
+      let remaining: String = parser.iter.collect();
+      env.push(Item::derive(obj_buffer));
+      env.push(Item::derive(remaining));
+      Ok(())
   }
 
   pub trait Emit {
@@ -5592,6 +5639,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ),
           ("range", Box::leak(Box::new(f_stack3(range)))),
           ("read", Box::leak(Box::new(f_stack1(serialize::parse)))),
+          ("read-chunk", Box::leak(Box::new(f_result(serialize::read_chunk)))),
           (
               "receiver",
               Box::leak(Box::new(f_stack1(crate::types::container::pipe::channel::receiver))),
