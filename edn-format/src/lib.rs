@@ -1478,8 +1478,8 @@ pub fn emit_str(value: &Value) -> String {
 /// Parser which can yield multiple forms from a single iterator of
 /// chars
 pub struct Parser<Iter: Iterator<Item = char>> {
-    opts: ParserOptions,
-    iter: Peekable<Iter>,
+    pub opts: ParserOptions,
+    pub iter: Peekable<Iter>,
 }
 
 impl<'a> Parser<Chars<'a>> {
