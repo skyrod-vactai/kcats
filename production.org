@@ -5000,7 +5000,7 @@ example, in order to read/write to/from disk).
   /// When parsing raw tokens (symbols, numbers, etc) at chunk
   /// boundaries, it may occasionally fail to properly join tokens
   /// that span multiple chunks.
-  pub fn read_chunk(env: &mut Environment) -> Result<(), Error> {
+  pub fn parse_edn(env: &mut Environment) -> Result<(), Error> {
       let state: String = env.pop().try_fit()?;
       let mut obj_buffer: coll::List = env.pop().try_fit()?;
       let mut parser = edn_format::Parser {
@@ -5030,6 +5030,36 @@ example, in order to read/write to/from disk).
       }
       env.pop_prog();
       let remaining: String = parser.iter.collect();
+      env.push(Item::derive(obj_buffer));
+      env.push(Item::derive(remaining));
+      Ok(())
+  }
+
+  /// A function to use with a streaming parser, converting from byte
+  /// arrays to strings. Returns whatever couldn't be parsed from the
+  /// byte array, in the event a utf8 character is incomplete.
+  fn split_at_utf8_boundary(bytes: &[u8]) -> (String, Vec<u8>) {
+      match std::str::from_utf8(bytes) {
+          Ok(s) => (s.to_string(), Vec::new()),
+          Err(e) => {
+              // e.valid_up_to() tells us the position where valid UTF-8 ends
+              let valid_str = String::from_utf8_lossy(&bytes[..e.valid_up_to()]).into_owned();
+              let remainder = bytes[e.valid_up_to()..].to_vec();
+              (valid_str, remainder)
+          }
+      }
+  }
+
+  pub fn parse_utf8(env: &mut Environment) -> Result<(), Error> {
+      let state: Bytes = env.pop().try_fit()?;
+      let buffer = env.pop();
+      let mut obj_buffer: String = Default::default();
+      if !buffer.is_empty() {
+          obj_buffer = buffer.try_fit()?;
+      }
+      let (parsed, remaining) = split_at_utf8_boundary(&state);
+      env.pop_prog();
+      obj_buffer.push_str(parsed.as_str());
       env.push(Item::derive(obj_buffer));
       env.push(Item::derive(remaining));
       Ok(())
@@ -5630,6 +5660,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("odd?", Box::leak(Box::new(f_stack1(is_odd)))),
           ("or", Box::leak(Box::new(f_stack2(or)))),
           ("pack", Box::leak(Box::new(f_result(pack)))),
+          ("parse-edn", Box::leak(Box::new(f_result(serialize::parse_edn)))),
+          ("parse-utf8", Box::leak(Box::new(f_result(serialize::parse_utf8)))),
           ("pop", Box::leak(Box::new(pop))),
           ("put", Box::leak(Box::new(put))),
           ("pipe?", Box::leak(Box::new(f_stack1(is_pipe)))),
@@ -5639,7 +5671,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ),
           ("range", Box::leak(Box::new(f_stack3(range)))),
           ("read", Box::leak(Box::new(f_stack1(serialize::parse)))),
-          ("read-chunk", Box::leak(Box::new(f_result(serialize::read_chunk)))),
           (
               "receiver",
               Box::leak(Box::new(f_stack1(crate::types::container::pipe::channel::receiver))),
@@ -7568,6 +7599,8 @@ rust project or some other language through FFI.
       #[test_case("pad")]
       #[test_case("pair?" ; "is_pair")]
       #[test_case("pairwise")]
+      #[test_case("parse-edn")]
+      #[test_case("parse-utf8")]
       #[test_case("partition")]
       #[test_case("pipe?" ; "is_pipe")]
       #[test_case("put")]
@@ -7624,7 +7657,7 @@ rust project or some other language through FFI.
       #[test_case("zero?" ; "is_zero")]
       #[test_case("zip")]
       fn test_lexicon(word: &str) {
-          crate::default::configure_platform();
+          crate::config::configure_platform();
           let e = Environment::default();
 
           let r = test_word(e.clone(), word.fit());
@@ -9635,6 +9668,172 @@ Then the resplitting generator becomes:
   any). If non-empty, join with previous byte buffer state
 - run the splitter function on the byte buffer, join with previous
   object buffer state, emit one object
+
+  #+begin_src kcats
+    ["[foo] [bar] [ba" "z] [quux" "] [[this] " "[that]]" "[foo" "]"] [take] [] []
+    ;; if there is already a parsed object, emit it and don't pull from the parent yet
+    [[swap not] ;; nothing in output
+     [ [generate] divedown join read-chunk]
+     while
+     [take] dive] collect
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  [[foo] [bar] [baz] [quux] [[this] [that]]] [[swap not]
+                                              [[generate] divedown join read-chunk] when [take] dive]
+  "[foo" [] [take] ["]"]
+  #+end_src
+
+#+begin_src kcats
+  ["[foo] [bar] [ba" "z] [quux" "] [[this] " "[that]]" "[foo" "]"] [take] [] []
+  ;; if there is already a parsed object, emit it and don't pull from the parent yet
+  [[[swap not]
+    [[generate] divedown ]
+    [[]] if] ;; chunk|unprocessed|emittables 
+   [[[] [swap not]] [execute] every?] ;; parent generated something and nothing in output yet
+   [join  read-chunk ] 
+   prime ;dump 
+   drop 
+   [take] dive] collect
+  #+end_src
+
+#+begin_src kcats
+
+  ["[foo]\n [bar] [ba" "z] [quux" "] [[this] " "[that]]" "[other" "]"] [take] [] []
+
+  [[swap not] ;; if there's nothing in the output, 
+   [[[generate] divedown ] ;;generate parent
+    [[[] [swap not]] [execute] every?] ;; as long as the parent generates and there's no output
+    [join read-chunk] prime
+    ;; we may have bailed out of the loop either because the parent is done or there's output, see which
+    [] [join read-chunk] when
+   ] ;; generate until either we have output or the parent returned nothing
+   ;; otherwise keep generating 
+   when
+   [take] dive ] collect
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[foo] [bar] [baz] [quux] [[this] [that]]
+ [other]]
+[[swap not]
+ [[[generate] divedown]
+  [[[] [swap not]]
+   [execute] every?]
+  [join read-chunk]
+  prime [] [join read-chunk]
+  when]
+ when [take] dive]
+[] "" [] [take] []
+#+end_src
+
+  Now let's demonstrate with reading UTF8 bytes
+
+  #+begin_src kcats
+    ["[foo] [bar] [ba" "z] [quux" "] [[this] " "[that]]" "[foo" "]"] [take] [] []
+    ;; if there is already a parsed object, emit it and don't pull from the parent yet
+    [[swap not]
+     [ [generate] divedown join read-chunk]
+     when
+     [take] dive] collect
+  #+end_src
+
+  #+begin_src kcats
+    [[104 101 108 108 111]              ;; "hello" (all ASCII)
+     [228 189 160 229 165 189]          ;; "你好" (two complete Chinese chars)
+     [104 105 226]                      ;; "hi" + start of "€"
+     [130 172]                          ;; completion of "€"
+     [240 159 145]                      ;; start of "👑"
+     [145]                              ;; completion of "👑"
+     [97 98 99 240]                     ;; "abc" + start of "🌈"
+     [159 140 136]]                     ;; completion of "🌈"
+
+    [#b64 "" swap [put] step] map
+
+    [take] [string-chunk]
+    [[] []
+
+     [[swap not] ;; if there's nothing in the output, 
+      [[[generate] divedown] ;;generate parent
+       [[[] [swap not]] [execute] every?] ;; as long as the parent generates and there's no output
+       [join **1] prime
+       ;; we may have bailed out of the loop either because the parent is done or there's output, see which
+       [] [join **1] when
+      ] ;; generate until either we have output or the parent returned nothing
+      ;; otherwise keep generating 
+      when
+      [take] dive]] pack execute "" into
+
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  [[actual #b64 "aGVsbG8"]
+   [asked [char]]
+   [handled []]
+   [reason "type mismatch"]
+   [type error]
+   [unwound [put [generate] dip swap clone [put [generate] dip swap clone] loop drop]]]
+  "" [[swap not]
+      [[[generate] divedown]
+       [[[] [swap not]]
+        [execute] every?]
+       [join string-chunk]
+       prime [] [join string-chunk]
+       when]
+      when [take] dive]
+  [take] [#b64 "5L2g5aW9" #b64 "aGni" #b64 "gqw" #b64 "8J-R" #b64 "kQ" #b64 "YWJj8A"
+          #b64 "n4yI"]
+  #+end_src
+
+  #+begin_src kcats
+  #b64 "" 123 put string
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  "{"
+  #+end_src
+
+  #+begin_src kcats
+    "" [104 101 108 108 111] #b64 "" swap [put] step; parse-utf8
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  "" #b64 "aGni" parse-utf8
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  #b64 "4g" "hi"
+  #+end_src
+
+  #+begin_src kcats
+[[["" #b64 "aGni" parse-utf8] ["hi" #b64 "4g"]]
+                        [["" #b64 "aGVsbG8" parse-utf8] ["hello" #b64 ""]]]
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+    [parse-utf8 [[spec [[[bytes input] [sized current-output]]
+                      [[bytes remaining-input] [string updated-output-sequence]]]]
+               [examples [[["" #b64 "aGni" parse-utf8] ["hi" #b64 "4g"]]
+                          [["" #b64 "aGVsbG8" parse-utf8] ["hello" #b64 ""]]]]]]
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  [parse-utf8 [[spec [[[bytes input]
+                       [sized current-output]]
+                      [[bytes remaining-input]
+                       [string updated-output-sequence]]]]
+               [examples [[["" #b64 "aGni" parse-utf8] ["hi" #b64 "4g"]]
+                          [["" #b64 "aGVsbG8" parse-utf8] ["hello" #b64 ""]]]]]]
+  #+end_src
+
 *** DONE Time pipe
 Each take from the pipe return the current unix time in ms.  Should be
 a "singleton" - probably using Box::leak, so that we can insert a copy
