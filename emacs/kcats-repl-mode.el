@@ -3,7 +3,7 @@
 (defun kcats-send (proc code)
   "Send the CODE to the kcats interpreter and return the result."
   (message "Sending: %s" code)
-  (let* ((code-len (+ (length code) 1))
+  (let* ((code-len (+ (string-bytes code) 1))
          (code-str (format "%d\n%s" code-len code)))
     (with-temp-buffer
       (insert code-str)
