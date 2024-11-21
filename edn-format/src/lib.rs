@@ -697,6 +697,7 @@ fn interpret_atom(atom: &[char]) -> Result<Value, ParserError> {
     match atom {
         &[] => Err(ParserError::UnexpectedEndOfInput),
         &['n', 'i', 'l'] => Ok(Value::Nil),
+        &['🔳'] => Ok(Value::Vector(Vec::new())),
         &['t', 'r', 'u', 'e'] => Ok(Value::Boolean(true)),
         &['f', 'a', 'l', 's', 'e'] => Ok(Value::Boolean(false)),
         &[':'] => Err(ParserError::InvalidKeyword),
