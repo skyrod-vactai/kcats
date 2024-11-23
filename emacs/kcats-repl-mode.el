@@ -47,3 +47,6 @@
   (setq comint-input-sender 'kcats-send)
   (set-syntax-table kcats-mode-syntax-table)
   (setq font-lock-defaults '(kcats-font-lock-keywords)))
+
+(define-abbrev-table 'kcats-repl-mode-abbrev-table kcats-abbrevs)
+(add-hook 'kcats-repl-mode-hook 'abbrev-mode)
