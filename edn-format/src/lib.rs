@@ -788,6 +788,12 @@ fn interpret_atom(atom: &[char]) -> Result<Value, ParserError> {
                                         }
                                     })?,
                                 ))
+                            }
+                            // A keycap emoji that looks like a number
+                            else if name[1..].contains(&'\u{FE0F}')
+                                && name[1..].contains(&'\u{20E3}')
+                            {
+                                Ok(Value::Symbol(Symbol::from_name(&char_slice_to_str(name))))
                             } else {
                                 Ok(Value::Integer(
                                     str::parse::<i64>(&char_slice_to_str(chars)).map_err(
