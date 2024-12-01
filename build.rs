@@ -21,41 +21,37 @@ impl std::fmt::Display for MyError {
 impl std::error::Error for MyError {}
 
 fn main() -> Result<(), Box<dyn Error>> {
-    //copy source files to the interpreter's cache, and hardcode the hashes
-    if let Some(proj_dirs) = ProjectDirs::from("org", "skyrod", "kcats") {
-        let data_dir = proj_dirs.data_dir();
-        fs::create_dir_all(data_dir).expect("Failed to create data directory");
+    //println!("cargo:rustc-link-lib=sqlite3");
+    let project_dirs = ProjectDirs::from("org", "skyrod", "kcats").unwrap();
+    let project_dir = project_dirs.data_dir();
+    std::fs::create_dir_all(project_dir).unwrap();
+    let cache_dir = ProjectDirs::from("org", "skyrod", "kcats")
+        .map(|proj_dirs| proj_dirs.data_dir().join("cache"))
+        .unwrap_or_else(|| Path::new(".").join("cache"));
 
-        let std_path = data_dir.join("cache");
-        fs::create_dir_all(&std_path).expect("Failed to create cache directory");
-        // Specify the path to your project's stdlib folder
-        let src = "src/kcats/stdlib";
-        let src_stdlib_path = Path::new(src);
+    let cache = cache::Cache::new(cache_dir)?;
+    let src = "src/kcats/stdlib";
+    let src_stdlib_path = Path::new(src);
 
-        // Iterate over the contents of the source stdlib directory
-        if src_stdlib_path.exists() && src_stdlib_path.is_dir() {
-            let entries = fs::read_dir(src_stdlib_path)?;
+    // Iterate over the contents of the source stdlib directory
+    if src_stdlib_path.exists() && src_stdlib_path.is_dir() {
+        let entries = fs::read_dir(src_stdlib_path)?;
 
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() && path.file_name().is_some() {
-                    let module_name = <PathBuf as AsRef<Path>>::as_ref(&path)
-                        .file_stem()
-                        .unwrap()
-                        .to_str()
-                        .unwrap();
-                    cache::put_from_path(&path, Some(module_name.to_string()))?;
-                }
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() && path.file_name().is_some() {
+                let module_name = <PathBuf as AsRef<Path>>::as_ref(&path)
+                    .file_stem()
+                    .unwrap()
+                    .to_str()
+                    .unwrap();
+                cache.put_from_path(&path, Some(module_name.to_string()))?;
             }
-            Ok(())
-        } else {
-            Err(Box::new(MyError::CustomError(
-                "Cache directory does not exist or is not a directory".to_string(),
-            )))
         }
+        Ok(())
     } else {
         Err(Box::new(MyError::CustomError(
-            "Can't find project data dir".to_string(),
+            "Cache directory does not exist or is not a directory".to_string(),
         )))
     }
 }

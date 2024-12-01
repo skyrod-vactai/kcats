@@ -21,7 +21,8 @@
 Built in Rust - it's fast and modern, its memory allocation model
 seems well suited to kcats.
 ** Status
-Unstable
+Unstable - code written in kcats now will likely require modification to work
+with future versions of the interpreter.
 ** Building
 *** Dependencies
 - rustc
@@ -122,13 +123,18 @@ the location where you installed the kcats binary.
   ## Figure out best place to store the db and stdlib files
   directories = "5"
 
-  rusqlite = { version = "0", optional = true, features = ["uuid"] }
+  rusqlite = { version = "0", optional = true, features = ["uuid", "bundled"] }
 
   # memoized functions
   once_cell = "1"
 
   # The blob cache
   cache = {path = "./cache"}
+
+  # Android
+  # android logging
+  libc = "0.2"
+  jni = "0.21"
 
   [dependencies.uuid]
   version = "1"
@@ -150,6 +156,15 @@ the location where you installed the kcats binary.
 
   [features]
   database = ["rusqlite"]
+
+  [lib]
+  name = "kcats"
+  crate-type = ["cdylib", "rlib"]
+  path = "src/lib.rs"
+
+  [[bin]]
+  name = "kcats"
+  path = "src/main.rs"
 #+END_SRC
 
 *** Interal traits
@@ -471,22 +486,27 @@ internally, to keep track of things like the stack, program, lists etc.
       fn try_derive(i: Item) -> Result<Self, Self::Error> {
           match i {
               Item::Word(i) => Ok(i),
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(s))) => Ok(s.fit()),
               i => {
-                  let i2 = i.clone();
-                  let l = coll::List::try_derive(i);
-                  match l {
-                      Ok(mut l) => {
-                          if l.len() == 1 {
-                              let lm = l.mutate();
+                  let s = coll::Sized::try_derive(i)?;
+                  match s {
+                      coll::Sized::String(s) => Ok(s.fit()),
+                      s => {
+                          let i2 = s.clone();
+                          let l = coll::List::try_derive(s);
+                          match l {
+                              Ok(mut l) => {
+                                  if l.len() == 1 {
+                                      let lm = l.mutate();
 
-                              let i = lm.pop_front().unwrap();
-                              i.try_fit()
-                          } else {
-                              Err(Error::expected("word", l))
+                                      let i = lm.pop_front().unwrap();
+                                      i.try_fit()
+                                  } else {
+                                      Err(Error::expected("word", l))
+                                  }
+                              }
+                              Err(_) => Err(Error::expected("word", i2)),
                           }
                       }
-                      Err(_) => Err(Error::expected("word", i2)),
                   }
               }
           }
@@ -2265,6 +2285,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn try_derive(k: KeyItem) -> Result<Self, Self::Error> {
           match k {
               KeyItem::Word(w) => Ok(w),
+              KeyItem::String(s) => Ok(s.fit()),
               i => Err(Error::expected("word", i)),
           }
       }
@@ -3144,7 +3165,6 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::types::container::associative::Convert;
   use crate::types::container::{self as coll, Count, Mutey};
   use crate::types::{self, Bytes, Error, Item};
-  use cache::cache;
   use core::fmt;
   use internment::Intern;
   use std::collections::HashMap;
@@ -3364,9 +3384,6 @@ internally, to keep track of things like the stack, program, lists etc.
           match i {
               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(b))) => Ok(bytes_to_ns(b)),
               Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(b))) => Ok(bytes_to_ns(b)),
-              Item::Word(w) => Ok(cache::Key::Alias(String::derive(w.clone()))
-                  .deref()
-                  .map(bytes_to_ns)?),
 
               i => {
                   let s = coll::Sized::try_derive(i)?;
@@ -4445,7 +4462,6 @@ crate so we can use it at both build time and runtime.
 #+begin_src rust :tangle cache/src/lib.rs :mkdirp yes
   pub mod cache {
       use base64::URL_SAFE_NO_PAD;
-      use directories::ProjectDirs;
       use io::Error;
       use sha2::Sha256;
       use sha2::{self, Digest};
@@ -4464,98 +4480,83 @@ crate so we can use it at both build time and runtime.
           Alias(String),
       }
 
-      impl Key {
-          fn path(&self) -> Result<PathBuf, Error> {
-              {
-                  if let Some(proj_dirs) = ProjectDirs::from("org", "skyrod", "kcats") {
-                      let data_dir = proj_dirs.data_dir();
+      #[derive(Clone, PartialEq, Debug)]
+      pub struct Cache {
+          path: PathBuf,
+      }
 
-                      let cache_path = data_dir.join("cache");
-
-                      // Look up the file
-                      if cache_path.exists() && cache_path.is_dir() {
-                          let filename = match self {
-                              Key::Hash(hash) => base64::encode_config(hash, base64::URL_SAFE_NO_PAD),
-                              Key::Alias(word) => word.to_string(),
-                          };
-
-                          let file = cache_path.join(filename);
-
-                          Ok(file)
-                      } else {
-                          Err(Error::new(io::ErrorKind::Other, "Cache dir not found"))
-                      }
-                  } else {
-                      Err(Error::new(io::ErrorKind::Other, "Cache data dir not found"))
-                  }
+      impl Cache {
+          pub fn new(path: PathBuf) -> Result<Self, Error> {
+              if path.exists() && path.is_dir() {
+                  fs::create_dir_all(&path)?;
+                  Ok(Cache { path: path })
+              } else {
+                  Err(Error::new(io::ErrorKind::NotFound, "Cache dir not found"))
               }
           }
 
-          pub fn get(&self) -> Result<Bytes, Error> {
-              let mut content = Bytes::new();
-              self.path()
-                  .and_then(|pb| fetch_link(pb.as_path()))
-                  .and_then(|mut f| f.read_to_end(&mut content))?;
+          fn path(&self, key: &Key) -> PathBuf {
+              // Look up the file
 
+              let filename = match key {
+                  Key::Hash(hash) => base64::encode_config(hash, base64::URL_SAFE_NO_PAD),
+                  Key::Alias(word) => word.to_string(),
+              };
+
+              let file = self.path.join(filename);
+
+              file
+          }
+
+          pub fn get(&self, key: &Key) -> Result<Bytes, Error> {
+              let mut content = Bytes::new();
+              fetch_link(self.path(key).as_path()).and_then(|mut f| f.read_to_end(&mut content))?;
               Ok(content)
           }
 
-          pub fn deref(&self) -> Result<Bytes, io::Error> {
-              match self {
+          pub fn deref(&self, key: &Key) -> Result<Bytes, io::Error> {
+              match key {
                   Key::Hash(h) => Ok(h.clone()),
-                  Key::Alias(a) => target(a.clone())
+                  Key::Alias(a) => self
+                      .target(a.clone())
                       .and_then(|t| Ok(base64::decode_config(t, base64::URL_SAFE_NO_PAD).unwrap())),
               }
           }
-      }
 
-      pub fn put(content: &Bytes, alias: Option<String>) -> Result<Bytes, Error> {
-          if let Some(proj_dirs) = ProjectDirs::from("org", "skyrod", "kcats") {
-              let data_dir = proj_dirs.data_dir();
-
-              let cache_path = data_dir.join("cache");
-
-              // Look up the file
-              if cache_path.exists() && cache_path.is_dir() {
-                  let hash = sha2::Sha256::digest(&content);
-                  let hashfilename = base64::encode_config(hash, base64::URL_SAFE_NO_PAD);
-                  let target = cache_path.join(hashfilename.clone());
-                  // only write the file if it doesn't exist
-                  if !target.exists() {
-                      std::fs::write(target.clone(), content)?;
+          fn target(&self, alias: String) -> Result<String, io::Error> {
+              let path = self.path(&Key::Alias(alias));
+              match get_link_type() {
+                  Link::Symlink => fs::read_link(path)
+                      .map(|p| p.file_name().unwrap().to_str().unwrap().to_string()),
+                  Link::Manual => {
+                      let mut link_file = File::open(path)?;
+                      let mut target_path = String::new();
+                      link_file.read_to_string(&mut target_path)?;
+                      Ok(target_path)
                   }
-
-                  // Create the alias if necessary
-                  if let Some(alias) = alias {
-                      let alias_path = cache_path.join(PathBuf::from(alias.to_string()));
-                      create_link(Path::new(&hashfilename), alias_path.as_path())?;
-                  }
-                  Ok(hash.to_vec())
-              } else {
-                  Err(Error::new(io::ErrorKind::Other, "Cache dir not found"))
               }
-          } else {
-              Err(Error::new(io::ErrorKind::Other, "Cache data dir not found"))
           }
-      }
 
-      enum Link {
-          Manual,
-          Symlink,
-      }
-
-      pub fn put_from_path(path: &Path, alias: Option<String>) -> Result<Bytes, Error> {
-          if let Some(proj_dirs) = ProjectDirs::from("org", "skyrod", "kcats") {
-              let data_dir = proj_dirs.data_dir();
-              let cache_path = data_dir.join("cache");
-
-              // Ensure the cache directory exists
-              if !cache_path.exists() {
-                  fs::create_dir_all(&cache_path)?;
+          pub fn put(&self, content: &Bytes, alias: Option<String>) -> Result<Bytes, Error> {
+              let hash = sha2::Sha256::digest(&content);
+              let hashfilename = base64::encode_config(hash, base64::URL_SAFE_NO_PAD);
+              let target = self.path.join(hashfilename.clone());
+              // only write the file if it doesn't exist
+              if !target.exists() {
+                  std::fs::write(target.clone(), content)?;
               }
 
+              // Create the alias if necessary
+              if let Some(alias) = alias {
+                  let alias_path = self.path.join(PathBuf::from(alias.to_string()));
+                  create_link(Path::new(&hashfilename), alias_path.as_path())?;
+              }
+              Ok(hash.to_vec())
+          }
+
+          pub fn put_from_path(&self, path: &Path, alias: Option<String>) -> Result<Bytes, Error> {
               let unique_temp_file = format!("temp_{}", Uuid::new_v4()); // Generate a unique temporary filename
-              let temp_file_path = cache_path.join(unique_temp_file);
+              let temp_file_path = self.path.join(unique_temp_file);
               let file = File::open(path)?;
               let mut reader = BufReader::new(file);
               let mut hasher = Sha256::new();
@@ -4576,31 +4577,35 @@ crate so we can use it at both build time and runtime.
               // Compute the final hash and rename the file according to the hash
               let hash = hasher.finalize();
               let file_name = base64::encode_config(&hash, URL_SAFE_NO_PAD);
-              let final_path = cache_path.join(file_name.clone());
+              let final_path = self.path.join(file_name.clone());
 
               // Move to final destination, overwriting anything there
               fs::rename(temp_file_path.clone(), final_path.clone())?;
               // Create the alias if necessary
 
               if let Some(alias) = alias {
-                  let alias_path = cache_path.join(alias);
+                  let alias_path = self.path.join(alias);
                   let target_path = Path::new(".").join(file_name);
                   create_link(&target_path, &alias_path)?;
               }
               Ok(hash.to_vec())
-          } else {
-              Err(io::Error::new(
-                  io::ErrorKind::NotFound,
-                  "Failed to locate project directory.",
-              ))
           }
+      }
+
+      enum Link {
+          Manual,
+          Symlink,
       }
 
       /// Determines the appropriate link type based on the operating system.
       fn get_link_type() -> Link {
-          if cfg!(target_os = "linux") || cfg!(target_os = "macos") || cfg!(target_os = "windows") {
+          if cfg!(target_os = "linux")
+              || cfg!(target_os = "macos")
+              || cfg!(target_os = "windows")
+              || cfg!(target_os = "android")
+          {
               Link::Symlink
-          } else if cfg!(target_os = "android") || cfg!(target_os = "ios") {
+          } else if cfg!(target_os = "ios") {
               Link::Manual
           } else {
               panic!("Unsupported operating system for linking");
@@ -4616,7 +4621,7 @@ crate so we can use it at both build time and runtime.
       /// # Returns
       /// A `Result` indicating success or failure.
       fn create_link(target: &Path, link_name: &Path) -> io::Result<()> {
-          println!("Creating link from {:?} to {:?}", link_name, target);
+          //println!("Creating link from {:?} to {:?}", link_name, target);
 
           if link_name.exists() {
               fs::remove_file(link_name)?;
@@ -4669,21 +4674,6 @@ crate so we can use it at both build time and runtime.
           }
       }
 
-      fn target(alias: String) -> Result<String, io::Error> {
-          let path = Key::Alias(alias).path()?;
-          match get_link_type() {
-              Link::Symlink => {
-                  fs::read_link(path).map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
-              }
-              Link::Manual => {
-                  let mut link_file = File::open(path)?;
-                  let mut target_path = String::new();
-                  link_file.read_to_string(&mut target_path)?;
-                  Ok(target_path)
-              }
-          }
-      }
-
       /// Deletes a link.
       ///
       /// # Arguments
@@ -4716,7 +4706,7 @@ words for them (hashing, encryption, signing)
 
   pub fn hash(i: Item) -> ItemResult {
       let b = Bytes::try_derive(i).unwrap();
-      Ok(sha2::Sha256::digest(b).deref().to_vec().fit())
+      Ok(sha2::Sha256::digest(&b).deref().to_vec().fit())
   }
 
   type Value = Vec<u8>;
@@ -4882,6 +4872,7 @@ example, in order to read/write to/from disk).
   use std::collections::VecDeque;
   use std::fmt;
   use std::string;
+  use std::sync::Arc;
 
   pub trait Display {
       fn representation(&self) -> Item;
@@ -5196,6 +5187,16 @@ example, in order to read/write to/from disk).
       format_indentation(&with_breaks)
   }
 
+  /// a function that takes an env, and an input string. Parses the
+  /// string, if it parses, returns the env with the input added to the
+  /// program. Otherwise returns Error.
+  pub fn parse_input(env: &mut Environment, input: String) -> Result<(), Error> {
+      let mut parsed = parse(input)?;
+      let expr = Arc::make_mut(&mut env.program);
+      expr.extend(Arc::make_mut(&mut parsed).drain(..));
+      Ok(())
+  }
+
   #[cfg(test)]
   mod tests {
       use super::*;
@@ -5242,6 +5243,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   use crate::serialize::{self, Emit};
   use crate::traits::*;
 
+  use crate::config;
   #[cfg(feature = "database")]
   use crate::types::container::pipe::db;
   use crate::types::container::{
@@ -5250,7 +5252,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   };
   use crate::types::number::{Float, Int, Number};
   use crate::types::*;
-
   use cache::cache;
   use dynfmt::{Format, SimpleCurlyFormat};
   use futures::future::FutureExt;
@@ -6771,11 +6772,12 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   /// either the hash of the content or its alias (a [Word]).
   pub fn read_blob(env: &mut Environment) -> Result<(), Error> {
       //println!("Env: {:?}", env);
+      let cache = config::PlatformConfig::get()?.cache;
       let contents = match env.pop() {
-          Item::Word(alias) => cache::Key::Alias(alias.fit()).get()?,
+          Item::Word(alias) => cache.get(&cache::Key::Alias(alias.fit()))?,
           i => {
               let hash = Bytes::try_derive(i)?;
-              cache::Key::Hash(hash).get()?
+              cache.get(&cache::Key::Hash(hash))?
           }
       };
       env.pop_prog();
@@ -6795,7 +6797,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       };
       match env.pop() {
           Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(b))) => {
-              let hash = cache::put(&b, alias)?;
+              let cache = config::PlatformConfig::get()?.cache;
+              let hash = cache.put(&b, alias)?;
               env.push(hash);
               env.pop_prog();
               Ok(())
@@ -7091,194 +7094,217 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       Ok(())
   }
 #+end_src
-*** Top level execution
-We'll define the main module which reads input for the kcats
-interpreter process, and prints output.
+*** Top level library
+Here is the top level for using kcats as a library, either in another
+rust project or some other language through FFI.
 
-We'll also define how to run unit tests.
-#+begin_src rust :tangle src/main.rs :mkdirp yes
-  //! The main kcats module, that executes the kcats interpreter. See [main]
-  mod axiom;
+#+begin_src rust :tangle src/lib.rs :mkdirp yes
+  pub mod axiom;
   mod crypto;
-  mod serialize;
-  mod traits;
-  mod types;
-  pub use traits::*;
+  pub mod serialize;
+  pub mod traits;
+  pub mod types;
 
-  use serialize::Emit;
-  use std::io::{self, BufRead, Read, Write};
-  use std::sync::Arc;
-  use types::container::{environment::Environment, error};
+  #[cfg(target_os = "android")]
+  mod android {
+      use crate::axiom;
+      use crate::config::PlatformConfig;
+      use crate::serialize::{self, Emit};
+      use crate::types::container::environment::Environment;
+      use std::ffi::CString;
+      use std::path::PathBuf;
 
-  fn print_result(env: Environment) {
-      if env.program.is_empty() {
-          println!(
-              "{}",
-              serialize::auto_format(env.stack.iter().emit().as_str(), 20, 80)
-          );
-      } else {
-          println!(
-              "stack: {}\nprogram: {}",
-              serialize::auto_format(env.stack.iter().emit().as_str(), 20, 80),
-              serialize::auto_format(env.program.iter().emit().as_str(), 20, 80)
-          )
+      use cache::cache;
+      use jni::objects::{JClass, JString};
+      use jni::sys::jstring;
+      use jni::JNIEnv;
+
+      use libc::c_char as lc_char;
+      #[link(name = "log")]
+      extern "C" {
+          fn __android_log_print(prio: i32, tag: *const lc_char, fmt: *const lc_char, ...) -> i32;
       }
-  }
 
-  fn get_stdin() -> String {
-      let mut buf = String::new();
-      for line in io::stdin().lock().lines() {
-          buf.push_str(&line.unwrap());
-          buf.push('\n');
+      const ANDROID_LOG_INFO: i32 = 4;
+
+      pub fn log(message: &str) {
+          let tag = CString::new("kcats").unwrap();
+          let message = CString::new(message).unwrap();
+
+          unsafe {
+              __android_log_print(ANDROID_LOG_INFO, tag.as_ptr(), message.as_ptr());
+          }
       }
-      buf
-  }
 
-  // A function that takes a handle to stdin. It reads a length from
-  // stdin, then reads that many bytes and returns a string.
-  async fn read_input() -> Option<String> {
-      //spawn a thread to read from stdin
-      //println!("Reading input");
-      tokio::spawn(async move {
-          let mut stdin = io::stdin().lock();
-          let mut buf = String::new();
-          if let Err(e) = stdin.read_line(&mut buf) {
-              println!("Error reading content length {:?}", e);
-              return None;
+      #[no_mangle]
+      pub extern "system" fn Java_org_skyrod_subverse_MainActivity_kcatsEval<'local>(
+          mut jnienv: JNIEnv<'local>,
+          _class: JClass<'local>,
+          env: *mut Environment,
+          program: JString,
+      ) -> jstring {
+          log("Starting eval");
+          let mut program: String = jnienv
+              .get_string(&program)
+              .expect("Couldn't get java string!")
+              .into();
+          // to ensure errors are handled by the repl- so that the
+          // user can continue with more input.
+          program.push_str(" handle");
+
+          log(format!("Got program {:?}", program).as_str());
+          if env.is_null() {
+              return jnienv
+                  .new_string("Invalid environment pointer")
+                  .unwrap()
+                  .as_raw();
           }
-          // parse an integer from buf
-          let read_len = buf.trim();
-          //println!("Read length {}", read_len);
-          let len = read_len.parse::<usize>().unwrap_or_default();
-          if len == 0 {
-              return None;
-          }
-          // read len bytes from stdin
-          let mut buf = vec![0; len];
-          stdin.read_exact(&mut buf).unwrap();
 
-          // convert the bytes to a string
-          Some(String::from_utf8(buf).unwrap())
-      })
-      .await
-      .unwrap()
-  }
+          log("Taking pointer ownership");
+          // Take ownership of the Environment
+          unsafe {
+              let mut env_val = std::ptr::read(env);
+              log("Parsing input");
+              match serialize::parse_input(&mut env_val, program) {
+                  Ok(_) => {
+                      // Execute the eval and re-assign the result back to the env pointer
+                      log("Executing environment");
+                      env_val =
+                          futures::executor::block_on(async move { axiom::eval(env_val).await });
+                      log("Formatting result");
+                      let result =
+                          serialize::auto_format(env_val.stack.iter().emit().as_str(), 20, 80);
+                      // Write the updated environment back to the pointer
+                      std::ptr::write(env, env_val);
 
-  async fn print_with_length(env: &Environment) {
-      let result = serialize::auto_format(env.stack.iter().emit().as_str(), 20, 80);
-
-      // first print the length of the result
-      println!("{}\n{}", result.len(), result);
-  }
-
-  async fn print(env: &Environment) {
-      let result = serialize::auto_format(env.stack.iter().emit().as_str(), 20, 80);
-      println!("{}", result);
-  }
-
-  // a function that takes an env, and an input string. Parses the
-  // string, if it parses, returns the env with the input added to the
-  // program. Otherwise returns Error.
-  fn parse_input(mut env: Environment, input: String) -> Result<Environment, error::Error> {
-      let mut parsed = serialize::parse(input)?;
-      let expr = Arc::make_mut(&mut env.program);
-      expr.extend(Arc::make_mut(&mut parsed).drain(..));
-      Ok(env)
-  }
-
-  //It converts the bytes to a
-  // string, and then evaluates that string as a kcats program. It then
-  // prints the length of the result, and then the result itself.
-  async fn interactive_mode() {
-      let mut env = Environment::default();
-
-      loop {
-          if let Some(mut program) = read_input().await {
-              // to ensure errors are handled by the repl- so that the
-              // user can continue with more input.
-              program.push_str(" handle");
-              match parse_input(env, program) {
-                  Ok(parsed_env) => {
-                      env = axiom::eval(parsed_env).await;
-                      print_with_length(&env).await;
+                      // Convert the evaluation result back to a C string
+                      jnienv.new_string(result).unwrap().as_raw()
                   }
-                  Err(e) => {
-                      println!("Error: {:?}", e);
-                      break;
-                  }
+                  Err(e) => jnienv
+                      .new_string(format!("Error: {:?}", e))
+                      .unwrap()
+                      .as_raw(),
               }
-          } else {
-              //println!("Blank input received, exiting");
-              continue;
           }
       }
-  }
 
-  async fn repl() {
-      let mut env = Environment::default();
+      #[no_mangle]
+      pub extern "system" fn Java_org_skyrod_subverse_MainActivity_kcatsNew<'local>(
+          mut jnienv: JNIEnv<'local>,
+          _class: JClass<'local>,
+          cachepath: JString,
+          dbfile: JString,
+      ) -> *mut Environment {
+          //panic!("oh noes");
+          log("creating new kcats env");
+          let cacheloc: String = jnienv
+              .get_string(&cachepath)
+              .expect("Couldn't get java string!")
+              .into();
+          log("creating new cache");
+          let cache = cache::Cache::new(PathBuf::from(cacheloc)).expect("Valid cache location");
+          let dbloc: String = jnienv
+              .get_string(&dbfile)
+              .expect("Couldn't get java string!")
+              .into();
+          log("setting platform config");
 
-      loop {
-          // Print the prompt and flush it to stdout immediately
-          print!("kcats> ");
-          io::stdout().flush().unwrap();
+          let result = std::panic::catch_unwind(|| {
+              // Your potentially panicking code here
 
-          // Read a line from stdin
-          let mut line = String::new();
-          io::stdin().read_line(&mut line).unwrap();
+              PlatformConfig::init(PathBuf::from(dbloc), cache).expect("Failed platform init");
+              Box::into_raw(Box::new(Environment::default()))
+          });
 
-          // Check if the input is empty, if so, continue to the next loop iteration
-          if line.trim().is_empty() {
-              continue;
-          }
-
-          // Parse and evaluate the input, then print the result
-          match parse_input(env, line) {
-              Ok(parsed_env) => {
-                  env = axiom::eval(parsed_env).await;
-                  print(&env).await;
-              }
+          match result {
+              Ok(value) => return value,
               Err(e) => {
-                  println!("Error: {:?}", e);
-                  break;
+                  if let Some(s) = e.downcast_ref::<String>() {
+                      log(format!("Panic occurred: {}", s).as_str());
+                  } else if let Some(s) = e.downcast_ref::<&str>() {
+                      log(format!("Panic occurred: {}", s).as_str());
+                  }
+                  // Handle the panic
+              }
+          }
+          panic!("uh oh");
+      }
+
+      #[no_mangle]
+      pub extern "C" fn Java_org_skyrod_subverse_MainActivity_katsFree(env: *mut Environment) {
+          log("FREE");
+          if !env.is_null() {
+              unsafe {
+                  drop(Box::from_raw(env));
               }
           }
       }
   }
 
-  async fn read_eval_print(program: String) {
-      match parse_input(Environment::default(), program) {
-          Ok(env) => {
-              print_result(axiom::eval(env).await);
+  pub mod config {
+      use crate::types::container::error::Error;
+      use crate::types::Item;
+      use cache::cache;
+      use directories::ProjectDirs;
+      use std::path::Path;
+
+      use std::path::PathBuf;
+      use std::sync::Arc;
+
+      use lazy_static::lazy_static;
+      use std::sync::RwLock;
+
+      lazy_static! {
+          pub static ref PLATFORM_CONFIG: RwLock<Option<PlatformConfig>> = {
+              //println!("Creating PLATFORM_CONFIG at {}:{}", file!(), line!());
+              RwLock::new(None)
+          };
+      }
+
+      /// A configuration struct for the platform we're running on,
+      /// specifies where some filesystem resources are located. On some
+      /// platforms (like android) we can't guess and will only know at
+      /// runtime.
+      #[derive(Clone, Debug)]
+      pub struct PlatformConfig {
+          pub database: Option<Arc<PathBuf>>,
+          pub cache: Arc<cache::Cache>,
+      }
+
+      impl PlatformConfig {
+          pub fn init(database: PathBuf, cache: cache::Cache) -> Result<(), Error> {
+              //println!("Initializing with {:?} and {:?}", database, cache);
+              let mut config = PLATFORM_CONFIG.write().unwrap();
+              ,*config = Some(PlatformConfig {
+                  database: Some(Arc::new(database)),
+                  cache: Arc::new(cache),
+              });
+              Ok(())
           }
-          Err(e) => {
-              println!("Error parsing input: {:?}", e);
+
+          pub fn get() -> Result<PlatformConfig, Error> {
+              let config = PLATFORM_CONFIG.read().unwrap();
+              //println!("Getting platform config: {:?}", config);
+              config
+                  .as_ref()
+                  .ok_or(Error::expected("initialization", None::<Item>))
+                  .map(|c| c.clone())
           }
       }
-  }
+      /// If we call this function it's because kcats is running as a binary
+      /// and we can figure out storage locations without outside input.
+      pub fn configure_platform() {
+          //println!("Configure platform");
+          let project_dirs = ProjectDirs::from("org", "skyrod", "kcats").unwrap();
+          let project_dir = project_dirs.data_dir();
+          std::fs::create_dir_all(project_dir).unwrap();
+          let db_file = project_dir.join("kcats-database.db");
 
-  /// The main intepreter entry function that can start the interpreter
-  /// in several different modes.
-  #[tokio::main]
-  async fn main() {
-      // read command line options, to look for -i switch
-      let args: Vec<String> = std::env::args().collect();
-      // if args contains "-i", read via handle_stdin
-      if args.contains(&"-i".to_string()) {
-          interactive_mode().await;
-      } else if args.contains(&"-r".to_string()) {
-          repl().await;
-      } else if args.contains(&"-f".to_string()) {
-          let filename = args.get(2).unwrap();
-          let mut file = std::fs::File::open(filename).unwrap();
-          let mut buf = String::new();
-          file.read_to_string(&mut buf).unwrap();
-          read_eval_print(buf).await;
-      } else if args.contains(&"-p".to_string()) {
-          let program = args.get(2).unwrap();
-          read_eval_print(program.clone()).await;
-      } else {
-          // otherwise, read from stdin
-          read_eval_print(get_stdin()).await;
+          let cache_dir = ProjectDirs::from("org", "skyrod", "kcats")
+              .map(|proj_dirs| proj_dirs.data_dir().join("cache"))
+              .unwrap_or_else(|| Path::new(".").join("cache"));
+
+          PlatformConfig::init(db_file, cache::Cache::new(cache_dir).unwrap()).unwrap();
       }
   }
 
@@ -7290,10 +7316,15 @@ We'll also define how to run unit tests.
       //! `5`. Runs both programs in separate environments, compares the
       //! resulting stack to ensure they are equal.
       // Note this useful idiom: importing names from outer (for mod tests) scope.
-      use super::error::Error;
-      use super::*;
+      //use super::error::Error;
+      //use super::*;
+      use crate::axiom;
+      use crate::list;
+      use crate::serialize::Emit;
+      use crate::traits::*;
       use crate::types::container as coll;
       use crate::types::container::Ordered;
+      use crate::types::container::{environment::Environment, error::Error};
       use crate::types::{Item, Word};
 
       use test_case::test_case;
@@ -7545,10 +7576,182 @@ We'll also define how to run unit tests.
       #[test_case("zero?" ; "is_zero")]
       #[test_case("zip")]
       fn test_lexicon(word: &str) {
+          crate::default::configure_platform();
           let e = Environment::default();
 
           let r = test_word(e.clone(), word.fit());
           assert!(r.is_empty(), "{:?}", r);
+      }
+  }
+#+end_src
+*** Top level execution
+We'll define the main module which reads input for the kcats
+interpreter process, and prints output.
+
+We'll also define how to run unit tests.
+#+begin_src rust :tangle src/main.rs :mkdirp yes
+  //! The main kcats module, that executes the kcats interpreter. See [main]
+  //mod default;
+
+  use kcats::axiom;
+  use kcats::config::configure_platform;
+  use kcats::serialize::{self, Emit};
+  pub use kcats::traits::*;
+  use kcats::types::container::environment::Environment;
+  use kcats::types::container::error::Error;
+  use std::io::{self, BufRead, Read, Write};
+
+  fn print_result(env: Environment) {
+      if env.program.is_empty() {
+          println!(
+              "{}",
+              serialize::auto_format(env.stack.iter().emit().as_str(), 20, 80)
+          );
+      } else {
+          println!(
+              "stack: {}\nprogram: {}",
+              serialize::auto_format(env.stack.iter().emit().as_str(), 20, 80),
+              serialize::auto_format(env.program.iter().emit().as_str(), 20, 80)
+          )
+      }
+  }
+
+  fn get_stdin() -> String {
+      let mut buf = String::new();
+      for line in io::stdin().lock().lines() {
+          buf.push_str(&line.unwrap());
+          buf.push('\n');
+      }
+      buf
+  }
+
+  /// Evaluates the program in the context of the env, and handles any
+  /// unhandled errors. Good for interactive programming.
+  async fn repl_eval(mut env: Environment, mut program: String) -> Result<Environment, Error> {
+      // to ensure errors are handled by the repl- so that the
+      // user can continue with more input.
+      program.push_str(" handle");
+
+      match serialize::parse_input(&mut env, program) {
+          Ok(_) => Ok(axiom::eval(env).await),
+          Err(e) => Err(e),
+      }
+  }
+  // A function that takes a handle to stdin. It reads a length from
+  // stdin, then reads that many bytes and returns a string.
+  async fn read_input() -> Option<String> {
+      //spawn a thread to read from stdin
+      //println!("Reading input");
+      tokio::spawn(async move {
+          let mut stdin = io::stdin().lock();
+          let mut buf = String::new();
+          if let Err(e) = stdin.read_line(&mut buf) {
+              println!("Error reading content length {:?}", e);
+              return None;
+          }
+          // parse an integer from buf
+          let read_len = buf.trim();
+          //println!("Read length {}", read_len);
+          let len = read_len.parse::<usize>().unwrap_or_default();
+          if len == 0 {
+              return None;
+          }
+          // read len bytes from stdin
+          let mut buf = vec![0; len];
+          stdin.read_exact(&mut buf).unwrap();
+
+          // convert the bytes to a string
+          Some(String::from_utf8(buf).unwrap())
+      })
+      .await
+      .unwrap()
+  }
+
+  async fn print_with_length(env: &Environment) {
+      let result = serialize::auto_format(env.stack.iter().emit().as_str(), 20, 80);
+
+      // first print the length of the result
+      println!("{}\n{}", result.len(), result);
+  }
+
+  async fn print(env: &Environment) {
+      let result = serialize::auto_format(env.stack.iter().emit().as_str(), 20, 80);
+      println!("{}", result);
+  }
+
+  //It converts the bytes to a
+  // string, and then evaluates that string as a kcats program. It then
+  // prints the length of the result, and then the result itself.
+  async fn interactive_mode() {
+      let mut env = Environment::default();
+
+      loop {
+          if let Some(program) = read_input().await {
+              env = repl_eval(env, program).await.unwrap();
+              print_with_length(&env).await;
+          }
+      }
+  }
+
+  async fn repl() {
+      let mut env = Environment::default();
+
+      loop {
+          // Print the prompt and flush it to stdout immediately
+          print!("kcats> ");
+          io::stdout().flush().unwrap();
+
+          // Read a line from stdin
+          let mut line = String::new();
+          io::stdin().read_line(&mut line).unwrap();
+
+          // Check if the input is empty, if so, continue to the next loop iteration
+          if line.trim().is_empty() {
+              continue;
+          }
+
+          env = repl_eval(env, line).await.unwrap();
+          print(&env).await;
+      }
+  }
+
+  async fn read_eval_print(program: String) {
+      let mut env = Environment::default();
+      match serialize::parse_input(&mut env, program) {
+          Ok(_) => {
+              print_result(axiom::eval(env).await);
+          }
+          Err(e) => {
+              println!("Error parsing input: {:?}", e);
+          }
+      }
+  }
+
+  /// The main intepreter entry function that can start the interpreter
+  /// in several different modes.
+  #[tokio::main]
+  async fn main() {
+      // Set up process-wide paths and panic if this fails
+      configure_platform();
+      // read command line options, to look for -i switch
+      let args: Vec<String> = std::env::args().collect();
+      // if args contains "-i", read via handle_stdin
+      if args.contains(&"-i".to_string()) {
+          interactive_mode().await;
+      } else if args.contains(&"-r".to_string()) {
+          repl().await;
+      } else if args.contains(&"-f".to_string()) {
+          let filename = args.get(2).unwrap();
+          let mut file = std::fs::File::open(filename).unwrap();
+          let mut buf = String::new();
+          file.read_to_string(&mut buf).unwrap();
+          read_eval_print(buf).await;
+      } else if args.contains(&"-p".to_string()) {
+          let program = args.get(2).unwrap();
+          read_eval_print(program.clone()).await;
+      } else {
+          // otherwise, read from stdin
+          read_eval_print(get_stdin()).await;
       }
   }
 
@@ -8680,29 +8883,31 @@ Implement the =handoff= type
 ***** Database
 #+begin_src rust :tangle src/types/container/pipe/db.rs :mkdirp yes
   use crate::axiom;
+  use crate::config;
   use crate::list;
   use crate::traits::*;
   use crate::types::container::{self as coll, associative as assoc, error::Error};
   use crate::types::number::Number;
   use crate::types::{self, Item};
-  use directories::ProjectDirs;
 
   use rusqlite::types::{ToSql, ToSqlOutput, Value, ValueRef};
-  use rusqlite::{params, Connection, Result};
+  use rusqlite::{params, Connection, Error as DBError};
+  use std::path::PathBuf;
+
   use uuid;
 
-  #[derive(Debug)]
   pub struct Db {
       conn: Connection,
   }
 
   impl Db {
-      pub fn new() -> Result<Self> {
-          let project_dirs = ProjectDirs::from("org", "skyrod", "kcats").unwrap();
-          let project_dir = project_dirs.data_dir();
-          std::fs::create_dir_all(project_dir).unwrap();
-          let db_file = project_dir.join("kcats-database.db");
-          let conn = Connection::open(db_file)?;
+      pub fn new() -> Result<Self, DBError> {
+          let db_file = config::PlatformConfig::get()
+              .unwrap()
+              .database
+              .ok_or(DBError::InvalidPath(PathBuf::from("".to_string())))?;
+
+          let conn = Connection::open(db_file.as_path())?;
           Ok(Db { conn })
       }
 
@@ -8733,37 +8938,82 @@ Implement the =handoff= type
           let q = "INSERT INTO EAV (entity, attribute, value) VALUES (?, ?, ?)";
 
           match value {
-              //TODO: differentiate between strings and words as values
-              // by prefixing with something like s: or w:
               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(a))) => {
-                  let id = uuid::Uuid::new_v4();
-                  self.insert_item(a.fit(), id)?;
-                  self.conn.execute(q, params![id, attribute, id])?;
+                  let sub_id = uuid::Uuid::new_v4();
+                  self.insert_item(a.fit(), sub_id)?;
+                  self.conn.execute(q, params![id, attribute, sub_id])?;
               }
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Set(s))) => {
-                  for v in s.iter() {
-                      self.insert_attribute(id, attribute.clone(), v.clone().fit())?;
-                  }
+              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Set(s))) => self.insert_iter(
+                  Some((id, attribute)),
+                  s.iter().map(|i| Item::derive(i.clone())),
+              )?,
+              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(l))) => {
+                  self.insert_iter(Some((id, attribute)), (*l).clone())?
               }
               i => {
                   self.conn.execute(q, params![id, attribute, i])?;
-              } //_ => todo!("Other item types as values in db"),
+              }
           }
           Ok(Item::default())
       }
 
-      pub fn insert_item(&self, i: Item, id: uuid::Uuid) -> axiom::ItemResult {
-          let obj = assoc::Associative::try_derive(i)?;
-
-          for (k, v) in obj.to_iter() {
-              match k {
-                  assoc::KeyItem::Word(w) => {
-                      self.insert_attribute(id, Item::Word(w), v)?;
+      pub fn insert_iter<I>(&self, parent_link: Option<(uuid::Uuid, Item)>, l: I) -> Result<(), Error>
+      where
+          I: IntoIterator<Item = Item>,
+      {
+          for v in l {
+              if is_value(&v) {
+                  match parent_link {
+                      Some(parent_link) => {
+                          self.insert_attribute(parent_link.0, parent_link.1.clone(), v.clone())?;
+                          return Ok(());
+                      }
+                      None => {
+                          return Err(Error::expected("parent-link", v.clone()));
+                      }
                   }
-                  other => return Err(Error::expected("word", other)),
+              } else {
+                  let sub_id = uuid::Uuid::new_v4();
+                  self.insert_item(v.clone(), sub_id)?;
+                  if let Some(parent_link) = parent_link.clone() {
+                      self.insert_attribute(
+                          parent_link.0,
+                          parent_link.1.clone(),
+                          sub_id.into_bytes().to_vec().fit(),
+                      )?;
+                  }
               }
           }
+          Ok(())
+      }
+
+      pub fn insert_item(&self, i: Item, id: uuid::Uuid) -> axiom::ItemResult {
+          let s = coll::Sized::try_derive(i)?;
+          match s {
+              coll::Sized::Associative(a) => {
+                  for (k, v) in a.to_iter() {
+                      //println!("Insert! {:?} {:?}", k, v);
+                      let w: types::Word = k.try_fit()?;
+                      self.insert_attribute(id, Item::Word(w), v)?;
+                  }
+              }
+              coll::Sized::List(l) => {
+                  self.insert_iter(None, (*l).clone())?;
+              }
+              s => return Err(Error::expected("db-object", s)),
+          }
           Ok(Item::default())
+      }
+  }
+
+  pub fn is_value(i: &Item) -> bool {
+      match i {
+          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(_))) => true,
+          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(_))) => true,
+          Item::Number(_) => true,
+          Item::Word(_) => true,
+          Item::Char(_) => true,
+          _ => false,
       }
   }
 
@@ -8845,7 +9095,7 @@ Implement the =handoff= type
   }
 
   impl rusqlite::ToSql for Item {
-      fn to_sql(&self) -> Result<ToSqlOutput<'_>> {
+      fn to_sql(&self) -> Result<ToSqlOutput<'_>, DBError> {
           match self {
               Item::Number(Number::Int(i)) => i.to_sql(),
               Item::Number(Number::Float(f)) => f.to_sql(),
