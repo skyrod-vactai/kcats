@@ -145,7 +145,7 @@
 (define-abbrev-table 'kcats-mode-abbrev-table kcats-abbrevs)
 
 (add-hook 'kcats-mode-hook 'abbrev-mode)
-("add-to-list" 'auto-mode-alist '("\"\\\\.kcats\\\\'\"" . kcats-mode))
+(add-to-list 'auto-mode-alist '("\"\\\\.kcats\\\\'\"" . kcats-mode))
 
 (defun kcats-replace-all ()
   "Perform query-replace for all pairs in kcats-abbrevs."
