@@ -1431,16 +1431,20 @@ impl Display for Value {
                 write!(f, ")")?;
             }
             Value::Vector(elements) => {
-                write!(f, "[")?;
-                let mut i = 0;
-                while i < elements.len() {
-                    write!(f, "{}", elements[i])?;
-                    if i != elements.len() - 1 {
-                        write!(f, " ")?;
+                if elements.is_empty() {
+                    write!(f, "🔳")?;
+                } else {
+                    write!(f, "[")?;
+                    let mut i = 0;
+                    while i < elements.len() {
+                        write!(f, "{}", elements[i])?;
+                        if i != elements.len() - 1 {
+                            write!(f, " ")?;
+                        }
+                        i += 1;
                     }
-                    i += 1;
+                    write!(f, "]")?;
                 }
-                write!(f, "]")?;
             }
             Value::Map(entries) => {
                 write!(f, "{{")?;
