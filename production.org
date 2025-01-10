@@ -4855,6 +4855,7 @@ example, in order to read/write to/from disk).
   use base64::prelude::BASE64_URL_SAFE_NO_PAD;
   use base64::Engine;
   use edn_format::ParserOptions;
+  use internment::Intern;
 
   use std::collections::VecDeque;
   use std::fmt;
@@ -4880,7 +4881,15 @@ example, in order to read/write to/from disk).
               )
               .fit()
           }),
-          edn_format::Value::Symbol(s) => Ok(Item::Word(s.to_string().fit())),
+          edn_format::Value::Symbol(s) => Ok(Item::Word(Word {
+              data: Intern::new(s.to_string()),
+              namespace: s
+                  .namespace()
+                  .map(|ns| BASE64_URL_SAFE_NO_PAD.decode(ns.to_string()))
+                  .transpose()?
+                  .map(|decoded| Intern::new(decoded)),
+              quoted: false,
+          })),
           // we don't have booleans in kcats, so if we see 'false' that
           // is the word false which is not defined in the base
           // language, but might be user-defined later.
@@ -4951,7 +4960,16 @@ example, in order to read/write to/from disk).
               Item::Number(Number::Int(i)) => edn_format::Value::Integer(*i),
               Item::Number(Number::Float(f)) => edn_format::Value::from(*f),
               Item::Char(c) => edn_format::Value::Character(*c),
-              Item::Word(w) => edn_format::Value::Symbol(edn_format::Symbol::from_name(w.fit())),
+              Item::Word(w) => edn_format::Value::Symbol({
+                  if let Some(ns) = w.namespace {
+                      edn_format::Symbol::from_namespace_and_name(
+                          BASE64_URL_SAFE_NO_PAD.encode(ns.as_ref()).as_str(),
+                          w.fit(),
+                      )
+                  } else {
+                      edn_format::Symbol::from_name(w.fit())
+                  }
+              }),
               //Item::Entry(w) => edn_format::Value::Symbol(edn_format::Symbol::from_name(&w.word)),
               Item::Dispenser(coll::Dispenser::Out(o)) => (&o.representation()).into(),
               Item::Dispenser(coll::Dispenser::Tunnel(t)) => (&t.representation()).into(),
@@ -5108,6 +5126,12 @@ example, in order to read/write to/from disk).
 
   impl From<string::FromUtf8Error> for Error {
       fn from(e: string::FromUtf8Error) -> Self {
+          Error::parse(e.to_string().as_str())
+      }
+  }
+
+  impl From<base64::DecodeError> for Error {
+      fn from(e: base64::DecodeError) -> Self {
           Error::parse(e.to_string().as_str())
       }
   }
