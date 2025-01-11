@@ -289,6 +289,7 @@ internally, to keep track of things like the stack, program, lists etc.
 #+begin_src rust :tangle src/types.rs :mkdirp yes
   //! Defines kcats internal data types.
   use crate::list;
+  use crate::serialize::Emit;
   use crate::traits::*;
   use crate::types::container as coll;
   use crate::types::container::dictionary as dict;
@@ -324,9 +325,9 @@ internally, to keep track of things like the stack, program, lists etc.
   impl fmt::Debug for Word {
       fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
           if self.quoted {
-              write!(f, "[{}]", self.data.as_str())
+              write!(f, "[{}]", Item::Word(self.clone()).emit())
           } else {
-              write!(f, "{}", self.data.as_str())
+              write!(f, "{}", Item::Word(self.clone()).emit())
           }
       }
   }
@@ -3180,6 +3181,7 @@ internally, to keep track of things like the stack, program, lists etc.
   use std::hash::Hash;
   use std::ptr;
   use std::sync::Arc;
+  use std::sync::OnceLock;
 
   /// The definition of a [Word], contains its actual code (the
   /// definition), and also documentation like specs and examples.
@@ -3391,6 +3393,9 @@ internally, to keep track of things like the stack, program, lists etc.
       pub modules: Vec<Namespace>,
   }
 
+  /// A namespace for the core functions
+  pub static CORE: OnceLock<Namespace> = OnceLock::new();
+
   /// A custom impl for Dictionary that doesn't dump a massive data
   /// structure. comment this out to get access to the full debug output.
   impl fmt::Debug for Dictionary {
@@ -3444,10 +3449,16 @@ internally, to keep track of things like the stack, program, lists etc.
               let mut grouped: HashMap<Namespace, Vec<(types::Word, Entry)>> = HashMap::new();
 
               for (k, v) in words.iter() {
-                  grouped
-                      .entry(k.namespace)
-                      .or_insert_with(Vec::new)
-                      .push((k.clone(), v.clone()));
+                  grouped.entry(k.namespace).or_insert_with(Vec::new).push((
+                      {
+                          // Block out the namespace, since we want to
+                          // find the word using no namespace
+                          let mut kk = k.clone();
+                          kk.namespace = None;
+                          kk
+                      },
+                      v.clone(),
+                  ));
               }
 
               grouped
@@ -3458,6 +3469,7 @@ internally, to keep track of things like the stack, program, lists etc.
           // first all the non-namespaced core words that can be overridden
           cache.extend(by_ns.get(&None).cloned().unwrap_or_default());
           for module in self.modules.iter() {
+              //println!("Adding {:?} to cache", module);
               cache.extend(by_ns.get(module).cloned().unwrap_or_default())
           }
 
@@ -3543,11 +3555,12 @@ internally, to keep track of things like the stack, program, lists etc.
 
       fn insert_core_module(&mut self, lexicon: String) -> Result<(), Error> {
           //println!("Parsing: {}", lexicon);
+          let core = CORE.get().unwrap();
           let items = serialize::parse(lexicon)?;
           for r in Box::new(items.iter().cloned()) {
               let (k, def): (assoc::KeyItem, Item) = r.try_fit().unwrap();
-              let word: Word = k.try_fit().unwrap();
-
+              let mut word: Word = k.try_fit().unwrap();
+              word.namespace = core.clone();
               let iter: Box<dyn Iterator<Item = Item>> = def.try_fit().unwrap();
               let new_entry: Entry = iter.try_fit().unwrap();
               let new_entry2 = new_entry.clone();
@@ -3557,6 +3570,7 @@ internally, to keep track of things like the stack, program, lists etc.
                       e.examples = new_entry.examples;
                       e.spec = new_entry.spec;
                       e.doc = new_entry.doc;
+                      e.namespace = core.clone();
                       // Don't overwrite the definition, this should be
                       // an axiom word where we've left the
                       // spec/examples temporarily blank and we're
@@ -3571,6 +3585,7 @@ internally, to keep track of things like the stack, program, lists etc.
       }
 
       fn builtins() -> Self {
+          let core = CORE.get_or_init(|| Some(Intern::new(vec![114, 138, 222]))); // base64 encodes to "core"
           let mut dict = HashMap::new();
           for (bw, bd) in BUILTIN_FUNCTIONS.iter() {
               let entry = Entry {
@@ -3580,6 +3595,8 @@ internally, to keep track of things like the stack, program, lists etc.
                   namespace: None,
                   doc: None,
               };
+              let mut bw = bw.clone();
+              bw.namespace = core.clone();
               dict.insert(Word::derive(bw.clone()), entry);
           }
           Arc::new(dict)
@@ -4175,7 +4192,8 @@ internally, to keep track of things like the stack, program, lists etc.
   /// existing env, loads the given module and returns the new env with
   /// the dictionary that the module built on the stack.
   fn load_module(mut env: Environment, module: &&str) -> Environment {
-      //println!("Loading module {}", *module);
+      println!("Loading module {}", *module);
+      //println!("Cache: {:?}", env.dictionary.cache);
       env.push(Word::derive(*module));
       env.program.prepend(list!(
           "dictionary",
@@ -4211,8 +4229,13 @@ internally, to keep track of things like the stack, program, lists etc.
                   stack: Default::default(),
                   program: Default::default(),
               };
+
               env.load_core_modules()
                   .expect("failed to load core modules");
+              // add core module as default module
+              env.dictionary
+                  .modules
+                  .push(dict::CORE.get().unwrap().clone());
               env.dictionary.resolve();
               //println!("Dict has {} words", env.dictionary.entries.len());
               let mut env = [
@@ -7418,7 +7441,7 @@ rust project or some other language through FFI.
       }
 
       fn test_word(standard_env: Environment, w: Word) -> Vec<Error> {
-          if let Some(d) = standard_env.dictionary.words.get(&w.clone().fit()) {
+          if let Some(d) = standard_env.dictionary.cache.get(&w.clone().fit()) {
               d.examples
                   .clone()
                   .unwrap()
