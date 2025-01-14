@@ -3377,9 +3377,6 @@ internally, to keep track of things like the stack, program, lists etc.
 
   /// Holds [Word]s and their definitions.
   pub type Words = coll::Arc<HashMap<Word, Entry>>;
-  /// Words are looked up from the Cache, which takes modules into
-  /// account.
-  pub type Cache = HashMap<types::Word, Entry>;
 
   /// One of the main components of an
   /// [crate::types::container::environment::Environment]. Provides
@@ -3389,7 +3386,7 @@ internally, to keep track of things like the stack, program, lists etc.
   #[derive(Clone, PartialEq)]
   pub struct Dictionary {
       pub words: Words,
-      pub cache: Cache,
+      pub cache: Words,
       pub modules: Vec<Namespace>,
   }
 
@@ -3415,6 +3412,7 @@ internally, to keep track of things like the stack, program, lists etc.
               assoc::KeyItem::Word(w) => match w.data.as_str() {
                   "words" => Some(self.words.clone().fit()),
                   "modules" => Some(self.modules.clone().fit()),
+                  "cache" => Some(self.cache.clone().fit()),
                   _ => None,
               },
               _ => None,
@@ -3437,8 +3435,9 @@ internally, to keep track of things like the stack, program, lists etc.
       }
 
       pub fn contains_key(&self, key: &assoc::KeyItem) -> bool {
-          types::Word::try_derive(key.clone())
-              .map_or(false, |ref w| matches!(w.fit(), "modules" | "words"))
+          types::Word::try_derive(key.clone()).map_or(false, |ref w| {
+              matches!(w.fit(), "modules" | "words" | "cache")
+          })
       }
 
       /// Produce an [Words] map that is pre-resolved using the
@@ -3465,12 +3464,13 @@ internally, to keep track of things like the stack, program, lists etc.
           }
           let by_ns = group_by_namespace(&self.words);
           //println!("by namespace: {:?}", by_ns);
-          let mut cache = Cache::new();
+          let mut cache = Words::fresh();
+          let mcache = cache.mutate();
           // first all the non-namespaced core words that can be overridden
-          cache.extend(by_ns.get(&None).cloned().unwrap_or_default());
+          mcache.extend(by_ns.get(&None).cloned().unwrap_or_default());
           for module in self.modules.iter() {
               //println!("Adding {:?} to cache", module);
-              cache.extend(by_ns.get(module).cloned().unwrap_or_default())
+              mcache.extend(by_ns.get(module).cloned().unwrap_or_default())
           }
 
           // println!(
@@ -3785,6 +3785,7 @@ internally, to keep track of things like the stack, program, lists etc.
           let v: Vec<(assoc::KeyItem, Item)> = vec![
               ("words".fit(), self.words.fit()),
               ("modules".fit(), self.modules.fit()),
+              ("cache".fit(), self.cache.fit()),
           ];
           Box::new(v.into_iter())
       }
@@ -3839,6 +3840,7 @@ internally, to keep track of things like the stack, program, lists etc.
       type Error = Error;
       fn try_derive(iter: Box<dyn Iterator<Item = Item>>) -> Result<Self, Error> {
           let mut words = Words::default();
+          let mut cache = Words::default();
           let mut modules = Vec::<Namespace>::default();
 
           for i in iter {
@@ -3848,14 +3850,16 @@ internally, to keep track of things like the stack, program, lists etc.
                   words = v.try_fit()?;
               } else if k == "modules".fit() {
                   modules = v.try_fit()?;
+              } else if k == "cache".fit() {
+                  cache = v.try_fit()?;
               } else {
                   continue;
               }
           }
           Ok(Dictionary {
-              words: words,
+              words,
               modules,
-              cache: HashMap::new(),
+              cache,
           })
       }
   }
@@ -4192,7 +4196,7 @@ internally, to keep track of things like the stack, program, lists etc.
   /// existing env, loads the given module and returns the new env with
   /// the dictionary that the module built on the stack.
   fn load_module(mut env: Environment, module: &&str) -> Environment {
-      println!("Loading module {}", *module);
+      //println!("Loading module {}", *module);
       //println!("Cache: {:?}", env.dictionary.cache);
       env.push(Word::derive(*module));
       env.program.prepend(list!(
@@ -4224,7 +4228,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   dictionary: dict::Dictionary {
                       words: dict::Words::builtins(),
                       modules: Default::default(),
-                      cache: HashMap::new(),
+                      cache: dict::Words::fresh(),
                   },
                   stack: Default::default(),
                   program: Default::default(),
@@ -7216,8 +7220,13 @@ rust project or some other language through FFI.
       use jni::objects::{JClass, JString};
       use jni::sys::jstring;
       use jni::JNIEnv;
-
       use libc::c_char as lc_char;
+      use once_cell::sync::Lazy;
+      use tokio::runtime::Runtime;
+
+      static RUNTIME: Lazy<Runtime> =
+          Lazy::new(|| Runtime::new().expect("Failed to create Tokio runtime"));
+
       #[link(name = "log")]
       extern "C" {
           fn __android_log_print(prio: i32, tag: *const lc_char, fmt: *const lc_char, ...) -> i32;
@@ -7267,8 +7276,7 @@ rust project or some other language through FFI.
                   Ok(_) => {
                       // Execute the eval and re-assign the result back to the env pointer
                       log("Executing environment");
-                      env_val =
-                          futures::executor::block_on(async move { axiom::eval(env_val).await });
+                      env_val = RUNTIME.block_on(async move { axiom::eval(env_val).await });
                       log("Formatting result");
                       let result =
                           serialize::auto_format(env_val.stack.iter().emit().as_str(), 20, 80);
@@ -7293,7 +7301,12 @@ rust project or some other language through FFI.
           cachepath: JString,
           dbfile: JString,
       ) -> *mut Environment {
-          //panic!("oh noes");
+          //set panic hook to log panics
+          std::panic::set_hook(Box::new(|panic_info| {
+              // Log panic info
+              log(format!("Rust panic: {:?}", panic_info).as_str());
+          }));
+
           log("creating new kcats env");
           let cacheloc: String = jnienv
               .get_string(&cachepath)
@@ -7636,6 +7649,7 @@ rust project or some other language through FFI.
       #[test_case("🪆" ; "recur")]
       #[test_case("repetition")]
       #[test_case("rest")]
+      #[test_case("resolve")]
       #[test_case("restore")]
       #[test_case("retry")]
       #[test_case("reverse")]
@@ -7666,6 +7680,7 @@ rust project or some other language through FFI.
       #[test_case("type")]
       #[test_case("unassign")]
       #[test_case("under")]
+      #[test_case("unnamespace")]
       #[test_case("until")]
       #[test_case("🍫" ; "unwrap")]
       #[test_case("update")]
@@ -17036,8 +17051,14 @@ float -> val rform pred
 #+begin_src kcats
   [1 2 3 -4 5] liberator
   [positive?]
-  [[▶️] 🐋 [🔀 [▶️] 🛡️ ▶️] bail 🔳 [🔳 🔳 🔳] ↔️] ;; pred matches
-  [🗑️ 🔀] [🗑️ 🗑️ 🗑️ 🔳] ⚖️ 🔳 [[🔳] 🔳] [🔀] 🪆 collect
+  [[▶️] 🐋 ;; get value from parent
+   [🔀 [▶️] 🛡️ ▶️] bail ;; only check pred iff we get a value, preserve pred
+   🔳
+   [🔳 🔳 🔳] ↔️] ;; place some dummy values to drop if we didn't get a value
+  [🗑️ 🔀] ;; iff pred matches drop the pred result 
+  [🗑️ 🗑️ 🗑️ 🔳] ;; otherwise drop all the stuff we no longer need
+  ⚖️ 🔳
+  [[🔳] 🔳] [🔀] 🪆 collect
 
 #+end_src
 
