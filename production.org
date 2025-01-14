@@ -78,14 +78,14 @@ the location where you installed the kcats binary.
 #+BEGIN_SRC toml :tangle Cargo.toml
   [package]
   name = "kcats"
-  version = "0.10.0"
+  version = "1.0.0"
   edition = "2021"
 
   # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
   [dependencies]
   # serialization
-  edn-format = "3"
+  edn-format = {path = "./edn-format"}
   serde = "1"
   serde_json = "1"
 
@@ -167,7 +167,7 @@ the location where you installed the kcats binary.
   path = "src/main.rs"
 #+END_SRC
 
-*** Interal traits
+*** Internal traits
 Because of Rust's orphan rule (you can't implement a trait on a type
 unless you own either the trait or the type), we'll opt for making our
 own traits rather than using the "newtype" pattern of making our own
@@ -289,6 +289,7 @@ internally, to keep track of things like the stack, program, lists etc.
 #+begin_src rust :tangle src/types.rs :mkdirp yes
   //! Defines kcats internal data types.
   use crate::list;
+  use crate::serialize::Emit;
   use crate::traits::*;
   use crate::types::container as coll;
   use crate::types::container::dictionary as dict;
@@ -300,6 +301,7 @@ internally, to keep track of things like the stack, program, lists etc.
   use core::fmt;
   use internment::Intern;
   use lazy_static::lazy_static;
+  use number::Number;
   use std::collections::{HashMap, VecDeque};
 
   use std::hash::Hash;
@@ -317,14 +319,15 @@ internally, to keep track of things like the stack, program, lists etc.
   pub struct Word {
       pub data: Intern<String>,
       pub quoted: bool,
+      pub namespace: dict::Namespace,
   }
 
   impl fmt::Debug for Word {
       fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
           if self.quoted {
-              write!(f, "[{}]", self.data.as_str())
+              write!(f, "[{}]", Item::Word(self.clone()).emit())
           } else {
-              write!(f, "{}", self.data.as_str())
+              write!(f, "{}", Item::Word(self.clone()).emit())
           }
       }
   }
@@ -340,6 +343,7 @@ internally, to keep track of things like the stack, program, lists etc.
           Word {
               data: Intern::<String>::from(s),
               quoted: false,
+              namespace: None,
           }
       }
   }
@@ -443,7 +447,7 @@ internally, to keep track of things like the stack, program, lists etc.
           match (self, other) {
               // same types, just use their own eq
               (Item::Number(a), Item::Number(b)) => a == b,
-              (Item::Word(a), Item::Word(b)) => a.data == b.data,
+              (Item::Word(a), Item::Word(b)) => a == b,
               (
                   Item::Dispenser(coll::Dispenser::Sized(a)),
                   Item::Receptacle(coll::Receptacle::Sized(b)),
@@ -529,20 +533,24 @@ internally, to keep track of things like the stack, program, lists etc.
       fn try_derive(i: Item) -> Result<Self, Self::Error> {
           match i {
               Item::Char(c) => Ok(c),
-              b => Err(Error::expected("char", b)),
+              Item::Number(Number::Int(i)) => match char::from_u32(i as u32) {
+                  Some(c) => Ok(c),
+                  None => Err(Error::expected("character-encoding", i)),
+              },
+              b => Err(Error::expected("character", b)),
           }
       }
   }
 
-  /// As there are no real booleans, we use the word 'yes' but literally
+  /// As there are no real booleans, we use the word '✔️' but literally
   /// any value except empty containers is truthy. If we read a value
   /// 'false', that's not actually a boolean, it's just the [Word]
-  /// false. The fact that the word 'yes' is used in the language but
+  /// false. The fact that the word '✔️' is used in the language but
   /// 'no' is not, is a known tradeoff.
   impl Derive<bool> for Item {
       fn derive(b: bool) -> Item {
           if b {
-              "yes".fit()
+              "✔️".fit()
           } else {
               Item::default()
           }
@@ -2542,7 +2550,7 @@ internally, to keep track of things like the stack, program, lists etc.
       pub fn put(self, other: Item) -> Result<Associative, Error> {
           match (self, other) {
               (Associative::Words(mut this), other) => {
-                  let (word, entry) = <(dict::Word, dict::Entry)>::try_derive(other)?;
+                  let (word, entry) = <(Word, dict::Entry)>::try_derive(other)?;
                   let thismut = this.mutate();
                   thismut.insert(word.fit(), entry.fit());
                   Ok(Associative::Words(this))
@@ -2599,7 +2607,7 @@ internally, to keep track of things like the stack, program, lists etc.
               }
               Associative::Words(mut d) => {
                   let dm = coll::Arc::mutate(&mut d);
-                  let v = dm.remove(&dict::Word::try_derive(k.clone()).unwrap_or_default());
+                  let v = dm.remove(&Word::try_derive(k.clone()).unwrap_or_default());
                   (Associative::Words(d), v.map(|v| v.fit()))
               }
               Associative::Error(mut e) => {
@@ -3164,7 +3172,7 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::traits::*;
   use crate::types::container::associative::Convert;
   use crate::types::container::{self as coll, Count, Mutey};
-  use crate::types::{self, Bytes, Error, Item};
+  use crate::types::{self, Bytes, Error, Item, Word};
   use core::fmt;
   use internment::Intern;
   use std::collections::HashMap;
@@ -3173,40 +3181,7 @@ internally, to keep track of things like the stack, program, lists etc.
   use std::hash::Hash;
   use std::ptr;
   use std::sync::Arc;
-
-  /// A word in a dictionary is slightly different than a 'word' piece
-  /// of data: when looking up words in the dictionary, the namespace is
-  /// used for comparison. Due to differences in equality checking, we
-  /// use a wrapper type here so we can distinguish the behavior.
-  #[derive(Eq, Debug, Clone, Default, PartialEq, Hash)]
-  pub struct Word(pub types::Word, pub Namespace);
-
-  /// Easily convert from [Word]
-  impl Derive<Word> for types::Word {
-      fn derive(w: Word) -> Self {
-          w.0
-      }
-  }
-
-  /// Easily convert from [types::Word]
-  impl Derive<types::Word> for Word {
-      fn derive(w: types::Word) -> Self {
-          Word(w, None)
-      }
-  }
-
-  impl Derive<&str> for Word {
-      fn derive(w: &str) -> Self {
-          Word::derive(types::Word::derive(w))
-      }
-  }
-
-  impl TryDerive<assoc::KeyItem> for Word {
-      type Error = Error;
-      fn try_derive(k: assoc::KeyItem) -> Result<Self, Self::Error> {
-          Ok(types::Word::try_derive(k)?.fit())
-      }
-  }
+  use std::sync::OnceLock;
 
   /// The definition of a [Word], contains its actual code (the
   /// definition), and also documentation like specs and examples.
@@ -3216,6 +3191,7 @@ internally, to keep track of things like the stack, program, lists etc.
       pub spec: Option<Spec>,
       pub definition: Definition,
       pub namespace: Namespace,
+      pub doc: Option<String>,
   }
 
   impl Eq for Entry {}
@@ -3354,6 +3330,8 @@ internally, to keep track of things like the stack, program, lists etc.
                       Definition::Axiom(_) => "builtin".fit(),
                       Definition::Derived(d) => d.fit(),
                   }),
+                  "namespace" => self.namespace.map(|x| x.as_ref().clone().fit()),
+                  "doc" => self.doc.clone().map(|x| x.fit()),
                   _ => None,
               },
               _ => None,
@@ -3362,7 +3340,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
       pub fn contains_key(&self, key: &assoc::KeyItem) -> bool {
           types::Word::try_derive(key.clone()).map_or(false, |ref w| {
-              matches!(w.fit(), "examples" | "spec" | "definition")
+              matches!(w.fit(), "examples" | "spec" | "definition" | "doc")
           })
       }
   }
@@ -3399,9 +3377,6 @@ internally, to keep track of things like the stack, program, lists etc.
 
   /// Holds [Word]s and their definitions.
   pub type Words = coll::Arc<HashMap<Word, Entry>>;
-  /// Words are looked up from the Cache, which takes modules into
-  /// account.
-  pub type Cache = HashMap<types::Word, Entry>;
 
   /// One of the main components of an
   /// [crate::types::container::environment::Environment]. Provides
@@ -3411,9 +3386,12 @@ internally, to keep track of things like the stack, program, lists etc.
   #[derive(Clone, PartialEq)]
   pub struct Dictionary {
       pub words: Words,
-      pub cache: Cache,
+      pub cache: Words,
       pub modules: Vec<Namespace>,
   }
+
+  /// A namespace for the core functions
+  pub static CORE: OnceLock<Namespace> = OnceLock::new();
 
   /// A custom impl for Dictionary that doesn't dump a massive data
   /// structure. comment this out to get access to the full debug output.
@@ -3434,6 +3412,7 @@ internally, to keep track of things like the stack, program, lists etc.
               assoc::KeyItem::Word(w) => match w.data.as_str() {
                   "words" => Some(self.words.clone().fit()),
                   "modules" => Some(self.modules.clone().fit()),
+                  "cache" => Some(self.cache.clone().fit()),
                   _ => None,
               },
               _ => None,
@@ -3456,8 +3435,9 @@ internally, to keep track of things like the stack, program, lists etc.
       }
 
       pub fn contains_key(&self, key: &assoc::KeyItem) -> bool {
-          types::Word::try_derive(key.clone())
-              .map_or(false, |ref w| matches!(w.fit(), "modules" | "words"))
+          types::Word::try_derive(key.clone()).map_or(false, |ref w| {
+              matches!(w.fit(), "modules" | "words" | "cache")
+          })
       }
 
       /// Produce an [Words] map that is pre-resolved using the
@@ -3468,21 +3448,29 @@ internally, to keep track of things like the stack, program, lists etc.
               let mut grouped: HashMap<Namespace, Vec<(types::Word, Entry)>> = HashMap::new();
 
               for (k, v) in words.iter() {
-                  grouped
-                      .entry(k.1)
-                      .or_insert_with(Vec::new)
-                      .push((k.0.clone(), v.clone()));
+                  grouped.entry(k.namespace).or_insert_with(Vec::new).push((
+                      {
+                          // Block out the namespace, since we want to
+                          // find the word using no namespace
+                          let mut kk = k.clone();
+                          kk.namespace = None;
+                          kk
+                      },
+                      v.clone(),
+                  ));
               }
 
               grouped
           }
           let by_ns = group_by_namespace(&self.words);
           //println!("by namespace: {:?}", by_ns);
-          let mut cache = Cache::new();
+          let mut cache = Words::fresh();
+          let mcache = cache.mutate();
           // first all the non-namespaced core words that can be overridden
-          cache.extend(by_ns.get(&None).cloned().unwrap_or_default());
+          mcache.extend(by_ns.get(&None).cloned().unwrap_or_default());
           for module in self.modules.iter() {
-              cache.extend(by_ns.get(module).cloned().unwrap_or_default())
+              //println!("Adding {:?} to cache", module);
+              mcache.extend(by_ns.get(module).cloned().unwrap_or_default())
           }
 
           // println!(
@@ -3543,8 +3531,9 @@ internally, to keep track of things like the stack, program, lists etc.
 
           let adds: Vec<_> = adds
               .into_iter()
-              .map(|(mut w, e)| {
-                  w.1 = *namespace;
+              .map(|(mut w, mut e)| {
+                  w.namespace = *namespace;
+                  e.namespace = *namespace;
                   //println!("Adding {:?}", w);
                   (w, e)
               })
@@ -3552,7 +3541,7 @@ internally, to keep track of things like the stack, program, lists etc.
           let deletes: Vec<_> = deletes
               .into_iter()
               .map(|mut w| {
-                  w.1 = *namespace;
+                  w.namespace = *namespace;
                   w
               })
               .collect();
@@ -3566,11 +3555,12 @@ internally, to keep track of things like the stack, program, lists etc.
 
       fn insert_core_module(&mut self, lexicon: String) -> Result<(), Error> {
           //println!("Parsing: {}", lexicon);
+          let core = CORE.get().unwrap();
           let items = serialize::parse(lexicon)?;
           for r in Box::new(items.iter().cloned()) {
               let (k, def): (assoc::KeyItem, Item) = r.try_fit().unwrap();
-              let word: Word = k.try_fit().unwrap();
-
+              let mut word: Word = k.try_fit().unwrap();
+              word.namespace = core.clone();
               let iter: Box<dyn Iterator<Item = Item>> = def.try_fit().unwrap();
               let new_entry: Entry = iter.try_fit().unwrap();
               let new_entry2 = new_entry.clone();
@@ -3579,6 +3569,8 @@ internally, to keep track of things like the stack, program, lists etc.
                   .and_modify(|e| {
                       e.examples = new_entry.examples;
                       e.spec = new_entry.spec;
+                      e.doc = new_entry.doc;
+                      e.namespace = core.clone();
                       // Don't overwrite the definition, this should be
                       // an axiom word where we've left the
                       // spec/examples temporarily blank and we're
@@ -3593,6 +3585,7 @@ internally, to keep track of things like the stack, program, lists etc.
       }
 
       fn builtins() -> Self {
+          let core = CORE.get_or_init(|| Some(Intern::new(vec![114, 138, 222]))); // base64 encodes to "core"
           let mut dict = HashMap::new();
           for (bw, bd) in BUILTIN_FUNCTIONS.iter() {
               let entry = Entry {
@@ -3600,7 +3593,10 @@ internally, to keep track of things like the stack, program, lists etc.
                   examples: None,
                   spec: None,
                   namespace: None,
+                  doc: None,
               };
+              let mut bw = bw.clone();
+              bw.namespace = core.clone();
               dict.insert(Word::derive(bw.clone()), entry);
           }
           Arc::new(dict)
@@ -3624,7 +3620,8 @@ internally, to keep track of things like the stack, program, lists etc.
                   examples: None,
                   spec: None,
                   definition: Definition::Derived(list!(err, "fail")),
-                  namespace: word.1,
+                  namespace: word.namespace.clone(),
+                  doc: None,
               };
               (word, entry)
           })
@@ -3770,6 +3767,12 @@ internally, to keep track of things like the stack, program, lists etc.
           if let Some(s) = self.spec {
               v.push(("spec".fit(), s.fit()))
           }
+          if let Some(d) = self.doc {
+              v.push(("doc".fit(), d.fit()))
+          }
+          if let Some(n) = self.namespace {
+              v.push(("namespace".fit(), n.as_ref().clone().fit()))
+          }
           Box::new(v.into_iter())
       }
   }
@@ -3782,6 +3785,7 @@ internally, to keep track of things like the stack, program, lists etc.
           let v: Vec<(assoc::KeyItem, Item)> = vec![
               ("words".fit(), self.words.fit()),
               ("modules".fit(), self.modules.fit()),
+              ("cache".fit(), self.cache.fit()),
           ];
           Box::new(v.into_iter())
       }
@@ -3794,6 +3798,7 @@ internally, to keep track of things like the stack, program, lists etc.
           let mut definition: Option<Definition> = None;
           let mut spec: Option<Spec> = None;
           let mut namespace: Namespace = None;
+          let mut doc: Option<String> = None;
           for i in iter {
               let (k, v): (assoc::KeyItem, Item) = i.try_fit()?;
               //println!("k: {:?}, v: {:?}", k, v);
@@ -3805,6 +3810,8 @@ internally, to keep track of things like the stack, program, lists etc.
                   spec = v.try_fit().ok();
               } else if k == "namespace".fit() {
                   namespace = v.try_fit().unwrap_or_default();
+              } else if k == "doc".fit() {
+                  doc = v.try_fit().ok();
               } else {
                   continue;
               }
@@ -3814,6 +3821,7 @@ internally, to keep track of things like the stack, program, lists etc.
               definition: definition.unwrap_or(Definition::Derived(coll::List::default())),
               spec,
               namespace,
+              doc,
           })
       }
   }
@@ -3832,6 +3840,7 @@ internally, to keep track of things like the stack, program, lists etc.
       type Error = Error;
       fn try_derive(iter: Box<dyn Iterator<Item = Item>>) -> Result<Self, Error> {
           let mut words = Words::default();
+          let mut cache = Words::default();
           let mut modules = Vec::<Namespace>::default();
 
           for i in iter {
@@ -3841,14 +3850,16 @@ internally, to keep track of things like the stack, program, lists etc.
                   words = v.try_fit()?;
               } else if k == "modules".fit() {
                   modules = v.try_fit()?;
+              } else if k == "cache".fit() {
+                  cache = v.try_fit()?;
               } else {
                   continue;
               }
           }
           Ok(Dictionary {
-              words: words,
+              words,
               modules,
-              cache: HashMap::new(),
+              cache,
           })
       }
   }
@@ -3877,7 +3888,9 @@ internally, to keep track of things like the stack, program, lists etc.
           let a = assoc.mutate();
           d.examples.and_then(|l| a.insert("examples".fit(), l.fit()));
           d.spec.and_then(|l| a.insert("spec".fit(), l.fit()));
-
+          d.doc.and_then(|l| a.insert("doc".fit(), l.fit()));
+          d.namespace
+              .and_then(|l| a.insert("namespace".fit(), l.as_ref().clone().fit()));
           if let Definition::Derived(d) = d.definition {
               a.insert("definition".fit(), d.fit());
           }
@@ -4184,20 +4197,15 @@ internally, to keep track of things like the stack, program, lists etc.
   /// the dictionary that the module built on the stack.
   fn load_module(mut env: Environment, module: &&str) -> Environment {
       //println!("Loading module {}", *module);
+      //println!("Cache: {:?}", env.dictionary.cache);
       env.push(Word::derive(*module));
       env.program.prepend(list!(
           "dictionary",
-          "swap",
-          list!(
-              "decache",
-              "string",
-              "read",
-              list!("words"),
-              "swap",
-              "update"
-          ),
-          "shielddown",
-          "dropdown"
+          "🔀",
+          list!("decache", "string", "read", list!("words"), "🔀", "update"),
+          "•🛡️",
+          "▶️",
+          "•🗑️"
       ));
       //println!("Dictionary: {:?}", env.dictionary);
       let mut new_env = futures::executor::block_on(async move { axiom::eval(env).await });
@@ -4220,13 +4228,18 @@ internally, to keep track of things like the stack, program, lists etc.
                   dictionary: dict::Dictionary {
                       words: dict::Words::builtins(),
                       modules: Default::default(),
-                      cache: HashMap::new(),
+                      cache: dict::Words::fresh(),
                   },
                   stack: Default::default(),
                   program: Default::default(),
               };
+
               env.load_core_modules()
                   .expect("failed to load core modules");
+              // add core module as default module
+              env.dictionary
+                  .modules
+                  .push(dict::CORE.get().unwrap().clone());
               env.dictionary.resolve();
               //println!("Dict has {} words", env.dictionary.entries.len());
               let mut env = [
@@ -4237,10 +4250,8 @@ internally, to keep track of things like the stack, program, lists etc.
                   "methods",
                   "generators",
                   "debug",
-                  "more-generators",
-                  "database",
-                  //"template",
-                  //"debug", // END default namespace // another good candidate for lib
+                  //"more-generators",
+                  //"database",
               ]
               .iter()
               .fold(env, load_module);
@@ -4270,6 +4281,7 @@ internally, to keep track of things like the stack, program, lists etc.
           (w, Item::Receptacle(_) | Item::Dispenser(_)) if *w == *S_RECEPTACLE => Ok(()),
           (w, Item::Number(Number::Int(_))) if *w == *S_INTEGER || *w == *S_NUMBER => Ok(()),
           (w, Item::Number(Number::Float(_))) if *w == *S_FLOAT || *w == *S_NUMBER => Ok(()),
+          (w, Item::Char(_)) if *w == *S_CHAR => Ok(()),
           // TODO: also handle cases where bytes/string is a list
           (
               w,
@@ -4860,6 +4872,7 @@ example, in order to read/write to/from disk).
   //! one custom tag is used for encoding byte arrays, but this is
   //! subject to change.
   use crate::traits::*;
+  use crate::types::container::Mutey;
   use crate::types::container::{
       self as coll, associative as assoc, environment::Environment, error::Error,
   };
@@ -4868,6 +4881,8 @@ example, in order to read/write to/from disk).
 
   use base64::prelude::BASE64_URL_SAFE_NO_PAD;
   use base64::Engine;
+  use edn_format::ParserOptions;
+  use internment::Intern;
 
   use std::collections::VecDeque;
   use std::fmt;
@@ -4893,7 +4908,15 @@ example, in order to read/write to/from disk).
               )
               .fit()
           }),
-          edn_format::Value::Symbol(s) => Ok(Item::Word(s.to_string().fit())),
+          edn_format::Value::Symbol(s) => Ok(Item::Word(Word {
+              data: Intern::new(s.name().to_string()),
+              namespace: s
+                  .namespace()
+                  .map(|ns| BASE64_URL_SAFE_NO_PAD.decode(ns.to_string()))
+                  .transpose()?
+                  .map(|decoded| Intern::new(decoded)),
+              quoted: false,
+          })),
           // we don't have booleans in kcats, so if we see 'false' that
           // is the word false which is not defined in the base
           // language, but might be user-defined later.
@@ -4964,7 +4987,16 @@ example, in order to read/write to/from disk).
               Item::Number(Number::Int(i)) => edn_format::Value::Integer(*i),
               Item::Number(Number::Float(f)) => edn_format::Value::from(*f),
               Item::Char(c) => edn_format::Value::Character(*c),
-              Item::Word(w) => edn_format::Value::Symbol(edn_format::Symbol::from_name(w.fit())),
+              Item::Word(w) => edn_format::Value::Symbol({
+                  if let Some(ns) = w.namespace {
+                      edn_format::Symbol::from_namespace_and_name(
+                          BASE64_URL_SAFE_NO_PAD.encode(ns.as_ref()).as_str(),
+                          w.fit(),
+                      )
+                  } else {
+                      edn_format::Symbol::from_name(w.fit())
+                  }
+              }),
               //Item::Entry(w) => edn_format::Value::Symbol(edn_format::Symbol::from_name(&w.word)),
               Item::Dispenser(coll::Dispenser::Out(o)) => (&o.representation()).into(),
               Item::Dispenser(coll::Dispenser::Tunnel(t)) => (&t.representation()).into(),
@@ -4986,6 +5018,81 @@ example, in order to read/write to/from disk).
               })
               .collect::<Result<Vec<Item>, Error>>()?,
       ))
+  }
+
+  /// A streaming parser function that takes the state of the parsing
+  /// off the stack and uses the edn-format crate to do the heavy
+  /// lifting. Reads all the remaining objects and returns a list of
+  /// them plus whatever string is leftover (empty string if nothing
+  /// left)
+  /// Note: This implementation is primarily designed for parsing
+  /// complete EDN data structures (lists, vectors, maps, etc).
+  /// When parsing raw tokens (symbols, numbers, etc) at chunk
+  /// boundaries, it may occasionally fail to properly join tokens
+  /// that span multiple chunks.
+  pub fn parse_edn(env: &mut Environment) -> Result<(), Error> {
+      let state: String = env.pop().try_fit()?;
+      let mut obj_buffer: coll::List = env.pop().try_fit()?;
+      let mut parser = edn_format::Parser {
+          opts: ParserOptions::default(),
+          iter: state.chars().peekable(),
+      };
+
+      // Collect items until we hit the end or can't parse anymore
+      let forms = obj_buffer.mutate();
+
+      loop {
+          // Save iterator state before attempting parse
+          let before_parse = parser.iter.clone();
+
+          match parser.next() {
+              Some(Ok(v)) => {
+                  forms.push_back(to_item(&v)?);
+              }
+              Some(Err(edn_format::ParserError::UnexpectedEndOfInput)) => {
+                  // Restore iterator to state before failed parse
+                  parser.iter = before_parse;
+                  break;
+              }
+              Some(Err(e)) => return Err(Error::from(e)),
+              None => break,
+          }
+      }
+      env.pop_prog();
+      let remaining: String = parser.iter.collect();
+      env.push(Item::derive(obj_buffer));
+      env.push(Item::derive(remaining));
+      Ok(())
+  }
+
+  /// A function to use with a streaming parser, converting from byte
+  /// arrays to strings. Returns whatever couldn't be parsed from the
+  /// byte array, in the event a utf8 character is incomplete.
+  fn split_at_utf8_boundary(bytes: &[u8]) -> (String, Vec<u8>) {
+      match std::str::from_utf8(bytes) {
+          Ok(s) => (s.to_string(), Vec::new()),
+          Err(e) => {
+              // e.valid_up_to() tells us the position where valid UTF-8 ends
+              let valid_str = String::from_utf8_lossy(&bytes[..e.valid_up_to()]).into_owned();
+              let remainder = bytes[e.valid_up_to()..].to_vec();
+              (valid_str, remainder)
+          }
+      }
+  }
+
+  pub fn parse_utf8(env: &mut Environment) -> Result<(), Error> {
+      let state: Bytes = env.pop().try_fit()?;
+      let buffer = env.pop();
+      let mut obj_buffer: String = Default::default();
+      if !buffer.is_empty() {
+          obj_buffer = buffer.try_fit()?;
+      }
+      let (parsed, remaining) = split_at_utf8_boundary(&state);
+      env.pop_prog();
+      obj_buffer.push_str(parsed.as_str());
+      env.push(Item::derive(obj_buffer));
+      env.push(Item::derive(remaining));
+      Ok(())
   }
 
   pub trait Emit {
@@ -5034,12 +5141,24 @@ example, in order to read/write to/from disk).
 
   impl From<edn_format::ParserError> for Error {
       fn from(e: edn_format::ParserError) -> Self {
-          Error::parse(e.to_string().as_str())
+          let s = match e {
+              edn_format::ParserError::UnexpectedCharacter(c) => {
+                  format!("Unexpected Character: {}", c)
+              }
+              e => e.to_string(),
+          };
+          Error::parse(s.as_str())
       }
   }
 
   impl From<string::FromUtf8Error> for Error {
       fn from(e: string::FromUtf8Error) -> Self {
+          Error::parse(e.to_string().as_str())
+      }
+  }
+
+  impl From<base64::DecodeError> for Error {
+      fn from(e: base64::DecodeError) -> Self {
           Error::parse(e.to_string().as_str())
       }
   }
@@ -5255,6 +5374,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   use cache::cache;
   use dynfmt::{Format, SimpleCurlyFormat};
   use futures::future::FutureExt;
+  use internment::Intern;
   use lazy_static::lazy_static;
   use std::cmp::max;
   use std::collections::HashMap;
@@ -5481,11 +5601,11 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("sort-indexed", Box::leak(Box::new(f_stack1(sort_by_key)))),
           ("-", Box::leak(Box::new(f_stack2(minus)))),
           ("/", Box::leak(Box::new(f_stack2(div)))),
-          ("<", Box::leak(Box::new(f_stack2(lt)))),
-          ("<=", Box::leak(Box::new(f_stack2(lte)))),
+          //("<", Box::leak(Box::new(f_stack2(lt)))),
+          //("<=", Box::leak(Box::new(f_stack2(lte)))),
           ("=", Box::leak(Box::new(eq))),
-          (">", Box::leak(Box::new(f_stack2(gt)))),
-          (">=", Box::leak(Box::new(f_stack2(gte)))),
+          //(">", Box::leak(Box::new(f_stack2(gt)))),
+          //(">=", Box::leak(Box::new(f_stack2(gte)))),
           ("abs", Box::leak(Box::new(f_stack1(abs)))),
           ("and", Box::leak(Box::new(f_stack2(and)))),
           ("animate", Box::leak(Box::new(animate))),
@@ -5505,23 +5625,29 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               Box::leak(Box::new(f_stack1(crate::types::container::pipe::channel::select))),
           ),
           ("autoformat", Box::leak(Box::new(f_stack1(autoformat)))),
-          ("branch", Box::leak(Box::new(branch))),
+          ("↔️", Box::leak(Box::new(branch))),
           ("bytes?", Box::leak(Box::new(f_stack1(is_bytes)))),
           ("cache", Box::leak(Box::new(f_result(write_blob)))),
-          ("clone", Box::leak(Box::new(clone))),
+          (
+              "character",
+              Box::leak(Box::new(f_stack1::<Char, Item, Error>(
+                  Char::try_derive,
+              ))),
+          ),
+          ("👥", Box::leak(Box::new(clone))),
           ("contains?", Box::leak(Box::new(f_stack2(contains)))),
           ("ceiling", Box::leak(Box::new(f_stack1(ceiling)))),
           ("compare", Box::leak(Box::new(f_stack2(compare)))),
-          ("count", Box::leak(Box::new(f_stack1(count)))),
+          ("📏", Box::leak(Box::new(f_stack1(count)))),
           ("dec", Box::leak(Box::new(f_stack1(dec)))),
           ("decache", Box::leak(Box::new(f_result(read_blob)))),
-          ("decide", Box::leak(Box::new(decide))),
+         // ("decide", Box::leak(Box::new(decide))),
           ("decodejson", Box::leak(Box::new(f_stack1(decode_json)))),
           ("dictmerge", Box::leak(Box::new(f_result(dictmerge)))),
-          ("dip", Box::leak(Box::new(dip))),
+          ("🪄", Box::leak(Box::new(dip))),
           ("dictionary", Box::leak(Box::new(dictionary))),
-          ("dipdown", Box::leak(Box::new(dipdown))),
-          ("drop", Box::leak(Box::new(drop))),
+          ("•🪄", Box::leak(Box::new(dipdown))),
+          ("🗑️", Box::leak(Box::new(drop))),
           ("emit", Box::leak(Box::new(f_stack1(emit)))),
           ("empty", Box::leak(Box::new(f_stack1(empty)))),
           ("empty?", Box::leak(Box::new(f_stack1(is_empty)))),
@@ -5539,8 +5665,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("eval-step", Box::leak(Box::new(eval_step_outer))),
           ("evaluate", Box::leak(Box::new(evaluate))),
           ("even?", Box::leak(Box::new(f_stack1(is_even)))),
-          ("evert", Box::leak(Box::new(evert))),
-          ("execute", Box::leak(Box::new(execute))),
+          ("🧦", Box::leak(Box::new(evert))),
+          ("▶️", Box::leak(Box::new(execute))),
           ("exp", Box::leak(Box::new(f_stack2(exp)))),
           ("fail", Box::leak(Box::new(f_result(fail)))),
           (
@@ -5553,7 +5679,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ),
           ("finished?", Box::leak(Box::new(f_stack1(is_finished)))),
           //("first", Box::leak(Box::new(f_stack1(first)))),
-          ("float", Box::leak(Box::new(float))),
+          ("🛟", Box::leak(Box::new(float))),
           ("floor", Box::leak(Box::new(f_stack1(floor)))),
           ("format", Box::leak(Box::new(f_stack2(format)))),
           ("handle", Box::leak(Box::new(handle))),
@@ -5568,23 +5694,26 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("inc", Box::leak(Box::new(f_stack1(inc)))),
           ("intersection", Box::leak(Box::new(f_stack2(intersection)))),
           ("inspect", Box::leak(Box::new(f_stack1(inspect)))),
-          ("join", Box::leak(Box::new(f_stack2(join)))),
+          ("🔗", Box::leak(Box::new(f_stack2(join)))),
           ("key", Box::leak(Box::new(f_stack1(crate::crypto::key)))),
           ("last", Box::leak(Box::new(f_stack1(last)))),
           ("list?", Box::leak(Box::new(f_stack1(is_list)))),
           ("log", Box::leak(Box::new(f_stack2(log)))),
-          ("loop", Box::leak(Box::new(loop_))),
+          //("🌀", Box::leak(Box::new(loop_))),
           ("mod", Box::leak(Box::new(f_stack2(mod_)))),
-          ("not", Box::leak(Box::new(f_stack1(not)))),
+          ("☯️", Box::leak(Box::new(f_stack1(not)))),
+          ("namespace", Box::leak(Box::new(f_stack2(namespace)))),
           ("number", Box::leak(Box::new(f_stack1::<Number, Item, Error>(
               Number::try_derive,
           )))),
           ("number?", Box::leak(Box::new(f_stack1(is_number)))),
           ("odd?", Box::leak(Box::new(f_stack1(is_odd)))),
           ("or", Box::leak(Box::new(f_stack2(or)))),
-          ("pack", Box::leak(Box::new(f_result(pack)))),
+          ("🎒", Box::leak(Box::new(f_result(pack)))),
+          ("parse-edn", Box::leak(Box::new(f_result(serialize::parse_edn)))),
+          ("parse-utf8", Box::leak(Box::new(f_result(serialize::parse_utf8)))),
           ("pop", Box::leak(Box::new(pop))),
-          ("put", Box::leak(Box::new(put))),
+          ("📮", Box::leak(Box::new(put))),
           ("pipe?", Box::leak(Box::new(f_stack1(is_pipe)))),
           (
               "random",
@@ -5596,7 +5725,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               "receiver",
               Box::leak(Box::new(f_stack1(crate::types::container::pipe::channel::receiver))),
           ),
-          ("recur", Box::leak(Box::new(recur))),
+          //("recur", Box::leak(Box::new(recur))),
+          ("resolve", Box::leak(Box::new(resolve))),
           ("resume", Box::leak(Box::new(identity))),
           ("reverse", Box::leak(Box::new(f_stack1(reverse)))),
           ("round", Box::leak(Box::new(f_stack1(round)))),
@@ -5617,7 +5747,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ),
           ("set?", Box::leak(Box::new(f_stack1(is_set)))),
           ("sign", Box::leak(Box::new(f_stack2(crate::crypto::sign)))),
-          ("sink", Box::leak(Box::new(sink))),
+          ("⚓", Box::leak(Box::new(sink))),
           ("slice", Box::leak(Box::new(f_stack3(slice)))),
           (
               "socket",
@@ -5625,19 +5755,19 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ),
           ("sqrt", Box::leak(Box::new(f_stack1(sqrt)))),
           ("standard", Box::leak(Box::new(standard))),
-          ("step", Box::leak(Box::new(step))),
           ("string", Box::leak(Box::new(f_stack1(string)))),
           ("string?", Box::leak(Box::new(f_stack1(is_string)))),
-          ("swap", Box::leak(Box::new(swap))),
-          ("swapdown", Box::leak(Box::new(swapdown))),
+          ("🔀", Box::leak(Box::new(swap))),
+          ("•🔀", Box::leak(Box::new(swapdown))),
           (
               "timer",
               Box::leak(Box::new(f_stack1(crate::types::container::pipe::channel::timer))),
           ),
           ("timestamps", Box::leak(Box::new(timestamps))),
           ("unassign", Box::leak(Box::new(f_stack2(unassign)))),
-          ("take", Box::leak(Box::new(take))),
-          ("unwrap", Box::leak(Box::new(unwrap))),
+          ("unnamespace", Box::leak(Box::new(unnamespace))),
+          ("📤", Box::leak(Box::new(take))),
+          ("🍫", Box::leak(Box::new(unwrap))),
           ("using", Box::leak(Box::new(f_result(using)))),
           (
               "verify",
@@ -5648,9 +5778,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               Word::try_derive,
           )))),
           ("word?", Box::leak(Box::new(f_stack1(is_word)))),
-          ("wrap", Box::leak(Box::new(wrap))),
+          ("🎁", Box::leak(Box::new(wrap))),
           ("xor", Box::leak(Box::new(f_stack2(xor)))),
-          ("yes", Box::leak(Box::new(yes))),
+          ("✔️", Box::leak(Box::new(yes))),
           ("zero?", Box::leak(Box::new(f_stack1(is_zero)))),
       ];
 
@@ -5927,25 +6057,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       Ok(c.into_iter().last().unwrap_or_default())
   }
 
-  pub fn loop_(mut env: Environment) -> Future<Environment> {
-      let p = coll::List::try_derive(env.pop());
-      match p {
-          Ok(mut p) => {
-              env.pop_prog();
-              let f = env.pop();
-              if is_truthy(f) {
-                  let p2 = p.clone();
-                  let pm = Arc::make_mut(&mut p);
-                  pm.push_back(Item::derive(p2));
-                  pm.push_back("loop".fit());
-                  env.program.prepend(p);
-              }
-          }
-          Err(e) => env.push(e),
-      }
-      env.fit()
-  }
-
   pub fn execute(mut env: Environment) -> Future<Environment> {
       let i = env.pop();
       match coll::List::try_derive(i) {
@@ -6065,7 +6176,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       env.fit()
   }
 
-  pub fn is_truthy(i: Item) -> bool {
+  pub fn is_truthy(i: &Item) -> bool {
       match i {
           Item::Dispenser(coll::Dispenser::Sized(d)) => !d.is_empty(),
           Item::Receptacle(coll::Receptacle::Sized(r)) => !r.is_empty(),
@@ -6080,13 +6191,16 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       ) {
           (Ok(false_branch), Ok(true_branch)) => {
               env.pop_prog();
-              let b = env.pop();
+              let b = env.stack.front().unwrap();
 
-              env.program.prepend(if is_truthy(b) {
+              let selected_branch = if is_truthy(b) {
                   true_branch
               } else {
+                  // A falsey value is useless, so drop it
+                  env.pop();
                   false_branch
-              })
+              };
+              env.program.prepend(selected_branch)
           }
           (Err(e), _) => env.push(e),
           (_, Err(e)) => env.push(e),
@@ -6343,9 +6457,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn or(i: Item, j: Item) -> ItemResult {
-      Ok(if is_truthy(i.clone()) {
+      Ok(if is_truthy(&i) {
           i
-      } else if is_truthy(j.clone()) {
+      } else if is_truthy(&j) {
           j
       } else {
           Item::default()
@@ -6354,7 +6468,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn and(i: Item, j: Item) -> ItemResult {
-      Ok(if is_truthy(i) && is_truthy(j.clone()) {
+      Ok(if is_truthy(&i) && is_truthy(&j) {
           j
       } else {
           Item::default()
@@ -6362,7 +6476,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn not(i: Item) -> ItemResult {
-      Ok(Item::derive(!is_truthy(i)))
+      Ok(Item::derive(!is_truthy(&i)))
   }
 
   pub fn is_association(i: Item) -> Result<bool, Error> {
@@ -6383,72 +6497,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn is_even(i: Int) -> Result<bool, Error> {
       Ok(i & 1 == 0)
-  }
-
-  pub fn decide(mut env: Environment) -> Future<Environment> {
-      let mut clauses = coll::List::try_derive(env.pop()).unwrap();
-      let clauses_data = Arc::make_mut(&mut clauses);
-      let clause = clauses_data.pop_front();
-
-      if let Some(clause) = clause {
-          let clause: Result<coll::List, Error> = clause.try_fit();
-          match clause {
-              Ok(mut clause) => {
-                  if clause.len() != 2 {
-                      env.push(Error::list_count(2));
-                  } else {
-                      let clause_data = clause.mutate();
-                      let test: Result<coll::List, Error> = clause_data
-                          .pop_front()
-                          .ok_or(Error::list_count(2))
-                          .and_then(|i| i.try_fit());
-                      let expr: Result<coll::List, Error> = clause_data
-                          .pop_front()
-                          .ok_or(Error::list_count(2))
-                          .and_then(|i| i.try_fit());
-
-                      match (test, expr) {
-                          (Ok(test), Ok(expr)) => {
-                              // construct if
-                              let testp = list!(test, "shield");
-
-                              let newexpr = list!(
-                                  testp,
-                                  expr,
-                                  list!(clauses, "decide"),
-                                  list!("shield"),
-                                  // This is the definition of 'dipdown'
-                                  // which we don't want to depend on so
-                                  // early in bootstrapping
-                                  "wrap",
-                                  list!("dip"),
-                                  "join",
-                                  "dip",
-                                  // end 'dipdown'
-                                  "branch"
-                              );
-                              env.pop_prog();
-                              env.program.prepend(newexpr);
-                          }
-                          (Err(test), _) => {
-                              env.push(test);
-                          }
-                          (_, Err(expr)) => {
-                              env.push(expr);
-                          }
-                      }
-                  }
-              }
-              Err(e) => {
-                  env.push(e);
-              }
-          }
-      } else {
-          // clauses empty, return nothing
-          env.pop_prog();
-          env.push(Item::default());
-      }
-      env.fit()
   }
 
   pub fn emit(l: coll::List) -> ItemResult {
@@ -6729,7 +6777,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       env.fit()
   }
 
-  /// Makes 'yes' a word that doesn't have to be quoted, just pushes
+  /// Makes '✔️' a word that doesn't have to be quoted, just pushes
   /// itself onto the stack.
   pub fn yes(mut env: Environment) -> Future<Environment> {
       let t = env.pop_prog();
@@ -6880,13 +6928,33 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn compare(i: Item, j: Item) -> ItemResult {
-      let ki = assoc::KeyItem::try_derive(i)?;
-      let kj = assoc::KeyItem::try_derive(j)?;
-      match ki.partial_cmp(&kj) {
-          Some(std::cmp::Ordering::Less) => Ok("less".fit()),
-          Some(std::cmp::Ordering::Equal) => Ok("equal".fit()),
-          Some(std::cmp::Ordering::Greater) => Ok("greater".fit()),
-          None => Err(Error::expected("comparable", pair(ki.fit(), kj.fit()))),
+      fn res(r: Option<std::cmp::Ordering>, i: Item, j: Item) -> ItemResult {
+          match r {
+              Some(std::cmp::Ordering::Less) => Ok("less".fit()),
+              Some(std::cmp::Ordering::Equal) => Ok("equal".fit()),
+              Some(std::cmp::Ordering::Greater) => Ok("greater".fit()),
+              None => Err(Error::expected("comparable", pair(i, j))),
+          }
+      }
+      match (i, j) {
+          (Item::Number(Number::Float(fi)), Item::Number(Number::Float(fj))) => {
+              let r = fi.partial_cmp(&fj);
+              res(r, fi.fit(), fj.fit())
+          }
+          (Item::Number(Number::Int(fi)), Item::Number(Number::Float(fj))) => {
+              let r = (fi as f64).partial_cmp(&fj);
+              res(r, fi.fit(), fj.fit())
+          }
+          (Item::Number(Number::Float(fi)), Item::Number(Number::Int(fj))) => {
+              let r = fi.partial_cmp(&(fj as f64));
+              res(r, fi.fit(), fj.fit())
+          }
+          (i, j) => {
+              let ki = assoc::KeyItem::try_derive(i)?;
+              let kj = assoc::KeyItem::try_derive(j)?;
+              let r = ki.partial_cmp(&kj);
+              res(r, ki.fit(), kj.fit())
+          }
       }
   }
 
@@ -6988,6 +7056,37 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       Ok(Item::derive(serde_json::to_string(&i)?))
   }
 
+  fn namespace(word: Word, ns: Bytes) -> Result<Word, Infallible> {
+      let mut word = word;
+      word.namespace = Some(Intern::new(ns));
+      Ok(word.fit())
+  }
+
+  fn unnamespace(mut env: Environment) -> Future<Environment> {
+      env.pop_prog();
+      let mut w: Word = env.pop().try_fit().unwrap();
+      if let Some(ns) = w.namespace {
+          w.namespace = None;
+          env.push(w);
+          env.push(Item::derive(ns.as_ref().clone()));
+      } else {
+          env.push(w);
+          env.push(Item::default())
+      }
+      env.fit()
+  }
+
+  fn resolve(mut env: Environment) -> Future<Environment> {
+      env.pop_prog();
+      let mut w: Word = env.pop().try_fit().unwrap();
+
+      if let Some(e) = env.dictionary.cache.get(&w) {
+          w.namespace = e.namespace.clone();
+      }
+      env.push(w);
+      env.fit()
+  }
+
   fn is_finished(env: Environment) -> Result<bool, Infallible> {
       Ok(env.is_finished())
   }
@@ -7008,18 +7107,21 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
       fn stackpoint(w: Word) -> Option<(usize, bool)> {
           let s = String::derive(w.clone());
-          //println!("string! {:?}", s);
-          if let Some(slot) = s.strip_prefix("**") {
-              slot.parse::<usize>()
-                  .ok()
-                  .and_then(|n| if n > 0 { Some((n, true)) } else { None })
-          } else if let Some(slot) = s.strip_prefix("*") {
-              slot.parse::<usize>()
-                  .ok()
-                  .and_then(|n| if n > 0 { Some((n, false)) } else { None })
-          } else {
-              None
+
+          // Define mappings for number emojis
+          const NUMBER_EMOJIS: [&str; 9] = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣"];
+
+          // Check for splice (scissors + number)
+          if let Some(rest) = s.strip_prefix("✂️") {
+              if let Some(position) = NUMBER_EMOJIS.iter().position(|&emoji| emoji == rest) {
+                  return Some((position + 1, true));
+              }
+          // Check for just the number (insert operation)
+          } else if let Some(position) = NUMBER_EMOJIS.iter().position(|&emoji| emoji == s) {
+              return Some((position + 1, false));
           }
+
+          None
       }
 
       /// Takes an accumulator that is a pair of the stack and the
@@ -7118,8 +7220,13 @@ rust project or some other language through FFI.
       use jni::objects::{JClass, JString};
       use jni::sys::jstring;
       use jni::JNIEnv;
-
       use libc::c_char as lc_char;
+      use once_cell::sync::Lazy;
+      use tokio::runtime::Runtime;
+
+      static RUNTIME: Lazy<Runtime> =
+          Lazy::new(|| Runtime::new().expect("Failed to create Tokio runtime"));
+
       #[link(name = "log")]
       extern "C" {
           fn __android_log_print(prio: i32, tag: *const lc_char, fmt: *const lc_char, ...) -> i32;
@@ -7169,8 +7276,7 @@ rust project or some other language through FFI.
                   Ok(_) => {
                       // Execute the eval and re-assign the result back to the env pointer
                       log("Executing environment");
-                      env_val =
-                          futures::executor::block_on(async move { axiom::eval(env_val).await });
+                      env_val = RUNTIME.block_on(async move { axiom::eval(env_val).await });
                       log("Formatting result");
                       let result =
                           serialize::auto_format(env_val.stack.iter().emit().as_str(), 20, 80);
@@ -7195,7 +7301,12 @@ rust project or some other language through FFI.
           cachepath: JString,
           dbfile: JString,
       ) -> *mut Environment {
-          //panic!("oh noes");
+          //set panic hook to log panics
+          std::panic::set_hook(Box::new(|panic_info| {
+              // Log panic info
+              log(format!("Rust panic: {:?}", panic_info).as_str());
+          }));
+
           log("creating new kcats env");
           let cacheloc: String = jnienv
               .get_string(&cachepath)
@@ -7378,7 +7489,7 @@ rust project or some other language through FFI.
       }
 
       fn test_word(standard_env: Environment, w: Word) -> Vec<Error> {
-          if let Some(d) = standard_env.dictionary.words.get(&w.clone().fit()) {
+          if let Some(d) = standard_env.dictionary.cache.get(&w.clone().fit()) {
               d.examples
                   .clone()
                   .unwrap()
@@ -7416,7 +7527,7 @@ rust project or some other language through FFI.
       #[test_case("abs")]
       #[test_case("addmethod")]
       #[test_case("and")]
-      #[test_case("any?" ; "is_any")]
+      #[test_case("📣" ; "is_any")]
       #[test_case("assemble")]
       #[test_case("assign")]
       #[test_case("association")]
@@ -7424,36 +7535,38 @@ rust project or some other language through FFI.
       #[test_case("bail")]
       #[test_case("bits")]
       #[test_case("both?" ; "is_both")]
-      #[test_case("branch")]
+      #[test_case("both")]
+      #[test_case("↔️" ; "branch")]
       #[test_case("butlast")]
       #[test_case("bytes?" ; "is_bytes")]
       #[test_case("catcher")]
       #[test_case("ceiling")]
-      #[test_case("clone")]
-      #[test_case("clonedown")]
-      #[test_case("clonedeep")]
+      #[test_case("character")]
+      #[test_case("👥" ; "clone")]
+      #[test_case("•👥" ; "clonedown")]
+      #[test_case("••👥" ; "clonedeep")]
       #[test_case("collect")]
       #[test_case("compare")]
+      #[test_case("compare-by")]
+      #[test_case("🎭" ; "complement")]
       #[test_case("contains?" ; "contains")]
-      #[test_case("count")]
+      #[test_case("📏" ; "count")]
       #[test_case("cram")]
       #[test_case("cut")]
       #[test_case("dec")]
       #[test_case("decide")]
       #[test_case("decodejson")]
-      #[test_case("decorate")]
-      #[test_case("decorated")]
       #[test_case("definition")]
-      #[test_case("dip")]
-      #[test_case("dipdown")]
-      #[test_case("dipdeep")]
-      #[test_case("dive")]
-      #[test_case("divedown")]
-      #[test_case("divedeep")]
+      #[test_case("🪄" ; "dip")]
+      #[test_case("•🪄" ; "dipdown")]
+      #[test_case("••🪄" ; "dipdeep")]
+      #[test_case("🐋" ; "dive")]
+      #[test_case("•🐋" ; "divedown")]
+      #[test_case("••🐋" ; "divedeep")]
       //#[test_case("draft")]
-      #[test_case("drop")]
-      #[test_case("dropdown")]
-      #[test_case("dropdeep")]
+      #[test_case("🗑️" ; "drop")]
+      #[test_case("•🗑️" ; "dropdown")]
+      #[test_case("••🗑️" ; "dropdeep")]
       #[test_case("dropper")]
       #[test_case("each")]
       #[test_case("emit")]
@@ -7467,116 +7580,123 @@ rust project or some other language through FFI.
       #[test_case("evaluate")]
       #[test_case("eval-step")]
       #[test_case("even?" ; "is_even")]
-      #[test_case("evert")]
-      #[test_case("every?" ; "is_every")]
-      #[test_case("execute")]
+      #[test_case("🧦" ; "evert")]
+      #[test_case("💯" ; "is_every")]
+      #[test_case("▶️"; "execute")]
       #[test_case("exp")]
-      #[test_case("filter")]
+      #[test_case("🧲" ; "filter")]
       #[test_case("finished?" ; "is_finished")]
       #[test_case("first")]
       #[test_case("flatten")]
       #[test_case("flip")]
-      #[test_case("float")]
+      #[test_case("🛟" ; "float")]
       #[test_case("floor")]
       #[test_case("fold")]
       #[test_case("format")]
       #[test_case("frequencies")]
       #[test_case("future")]
       #[test_case("get")]
-      #[test_case("generate")]
       #[test_case("group")]
       #[test_case("hashbytes")]
-      #[test_case("if")]
+      #[test_case("⚖️" ; "_if")]
       #[test_case("inc")]
       #[test_case("indexed")]
       #[test_case("indexer")]
       #[test_case("indexof")]
-      #[test_case("inject")]
+      #[test_case("💉" ; "inject")]
       //#[test_case("inscribe")]
       #[test_case("intersection")]
-      #[test_case("into")]
-      #[test_case("join")]
-      #[test_case("joiner")]
+      #[test_case("🧹" ; "into")]
+      #[test_case("🔗" ; "join")]
       #[test_case("keep")]
       #[test_case("label")]
       #[test_case("let")]
       #[test_case("list?" ; "is_list")]
       #[test_case("lookup")]
-      #[test_case("loop")]
+      #[test_case("🌀"; "_loop")]
       #[test_case("log")]
-      #[test_case("map")]
+      #[test_case("🚜" ; "map")]
       #[test_case("max")]
+      #[test_case("max-by")]
       #[test_case("min")]
+      #[test_case("min-by")]
       #[test_case("mod")]
       //#[test_case("module")]
-      #[test_case("not")]
+      #[test_case("☯️" ; "not")]
       #[test_case("empty?" ; "is_empty")]
+      #[test_case("namespace")]
       #[test_case("number")]
       #[test_case("number?" ; "is_number")]
       #[test_case("odd?" ; "is_odd")]
       #[test_case("or")]
       #[test_case("over")]
-      #[test_case("pack")]
+      #[test_case("🎒" ; "pack")]
       #[test_case("pad")]
       #[test_case("pair?" ; "is_pair")]
       #[test_case("pairwise")]
+      #[test_case("parse")]
+      #[test_case("parse-edn")]
+      #[test_case("parse-utf8")]
       #[test_case("partition")]
       #[test_case("pipe?" ; "is_pipe")]
-      #[test_case("put")]
+      #[test_case("📮" ; "put")]
       #[test_case("prepend")]
       #[test_case("primrec")]
+      #[test_case("produce")]
       #[test_case("radix")]
       #[test_case("range")]
-      #[test_case("recover")]
-      #[test_case("recur")]
-      #[test_case("repeat")]
+      #[test_case("🩹" ; "recovery")]
+      #[test_case("🪆" ; "recur")]
+      #[test_case("repetition")]
       #[test_case("rest")]
+      #[test_case("resolve")]
       #[test_case("restore")]
       #[test_case("retry")]
       #[test_case("reverse")]
       #[test_case("round")]
       #[test_case("set")]
       #[test_case("set?" ; "is_set")]
-      #[test_case("shield")]
-      #[test_case("shielddown")]
-      #[test_case("shielddeep")]
-      #[test_case("sink")]
-      #[test_case("siphon")]
+      #[test_case("🛡️" ; "shield")]
+      #[test_case("•🛡️" ; "shielddown")]
+      #[test_case("••🛡️" ; "shielddeep")]
+      #[test_case("⚓" ; "sink")]
+      #[test_case("reap")]
       #[test_case("skipper")]
       #[test_case("slice")]
-      #[test_case("snapshot")]
+      #[test_case("📸" ; "snapshot")]
       #[test_case("something?" ; "is_something")]
       #[test_case("sqrt")]
       #[test_case("starts?" ; "is_starts")]
-      #[test_case("step")]
+      #[test_case("🪜" ; "step")]
       #[test_case("string")]
       #[test_case("string?" ; "is_string")]
       #[test_case("spawn")]
       #[test_case("split")]
-      #[test_case("swap")]
-      #[test_case("swapdown")]
-      #[test_case("take")]
+      #[test_case("🔀" ; "swap")]
+      #[test_case("•🔀" ; "swapdown")]
+      #[test_case("📤" ; "take")]
       #[test_case("taker")]
       #[test_case("times")]
       #[test_case("type")]
       #[test_case("unassign")]
       #[test_case("under")]
+      #[test_case("unnamespace")]
       #[test_case("until")]
-      #[test_case("unwrap")]
+      #[test_case("🍫" ; "unwrap")]
       #[test_case("update")]
       #[test_case("value")]
       #[test_case("walk")]
       #[test_case("when")]
-      #[test_case("while")]
+      #[test_case("⏳" ; "_while")]
       #[test_case("within?" ; "is_within")]
       #[test_case("word")]
       #[test_case("word?" ; "is_word")]
-      #[test_case("wrap")]
+      #[test_case("🎁" ; "wrap")]
       #[test_case("xor")]
       #[test_case("zero?" ; "is_zero")]
       #[test_case("zip")]
       fn test_lexicon(word: &str) {
-          crate::default::configure_platform();
+          crate::config::configure_platform();
           let e = Environment::default();
 
           let r = test_word(e.clone(), word.fit());
@@ -7598,7 +7718,6 @@ We'll also define how to run unit tests.
   use kcats::serialize::{self, Emit};
   pub use kcats::traits::*;
   use kcats::types::container::environment::Environment;
-  use kcats::types::container::error::Error;
   use std::io::{self, BufRead, Read, Write};
 
   fn print_result(env: Environment) {
@@ -7627,14 +7746,17 @@ We'll also define how to run unit tests.
 
   /// Evaluates the program in the context of the env, and handles any
   /// unhandled errors. Good for interactive programming.
-  async fn repl_eval(mut env: Environment, mut program: String) -> Result<Environment, Error> {
+  async fn repl_eval(mut env: Environment, mut program: String) -> Environment {
       // to ensure errors are handled by the repl- so that the
       // user can continue with more input.
       program.push_str(" handle");
 
       match serialize::parse_input(&mut env, program) {
-          Ok(_) => Ok(axiom::eval(env).await),
-          Err(e) => Err(e),
+          Ok(_) => axiom::eval(env).await,
+          Err(e) => {
+              env.push(e);
+              env
+          }
       }
   }
   // A function that takes a handle to stdin. It reads a length from
@@ -7687,7 +7809,7 @@ We'll also define how to run unit tests.
 
       loop {
           if let Some(program) = read_input().await {
-              env = repl_eval(env, program).await.unwrap();
+              env = repl_eval(env, program).await;
               print_with_length(&env).await;
           }
       }
@@ -7710,7 +7832,7 @@ We'll also define how to run unit tests.
               continue;
           }
 
-          env = repl_eval(env, line).await.unwrap();
+          env = repl_eval(env, line).await;
           print(&env).await;
       }
   }
@@ -8621,7 +8743,7 @@ Implement the =handoff= type
               self.close_take()
           };
           if let Some(ch) = self.sender.clone() {
-              if axiom::is_truthy(i.clone()) {
+              if axiom::is_truthy(&i) {
                   Box::pin(async move {
                       ch.send_async(i)
                           .await
@@ -9587,6 +9709,149 @@ Then the resplitting generator becomes:
   any). If non-empty, join with previous byte buffer state
 - run the splitter function on the byte buffer, join with previous
   object buffer state, emit one object
+
+  #+begin_src kcats
+    ["[foo] [bar] [ba" "z] [quux" "] [[this] " "[that]]" "[foo" "]"] [take] [] []
+    ;; if there is already a parsed object, emit it and don't pull from the parent yet
+    [[swap not] ;; nothing in output
+     [ [generate] divedown join read-chunk]
+     while
+     [take] dive] collect
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  [[foo] [bar] [baz] [quux] [[this] [that]]] [[swap not]
+                                              [[generate] divedown join read-chunk] when [take] dive]
+  "[foo" [] [take] ["]"]
+  #+end_src
+
+#+begin_src kcats
+  [["[foo] [bar] [ba"
+    "z] [quux"
+    "] [[this] "
+    "[that]]"
+    "[foo" "]"] [take]
+   [parse-edn] parse collect]
+  shield
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  [[foo] [bar] [baz] [quux] [[this] [that]]
+   [foo]]
+  #+end_src
+
+#+begin_src kcats
+
+  ["[foo]\n [bar] [ba" "z] [quux" "] [[this] " "[that]]" "[other" "]"] [take] [] []
+
+  [[swap not] ;; if there's nothing in the output, 
+   [[[generate] divedown ] ;;generate parent
+    [[[] [swap not]] [execute] every?] ;; as long as the parent generates and there's no output
+    [join read-chunk] prime
+    ;; we may have bailed out of the loop either because the parent is done or there's output, see which
+    [] [join read-chunk] when
+   ] ;; generate until either we have output or the parent returned nothing
+   ;; otherwise keep generating 
+   when
+   [take] dive ] collect
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[foo] [bar] [baz] [quux] [[this] [that]]
+ [other]]
+[[swap not]
+ [[[generate] divedown]
+  [[[] [swap not]]
+   [execute] every?]
+  [join read-chunk]
+  prime [] [join read-chunk]
+  when]
+ when [take] dive]
+[] "" [] [take] []
+#+end_src
+
+  Now let's demonstrate with reading UTF8 bytes
+
+  #+begin_src kcats
+    ["[foo] [bar] [ba" "z] [quux" "] [[this] " "[that]]" "[foo" "]"] [take] [] []
+    ;; if there is already a parsed object, emit it and don't pull from the parent yet
+    [[swap not]
+     [ [generate] divedown join read-chunk]
+     when
+     [take] dive] collect
+  #+end_src
+
+  #+begin_src kcats
+    [[[104 101 108 108 111]              ;; "hello" (all ASCII)
+      [228 189 160 229 165 189]          ;; "你好" (two complete Chinese chars)
+      [104 105 226]                      ;; "hi" + start of "€"
+      [130 172]                          ;; completion of "€"
+      [240 159 145]                      ;; start of "👑"
+      [145]                              ;; completion of "👑"
+      [97 98 99 240]                     ;; "abc" + start of "🌈"
+      [159 140 136]]                     ;; completion of "🌈"
+
+     [#b64 "" swap [put] step] map
+
+     [take] [parse-utf8]
+     parse "" into] shield
+
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  "hello你好hi€👑abc🌈"
+  #+end_src
+
+  #+begin_src kcats
+  #b64 "" 123 put string
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  "{"
+  #+end_src
+
+  #+begin_src kcats
+    "" [104 101 108 108 111] #b64 "" swap [put] step; parse-utf8
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  "" #b64 "aGni" parse-utf8
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  #b64 "4g" "hi"
+  #+end_src
+
+  #+begin_src kcats
+[[["" #b64 "aGni" parse-utf8] ["hi" #b64 "4g"]]
+                        [["" #b64 "aGVsbG8" parse-utf8] ["hello" #b64 ""]]]
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+    [parse-utf8 [[spec [[[bytes input] [sized current-output]]
+                      [[bytes remaining-input] [string updated-output-sequence]]]]
+               [examples [[["" #b64 "aGni" parse-utf8] ["hi" #b64 "4g"]]
+                          [["" #b64 "aGVsbG8" parse-utf8] ["hello" #b64 ""]]]]]]
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  [parse-utf8 [[spec [[[bytes input]
+                       [sized current-output]]
+                      [[bytes remaining-input]
+                       [string updated-output-sequence]]]]
+               [examples [[["" #b64 "aGni" parse-utf8] ["hi" #b64 "4g"]]
+                          [["" #b64 "aGVsbG8" parse-utf8] ["hello" #b64 ""]]]]]]
+  #+end_src
+
 *** DONE Time pipe
 Each take from the pipe return the current unix time in ms.  Should be
 a "singleton" - probably using Box::leak, so that we can insert a copy
@@ -10608,6 +10873,25 @@ integers 10 taker collect drop generate
 *** DONE map
 *** DONE filter
 *** DONE take
+#+begin_src kcats
+  ;; a generator of ints starting with 0
+  -1 [] [inc 👥] [] [🔀] 🪆
+  ;; taker
+  5
+  [[[positive?] 🛡️
+    [🗑️ 1️⃣ 🐋] 
+    [[]] ⚖️ ▶️] 🎒] 🐋
+  [[dec •🗑️] 🪄]  
+  [🗑️ []]
+  [🔀] 🪆 
+  collect
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[0 1 2 3 4] 4
+#+end_src
+
 *** DONE drop
 #+begin_src kcats
 integers 15 taker 10 dropper [+] reduce
@@ -11463,6 +11747,16 @@ This should work - the empty set and map maybe can't be compared but Nothing sho
 greater
 #+end_src
 
+=<= in terms of compare?
+#+begin_src kcats
+  "foo" "bar" compare [greater] 🍫 =
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+✔️
+#+end_src
+
 ** TODO Stream transformation
 Problem: kcats doesn't speak http or https or various other protocols
 and formats, but rust does. We want to be able to use the complicated
@@ -11567,6 +11861,32 @@ Read inputs from stdin, eval in a nested env, write to stdout.
     shielddown]
 [take] [[peer standard]
         [type tunnel]]
+#+end_src
+
+#+begin_src kcats
+  standard [take] ;; generate chunks of bytes from stdin
+  [parse-utf8] parse ;; now have chunks of strings
+
+#+end_src
+
+write a parser for length-delimited inputs
+#+begin_src kcats 
+  ; ["10\nabcdefg" "hij12\nfoo"]
+   []
+   ;;"5\nfooba4\nquux"
+   "5\nfo"
+   [take]
+   "\n" split generate [read first] bail 0 or ;; get count
+   [[drop] 4 times] dip ;; drop the split generator
+   [swap count <=]
+   [cut swap [put] dip]
+   when
+
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+5 "fo" []
 #+end_src
 
 ** CANCELED Words that quote programs instead of executing them
@@ -14902,7 +15222,8 @@ programs need to be called during the execution of templating so I
 think it's easily done in rust. Then that solves the chicken/egg
 problem where other stuff depends on template but template depends on
 it. 
-** TODO Add description to each example :testing:
+** INPROGRESS Add description to each example                      :testing:
+- State "INPROGRESS" from "TODO"       [2024-10-03 Thu 19:20]
 ** TODO Add integration tests :testing:
 ** TODO Size of option enums
 #+begin_src rust :toolchain 'stable :crates '((internment . "0.6"))
@@ -15067,3 +15388,1772 @@ recur again to drop evaluate from programs that are already done.
 - State "INPROGRESS" from "TODO"       [2024-09-08 Sun 10:37]
 Will be an axiom word.
 
+
+** INPROGRESS Emoji
+- State "INPROGRESS" from "TODO"       [2024-12-04 Wed 20:16]
+*** INPROGRESS Choose emoji aliases for combinators
+- State "INPROGRESS" from "TODO"       [2024-11-09 Sat 22:03]
+
+  Choices:
+
+|----------+------|
+| execute  | ▶️   |
+| loop     | 🌀 ♾ |
+| dive     | 🐋   |
+| down     | ⬇️   |
+| inject   | 💉   |
+| dip      | 🍲🪄 |
+| every?   | 💯   |
+| any?     | 💢📣 |
+| map      | 🚜   |
+| shield   | 🛡️   |
+| decorate | 🎀   |
+| if       | ⚖️   |
+| while    | ⏳🕐 |
+| filter   | 🧲   |
+| recur    | 🪆   |
+| clone    | 👥   |
+| swap     | 🔀   |
+| drop     | 🗑️   |
+| take     | 📤   |
+| put      | 📮   |
+| join     | 🔗   |
+| step     | 🪜   |
+| unwrap   | 🍫   |
+| wrap     | 🎁   |
+| sink     | ⚓   |
+| float    | 🛟   |
+|          |      |
+*** INPROGRESS Automatic conversion of english -> emoji
+- State "INPROGRESS" from "TODO"       [2024-11-11 Mon 08:21]
+
+  #+begin_src kcats
+  [;; Module to operate on generic data, that are used throughout
+  [[fork [[execute] map]]
+   [triangle [[[] [[take] dip swap [[put] shield sink swap pair] bail] collect] shielddown]]
+   [indexed-as-property [swap indexed
+                         [unwrap sink assign] map dropdown]]
+   [join-all [[first empty] shield swap [join] step]]
+   [selectkeys [set swap [first contains?] filter dropdown]]
+   [invert [[reverse] map association]]
+
+   ;; datalog variables
+   [variable? [[[word?]
+                [string last \? =]] [execute] every?]]
+   [variable= [[[pair [variable?] every?] [=]] [execute] every?]] 
+
+   ;; datalog constraints
+   [slots [[entity attribute value]]]
+   [slot-combos [slots [slots [pair] map] map join-all]]
+   [constraint [unwrap slots reverse label]] 
+
+   ;; links between datalog constraints
+   [links [slot-combos
+           [[wrap] map unwrap swapdown 
+            [[[lookup] inject] both] pairwise 
+            variable=]
+           filter    
+           [unwrap pair sink pair
+            [[index] lookup] map swap zip]
+           map]]
+   [all-links [[] sink
+               [[[[index] lookup] shield] both ;; lookup the indices of both constraints
+                [swapdown] dip sink ;; move the indices under the constraints
+                [links] shielddown
+                swap [dropdown dropdown join] dip] 
+
+               step drop]]
+   [format-link [[join] inject unwrap [string] map
+                 "c{0}.{1} = c{2}.{3}" swap format]] 
+
+   ;; formatting pieces of query data into text
+   [anded-together [" AND " interpose join-all]]
+
+   ;; where clause data processing
+   [where-data [[[index] lookup] shield swap 
+                [[[second variable? not]
+                  [first [index] unwrap = not]] [execute] every?] filter 
+                [swap prepend] map dropdown]]
+   [format-where [[string] map 
+                  "c{0}.{1} = :c{0}{1}" swap format]]
+   [make-where [first [where] lookup anded-together]]
+   [format-join [[[[on] lookup]
+                  [[where] lookup]
+                  [[index] lookup string]] [execute] map
+                 [join anded-together] inject 
+                 "JOIN EAV c{1} ON {0}" swap format]]
+   [make-query [rest [[on]
+                      [[format-link] map] update
+                      [format-join] shield [join] swap assign] map]]
+
+   ;; SQL parameters for rusqlite
+   [param-name [[string] map ":c{0}{1}" swap format]]
+   [extract-params [[] association swap [[params] lookup join] step]]
+
+
+   ;; SELECT clause
+   [wordval? [second word?]]
+   [invert [[reverse] map association]]
+   [validate [[[second not]
+               [first "All selected query variables must appear somewhere in constraints"
+                [reason variable] label fail]
+               when] map]]
+   [select-data [dump swap
+                 [[slots selectkeys invert] shield
+                  [wordval?] filter join association] map
+                 swap
+                 [[[index] swap put ;; make a list of the variable and 'index'
+                   wrap [selectkeys] join ;; make the program to cut down
+                   map [count 2 =] filter first [second] map
+                   [first number?] [reverse] when] ;; items are in random order due to coming from association, fix the order
+                  map]
+                 shield dropdeep zip
+                 validate dump]]
+
+   ;; query 
+   [extract-data [[[[unwrap all-links]
+                    [first where-data   ; [join] inject unwrap
+                     ;; build the query param map
+                     [[[] swap
+                       [[param-name] shield [last] dip wrap swap assign]
+                       step]
+                      ;; build the actual query where clauses
+                      [[format-where] map]]
+                     fork]]
+                   fork] shield
+                  ;; combine extracted items
+
+                  [first] dip ;; keep the original constraint to add properties to
+                  unwrap unwrap [where params on] label join]]
+   [format-select [[unwrap swap
+                    string butlast ;; remove the ? from the variable name for result column
+                    put
+                    [string] map
+                    "c{1}.{0} as {2}" swap format] map ", " interpose join-all]]]
+
+  ;; This is the program we need to modify that is `query`
+
+  [swap
+   ;; expand all combinations of constraints
+   [constraint] map
+   ;;[] prepend ;; an empty constraint to represent the orignal EAV table we're joining with
+   [index] indexed-as-property
+   triangle
+   ;; for each pair of constraints, build the "ON" clause data for the JOIN
+   [extract-data] map
+   [[extract-params]
+    [make-query]
+    [make-where]
+    [swap select-data]] fork 
+   dropdown ;; don't need original anymore
+   unwrap float
+   [[join] lookup] map  
+   swap format-select 
+   [" " interpose join-all] dip triplet reverse
+   "SELECT {0} from EAV as c0 {1} WHERE {2}" swap format
+   swap dropdeep]
+
+  let
+  [query] label  ;; the above program is the definition of `query`
+
+  [[[book? subjects love]
+    ;[book? subjects subjects?]
+    [book? title book-title?]
+    [book? author-last author-last?]
+    [book? author-first author-first?]
+    [author? first-name author-first?]
+    [author? last-name author-last?]
+    [author? sex m]
+    [author? country "United States"]
+
+    [author? birth-year author-birth-year?]]
+   [book-title? author-first? author-last? author-birth-year?]
+   query
+   database
+  ] let execute]
+
+  [emoji] unwrap decache string read
+  [[[first] [[1 definition] lookup unwrap]] [execute] map] map
+  ;; invert
+  [reverse] map association
+
+  [wrap [*1 swap lookup] shield [] [dropdown wrap] [drop] if ] pack
+  walk
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[[fork [[▶️] 🚜]]
+  [triangle [[[] [[📤] 🪄 🔀 [[📮] 🛡️ ⚓ 🔀 pair] bail] collect] 🛡️🔽]]
+  [indexed-a-property [🔀 indexed [🍫 ⚓ assign] 🚜 🗑️🔽]]
+  [join-all [[first empty]
+             🛡️ 🔀 [🔗] 🪜]]
+  [selectkeys [set 🔀 [first contains?]
+               🧲 🗑️🔽]]
+  [invert [[reverse] 🚜 association]]
+  [variable? [[[word?] [string last \? =]]
+              [▶️] 💯]]
+  [variable= [[[pair [variable?] 💯] [=]]
+              [▶️] 💯]]
+  [slots [[entity attribute value]]]
+  [slot-combos [slots [slots [pair] 🚜] 🚜 join-all]]
+  [constraint [🍫 slots reverse label]]
+  [links [slot-combos [[🎁] 🚜 🍫 🔀🔽 [[[lookup] 💉]
+                                   both]
+                       pairwise variable=]
+          🧲 [🍫 pair ⚓ pair [[index] lookup]
+             🚜 🔀 zip]
+          🚜]]
+  [all-links [[] ⚓ [[[[index] lookup]
+                     🛡️]
+                    both [🔀🔽] 🪄 ⚓ [links] 🛡️🔽 🔀 [🗑️🔽 🗑️🔽 🔗] 🪄]
+              🪜 🗑️]]
+  [format-link [[🔗] 💉 🍫 [string] 🚜 "c{0}.{1} = c{2}.{3}" 🔀 format]]
+  [anded-together [" AND " interpose join-all]]
+  [where-data [[[index] lookup]
+               🛡️ 🔀 [[[second variable? not] [first [index] 🍫 = not]]
+                     [▶️] 💯]
+               🧲 [🔀 prepend]
+               🚜 🗑️🔽]]
+  [format-where [[string] 🚜 "c{0}.{1} = :c{0}{1}" 🔀 format]]
+  [make-where [first [where] lookup anded-together]]
+  [format-join [[[[on] lookup]
+                 [[where] lookup]
+                 [[index] lookup string]]
+                [▶️] 🚜 [🔗 anded-together]
+                💉 "JOIN EAV c{1} ON {0}" 🔀 format]]
+  [make-query [rest [[on] [[format-link] 🚜]
+                     update [format-join] 🛡️ [🔗] 🔀 assign]
+               🚜]]
+  
+  [param-name [[string] 🚜 ":c{0}{1}" 🔀 format]]
+  [extract-params [[] association 🔀 [[params] lookup 🔗] 🪜]]
+  [wordval? [second word?]]
+  [invert [[reverse] 🚜 association]]
+  [validate [[[second not]
+              [first "All selected query variables must appear somewhere in constraints" [reason
+                                                                                          variable]
+               label fail]
+              when]
+             🚜]]
+  [select-data [dump 🔀 [[slots selectkeys invert] 🛡️ [wordval?] 🧲 🔗 association] 🚜
+                🔀 [[[index] 🔀 📮 🎁 [selectkeys] 🔗 🚜 [count 2 =] 🧲 first [second] 🚜 [first number?]
+                    [reverse] when]
+                   🚜]
+                🛡️ 🗑️⏬ zip validate dump]]
+  [extract-data [[[[🍫 all-links]
+                   [first where-data [[[] 🔀 [[param-name] 🛡️ [last] 🪄 🎁 🔀 assign]
+                                       🪜]
+                                      [[format-where] 🚜]]
+                    fork]]
+                  fork]
+                 🛡️ [first] 🪄 🍫 🍫 [where params on] label 🔗]]
+  [format-select [[🍫 🔀 string butlast 📮 [string] 🚜 "c{1}.{0} as {2}" 🔀 format]
+                  🚜 ", " interpose join-all]]]
+ [🔀 [constraint] 🚜 [index] indexed-as-property triangle [extract-data] 🚜 [[extract-params]
+                                                                          [make-query] [make-where] [🔀 select-data]]
+  fork 🗑️🔽 🍫 🛟 [[🔗] lookup]
+  🚜 🔀 format-select [" " interpose join-all] 🪄 triplet
+  reverse "SELECT {0} from EAV as c0 {1} WHERE {2}" 🔀 format 🔀 🗑️⏬]
+ let [query] label [[[book? subjects love] [book? title book-title?] [book? author-last
+                                                                      author-last?]
+                     [book? author-first author-first?] [author? first-name author-first?] [author? last-name
+                                                                                            author-last?]
+                     [author? sex m] [author? country "United States"] [author? birth-year author-birth-year?]]
+                    [book-title? author-first? author-last? author-birth-year?] query database]
+ let ▶️]
+#+end_src
+
+#+begin_src kcats
+  [[[[[name "Mouse"] [price 50] [rating 4.4] [inStock yes]]
+     [[name "Laptop"] [price 1000] [rating 4.7] [inStock yes]]
+     [[name "Desktop"] [price 1500] [rating 4.9] [inStock []]]
+     [[name "Tungsten Cube"] [price 2500] [rating 3.4] [inStock yes]]
+     [[name "Keyboard"] [price 70] [rating 4.8] [inStock []]]
+     [[name "Monitor"] [price 200] [rating 4.5] [inStock yes]]
+     [[name "Camera"] [price 600] [rating 4.3] [inStock yes]]]
+
+    ;; make a generator
+    [take] 
+
+    ;; keep only rating >= 4.5 AND inStock
+    [[[[rating] lookup 4.5 >=] 
+      [[inStock] lookup]]
+     [execute]
+     every?] keep
+
+    ;; find the remaining product with highest price
+    [[pair [[price] lookup] map unwrap >] [] [swap] if
+     drop]
+    fold] 
+   shield]
+
+  [emoji] unwrap decache string read
+  [[[first] [[1 definition] lookup unwrap]] [execute] map] map
+  ;; invert
+  [reverse] map association
+
+  [[[word?] [wrap *1 swap lookup] [[]] if] shield 
+   [] [dropdown wrap] [drop wrap] if] pack
+  walk
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+      [[[[name "Mouse"] [price 50] [rating 4.4] [inStock yes]]
+        [[name "Laptop"] [price 1000] [rating 4.7] [inStock yes]]
+        [[name "Desktop"] [price 1500] [rating 4.9] [inStock []]]
+        [[name "Tungsten Cube"] [price 2500] [rating 3.4] [inStock yes]]
+        [[name "Keyboard"] [price 70] [rating 4.8] [inStock []]]
+        [[name "Monitor"] [price 200] [rating 4.5] [inStock yes]]
+        [[name "Camera"] [price 600] [rating 4.3] [inStock yes]]]
+       [📤] [[[[rating] lookup 4.5 >=]
+              [[inStock] lookup]]
+             [▶️] 💯]
+       keep [[pair [[price] lookup] 🚜 🍫 >]
+             []
+             [🔀] ⚖️
+             🗑️] fold] 🛡️
+#+end_src
+*** DONE Decide standard syntax
+- State "DONE"       from "INPROGRESS" [2024-11-21 Thu 10:49]
+- State "INPROGRESS" from "TODO"       [2024-11-11 Mon 08:22]
+
+ We can make the convention either "combinators actually execute the
+ programs they modify" or "combinators only modify and you need
+ =execute= explicitly if you want to execute now"
+
+ Choices to be made:
+
+ #+begin_src kcats
+   [foo bar] 🛡️ ;; shield
+   ;;vs
+   [foo bar] 🛡️ ▶️ ;; shielded execute
+
+   [..] [[foo bar] 🛡️] when
+   ;;vs
+   [..] [foo bar] 🛡️ when
+ #+end_src
+
+I think there's a lot of merit for =shielded=, but I don't think the
+same value applies to =dip=. I think generally you want to execute it
+immediately.
+*** INPROGRESS Emit emoji for empty list
+
+- State "INPROGRESS" from "TODO"       [2024-12-04 Wed 20:17]
+** DONE Change yes to nonempty container
+- State "DONE"       from "TODO"       [2024-12-03 Tue 19:21]
+Using some neutral "thing" emoji like:
+🔘 or ⚪️ or 🎯 or 🔹 
+
+#+begin_src kcats
+[pred] -> [🔘]  ; "container has something"
+       -> []    ; "container is empty"
+#+end_src
+
+The beauty is:
+1. The emoji reinforces that the actual value doesn't matter
+2. It's just a token to make the container non-empty
+3. Users don't need to remember what it is
+4. Visually distinct from actual data values
+
+ So predicates become:
+#+begin_src kcats
+[even?]    ; Returns [🔘] or []
+[any?]     ; Returns [🔘] or []
+[empty?]   ; Returns [🔘] or []
+
+#+end_src
+This feels more "honest" than:
+
+#+begin_src kcats
+[yes]      ; Why yes specifically?
+[thing]    ; Still feels like it should mean something
+#+end_src
+
+Can also add words =anything= and =nothing= as aliases for these, that we
+can use in default branch for =decide= and other places.
+
+Also consider ✔️ for 'yes'
+** INPROGRESS Combinators
+- State "INPROGRESS" from "TODO"       [2024-11-13 Wed 09:11]
+
+*** TODO Discussion
+Let's think about what the language would look like if combinators
+that take programs didn't actually execute them but rather spit out
+new programs. Here's =looped=:
+
+#+begin_src kcats
+  [[looped [[[*1 execute
+              *1 looped execute]
+             []
+             branch]
+            pack]]]
+  [10 yes [-2 * clone 50 <] looped execute]
+  let execute 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+160
+#+end_src
+
+step
+
+#+begin_src kcats
+  [[dipped [wrap [dip] join]]
+   [stepped [[clone [take swap 
+                     *1 dip
+                     *1 stepped execute] [drop] branch]
+             pack]]]
+  [0 [1 2 3 4] [+] stepped]
+  let execute 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[actual evert]
+ [asked [sized?]]
+ [handled []]
+ [reason "type mismatch"]
+ [type error]
+ [unwound [update [dictionary program]
+           label environment [*1 capture evaluate [stack] lookup restore] pack execute]]]
+[[[[clone [take swap [swap [[[1] [entry] update] shielddown]
+                      dip swap put]
+           dip [swap [[[1] [entry] update] shielddown]
+                dip swap put]
+           step execute]
+    [drop] branch]
+   join]
+  [[modules []]
+   [words 205_entries]]
+  [[dipped [wrap [dip] join]]
+   [stepped [[clone [take swap *1 dip *1 stepped execute]
+              [drop] branch]
+             pack]]]
+  []]
+ put]
+[modules] evert [0 [1 2 3 4] [+] stepped] evert [[clone [take swap [swap [[[1] [entry]
+                                                                           update]
+                                                                          shielddown]
+                                                                    dip swap put]
+                                                         dip [swap [[[1] [entry] update] shielddown]
+                                                              dip swap put]
+                                                         step execute]
+                                                  [drop] branch]
+                                                 join]
+[[modules []]
+ [words 205_entries]]
+[[dipped [wrap [dip] join]]
+ [stepped [[clone [take swap *1 dip *1 stepped execute]
+            [drop] branch]
+           pack]]]
+[]
+#+end_src
+
+
+
+Here's some more 
+#+begin_src kcats :preserve-indent t
+  [[dipped [wrap [dip] join]]
+   [stepped [[👥 [take swap 
+                     ,*1 dip
+                     ,*1 stepped ▶️] [drop] branch]
+             pack]]
+   [💉 [dipped [evert **1 evert] pack]]
+   [🛡️ [💉 [snapshot **1 first] pack]]
+   [iffed [[**3 ;; the condition
+            ,*2 *1 branch] pack]]
+   [looped [[[**1
+              ,*1 looped ▶️]
+             []
+             branch]
+            pack]]
+   [⏳ [[*2 ;; run conditional
+             [**1 ;; run body
+              ,*2 *1 ⏳ ;; next iteration
+              ▶️]
+             []] ;; do nothing if condition is false
+            pack unwrap iffed]]]
+   ;[2 3 [dropdown odd?] shielded ["odd"] ["even"] iffed]
+   ;[3 [+] dipped 4 5 float execute]
+   ;[1 2 [10 3 4 5] [* +] injection execute]
+   ;[1 2 3 [dropdown *] shielded]
+    [0 [2 3 4 5] [+] stepped execute]
+   ;[5 [0 >] 🛡️
+   ; [👥 dec] ⏳ ▶️]
+   let ▶️
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[actual evert]
+ [asked [sized?]]
+ [handled []]
+ [reason "type mismatch"]
+ [type error]
+ [unwound [update [dictionary program]
+           label environment [*1 capture evaluate [stack] lookup restore] pack ▶️]]]
+[[[[clone [take swap [swap [[[1] [entry] update] shielddown]
+                      dip swap put]
+           dip [swap [[[1] [entry] update] shielddown]
+                dip swap put]
+           step execute]
+    [drop] branch]
+   join]
+  [[modules []]
+   [words 205_entries]]
+  [[dipped [wrap [dip] join]]
+   [stepped [[👥 [take swap *1 dip *1 stepped ▶️]
+              [drop] branch]
+             pack]]
+   [💉 [dipped [evert **1 evert] pack]]
+   [🛡️ [💉 [snapshot **1 first] pack]]
+   [iffed [[**3 *2 *1 branch] pack]]
+   [looped [[[**1 *1 looped ▶️] [] branch] pack]]
+   [⏳ [[*2 [**1 *2 *1 ⏳ ▶️] []] pack unwrap iffed]]]
+  []]
+ put]
+[modules] evert [0 [2 3 4 5] [+] stepped execute] evert [[clone [take swap [swap
+                                                                            [[[1] [entry] update] shielddown]
+                                                                            dip swap put]
+                                                                 dip [swap [[[1] [entry] update] shielddown]
+                                                                      dip swap put]
+                                                                 step execute]
+                                                          [drop] branch]
+                                                         join]
+[[modules []]
+ [words 205_entries]]
+[[dipped [wrap [dip] join]]
+ [stepped [[👥 [take swap *1 dip *1 stepped ▶️]
+            [drop] branch]
+           pack]]
+ [💉 [dipped [evert **1 evert] pack]]
+ [🛡️ [💉 [snapshot **1 first] pack]]
+ [iffed [[**3 *2 *1 branch] pack]]
+ [looped [[[**1 *1 looped ▶️] [] branch] pack]]
+ [⏳ [[*2 [**1 *2 *1 ⏳ ▶️] []] pack unwrap iffed]]]
+[]
+#+end_src
+
+#+begin_src kcats
+  1 [2 3 4] [+]
+             [ [take swap *1 dip *1 stepped ▶️]
+            [] branch] 
+           pack execute
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[asked [stepped]]
+ [handled []]
+ [reason "word is not defined"]
+ [type error]
+ [unwound [stepped ▶️]]]
+[+] [3 4]
+3
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+1 [2 3 4] [[drop take swap [+] dip [+] stepped ▶️]
+           [] branch]
+#+end_src
+
+
+*** DONE Update branch behavior to keep conditional
+- State "DONE"       from "INPROGRESS" [2024-11-16 Sat 18:52]
+- State "INPROGRESS" from "TODO"       [2024-11-13 Wed 12:21]
+Currently =branch= discards the value it uses to choose a program to
+run. But sometimes the program needs it. The false branch basically
+never needs it so maybe we could auto-discard it. AI says that's weird
+but I think it's better than having to prepend 'drop' to at least half
+the programs.
+
+try 'bail' impl
+#+begin_src kcats
+  3
+  [1 <=] shield
+  [] [clone dec] [execute *]
+  recur execute
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[actual [3
+                     [1 <=] shield
+                     [] [clone dec] [execute *]
+                     recur][snapshot evert [1 <=]
+          dip evert first [] [clone dec [[snapshot evert [1 <=]
+                                          dip evert first]
+                                         [] [clone dec]
+                                         [execute *]
+                                         recur]
+                              execute *]
+          branch]]
+ [asked [number?]]
+ [handled []]
+ [reason "type mismatch"]
+ [type error]
+ [unwound [*]]]
+[snapshot evert [1 <=]
+ dip evert first [] [clone dec [[snapshot evert [1 <=]
+                                 dip evert first]
+                                [] [clone dec]
+                                [execute *]
+                                recur]
+                     execute *]
+ branch]
+2 3
+#+end_src
+#+begin_src kcats
+  [[a 1] [b 2]] [b] [inc] shielddown
+  [lookup] shield dip execute assign
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[a 1]
+ [b 3]]
+#+end_src
+
+recur
+#+begin_src kcats
+  3
+  [1 <=] shield
+  [drop] [clone dec] [execute *]
+  ;[**2 [*4 *3 *2 *1  recur execute] **1] [pack] shielddeep execute  dropdown if execute 
+  recur  execute
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+6
+#+end_src
+
+decide(r)
+#+begin_src kcats
+    6 [[even?] []]
+    take
+    [unwrap ;; break up the pair
+     swap 
+     shield
+     ;; recur 
+     flip [*1 decide] pack if execute]
+    [drop]
+    branch
+  ;  [[]] or ;; return a program that returns nothing
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[actual even?]
+ [asked [program?]]
+ [handled []]
+ [reason "type mismatch"]
+ [type error]
+ [unwound [if execute]]]
+[6 decide]
+even? [snapshot evert [[]] dip evert first]
+#+end_src
+
+#+begin_src kcats
+  words [decide definition] lookup
+
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[take [unwrap swap shield flip [*1 decide]
+       pack if execute]
+ bail [[]] or]
+#+end_src
+
+flatten
+#+begin_src kcats
+[a b [c [d e] f] g] [] swap [list? not] shield [drop put] [] [step execute] recur execute
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[a b c d e f g]
+#+end_src
+
+#+begin_src kcats
+[1 2 [3 [4 5] 6]] [inc wrap] 
+  [list? not] shield swap
+                        [[] swap]
+                        [[join] join step execute wrap]
+                        recur ;execute unwrap
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[snapshot evert [list? not]
+ dip evert first [inc wrap]
+ [[] swap [[snapshot evert [list? not]
+            dip evert first]
+           [inc wrap]
+           [[] swap]
+           [[join] join step execute wrap] recur execute]
+  [join] join step execute wrap]
+ branch]
+[1 2 [3 [4 5]
+      6]]
+#+end_src
+
+#+begin_src kcats
+    [1 2 [3 [4 5] 6]] [inc wrap]
+    [drop **1] pack 
+    [list? not] shield swap
+    [[] swap]
+    [[join] join step execute wrap]
+    recur execute unwrap
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[2 3 [4 [5 6]
+      7]]
+#+end_src
+
+map
+#+begin_src kcats
+  [dropdown 5 + +] 
+
+  [[swap *1 shielddown dip swap put] step
+   [] sink ;; put empty results below list
+   execute] pack
+
+  [12 13 [1 2 3 4]] dip
+  execute
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[18 19 20 21] 13 12
+#+end_src
+
+filter
+#+begin_src kcats
+   [1 2 3 4] [odd?]
+
+   [[*1 shield
+      [drop swap put] [drop dropdown]
+      if step] [] sink execute]  
+   pack
+   execute
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[take swap [snapshot evert [odd?] dip evert first [drop swap put] [drop dropdown]
+             branch]
+  dip [snapshot evert [odd?] dip evert first [drop swap put] [drop dropdown]
+       branch]
+  step execute]
+ [] branch]
+[1 2 3 4] []
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+       [1 2 3 4] [odd?]
+       shield ;; run the predicate with no stack effect
+       [drop put] [drop] if ;; if match, drop the pred result and put the original item.
+
+       step
+       [*1 [] sink execute] ;; place the empty result container beneath
+       pack execute
+
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[1 3]
+#+end_src
+
+#+begin_src kcats
+  [1 2 3 4] [odd?] [[shield [drop put] [drop]
+    if step] [] sink execute] execute execute
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[1 2 3 4]
+#+end_src
+
+
+
+fix step to not literally clone
+#+begin_src kcats
+  0 [1 23 4 5] [+] [[take swap 
+                        ,*1 clone dipdown
+                        step execute]
+                       [] branch]
+                      pack execute
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+33
+#+end_src
+
+#+begin_src kcats
+["hi"] 5 [*1 [positive?] shield [drop dec [*2 clone dip] dip times execute] [drop] if execute] pack 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[5 [positive?] shield [drop dec [["hi"] clone dip] dip times execute] [drop] if execute]
+#+end_src
+
+prime
+
+#+begin_src kcats
+  [1 2 3 4 5] [take] [4 mod 0 = not] shield [drop] ;prime
+  [clone [drop **1] pack] divedown swap join while join execute
+  
+  ;[*3 clone *1 swap join *2 swap while] pack execute
+  ;[[clone [execute] dip] divedown join while] pack
+  ;[clone [execute] dip] divedown  join  while 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[actual 1]
+ [asked [dispenser?]]
+ [handled []]
+ [reason "type mismatch"]
+ [type error]
+ [unwound [take drop [snapshot evert [4 mod 0 = not] dip evert first] [drop take
+                                                                       drop]
+           while execute]]]
+1 [2 3 4 5]
+#+end_src
+
+maybe we don't need prime?
+#+begin_src kcats
+0 [1 2 3 4] [take] [swap [+] dip] while execute
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[] 10
+#+end_src
+
+redefine while in terms of recur?
+
+#+begin_src kcats
+3 [0 >] shield [drop clone dec] [] [execute] recur execute
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+0 1 2 3
+#+end_src
+
+*** INPROGRESS Update generators to compose more naturally
+- State "INPROGRESS" from "TODO"       [2024-11-16 Sat 18:52]
+
+ The problem previously was that generators left a bunch of machinery
+  on the stack. I think we can compose them via wrapping. I think we
+  could have done that before. The challenge is figuring out how to
+  keep state inside the program and only putting it onto the stack
+  when needed.
+
+  We have a program that produces a value like =[take]= but it's not a
+  generator. To be a generator it needs to run itself and leave a copy
+  of itself below the produced item. So we can write 'generator', so that you only need to 'execute' the generator:
+
+ #+begin_src kcats
+   [1 11 23 4 5 6 7]
+   [📤] ⬜ ⬜ [🔀] 🪆 ;; take from the source, swap the recurring
+                      ;;program beneath the value, if empty do nothing
+   ;; increment each
+   [👥 *] •🛡️ [*2 bail **1] pack []
+   ;[▶️] 🔀
+    [⬜] [🔀] 🪆 ;; execute the generator below. If we get a value,
+                         ;; execute the provided program on that value 
+
+   ;; keep odd values
+   [odd?]
+   ;; build the conditional for recurrence
+   [[▶️ ;; execute the generator below to get value v
+     [*1 🛡️ ▶️ ☯️] ;; check if v does NOT match given pred, 
+     [⬜ ⬜] ;; if generator below is finished, return 2 empty values 
+     ↔️]
+    [🗑️ 🗑️] ;; drop both the value v and the result of pred
+    ⏳ ▶️] ;; repeat until generator below is finished
+   pack
+   ⬜ [⬜] [🔀] 🪆 ;; drop non-matching values in a while loop
+                   ;; then emit a matching value
+   ;; collect
+   ⬜ [[▶️] 🐋] [📮] ⬜ [▶️] 🪆 ;; place an empty container for results,
+   ;; then execute the generator below.
+   ;;If we get a value, place it in the container
+   ;;and recur, otherwise stop.
+   ▶️ ;; execute the whole thing
+   ;; result => [5 7]
+
+   ; [1 11 23 4 5 6 7]
+   ; liberate
+   ; [inc] each
+   ; [odd?] keep
+   ; collect
+ #+end_src
+
+ #+RESULTS:
+ #+begin_src kcats
+ [[actual [📤]]
+  [asked [number?]]
+  [handled []]
+  [reason "type mismatch"]
+  [type error]
+  [unwound [* [[📤] [[📤] [] [] [🔀] recur execute] [[] [] [🔀] recur execute] [11 23
+                                                                            4 5 6 7]] evert dropdown first [[[[📤 [[[📤] [] [] [🔀] recur execute] 🔀]
+                                                                                                               [] branch]
+                                                                                                              bail snapshot evert [👥 *]
+                                                                                                              dip evert dropdown first]
+                                                                                                             [] [⬜] [🔀] recur execute]
+                                                                                                            🔀]
+            [⬜] branch [[odd?] 🛡️ ▶️ ☯️] [⬜ ⬜]
+            ↔️ [🗑️ 🗑️ [[▶️ [[odd?] 🛡️ ▶️ ☯️] [⬜ ⬜]
+                        ↔️]
+                       [🗑️ 🗑️]
+                       [] [execute] recur execute]
+                execute]
+            [] branch [[[[▶️ [[odd?] 🛡️ ▶️ ☯️] [⬜ ⬜]
+                          ↔️]
+                         [🗑️ 🗑️]
+                         ⏳ ▶️]
+                        [] [⬜] [🔀] recur execute]
+                       🔀]
+            [⬜] branch [1] swap [📮 [[[▶️] 🐋]
+                                    [📮] [] [▶️] recur execute]
+                                 ▶️]
+
+            [] branch]]]
+ [📤] [📤] [[📤] [] [] [🔀] recur execute] [[] [] [🔀] recur execute] [11 23 4 5 6 7]
+ #+end_src
+
+ below is a version of 'each' that wraps the previous generator (needs
+  that dropdeep, not sure why - something to do with the inner
+  recurrence replacing itself AND the outer recurrence also replacing
+  the inner recurrence along with the outer.
+
+  The solution is to separate the "produce a value" eg =[take]=, from a
+  generator (which both produces a value AND sets itself up to be
+  called again). The =recur= is a generator, but you don't want to wrap
+  a generator with a generator. You want to wrap a *producer* with a
+  generator - the generator should be the final bit added, I suppose
+  at consumption time? But then once you've made the generator you
+  can't add more layers?
+ #+begin_src kcats
+   [1 11 23 4 5 6 7]
+   [📤]; ⬜ ⬜ [🔀] 🪆 ;; take from the source, swap the recurring
+   ;;program beneath the value, if empty do nothing
+   ;; increment each
+   [👥 *] •🛡️ [**2 *1 bail] pack ;[] [⬜] [🔀 ] 🪆 ;; execute the generator below. If we get a value,
+   ;execute drop execute
+   ;; execute the provided program on that value
+    [*1 🐋] pack [] swap  [📮] ⬜ [ ▶️] 🪆 execute
+ #+end_src
+
+ #+RESULTS:
+ #+begin_src kcats
+ [1 121 529 16 25 36 49]
+ []
+ #+end_src
+
+ I don't think this actually works because generators like =keep= need
+ to call their parents multiple times. So the generation logic is needed
+
+ #+begin_src kcats
+   0 100 1 range
+   [📤] 🔳 🔳 [🔀] 🪆 ;; take from the source, swap the recurring
+   ;;program beneath the value, if empty do nothing
+
+   ;; increment each
+   [👥 *] •🛡️ [**2 *1 bail] 🎒
+   [•🗑️] [🔳] [🔀] 🪆 ;; execute the generator below. If we get a value,
+   ;; execute the provided program on that value, dropping the parent generator
+
+   [7 mod 0 =]
+   ;; build the conditional for recurrence
+   [[**2 ;; execute the generator below to get value v
+     [*1 🛡️ ▶️ ☯️] ;; check if v does NOT match given pred, 
+     [🔳 🔳] ;; if generator below is finished, return 2 empty values 
+     ↔️]
+    [🗑️ 🗑️] ;; drop both the value v and the result of pred
+    ⏳ ▶️] ;; repeat until generator below is finished
+   🎒
+   [•🗑️] [🔳] [🔀] 🪆 ;; drop non-matching values in a while loop
+   ;; then emit a matching value
+
+   ;🔳 [[*1 🐋] 🎒] 🪄 🔀 [📮] 🔳 [▶️] 🪆  ▶️
+ #+end_src
+
+ #+RESULTS:
+ #+begin_src kcats
+ [[actual [[📤 [[[📤] [] [] [🔀] recur ▶️] 🔀]
+            [] branch [snapshot evert [👥 *]
+                       dip evert dropdown first]
+            bail [•🗑️ [[📤 [[[📤] [] [] [🔀] recur ▶️] 🔀]
+                        [] branch [snapshot evert [👥 *]
+                                   dip evert dropdown first]
+                        bail]
+                       [•🗑️] [[]] [🔀] recur ▶️]
+                  🔀]
+            [[]] branch [[7 mod 0 =] 🛡️ ▶️ ☯️] [[] []]
+            ↔️]
+           [🗑️ 🗑️]
+           ⏳ ▶️]]
+  [asked [number?]]
+  [handled []]
+  [reason "type mismatch"]
+  [type error]
+  [unwound [* [[[📤 [[[📤] [] [] [🔀] recur ▶️] 🔀]
+                 [] branch [snapshot evert [👥 *]
+                            dip evert dropdown first]
+                 bail [•🗑️ [[📤 [[[📤] [] [] [🔀] recur ▶️] 🔀]
+                             [] branch [snapshot evert [👥 *]
+                                        dip evert dropdown first]
+                             bail]
+                            [•🗑️] [[]] [🔀] recur ▶️]
+                       🔀]
+                 [[]] branch [[7 mod 0 =] 🛡️ ▶️ ☯️] [[] []]
+                 ↔️]
+                [🗑️ 🗑️]
+                ⏳ ▶️]
+               [[📤] [] [] [🔀] recur ▶️] [[•🗑️] [[]] [🔀] recur ▶️] [1 2 3 4 5 6 7 8 9 10 11 12 13
+                                                                   14 15 16 17 18 19 20
+                                                                   21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40
+                                                                   41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60
+                                                                   61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80
+                                                                   81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99]]
+            evert dropdown first [•🗑️ [[📤 [[[📤] [] [] [🔀] recur ▶️] 🔀]
+                                        [] branch [snapshot evert [👥 *]
+                                                   dip evert dropdown first]
+                                        bail]
+                                       [•🗑️] [[]] [🔀] recur ▶️]
+                                  🔀]
+            [[]] branch [[7 mod 0 =] 🛡️ ▶️ ☯️] [[] []]
+            ↔️ [🗑️ 🗑️ [[📤 [[[📤] [] [] [🔀] recur ▶️] 🔀]
+                        [] branch [snapshot evert [👥 *]
+                                   dip evert dropdown first]
+                        bail [•🗑️ [[📤 [[[📤] [] [] [🔀] recur ▶️] 🔀]
+                                    [] branch [snapshot evert [👥 *]
+                                               dip evert dropdown first]
+                                    bail]
+                                   [•🗑️] [[]] [🔀] recur ▶️]
+                              🔀]
+                        [[]] branch [[7 mod 0 =] 🛡️ ▶️ ☯️] [[] []]
+                        ↔️]
+                       [🗑️ 🗑️]
+                       [] [▶️] recur ▶️]
+                ▶️]
+            [] branch [•🗑️ [[[📤 [[[📤] [] [] [🔀] recur ▶️] 🔀]
+                              [] branch [snapshot evert [👥 *]
+                                         dip evert dropdown first]
+                              bail [•🗑️ [[📤 [[[📤] [] [] [🔀] recur ▶️] 🔀]
+                                          [] branch [snapshot evert [👥 *]
+                                                     dip evert dropdown first]
+                                          bail]
+                                         [•🗑️] [[]] [🔀] recur ▶️]
+                                    🔀]
+                              [[]] branch [[7 mod 0 =] 🛡️ ▶️ ☯️] [[] []]
+                              ↔️]
+                             [🗑️ 🗑️]
+                             ⏳ ▶️]
+                            [•🗑️] [[]] [🔀] recur ▶️]
+                       🔀]
+            [[]] branch [0] swap [📮 [[[[📤 [[[📤] [] [] [🔀] recur ▶️] 🔀]
+                                        [] branch [snapshot evert [👥 *]
+                                                   dip evert dropdown first]
+                                        bail [•🗑️ [[📤 [[[📤] [] [] [🔀] recur ▶️] 🔀]
+                                                    [] branch [snapshot evert [👥 *]
+                                                               dip evert dropdown first]
+                                                    bail]
+                                                   [•🗑️] [[]] [🔀] recur ▶️]
+                                              🔀]
+                                        [[]] branch [[7 mod 0 =] 🛡️ ▶️ ☯️] [[] []]
+                                        ↔️]
+                                       [🗑️ 🗑️]
+                                       ⏳ ▶️ [•🗑️ [[[📤 [[[📤] [] [] [🔀] recur ▶️] 🔀]
+                                                    [] branch [snapshot evert [👥 *]
+                                                               dip evert dropdown first]
+                                                    bail [•🗑️ [[📤 [[[📤] [] [] [🔀] recur ▶️] 🔀]
+                                                                [] branch [snapshot evert [👥 *]
+                                                                           dip evert dropdown first]
+                                                                bail]
+                                                               [•🗑️] [[]] [🔀] recur ▶️]
+                                                          🔀]
+                                                    [[]] branch [[7 mod 0 =] 🛡️ ▶️ ☯️] [[] []]
+                                                    ↔️]
+                                                   [🗑️ 🗑️]
+                                                   ⏳ ▶️]
+                                                  [•🗑️] [[]] [🔀] recur ▶️]
+                                             🔀]
+                                       [[]] branch]
+                                      🐋]
+                                     [📮] [] [▶️] recur ▶️]
+                                  ▶️]
+
+            [] branch]]]
+ [[📤 [[[📤] [] [] [🔀] recur ▶️] 🔀]
+   [] branch [snapshot evert [👥 *]
+              dip evert dropdown first]
+   bail [•🗑️ [[📤 [[[📤] [] [] [🔀] recur ▶️] 🔀]
+               [] branch [snapshot evert [👥 *]
+                          dip evert dropdown first]
+               bail]
+              [•🗑️] [[]] [🔀] recur ▶️]
+         🔀]
+   [[]] branch [[7 mod 0 =] 🛡️ ▶️ ☯️] [[] []]
+   ↔️]
+  [🗑️ 🗑️]
+  ⏳ ▶️]
+ [[📤 [[[📤] [] [] [🔀] recur ▶️] 🔀]
+   [] branch [snapshot evert [👥 *]
+              dip evert dropdown first]
+   bail [•🗑️ [[📤 [[[📤] [] [] [🔀] recur ▶️] 🔀]
+               [] branch [snapshot evert [👥 *]
+                          dip evert dropdown first]
+               bail]
+              [•🗑️] [[]] [🔀] recur ▶️]
+         🔀]
+   [[]] branch [[7 mod 0 =] 🛡️ ▶️ ☯️] [[] []]
+   ↔️]
+  [🗑️ 🗑️]
+  ⏳ ▶️]
+ [[📤] [] [] [🔀] recur ▶️] [[•🗑️] [[]] [🔀] recur ▶️] [1 2 3 4 5 6 7 8 9 10 11 12 13
+                                                     14 15 16 17 18 19 20
+                                                     21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40
+                                                     41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60
+                                                     61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80
+                                                     81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99]
+ #+end_src
+
+ #+begin_src kcats
+   1 100 1 range
+   liberate
+   [👥 *] each
+   [7 mod 0 =] keep
+   collect
+ #+end_src
+
+ #+RESULTS:
+ #+begin_src kcats
+ [49 196 441 784 1225 1764 2401 3136 3969 4900 5929 7056 8281 9604]
+ #+end_src
+
+ work on keep to wrap previous
+ #+begin_src kcats
+   1 100 1 range liberate
+   [ 7 mod 0 =]
+   ;; build the conditional for recurrence
+   [*2
+    [▶️ ;; execute the generator below to get value v
+     [*1 🛡️ ▶️ ☯️] ;; check if v does NOT match given pred, 
+     [🔳 🔳] ;; if generator below is finished, return 2 empty values 
+     ↔️]
+    [🗑️ 🗑️] ;; drop both the value v and the result of pred
+    ⏳ ▶️ ] ;; repeat until generator below is finished
+   🎒
+   [•🗑️] [🔳] [ 🔀] 🪆 ;; drop non-matching values in a while loop
+   ;; then emit a matching value
+   🔳 [[ 🐋] 🎒 ] 🪄 🔀 [📮 •🗑️] 🔳 [▶️] 🪆  ▶️ 
+ #+end_src
+
+ #+RESULTS:
+ #+begin_src kcats
+ [7 14 21 28 35 42 49 56 63 70 77 84 91 98]
+ #+end_src
+
+ 
+*** DONE Fix recur logic
+- State "DONE"       from "TODO"       [2024-11-17 Sun 19:37]
+The branches are backward, should match =while=, with the loop body
+being first. Currently recur has the exit branch first and the main
+body 2nd.
+
+#+begin_src kcats
+  5
+  [2 >] shield
+  [drop clone dec dump] [] [execute *]
+  [**3 [*4 *3 *2 *1 recur execute] **1] [pack]
+  shielddeep execute dropdeep swap if execute
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[4 5]
+[3 4 5]
+[2 3 4 5]
+120
+#+end_src
+
+#+begin_src kcats
+[pred] [then] [else] [combo] [*3 clone [execute] dip []  ] 
+#+end_src
+
+*** DONE Every
+- State "DONE"       from "INPROGRESS" [2024-11-23 Sat 19:56]
+- State "INPROGRESS" from "TODO"       [2024-11-23 Sat 11:02]
+  two booleans: all matching so far?
+   is there any more numbers?
+#+begin_src kcats
+  ;11 [2 4 6] [+ odd?] •🛡️
+  12 [[ even?] [positive?] [3 mod 0 =]] [▶️] •🛡️
+   [[📤 🔀 1️⃣ 🐋 👥] ;; more items
+    [[] ✔️ []] ;; empty list, return ✔️
+    ↔️] 🎒
+   [🗑️ 🗑️]
+   [•🗑️]
+   [▶️] 🪆 ▶️  
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+✔️ 12
+#+end_src
+
+*** INPROGRESS  Recover
+- State "INPROGRESS" from "TODO"       [2024-11-23 Sat 19:56]
+
+  #+begin_src kcats
+     1 [+] [🗑️ 2 +]
+    [[snapshot] 🐋
+    🔀 [handle] 🔗 💉 ▶️ 
+    [first error?] 🛡️
+    [🗑️ ✂️1️⃣]
+    [evert 🗑️]
+    ⚖️ ▶️] 🎒 ▶️ 
+
+
+    ;[[[✂️1️⃣ handle] 🎒] 🪄 ;; add handle to the end of test
+    ;[snapshot] •🪄 ;; rec test ss
+    ;sink inject ▶️ ;; res rec
+    ;first error?] 🛡️  ;; err? res rec
+    ;[🗑️ •🗑️ 🔀 ▶️];; drop the snapshot and run recovery
+    ;[evert 🗑️] ;; use snapshot as stack
+    ;if ▶️ 
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  3
+  #+end_src
+
+  #+begin_src kcats
+    [1 2 "oh fudge"]
+    [5 +]
+    [🗑️ 5]
+    [[📸] 🐋
+     🔀 [handle] 🔗 💉 ▶️ 
+     [first error?] 🛡️
+     [🗑️ ✂️1️⃣]
+     [evert 🗑️]
+     ⚖️ ▶️] 🎒 [🎁] 🪄 🔗 🚜 ▶️
+
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  [6 7 5]
+  #+end_src
+** TODO Rename combinators to noun-based
+- recur :: recurrence
+- repeat :: repetition
+- inject :: injection
+-  ::
+
+Most of these no longer matter since they're emojis but there are some english stragglers.
+** DONE Support 'doc' field of dictionary entries
+- State "DONE"       from "TODO"       [2024-12-03 Tue 19:08]
+** INPROGRESS Back to stacking generators with optional encapsulation
+- State "INPROGRESS" from "TODO"       [2024-12-11 Wed 20:12]
+*** INPROGRESS See if we can wrap state with generator
+
+- State "INPROGRESS" from "TODO"       [2024-12-11 Wed 20:12]
+The fact that there's leftover state even after a generator is done,
+seems wrong. We should get rid of both.
+
+#+begin_src kcats
+  [1 2 3 4 5] liberator 5
+  [[[positive?] 🛡️ [🗑️ 1️⃣ 🐋] [🔳] ⚖️ ▶️] 🎒]
+  🐋 [[dec •🗑️]
+      🪄]
+  [🗑️ 🗑️ 🔳]
+  [🔀] 🪆
+
+  collect
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[1 2 3 4 5]
+#+end_src
+
+I think a good approach here may be to use evert/inject. So instead of
+just stacking generators right on top of the stack, wrap it in a list,
+and inject to generate a value, then take to extract:
+
+#+begin_src kcats
+  []  [[1 2 3 4 5] liberator [👥 *] each collect] 💉 ▶️
+  [▶️] 💉 ▶️ 📤
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[asked [consume]]
+ [handled 🔳]
+ [reason "not enough items on stack"]
+ [type error]
+ [unwound [🔀 [[📸 🧦 [👥 *]
+               🪄 🧦 •🗑️ first]
+              bail]
+           🪄 🔀 [•🗑️ [[📤 [[[📤] 🔳 🔳 [🔀] 🪆 ▶️] 🔀]
+                      🔳 ↔️ 🔀 [[📸 🧦 [👥 *]
+                               🪄 🧦 •🗑️ first]
+                              bail]
+                      🪄 🔀]
+                     [•🗑️] [🔳] [🔀] 🪆 ▶️]
+                🔀]
+           [🔳] ↔️ [1 4 9 16 25] 🔀 [📮 •🗑️ [[[📤 [[[📤] 🔳 🔳 [🔀] 🪆 ▶️] 🔀]
+                                            🔳 ↔️ 🔀 [[📸 🧦 [👥 *]
+                                                     🪄 🧦 •🗑️ first]
+                                                    bail]
+                                            🪄 🔀 [•🗑️ [[📤 [[[📤] 🔳 🔳 [🔀] 🪆 ▶️] 🔀]
+                                                       🔳 ↔️ 🔀 [[📸 🧦 [👥 *]
+                                                                🪄 🧦 •🗑️ first]
+                                                               bail]
+                                                       🪄 🔀]
+                                                      [•🗑️] [🔳] [🔀] 🪆 ▶️]
+                                                 🔀]
+                                            [🔳] ↔️]
+                                           🐋]
+                                          [📮 •🗑️]
+                                          🔳 [▶️] 🪆 ▶️]
+                                   ▶️]
+           🔳 ↔️ 🔳 🧦 [▶️] 💉 ▶️ 📤]]]
+🔳
+#+end_src
+
+
+#+begin_src kcats
+[1 2 3 4 5] liberator [👥 *] each collect
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[asked [consume]]
+ [handled 🔳]
+ [reason "not enough items on stack"]
+ [type error]
+ [unwound [🔀 [[📸 🧦 [👥 *]
+               🪄 🧦 •🗑️ first]
+              bail]
+           🪄 🔀 [•🗑️ [[📤 [[[📤] 🔳 🔳 [🔀] 🪆 ▶️] 🔀]
+                      🔳 ↔️ 🔀 [[📸 🧦 [👥 *]
+                               🪄 🧦 •🗑️ first]
+                              bail]
+                      🪄 🔀]
+                     [•🗑️] [🔳] [🔀] 🪆 ▶️]
+                🔀]
+           [🔳] ↔️ [1 4 9 16 25] 🔀 [📮 •🗑️ [[[📤 [[[📤] 🔳 🔳 [🔀] 🪆 ▶️] 🔀]
+                                            🔳 ↔️ 🔀 [[📸 🧦 [👥 *]
+                                                     🪄 🧦 •🗑️ first]
+                                                    bail]
+                                            🪄 🔀 [•🗑️ [[📤 [[[📤] 🔳 🔳 [🔀] 🪆 ▶️] 🔀]
+                                                       🔳 ↔️ 🔀 [[📸 🧦 [👥 *]
+                                                                🪄 🧦 •🗑️ first]
+                                                               bail]
+                                                       🪄 🔀]
+                                                      [•🗑️] [🔳] [🔀] 🪆 ▶️]
+                                                 🔀]
+                                            [🔳] ↔️]
+                                           🐋]
+                                          [📮 •🗑️]
+                                          🔳 [▶️] 🪆 ▶️]
+                                   ▶️]
+           🔳 ↔️]]]
+🔳
+#+end_src
+*** INPROGRESS Convert some generators to not wrap
+- State "INPROGRESS" from "TODO"       [2024-12-11 Wed 20:12]
+
+  #+begin_src kcats
+    -1 [👥 inc] generator ▶️ 
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  0 [[👥 inc]
+     🔳 🔳 [🔀] 🪆 ▶️]
+  -1
+  #+end_src
+
+   test combining generators
+  #+begin_src kcats
+      [] [integers generator] 💉 ▶️
+      [] [5 taker]  💉 ▶️ 🔀 🔗 
+    [collect] 💉 ▶️ first
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  [0 1 2 3 4]
+  #+end_src
+  
+now try combining before execution
+   #+begin_src kcats
+         [integers generator] 💉 
+         [5 taker]  💉 🔗
+         [] 🔀 ▶️ 
+      [collect] 💉 ▶️ first
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  [0 1 2 3 4]
+  #+end_src
+
+  encapsulation
+  #+begin_src kcats
+    [[1 2 3 4 5] liberator
+     [odd?] keep
+     collect]
+    [] 🔀 💉 ▶️ first 
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  [1 3 5]
+  #+end_src
+
+  aka assemble
+  #+begin_src kcats
+    [1 2 3 4 5]
+    [[odd?] keep
+     collect]
+    [liberator ✂️1️⃣] 🎒
+    [🎁] 🪄 💉 ▶️ first 
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  [1 3 5]
+  #+end_src
+
+**** each 
+   #+begin_src kcats
+     integers generator
+     5 taker
+     [👥 *]
+     •🛡️ ;; prevent mapping program from overwriting stack
+     [▶️ 1️⃣ bail] 🎒 ;; only execute the mapping program if parent produces value
+     [] [🔳] [🔀] 🪆 
+     collect
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  [0 1 4 9 16] 4
+  #+end_src
+**** joiner 
+  #+begin_src kcats
+    [[1 2 3] [4 5 6] [7 8 9]] liberator
+    [🔗] fold
+  #+end_src
+
+  #+RESULTS:
+  #+begin_src kcats
+  [1 2 3 4 5 6 7 8 9]
+  #+end_src
+#+begin_src kcats
+ 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[expected [[🔗] fold]]
+ [handled 🔳]
+ [reason "Deprecated"]
+ [unwound 🔳]]
+#+end_src
+**** skipper 
+#+begin_src kcats
+  ;integers generator
+  [1 2 3 4 5 6 7 8 9 10] liberator
+  [5 <]
+  ✔️
+  [[[▶️] •🪄 
+    [[▶️] 🛡️ 🪄 and]
+    [🔳] ↔️]
+   [••🗑️] ⏳ ▶️] 🔳 🔳
+  [🛟 🔳 ⚓]
+  🪆
+  ;30 taker
+  collect
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[5 6 7 8 9 10] [[[[▶️] •🪄 [[▶️] 🛡️ 🪄 and] [🔳] ↔️] [••🗑️] ⏳ ▶️] 🔳 [dump] [🛟 🔳 ⚓] 🪆
+                ▶️]
+🔳 [5 <]
+#+end_src
+
+have : rform pred val
+need : val rform [] pred gform
+float -> val rform pred
+[] sink 
+#+RESULTS:
+#+begin_src kcats
+[[[[[▶️] •🪄 [[▶️] 🛡️ 🪄 and] 🔳 ↔️] [••🗑️] ⏳ ▶️] 🔳 🔳 [dump 🛟 🔳 🔀 dump] 🪆 ▶️] [5 <]
+ 5 [[inc 👥]
+    🔳 🔳 [🔀] 🪆 ▶️]
+ 5]
+[5 🔳 [[[[▶️] •🪄 [[▶️] 🛡️ 🪄 and] 🔳 ↔️] [••🗑️] ⏳ ▶️] 🔳 🔳 [dump 🛟 🔳 🔀 dump] 🪆 ▶️] [5
+                                                                                <]
+ [[inc 👥]
+  🔳 🔳 [🔀] 🪆 ▶️]
+ 5]
+[[[[▶️] •🪄 [[▶️] 🛡️ 🪄 and] 🔳 ↔️] [••🗑️] ⏳ ▶️] 🔳 🔳 [dump 🛟 🔳 🔀 dump] 🪆 ▶️] [5 <]
+[[inc 👥]
+ 🔳 🔳 [🔀] 🪆 ▶️]
+5
+#+end_src
+
+#+begin_src kcats
+  [] ☯️ ☯️
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+🔳
+#+end_src
+
+#+begin_src kcats
+  ;integers generator
+  [1 2 3 4 5 6 7 1] liberator
+  [5 <]
+  [[▶️] 🐋] ;; get the item from parent
+  [🔀 [▶️] 🛡️ ▶️] ;; run the pred on it, keep the pred
+  [🗑️ [] []] ⚖️ ;; when parent is empty, leave negative on the stack
+  [🗑️ •🗑️] ⏳ ▶️ ;; keep consuming items while they match pred
+  [🗑️ []] ;; first value that doesn't match pred, drop pred,
+  ;; leave an empty generator that falls through to the value below
+  [[[]]] ↔️ ;; if parent ran out, leave a generator that produces end-of-stream
+  ;30 taker
+  collect
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[5 6 7 1]
+#+end_src
+#+begin_src kcats
+  [1 2 -3 4 5]
+  [[positive?] skipper collect]
+  assemble
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[-3 4 5]
+#+end_src
+
+**** keep
+#+begin_src kcats
+    integers generator
+    [odd?]
+
+    [▶️  ;; exec the generator below to get value v
+     [1️⃣ 🛡️ ▶️ ☯️] ;; check if v does NOT match given pred, 
+     [🔳 🔳] ;; if generator below is finished, return 2 empty values 
+     ↔️ ] 🎒
+    [🗑️ 🗑️] ;; drop both the value v and the result of pred
+    ⏳ ;; repeat until generator below is finished
+    [] [🔳] [🔀] 🪆
+    5 taker
+    collect
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[1 3 5 7 9] [[inc 👥]
+             🔳 🔳 [🔀] 🪆 ▶️]
+9
+#+end_src
+**** dropper
+#+begin_src kcats
+    [1 2 3 4 5 6 7] liberator
+    6 
+    [[[[[positive?] 🛡️ ▶️]
+       [[▶️] 🐋 ]] [▶️] 💯 ▶️]
+
+     [🗑️ dec] ⏳ ▶️ dump [🗑️ ▶️] [] ↔️] collect
+  ;▶️ 🗑️ ▶️ 🗑️ ▶️ 🗑️ ▶️ 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[0 [[📤] 🔳 🔳 [🔀] 🪆 ▶️] [7]]
+[7]
+#+end_src
+
+#+begin_src kcats
+  [1 2 3 4 5 6 7 8 9 10] 
+   [  11
+     [positive?] 🛡️ ;; condition
+     [🗑️ [▶️] 🐋 ;; call parent 
+      [] ;; if we get something, we're done
+      [🗑️ [[]] [] []] ;; otherwise signal stop with empty generator
+      ↔️]
+     [🗑️ ▶️ []] ⚖️ ;; if counter reaches zero we're done dropping 
+     [🗑️ dec] ⏳ ;; decrement the counter and drop the value we got
+  ;10 taker
+     collect] assemble
+  ;
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+🔳
+#+end_src
+
+#+begin_src kcats
+    [1 2 3 4 5] liberator
+    3
+    [positive?] 🛡️ ;; counter still positive?
+    [🗑️ [▶️] 🐋 ;; run the parent generator
+     [] [[] []] ↔️] ;; add padding to drop later
+    [🔳] ⚖️ ;; otherwise return nothing
+    [[dec] 🪄] ;; decrement counter
+    [🗑️ 🗑️ 🔳] ;; discard the counter and parent, all done
+    [🔀] 🪆
+    collect
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[1 2 3] [4 5]
+#+end_src
+
+#+begin_src kcats
+
+#+end_src
+**** catcher
+#+begin_src kcats
+  [1 2 3 -4 5] liberator
+  [positive?]
+  [[▶️] 🐋 ;; get value from parent
+   [🔀 [▶️] 🛡️ ▶️] bail ;; only check pred iff we get a value, preserve pred
+   🔳
+   [🔳 🔳 🔳] ↔️] ;; place some dummy values to drop if we didn't get a value
+  [🗑️ 🔀] ;; iff pred matches drop the pred result 
+  [🗑️ 🗑️ 🗑️ 🔳] ;; otherwise drop all the stuff we no longer need
+  ⚖️ 🔳
+  [[🔳] 🔳] [🔀] 🪆 collect
+
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[1 2 3] [🔳] -4 [[📤] 🔳 🔳 [🔀] 🪆 ▶️] [5]
+#+end_src
+**** produce
+#+begin_src kcats
+  [integers generator
+   [👥 *] each
+   10 taker
+   [+] fold] [] 🔀 💉 ▶️ first
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+285
+#+end_src
+**** cram
+#+begin_src kcats
+  ;[▶️] 🪄 ;; generate the first item below the reducer
+  integers generator 5 dropper 10 taker
+  0
+  [+]
+  [[▶️] •🐋] ;; check that we generated another item
+  [🔀 [▶️] 🛡️ ▶️ ⚓ •🗑️ ••🗑️] ;; if so, run the reducer shielded and drop component items
+  🔳 ;; otherwise stop
+  [▶️] 🪆
+  ▶️ 🗑️
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+95 14
+#+end_src
+**** indexer
+#+begin_src kcats
+  [foo bar baz] liberator
+  0 [[▶️] 🐋 [[pair] •🛡️ ▶️ [inc] 🪄] bail]
+  [] [🗑️ []] [🔀] 🪆 collect 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[0 foo]
+ [1 bar]
+ [2 baz]]
+#+end_src
+
+#+begin_src kcats
+  [foo bar baz] [indexer collect] assemble 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[0 foo]
+ [1 bar]
+ [2 baz]]
+#+end_src
+**** flatten
+#+begin_src kcats
+   [a [b [c e f] d]] 🔳 🔀
+   [list?] 🛡️ [🗑️] [📮] [🪜 ▶️] 🪆 ▶️
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[a b c e f d]
+#+end_src
+**** siphon
+deprecate?
+#+begin_src kcats
+  [integers generator
+   100 dropper
+   10 taker
+   [character] each
+   "" 🧹 ▶️]
+  siphon
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+"defghijklm"
+#+end_src
+** TODO max-by min-by
+#+begin_src kcats
+  [[price 25] [name bar]] [[price 15] [name foo]]
+  [[price] lookup]
+  [compare-by 🎁] •🛡️ ▶️ [less] =
+  [🗑️ •🗑️] [🗑️] ↔️ 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[price 25]
+ [name bar]]
+#+end_src
