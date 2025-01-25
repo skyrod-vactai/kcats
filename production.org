@@ -288,6 +288,7 @@ We'll start by defining the basic data structures that kcats will use
 internally, to keep track of things like the stack, program, lists etc.
 #+begin_src rust :tangle src/types.rs :mkdirp yes
   //! Defines kcats internal data types.
+  use crate::axiom;
   use crate::list;
   use crate::serialize::Emit;
   use crate::traits::*;
@@ -405,6 +406,8 @@ internally, to keep track of things like the stack, program, lists etc.
       Word(Word),
       /// A character value, like 'a', or '\n'.
       Char(Char),
+      /// A builtin function
+      Builtin(axiom::Builtin),
       /// A container value (that [Item]s can be taken from)
       Dispenser(coll::Dispenser),
       /// A container value (that [Item]s can be put into)
@@ -417,6 +420,7 @@ internally, to keep track of things like the stack, program, lists etc.
               Item::Number(n) => write!(f, "{:?}", n),
               Item::Word(w) => write!(f, "{:?}", w),
               Item::Char(c) => write!(f, "Char{:?}", c),
+              Item::Builtin(b) => write!(f, "Builtin{:?}", b.name),
               Item::Dispenser(d) => write!(f, "{:?}", d),
               Item::Receptacle(r) => write!(f, "{:?}", r),
           }
@@ -764,7 +768,9 @@ internally, to keep track of things like the stack, program, lists etc.
                   Item::Number(num) => num.serialize(serializer),
                   Item::Char(c) => serializer.serialize_char(*c),
                   Item::Word(w) => serializer.serialize_str(w.fit()),
-
+                  Item::Builtin(b) => {
+                      serializer.serialize_str(format!("builtin_{}", b.name).as_str())
+                  }
                   // Handle other variants
                   Item::Dispenser(ref dispenser) => dispenser.serialize(serializer),
                   Item::Receptacle(ref receptacle) => receptacle.serialize(serializer),
@@ -2482,7 +2488,7 @@ internally, to keep track of things like the stack, program, lists etc.
                           let l = coll::List::try_derive(v);
                           match l {
                               Ok(l) => {
-                                  de.definition = dict::Definition::Derived(l);
+                                  de.definition = dict::Executable::Derived(l);
                                   (Associative::DictEntry(de), None) // TODO: return the old def
                               }
                               Err(_) => (Associative::DictEntry(de), None),
@@ -3166,6 +3172,7 @@ internally, to keep track of things like the stack, program, lists etc.
 **** Dictionary types
 #+begin_src rust :tangle src/types/container/dictionary.rs :mkdirp yes
   use super::associative as assoc;
+  use crate::axiom;
   use crate::axiom::BUILTIN_FUNCTIONS;
   use crate::list;
   use crate::serialize;
@@ -3189,7 +3196,7 @@ internally, to keep track of things like the stack, program, lists etc.
   pub struct Entry {
       pub examples: Option<coll::List>,
       pub spec: Option<Spec>,
-      pub definition: Definition,
+      pub definition: Executable,
       pub namespace: Namespace,
       pub doc: Option<String>,
   }
@@ -3327,8 +3334,8 @@ internally, to keep track of things like the stack, program, lists etc.
                   "spec" => self.spec.clone().map(|x| x.fit()),
                   "examples" => self.examples.clone().map(|x| x.fit()),
                   "definition" => Some(match self.definition.clone() {
-                      Definition::Axiom(_) => "builtin".fit(),
-                      Definition::Derived(d) => d.fit(),
+                      Executable::Axiom(a) => a.clone().fit(),
+                      Executable::Derived(d) => d.fit(),
                   }),
                   "namespace" => self.namespace.map(|x| x.as_ref().clone().fit()),
                   "doc" => self.doc.clone().map(|x| x.fit()),
@@ -3619,7 +3626,7 @@ internally, to keep track of things like the stack, program, lists etc.
               let entry = Entry {
                   examples: None,
                   spec: None,
-                  definition: Definition::Derived(list!(err, "fail")),
+                  definition: Executable::Derived(list!(err, "fail")),
                   namespace: word.namespace.clone(),
                   doc: None,
               };
@@ -3717,31 +3724,31 @@ internally, to keep track of things like the stack, program, lists etc.
 
   /// The actual code for what a [Word] should do.
   #[derive(Clone)]
-  pub enum Definition {
+  pub enum Executable {
       /// A definition in the base language - a rust function that
       /// modifies the environment.
-      Axiom(&'static types::StepFn),
+      Axiom(&'static axiom::Builtin),
       /// A definition in terms of other [Word]s - a kcats program
       Derived(coll::List),
   }
 
   // dictionary words are equal if they have the same function reference,
   // no need to compare the function values
-  impl PartialEq for Definition {
+  impl PartialEq for Executable {
       fn eq(&self, other: &Self) -> bool {
           match (self, other) {
-              (Definition::Axiom(s), Definition::Axiom(o)) => ptr::eq(*s, *o),
-              (Definition::Derived(s), Definition::Derived(o)) => s == o,
+              (Executable::Axiom(s), Executable::Axiom(o)) => ptr::eq(*s, *o),
+              (Executable::Derived(s), Executable::Derived(o)) => s == o,
               _ => false,
           }
       }
   }
 
-  impl fmt::Debug for Definition {
+  impl fmt::Debug for Executable {
       fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
           match self {
-              Definition::Axiom(_) => f.write_str("Builtin"),
-              Definition::Derived(d) => {
+              Executable::Axiom(a) => f.write_str(format!("builtin_{}", a.name).as_str()),
+              Executable::Derived(d) => {
                   let mut ds = f.debug_list();
                   ds.entries(d.iter());
                   ds.finish()
@@ -3757,8 +3764,8 @@ internally, to keep track of things like the stack, program, lists etc.
       fn into_iter(self) -> Self::IntoIter {
           let mut v: Vec<(assoc::KeyItem, Item)> = vec![("definition".fit(), {
               match self.definition {
-                  Definition::Derived(l) => l.fit(),
-                  Definition::Axiom(_) => "builtin-function".fit(),
+                  Executable::Derived(l) => l.fit(),
+                  Executable::Axiom(a) => a.clone().fit(),
               }
           })];
           if let Some(e) = self.examples {
@@ -3795,7 +3802,7 @@ internally, to keep track of things like the stack, program, lists etc.
       type Error = Error;
       fn try_derive(iter: Box<dyn Iterator<Item = Item>>) -> Result<Self, Error> {
           let mut examples: Option<coll::List> = None;
-          let mut definition: Option<Definition> = None;
+          let mut definition: Option<Executable> = None;
           let mut spec: Option<Spec> = None;
           let mut namespace: Namespace = None;
           let mut doc: Option<String> = None;
@@ -3818,7 +3825,7 @@ internally, to keep track of things like the stack, program, lists etc.
           }
           Ok(Entry {
               examples,
-              definition: definition.unwrap_or(Definition::Derived(coll::List::default())),
+              definition: definition.unwrap_or(Executable::Derived(coll::List::default())),
               spec,
               namespace,
               doc,
@@ -3864,10 +3871,10 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  impl TryDerive<Item> for Definition {
+  impl TryDerive<Item> for Executable {
       type Error = Error;
       fn try_derive(i: Item) -> Result<Self, Self::Error> {
-          coll::List::try_derive(i).map(Definition::Derived)
+          coll::List::try_derive(i).map(Executable::Derived)
       }
   }
 
@@ -3891,7 +3898,7 @@ internally, to keep track of things like the stack, program, lists etc.
           d.doc.and_then(|l| a.insert("doc".fit(), l.fit()));
           d.namespace
               .and_then(|l| a.insert("namespace".fit(), l.as_ref().clone().fit()));
-          if let Definition::Derived(d) = d.definition {
+          if let Executable::Derived(d) = d.definition {
               a.insert("definition".fit(), d.fit());
           }
 
@@ -4987,6 +4994,9 @@ example, in order to read/write to/from disk).
               Item::Number(Number::Int(i)) => edn_format::Value::Integer(*i),
               Item::Number(Number::Float(f)) => edn_format::Value::from(*f),
               Item::Char(c) => edn_format::Value::Character(*c),
+              Item::Builtin(b) => edn_format::Value::Symbol(edn_format::Symbol::from_name(
+                  format!("builtin_{}", b.name).as_str(),
+              )),
               Item::Word(w) => edn_format::Value::Symbol({
                   if let Some(ns) = w.namespace {
                       edn_format::Symbol::from_namespace_and_name(
@@ -5588,8 +5598,20 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }
   }
 
+  #[derive(Clone)]
+  pub struct Builtin {
+      pub f: &'static StepFn,
+      pub name: &'static str,
+  }
+
+  impl Derive<Builtin> for Item {
+      fn derive(a: Builtin) -> Item {
+          Item::Builtin(a)
+      }
+  }
+
   lazy_static! {
-      pub static ref BUILTIN_FUNCTIONS: HashMap<Word, dict::Definition> = {
+      pub static ref BUILTIN_FUNCTIONS: HashMap<Word, dict::Executable> = {
   #[cfg(not(feature = "database"))]
       let entries: Vec<(&str, &'static StepFn)>;
       #[cfg(feature = "database")]
@@ -5789,7 +5811,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           entries.push(("database", Box::leak(Box::new(f_stack2(db::query)))));
           entries.push(("persist", Box::leak(Box::new(f_stack1(db::insert_object)))));
       }
-          HashMap::from_iter(entries.into_iter().map(|(s, f)| (Word::derive(s), dict::Definition::Axiom(f))))
+          HashMap::from_iter(entries.into_iter().map(|(s, f)| (Word::derive(s), dict::Executable::Axiom(Box::leak(Box::new(Builtin {name: s, f}))))))
       };
   }
 
@@ -6059,16 +6081,20 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn execute(mut env: Environment) -> Future<Environment> {
       let i = env.pop();
-      match coll::List::try_derive(i) {
-          Ok(program) => {
-              env.pop_prog();
-              env.program.prepend(program);
+      if let Item::Builtin(b) = i {
+          return (*b.f)(env).fit();
+      } else {
+          match coll::List::try_derive(i) {
+              Ok(program) => {
+                  env.pop_prog();
+                  env.program.prepend(program);
+              }
+              Err(e) => {
+                  env.push(e);
+              }
           }
-          Err(e) => {
-              env.push(e);
-          }
+          env.fit()
       }
-      env.fit()
   }
 
   pub fn wrap(mut env: Environment) -> Future<Environment> {
@@ -6543,8 +6569,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                               }
 
                               match &dfn.definition {
-                                  dict::Definition::Axiom(a) => (*a)(env),
-                                  dict::Definition::Derived(d) => {
+                                  dict::Executable::Axiom(a) => (*a.f)(env),
+                                  dict::Executable::Derived(d) => {
                                       let items = d.clone();
                                       env.pop_prog();
                                       env.program.prepend(items);
@@ -7533,6 +7559,7 @@ rust project or some other language through FFI.
       #[test_case("association")]
       #[test_case("association?" ; "is_association")]
       #[test_case("bail")]
+      #[test_case("bailer")]
       #[test_case("bits")]
       #[test_case("both?" ; "is_both")]
       #[test_case("both")]
@@ -7645,6 +7672,7 @@ rust project or some other language through FFI.
       #[test_case("produce")]
       #[test_case("radix")]
       #[test_case("range")]
+      #[test_case("reap")]
       #[test_case("🩹" ; "recovery")]
       #[test_case("🪆" ; "recur")]
       #[test_case("repetition")]
@@ -7660,7 +7688,6 @@ rust project or some other language through FFI.
       #[test_case("•🛡️" ; "shielddown")]
       #[test_case("••🛡️" ; "shielddeep")]
       #[test_case("⚓" ; "sink")]
-      #[test_case("reap")]
       #[test_case("skipper")]
       #[test_case("slice")]
       #[test_case("📸" ; "snapshot")]
