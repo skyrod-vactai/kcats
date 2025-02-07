@@ -1172,18 +1172,10 @@ internally, to keep track of things like the stack, program, lists etc.
       type Output = Sized;
       type Error = Infallible;
       fn join(mut self, rhs: String) -> Result<Self::Output, Self::Error> {
-          match self
-              .iter()
-              .cloned()
-              .map(|i| Char::try_derive(i))
-              .collect::<Result<Vec<Char>, Error>>()
-          {
-              Ok(vc) => {
-                  //join as string if all the list items are chars
-                  let mut x = vc.iter().collect::<String>();
-
-                  x.push_str(rhs.as_str());
-                  Ok(Sized::String(x))
+          match String::try_derive(self.clone()) {
+              Ok(mut s) => {
+                  s.push_str(rhs.as_str());
+                  Ok(Sized::String(s))
               }
               Err(_) => {
                   // join as list
@@ -1201,17 +1193,9 @@ internally, to keep track of things like the stack, program, lists etc.
       type Output = Sized;
       type Error = Infallible;
       fn join(mut self, rhs: List) -> Result<Self::Output, Self::Error> {
-          match rhs
-              .iter()
-              .cloned()
-              .map(|i| Char::try_derive(i))
-              .collect::<Result<Vec<Char>, Error>>()
-          {
-              Ok(vc) => {
-                  //join as string if all the list items are chars
-                  let x = vc.iter().collect::<String>();
-
-                  self.push_str(x.as_str());
+          match String::try_derive(rhs.clone()) {
+              Ok(s) => {
+                  self.push_str(s.as_str());
                   Ok(Sized::String(self))
               }
               Err(_) => {
@@ -1279,6 +1263,11 @@ internally, to keep track of things like the stack, program, lists etc.
 
       fn join(self, other: Sized) -> Result<Self::Output, Self::Error> {
           //println!("Joining sized {:?} to sized {:?}", self, other);
+          if self.is_empty() {
+              return Ok(other);
+          } else if other.is_empty() {
+              return Ok(self);
+          }
           Ok(match (self, other) {
               (Sized::Associative(a), Sized::List(l)) => Sized::Associative(a.join(l)?),
               (Sized::List(l), Sized::Associative(a)) => Sized::Associative(l.join(a)?),
@@ -1309,15 +1298,7 @@ internally, to keep track of things like the stack, program, lists etc.
               }
               (Sized::String(s), Sized::List(l)) => s.join(l).unwrap(),
               (Sized::List(l), Sized::String(s)) => l.join(s).unwrap(),
-              (s, other) => {
-                  if s.is_empty() {
-                      other
-                  } else if other.is_empty() {
-                      s
-                  } else {
-                      Err(Error::expected("joinable", list!(s, other)))?
-                  }
-              }
+              (s, other) => Err(Error::expected("joinable", list!(s, other)))?,
           })
       }
   }
@@ -1902,6 +1883,18 @@ internally, to keep track of things like the stack, program, lists etc.
   impl Derive<String> for List {
       fn derive(s: String) -> Self {
           List::derive_iter(s.chars())
+      }
+  }
+
+  impl TryDerive<List> for String {
+      type Error = Error;
+      fn try_derive(l: List) -> Result<Self, Error> {
+          let v = l
+              .iter()
+              .cloned()
+              .map(|i| Char::try_derive(i))
+              .collect::<Result<Vec<Char>, Error>>()?;
+          Ok(v.iter().collect::<String>())
       }
   }
 
@@ -5042,7 +5035,11 @@ example, in order to read/write to/from disk).
   /// that span multiple chunks.
   pub fn parse_edn(env: &mut Environment) -> Result<(), Error> {
       let mut obj_buffer: coll::List = env.pop().try_fit()?;
-      let state: String = env.pop().try_fit()?;
+      let next_input: String = env.pop().try_fit()?;
+      let mut state: String = env.pop().try_fit()?;
+
+      state.push_str(next_input.as_str());
+
       let mut parser = edn_format::Parser {
           opts: ParserOptions::default(),
           iter: state.chars().peekable(),
@@ -5092,7 +5089,10 @@ example, in order to read/write to/from disk).
 
   pub fn parse_utf8(env: &mut Environment) -> Result<(), Error> {
       let buffer = env.pop();
-      let state: Bytes = env.pop().try_fit()?;
+      let next_input = number::Int::try_derive(env.pop())? as u8;
+      let mut state: Bytes = env.pop().try_fit()?;
+
+      state.push(next_input);
 
       let mut obj_buffer: String = Default::default();
       if !buffer.is_empty() {
@@ -5715,6 +5715,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               Box::leak(Box::new(f_stack1(crate::crypto::hash))),
           ),
           ("inc", Box::leak(Box::new(f_stack1(inc)))),
+          ("integer?", Box::leak(Box::new(f_stack1(is_integer)))),
           ("intersection", Box::leak(Box::new(f_stack2(intersection)))),
           ("inspect", Box::leak(Box::new(f_stack1(inspect)))),
           ("🔗", Box::leak(Box::new(f_stack2(join)))),
@@ -6057,8 +6058,13 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               | Item::Receptacle(coll::Receptacle::Tunnel(_))
       ))
   }
+
   pub fn is_number(i: Item) -> Result<bool, Infallible> {
       Ok(matches!(i, Item::Number(_)))
+  }
+
+  pub fn is_integer(i: Item) -> Result<bool, Infallible> {
+      Ok(matches!(i, Item::Number(number::Number::Int(_))))
   }
 
   pub fn is_list(i: Item) -> Result<bool, Infallible> {
@@ -6627,27 +6633,22 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   fn string(i: Item) -> Result<String, Infallible> {
       match i {
-          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(b))) => {
-              Ok(std::str::from_utf8(&b).unwrap().to_string())
-          }
-          Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(b))) => {
-              Ok(std::str::from_utf8(&b).unwrap().to_string())
-          }
-          Item::Dispenser(coll::Dispenser::Sized(s)) => {
-              if s.is_empty() {
-                  Ok("".to_string())
-              } else {
-                  Ok((&Item::derive(s)).emit())
+          i => match coll::Sized::try_derive(i.clone()) {
+              Ok(s) => {
+                  if s.is_empty() {
+                      Ok("".to_string())
+                  } else {
+                      match s {
+                          coll::Sized::Bytes(b) => Ok(std::str::from_utf8(&b).unwrap().to_string()),
+                          coll::Sized::List(l) => {
+                              String::try_derive(l.clone()).or_else(|_| Ok((&Item::derive(l)).emit()))
+                          }
+                          s => Ok((&Item::derive(s)).emit()),
+                      }
+                  }
               }
-          }
-          Item::Receptacle(coll::Receptacle::Sized(s)) => {
-              if s.is_empty() {
-                  Ok("".to_string())
-              } else {
-                  Ok((&Item::derive(s)).emit())
-              }
-          }
-          i => Ok((&Item::derive(i)).emit()),
+              Err(_) => Ok(i.emit()),
+          },
       }
   }
 
@@ -7633,6 +7634,7 @@ rust project or some other language through FFI.
       #[test_case("indexof")]
       #[test_case("💉" ; "inject")]
       //#[test_case("inscribe")]
+      #[test_case("integer?" ; "is_integer")]
       #[test_case("intersection")]
       #[test_case("🧹" ; "into")]
       #[test_case("🔗" ; "join")]
