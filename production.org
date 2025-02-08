@@ -1898,6 +1898,18 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  impl TryDerive<List> for Bytes {
+      type Error = Error;
+      fn try_derive(l: List) -> Result<Self, Error> {
+          let v = l
+              .iter()
+              .cloned()
+              .map(|i| number::Int::try_derive(i).map(|i| i as u8))
+              .collect::<Result<Bytes, Error>>()?;
+          Ok(v)
+      }
+  }
+
   impl TryDerive<Item> for List {
       type Error = Error;
       fn try_derive(i: Item) -> Result<Self, Self::Error> {
@@ -5089,10 +5101,10 @@ example, in order to read/write to/from disk).
 
   pub fn parse_utf8(env: &mut Environment) -> Result<(), Error> {
       let buffer = env.pop();
-      let next_input = number::Int::try_derive(env.pop())? as u8;
+      let next_input: Bytes = env.pop().try_fit()?;
       let mut state: Bytes = env.pop().try_fit()?;
 
-      state.push(next_input);
+      state.extend(next_input);
 
       let mut obj_buffer: String = Default::default();
       if !buffer.is_empty() {
@@ -5674,8 +5686,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("emit", Box::leak(Box::new(f_stack1(emit)))),
           ("empty", Box::leak(Box::new(f_stack1(empty)))),
           ("empty?", Box::leak(Box::new(f_stack1(is_empty)))),
-          ("encodestring", Box::leak(Box::new(f_stack1(encode_string)))),
-          ("encodenumber", Box::leak(Box::new(f_stack1(encode_number)))),
+          ("encodeitem", Box::leak(Box::new(f_stack1(encode_item)))),
           ("encodejson", Box::leak(Box::new(f_stack1(encode_json)))),
           (
               "environment",
@@ -6620,15 +6631,35 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }
   }
 
-  fn encode_string(s: String) -> Result<Bytes, Infallible> {
-      Ok(s.as_bytes().to_vec())
-  }
-
-  fn encode_number(n: Number) -> Result<Bytes, Infallible> {
-      match n {
-          Number::Int(i) => Ok(i.to_be_bytes().to_vec()),
-          Number::Float(f) => Ok(f.to_be_bytes().to_vec()),
-      }
+  /// The default method of encoding items into byte arrays.
+  fn encode_item(i: Item) -> Result<Bytes, Infallible> {
+      Ok(match i {
+          Item::Number(n) => match n {
+              Number::Int(i) => i.to_be_bytes().to_vec(),
+              Number::Float(f) => f.to_be_bytes().to_vec(),
+          },
+          Item::Char(c) => vec![c as u8],
+          i => {
+              let r = coll::Sized::try_derive(i.clone());
+              match r {
+                  Ok(s) => match s {
+                      coll::Sized::String(s) => s.as_bytes().to_vec(),
+                      coll::Sized::Bytes(b) => b,
+                      coll::Sized::List(l) => Bytes::try_derive(l.clone()).unwrap_or_else(|_| {
+                          (&Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(l))))
+                              .emit()
+                              .as_bytes()
+                              .to_vec()
+                      }),
+                      s => (&Item::Dispenser(coll::Dispenser::Sized(s)))
+                          .emit()
+                          .as_bytes()
+                          .to_vec(),
+                  },
+                  Err(_) => (&i).emit().as_bytes().to_vec(),
+              }
+          }
+      })
   }
 
   fn string(i: Item) -> Result<String, Infallible> {
@@ -7602,8 +7633,7 @@ rust project or some other language through FFI.
       #[test_case("ends?" ; "is_ends")]
       #[test_case("encode")]
       #[test_case("encodejson")]
-      #[test_case("encodestring")]
-      #[test_case("encodenumber")]
+      #[test_case("encodeitem")]
       #[test_case("environment")]
       #[test_case("environment?" ; "is_environment")]
       #[test_case("evaluate")]
