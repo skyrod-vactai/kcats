@@ -790,6 +790,8 @@ internally, to keep track of things like the stack, program, lists etc.
   use num_integer::Roots;
   use serde::ser::{Serialize, Serializer};
   use std::num::{ParseFloatError, ParseIntError};
+  use std::ops::Div;
+  use std::ops::Rem;
   /// An integer type
   pub type Int = i64;
 
@@ -830,12 +832,41 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
-      pub fn divide(i: Float, j: Float) -> Result<Float, Error> {
-          let q = i / j;
-          if q.is_nan() {
-              Err(Error::division_by_zero())
-          } else {
-              Ok(q)
+      fn div<T>(a: T, b: T) -> Result<Number, Error>
+      where
+          T: Div<Output = T> + PartialEq + From<i32> + Copy + Fit<Number>,
+      {
+          if b == T::from(0) {
+              return Err(Error::division_by_zero());
+          }
+          Ok((a / b).fit())
+      }
+
+      fn rem<T>(a: T, b: T) -> Result<Number, Error>
+      where
+          T: Rem<Output = T> + PartialEq + From<i32> + Copy + Fit<Number>,
+      {
+          if b == T::from(0) {
+              return Err(Error::division_by_zero());
+          }
+          Ok((a % b).fit())
+      }
+
+      pub fn divide(i: Number, j: Number) -> Result<Number, Error> {
+          match (i, j) {
+              (Number::Int(i), Number::Int(j)) => Number::div(i, j),
+              (Number::Int(i), Number::Float(j)) => Number::div(i as Float, j),
+              (Number::Float(i), Number::Int(j)) => Number::div(i, j as Float),
+              (Number::Float(i), Number::Float(j)) => Number::div(i, j),
+          }
+      }
+
+      pub fn remainder(i: Number, j: Number) -> Result<Number, Error> {
+          match (i, j) {
+              (Number::Int(i), Number::Int(j)) => Number::rem(i, j),
+              (Number::Int(i), Number::Float(j)) => Number::rem(i as Float, j),
+              (Number::Float(i), Number::Int(j)) => Number::rem(i, j as Float),
+              (Number::Float(i), Number::Float(j)) => Number::rem(i, j),
           }
       }
 
@@ -990,6 +1021,18 @@ internally, to keep track of things like the stack, program, lists etc.
   impl Derive<Number> for Item {
       fn derive(c: Number) -> Self {
           Item::Number(c)
+      }
+  }
+
+  impl Derive<Int> for Number {
+      fn derive(c: Int) -> Self {
+          Number::Int(c)
+      }
+  }
+
+  impl Derive<Float> for Number {
+      fn derive(c: Float) -> Self {
+          Number::Float(c)
       }
   }
 
@@ -5405,6 +5448,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   use std::convert::Infallible;
   use std::default::Default;
   use std::mem;
+  use std::str::Utf8Error;
   use std::sync::Arc;
   //#[cfg(feature = "httpclient")]
   //use surf;
@@ -5750,6 +5794,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("pop", Box::leak(Box::new(pop))),
           ("📮", Box::leak(Box::new(put))),
           ("pipe?", Box::leak(Box::new(f_stack1(is_pipe)))),
+          ("quot", Box::leak(Box::new(f_stack2(div)))),
           (
               "random",
               Box::leak(Box::new(f_stack1(crate::crypto::random))),
@@ -5845,20 +5890,11 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn div(i: Number, j: Number) -> Result<Number, Error> {
-      match (i, j) {
-          (Number::Int(i), Number::Int(j)) => i
-              .checked_div(j)
-              .ok_or_else(Error::division_by_zero)
-              .map(Number::Int),
-
-          (Number::Float(i), Number::Float(j)) => Number::divide(i, j).map(Number::Float),
-          (Number::Int(i), Number::Float(j)) => Number::divide(i as Float, j).map(Number::Float),
-          (Number::Float(i), Number::Int(j)) => Number::divide(i, j as Float).map(Number::Float),
-      }
+      Number::divide(i, j).map(Number::derive)
   }
 
-  pub fn mod_(i: Int, j: Int) -> Result<Int, Error> {
-      Ok(i % j)
+  pub fn mod_(i: Number, j: Number) -> Result<Number, Error> {
+      Number::remainder(i, j).map(Number::derive)
   }
 
   pub fn floor(i: Number) -> Result<Int, Error> {
@@ -6662,7 +6698,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       })
   }
 
-  fn string(i: Item) -> Result<String, Infallible> {
+  fn string(i: Item) -> Result<String, Error> {
       match i {
           i => match coll::Sized::try_derive(i.clone()) {
               Ok(s) => {
@@ -6670,7 +6706,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       Ok("".to_string())
                   } else {
                       match s {
-                          coll::Sized::Bytes(b) => Ok(std::str::from_utf8(&b).unwrap().to_string()),
+                          coll::Sized::Bytes(b) => Ok(std::str::from_utf8(&b)?.to_string()),
                           coll::Sized::List(l) => {
                               String::try_derive(l.clone()).or_else(|_| Ok((&Item::derive(l)).emit()))
                           }
@@ -7103,6 +7139,12 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   impl<'a> From<dynfmt::Error<'a>> for Error {
       fn from(err: dynfmt::Error) -> Error {
           Error::create(list!("format"), &err.to_string(), Option::<Item>::None)
+      }
+  }
+
+  impl From<Utf8Error> for Error {
+      fn from(err: Utf8Error) -> Error {
+          Error::create(list!("decode"), &err.to_string(), Option::<Item>::None)
       }
   }
 
@@ -7731,7 +7773,7 @@ rust project or some other language through FFI.
       #[test_case("string")]
       #[test_case("string?" ; "is_string")]
       #[test_case("spawn")]
-      #[test_case("split")]
+      #[test_case("splitter")]
       #[test_case("🔀" ; "swap")]
       #[test_case("•🔀" ; "swapdown")]
       #[test_case("📤" ; "take")]
