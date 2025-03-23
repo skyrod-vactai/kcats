@@ -94,4 +94,5 @@ Supports incremental output and preserves output on interruption."
                      (run-with-timer 0.5 nil 'kill-buffer output-buffer))
                    ;; Return the cleaned output
                    (string-trim output))))))
+        (kill-buffer output-buffer)
         final-output))))
