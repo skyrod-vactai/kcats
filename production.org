@@ -5858,6 +5858,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("unnamespace", Box::leak(Box::new(unnamespace))),
           ("📤", Box::leak(Box::new(take))),
           ("🍫", Box::leak(Box::new(unwrap))),
+          ("unpack", Box::leak(Box::new(f_result(unpack)))),
           ("using", Box::leak(Box::new(f_result(using)))),
           (
               "verify",
@@ -7236,28 +7237,28 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       Ok(())
   }
 
+  fn stackpoint(w: &Word) -> Option<(usize, bool)> {
+      let s = String::derive(w.clone());
+
+      // Define mappings for number emojis
+      const NUMBER_EMOJIS: [&str; 9] = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣"];
+
+      // Check for splice (scissors + number)
+      if let Some(rest) = s.strip_prefix("✂️") {
+          if let Some(position) = NUMBER_EMOJIS.iter().position(|&emoji| emoji == rest) {
+              return Some((position + 1, true));
+          }
+      // Check for just the number (insert operation)
+      } else if let Some(position) = NUMBER_EMOJIS.iter().position(|&emoji| emoji == s) {
+          return Some((position + 1, false));
+      }
+
+      None
+  }
+
   fn pack(env: &mut Environment) -> Result<(), Error> {
       let template: coll::List = env.pop().try_fit()?;
       let mut last_stack_item_used = 0;
-
-      fn stackpoint(w: Word) -> Option<(usize, bool)> {
-          let s = String::derive(w.clone());
-
-          // Define mappings for number emojis
-          const NUMBER_EMOJIS: [&str; 9] = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣"];
-
-          // Check for splice (scissors + number)
-          if let Some(rest) = s.strip_prefix("✂️") {
-              if let Some(position) = NUMBER_EMOJIS.iter().position(|&emoji| emoji == rest) {
-                  return Some((position + 1, true));
-              }
-          // Check for just the number (insert operation)
-          } else if let Some(position) = NUMBER_EMOJIS.iter().position(|&emoji| emoji == s) {
-              return Some((position + 1, false));
-          }
-
-          None
-      }
 
       /// Takes an accumulator that is a pair of the stack and the
       /// compiled result so far, and then an item to incorporate. If
@@ -7270,7 +7271,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           match acc {
               Ok((stack, last_stack_item_used, mut list)) => match i {
                   Item::Word(w) => {
-                      if let Some((n, is_splice)) = stackpoint(w.clone()) {
+                      if let Some((n, is_splice)) = stackpoint(&w) {
                           ,*last_stack_item_used = max(n, *last_stack_item_used);
                           stack
                               .get(n - 1)
@@ -7318,6 +7319,112 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           env.pop();
       }
       env.push(coll::List::derive(filled));
+      Ok(())
+  }
+
+  /// Destructuring (inverse of pack). Takes a Sized input item to
+  /// unpack, and a pattern. The pattern should contain stack markers
+  /// like 1️⃣. Anywhere those markers occur in the pattern, the
+  /// corresponding value will be extracted from the input and placed at
+  /// that location on the stack.
+  fn unpack(env: &mut Environment) -> Result<(), Error> {
+      fn is_variable(w: &Word) -> bool {
+          stackpoint(w).is_some() || String::derive(w.clone()).ends_with("?")
+      }
+
+      fn destructure(data: &Item, pattern: &Item, acc: &mut HashMap<Word, Item>) -> bool {
+          // see if both are maps
+          //println!("Destructure: {:?} with {:?}", data, pattern);
+          let data_map = assoc::Associative::try_derive(data.clone());
+          let pattern_map = assoc::Associative::try_derive(pattern.clone());
+          match (data_map, pattern_map) {
+              (Ok(data_map), Ok(pattern_map)) => {
+                  //println!("destructuring map: {:?}", data_map);
+                  //map destructure
+                  // Iterate over the entries
+                  let mut potential_updates: HashMap<Word, Item> = Default::default();
+                  for (k, ref v) in pattern_map.to_iter() {
+                      // look up k in data
+                      let vd = data_map.get(&k.fit());
+                      // if v is a placeholder, vd is our target
+                      if let Some(vd) = vd {
+                          let r = Word::try_derive(v.clone());
+                          if let Ok(w) = r {
+                              if is_variable(&w) {
+                                  potential_updates.insert(w, vd);
+                              } else if !destructure(&vd, &v, acc) {
+                                  return false;
+                              }
+                          } else {
+                              // value is not a word
+                              if !destructure(&vd, v, &mut potential_updates) {
+                                  return false;
+                              }
+                          }
+                      }
+                  }
+                  acc.extend(potential_updates);
+                  return true;
+              }
+              (Err(_), Err(_)) => {
+                  //neither are maps, are they lists?
+                  let data_list = coll::List::try_derive(data.clone());
+                  let pattern_list = coll::List::try_derive(pattern.clone());
+                  match (data_list, pattern_list) {
+                      (Ok(data_list), Ok(pattern_list)) => {
+                          //println!("destructuring list: {:?}", data_list);
+                          fn is_wildcard(w: &Word) -> bool {
+                              String::derive(w.clone()) == "_"
+                          }
+
+                          let mut potential_updates: HashMap<Word, Item> = Default::default();
+                          for i in 0..(pattern_list.len()) {
+                              let p = pattern_list.get(i);
+                              let v = data_list.get(i).cloned().unwrap_or_default();
+                              match p {
+                                  Some(p) => match p {
+                                      Item::Word(w) => {
+                                          if is_variable(&w) {
+                                              acc.insert(w.clone(), v);
+                                          } else if is_wildcard(w) || Item::Word(w.clone()) == v {
+                                              // match! but not a variable so continue
+                                          } else {
+                                              // pattern does not match. bail out of list processing
+                                              return false;
+                                          }
+                                      }
+                                      p => {
+                                          if !destructure(&v, p, &mut potential_updates) {
+                                              return false;
+                                          };
+                                      }
+                                  },
+                                  // past end of list
+                                  None => {
+                                      break;
+                                  }
+                              }
+                          }
+                          acc.extend(potential_updates);
+                          return true;
+                      }
+                      (a, b) => a == b,
+                  }
+              }
+              (a, b) => a == b,
+          }
+      }
+      let pattern = env.pop();
+      let data = env.pop();
+      let mut matches: HashMap<Word, Item> = Default::default();
+
+      destructure(&data, &pattern, &mut matches);
+      let res: assoc::AssociationContent = matches
+          .into_iter()
+          .map(|(k, v)| (assoc::KeyItem::derive(k), v))
+          .collect();
+      env.pop_prog();
+      env.push(Item::derive(res));
       Ok(())
   }
 #+end_src
@@ -17659,4 +17766,117 @@ standard
 #+begin_src kcats
 [[peer standard]
  [type tunnel]]
+#+end_src
+** TODO Pattern matching and destructuring
+Pattern match is fairly simple if you specify paths:
+
+#+begin_src kcats
+  [[foo [[bar [[splook zoop]]]]]
+   [baz [item1 item2 item3]]
+   [quux [[bloop toop] [foop gloop]]]]
+  [[foo bar] [baz 2] [quux foop]] [🔍] 🚜 ▶️
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[[splook zoop]] item3 gloop] [[foo [[bar [[splook zoop]]]]]
+                               [baz [item1 item2 item3]]
+                               [quux [[bloop toop]
+                                      [foop gloop]]]]
+#+end_src
+
+the trick is specifying an actual pattern.
+
+#+begin_src kcats
+  [[foo [[bar [[splook zoop]]]]]
+   [baz [item1 item2 item3]]
+   [quux [[bloop toop] [foop gloop]]]]
+  [[foo [[bar 1️⃣]]]
+   [baz [_ _ 2️⃣]]
+   [quux [[foop 3️⃣]]]]
+  match
+#+end_src
+
+#+begin_src kcats
+  [[foo bar]
+   [baz quux]
+   [goop [[a b]
+          [c d]]]]
+  [[foo thing?]
+   [goop [[a bee?]]]
+   [barx other?]]
+  unpack
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[bee? b]
+ [thing? bar]]
+#+end_src
+
+#+begin_src kcats
+[a b c] [_ b 1️⃣] unpack
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+Destructure: [a, b, c] with [_, b, 1️⃣]
+destructuring list: [a, b, c]
+[[1️⃣ c]]
+#+end_src
+
+
+#+begin_src kcats
+  [anything
+   [foo [this is a] 12]
+   [5 [this is b] 5]
+   []
+   thisisc]
+  [_
+   [_ a? 12]
+   [5 b? 5]
+   []
+   c?] 
+  unpack
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+Destructure: [anything, [foo, [this, is, a], Int(12)], [Int(5), [this, is, b], Int(5)], [], thisisc] with [_, [_, a?, Int(12)], [Int(5), b?, Int(5)], [], c?]
+destructuring list: [anything, [foo, [this, is, a], Int(12)], [Int(5), [this, is, b], Int(5)], [], thisisc]
+Destructure: [foo, [this, is, a], Int(12)] with [_, a?, Int(12)]
+destructuring list: [foo, [this, is, a], Int(12)]
+Destructure: Int(12) with Int(12)
+Destructure: [Int(5), [this, is, b], Int(5)] with [Int(5), b?, Int(5)]
+destructuring list: [Int(5), [this, is, b], Int(5)]
+Destructure: Int(5) with Int(5)
+Destructure: Int(5) with Int(5)
+Destructure: [] with []
+destructuring map: Assoc({})
+[[a? [this is a]]
+ [b? [this is b]]
+ [c? thisisc]]
+#+end_src
+
+#+begin_src kcats
+  [[a [[b 12]
+       [c 15]]]
+   [d [[e []]
+       [f [5 4 3 2 1]]]]]
+  [[a a?]
+   [d [[f [_ _ b?]]]]] 
+  unpack
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+Destructure: [[a, [[b, Int(12)], [c, Int(15)]]], [d, [[e, []], [f, [Int(5), Int(4), Int(3), Int(2), Int(1)]]]]] with [[a, a?], [d, [[f, [_, _, b?]]]]]
+destructuring map: Assoc({Word(d): [[e, []], [f, [Int(5), Int(4), Int(3), Int(2), Int(1)]]], Word(a): [[b, Int(12)], [c, Int(15)]]})
+Destructure: [[e, []], [f, [Int(5), Int(4), Int(3), Int(2), Int(1)]]] with [[f, [_, _, b?]]]
+destructuring map: Assoc({Word(e): [], Word(f): [Int(5), Int(4), Int(3), Int(2), Int(1)]})
+Destructure: [Int(5), Int(4), Int(3), Int(2), Int(1)] with [_, _, b?]
+destructuring list: [Int(5), Int(4), Int(3), Int(2), Int(1)]
+[[a? [[b 12]
+      [c 15]]]
+ [b? 3]]
 #+end_src
