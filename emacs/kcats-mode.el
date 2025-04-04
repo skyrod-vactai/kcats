@@ -139,6 +139,7 @@
         ("swapdeep" "••🔀")
         ("swapdown" "•🔀")
         ("take" "📤")
+        ("unpack" "⛏️")
         ("unwrap" "🍫")
         ("while" "⏳")
         ("wrap" "🎁")
