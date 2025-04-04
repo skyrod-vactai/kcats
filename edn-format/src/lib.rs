@@ -892,7 +892,22 @@ fn parse_helper<Observer: ParseObserver, Iter: Iterator<Item = char> + Clone>(
                         parser_state = ParserState::ParsingCharacter;
                     } else if c == '#' {
                         s.next();
-                        parser_state = ParserState::SelectingDispatch;
+                        // Check if this is part of an emoji sequence
+                        if s.peek().map_or(false, |next_char| {
+                            // Check for variation selector or zero-width joiner that could indicate emoji
+                            //println!("Got next char: {}", next_char);
+                            *next_char == '\u{FE0F}'
+                                || *next_char == '\u{200D}'
+                                || *next_char == '\u{20E3}'
+                        }) {
+                            // This is likely an emoji sequence starting with #, treat it as a regular character
+                            let built_up = vec![c];
+                            observer.start_parsing_atom();
+                            parser_state = ParserState::ParsingAtom { built_up };
+                        } else {
+                            // This is a regular dispatch character
+                            parser_state = ParserState::SelectingDispatch;
+                        }
                     } else if is_allowed_atom_character(c) || c == ':' {
                         s.next();
                         let built_up = vec![c];
