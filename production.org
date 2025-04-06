@@ -5858,7 +5858,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("unnamespace", Box::leak(Box::new(unnamespace))),
           ("📤", Box::leak(Box::new(take))),
           ("🍫", Box::leak(Box::new(unwrap))),
-          ("unpack", Box::leak(Box::new(f_result(unpack)))),
+          ("⛏️", Box::leak(Box::new(f_result(unpack)))),
           ("using", Box::leak(Box::new(f_result(using)))),
           (
               "verify",
@@ -7322,14 +7322,85 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       Ok(())
   }
 
+  /// A struct to keep track of destructured values from the function
+  /// unpack. Can only have max 9 params because it's meant to go on the
+  /// stack - more than that and it's recommended to use named params
+  /// that get returned as an association.
+  #[derive(Debug, Clone, Default)]
+  struct PositionalParams<T> {
+      values: [Option<T>; 9],
+  }
+
+  impl<T: Clone> PositionalParams<T>
+  where
+      T: Fit<Item> + std::fmt::Debug,
+  {
+      // Set a value at position (1-9)
+      fn set(&mut self, position: usize, value: T) -> Result<(), String> {
+          //println!("Setting {} to {:?}", position, value);
+          if position < 1 || position > 9 {
+              return Err(format!("Position must be between 1-9, got {}", position));
+          }
+
+          // Convert to 0-based index
+          let idx = position - 1;
+
+          // Check if already set
+          if self.values[idx].is_some() {
+              return Err(format!("Position {} already has a value", position));
+          }
+
+          self.values[idx] = Some(value);
+          Ok(())
+      }
+
+      // Get a value at position (1-9)
+      #[allow(dead_code)]
+      fn get(&self, position: usize) -> Option<&T> {
+          if position < 1 || position > 9 {
+              return None;
+          }
+          self.values[position - 1].as_ref()
+      }
+
+      // Merge with another set of positional parameters
+      fn merge(&mut self, other: &Self) -> Result<(), Error> {
+          //let mut result = self.clone();
+
+          for i in 0..9 {
+              if let Some(value) = &other.values[i] {
+                  if self.values[i].is_some() {
+                      return Err(Error::create(
+                          list!("assign-param"),
+                          "Pattern matching params can't be used more than once",
+                          Some(value.clone()),
+                      ));
+                  }
+                  self.values[i] = Some(value.clone());
+              }
+          }
+
+          Ok(())
+      }
+
+      // Convert to a vector, useful for pushing onto stack
+      fn to_vec(&self) -> Vec<T>
+      where
+          T: Clone,
+      {
+          //println!("postional params {:?}", self);
+          self.values.iter().filter_map(|opt| opt.clone()).collect()
+      }
+  }
+
   /// Destructuring (inverse of pack). Takes a Sized input item to
   /// unpack, and a pattern. The pattern should contain stack markers
   /// like 1️⃣. Anywhere those markers occur in the pattern, the
   /// corresponding value will be extracted from the input and placed at
   /// that location on the stack.
   fn unpack(env: &mut Environment) -> Result<(), Error> {
-      fn is_variable(w: &Word) -> bool {
-          stackpoint(w).is_some() || String::derive(w.clone()).starts_with("📨")
+      fn is_map_variable(w: &Word) -> bool {
+          String::derive(w.clone()).starts_with("📨")
       }
 
       fn strip_variable(w: &Word) -> Word {
@@ -7346,60 +7417,38 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           };
       }
 
-      fn destructure(data: &Item, pattern: &Item, acc: &mut HashMap<Word, Item>) -> bool {
+      fn destructure(
+          data: &Item,
+          pattern: &Item,
+          acc_assoc: &mut HashMap<Word, Item>,
+          acc_seq: &mut PositionalParams<Item>,
+      ) -> bool {
           // see if both are maps
           //println!("Destructure: {:?} with {:?}", data, pattern);
-          let data_map = assoc::Associative::try_derive(data.clone());
-          let pattern_map = assoc::Associative::try_derive(pattern.clone());
-          match (data_map, pattern_map) {
-              (Ok(data_map), Ok(pattern_map)) => {
-                  //println!("destructuring map: {:?}", data_map);
-                  //map destructure
-                  // Iterate over the entries
-                  let mut potential_updates: HashMap<Word, Item> = Default::default();
-                  for (k, ref v) in pattern_map.to_iter() {
-                      // look up k in data
-                      let vd = data_map.get(&k.fit());
-                      // if v is a placeholder, vd is our target
-                      if let Some(vd) = vd {
-                          let r = Word::try_derive(v.clone());
-                          if let Ok(w) = r {
-                              if is_variable(&w) {
-                                  potential_updates.insert(strip_variable(&w), vd);
-                              } else if !destructure(&vd, &v, acc) {
-                                  return false;
-                              }
-                          } else {
-                              // value is not a word
-                              if !destructure(&vd, v, &mut potential_updates) {
-                                  return false;
-                              }
-                          }
-                      }
-                  }
-                  acc.extend(potential_updates);
-                  return true;
-              }
-              (Err(_), Err(_)) => {
-                  //neither are maps, are they lists?
-                  let data_list = coll::List::try_derive(data.clone());
-                  let pattern_list = coll::List::try_derive(pattern.clone());
-                  match (data_list, pattern_list) {
-                      (Ok(data_list), Ok(pattern_list)) => {
+          let data = coll::Sized::try_derive(data.clone());
+          let pattern = coll::Sized::try_derive(pattern.clone());
+          match (data, pattern) {
+              (Ok(data), Ok(pattern)) => {
+                  // We got containers
+                  match (data, pattern) {
+                      (coll::Sized::List(data_list), coll::Sized::List(pattern_list)) => {
                           //println!("destructuring list: {:?}", data_list);
                           fn is_wildcard(w: &Word) -> bool {
                               String::derive(w.clone()) == "_"
                           }
 
-                          let mut potential_updates: HashMap<Word, Item> = Default::default();
+                          let mut potential_updates_map: HashMap<Word, Item> = Default::default();
+                          let mut potential_updates_list: PositionalParams<Item> = Default::default();
                           for i in 0..(pattern_list.len()) {
                               let p = pattern_list.get(i);
                               let v = data_list.get(i).cloned().unwrap_or_default();
                               match p {
                                   Some(p) => match p {
                                       Item::Word(w) => {
-                                          if is_variable(&w) {
-                                              acc.insert(strip_variable(w), v);
+                                          if let Some((idx, _)) = stackpoint(&w) {
+                                              let _ = potential_updates_list.set(idx, v);
+                                          } else if is_map_variable(&w) {
+                                              acc_assoc.insert(strip_variable(w), v);
                                           } else if is_wildcard(w) || Item::Word(w.clone()) == v {
                                               // match! but not a variable so continue
                                           } else {
@@ -7408,7 +7457,12 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                                           }
                                       }
                                       p => {
-                                          if !destructure(&v, p, &mut potential_updates) {
+                                          if !destructure(
+                                              &v,
+                                              p,
+                                              &mut potential_updates_map,
+                                              &mut potential_updates_list,
+                                          ) {
                                               return false;
                                           };
                                       }
@@ -7419,26 +7473,75 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                                   }
                               }
                           }
-                          acc.extend(potential_updates);
+                          acc_assoc.extend(potential_updates_map);
+                          let _ = acc_seq.merge(&potential_updates_list);
+                          return true;
+                      }
+                      (coll::Sized::Associative(data), coll::Sized::Associative(pattern)) => {
+                          //println!("destructuring map: {:?}", data_map);
+                          //map destructure
+                          // Iterate over the entries
+                          let mut potential_updates_map: HashMap<Word, Item> = Default::default();
+                          let mut potential_updates_list: PositionalParams<Item> = Default::default();
+                          for (k, ref v) in pattern.to_iter() {
+                              // look up k in data
+                              let vd = data.get(&k.fit());
+                              // if v is a placeholder, vd is our target
+                              if let Some(vd) = vd {
+                                  let r = Word::try_derive(v.clone());
+                                  if let Ok(w) = r {
+                                      if let Some((idx, _)) = stackpoint(&w) {
+                                          let _ = potential_updates_list.set(idx, vd);
+                                      } else if is_map_variable(&w) {
+                                          potential_updates_map.insert(strip_variable(&w), vd);
+                                      } else if !destructure(
+                                          &vd,
+                                          &v,
+                                          &mut potential_updates_map,
+                                          &mut potential_updates_list,
+                                      ) {
+                                          return false;
+                                      }
+                                  } else {
+                                      // value is not a word
+                                      if !destructure(
+                                          &vd,
+                                          v,
+                                          &mut potential_updates_map,
+                                          &mut potential_updates_list,
+                                      ) {
+                                          return false;
+                                      }
+                                  }
+                              }
+                          }
+                          acc_assoc.extend(potential_updates_map);
+                          let _ = acc_seq.merge(&potential_updates_list);
                           return true;
                       }
                       (a, b) => a == b,
                   }
               }
-              (a, b) => a == b,
+              (Err(de), Err(pe)) => de.actual().unwrap() == pe.actual().unwrap(),
+              (Ok(d), Err(pe)) => Item::derive(d) == *pe.actual().unwrap(),
+              (Err(de), Ok(p)) => *de.actual().unwrap() == Item::derive(p),
           }
       }
       let pattern = env.pop();
       let data = env.pop();
-      let mut matches: HashMap<Word, Item> = Default::default();
+      let mut matches_map: HashMap<Word, Item> = Default::default();
+      let mut matches_list: PositionalParams<Item> = Default::default();
 
-      destructure(&data, &pattern, &mut matches);
-      let res: assoc::AssociationContent = matches
+      destructure(&data, &pattern, &mut matches_map, &mut matches_list);
+      let res_map: assoc::AssociationContent = matches_map
           .into_iter()
           .map(|(k, v)| (assoc::KeyItem::derive(k), v))
           .collect();
+      let res_list = matches_list.to_vec();
+      //println!("Got unpack result list {:?}", res_list);
       env.pop_prog();
-      env.push(Item::derive(res));
+      env.push(coll::List::derive(res_list));
+      env.push(Item::derive(res_map));
       Ok(())
   }
 #+end_src
@@ -7776,6 +7879,7 @@ rust project or some other language through FFI.
       #[test_case("assemble")]
       #[test_case("assign")]
       #[test_case("association")]
+      #[test_case("assocify")]
       #[test_case("association?" ; "is_association")]
       #[test_case("bail")]
       #[test_case("bailer")]
@@ -7929,6 +8033,7 @@ rust project or some other language through FFI.
       #[test_case("under")]
       #[test_case("unnamespace")]
       #[test_case("until")]
+      #[test_case("⛏️" ; "unpack")]
       #[test_case("🍫" ; "unwrap")]
       #[test_case("update")]
       #[test_case("value")]
@@ -17864,7 +17969,7 @@ the trick is specifying an actual pattern.
   [[a [[b 12]
        [c 15]]]
    [d [[e []]
-       [f [5 4 3 2 1]]]]]
+       [f [5 4 3 2 1]]]]] assocify
   [[a 📨a]
    [d [[f [_ 1️⃣ 📨b]]]]] 
   ⛏️
@@ -17872,8 +17977,6 @@ the trick is specifying an actual pattern.
 
 #+RESULTS:
 #+begin_src kcats
-Setting 1 to Int(4)
-Got unpack result list [Int(4)]
 [[a [[b 12]
      [c 15]]]
  [b 3]]
@@ -17882,8 +17985,50 @@ Got unpack result list [Int(4)]
 
 ** Match semantics
 #+begin_src kcats
-  [[[[1️⃣ 2️⃣] 💯] [[sqlexpr] 🚜 ▶️ 🍫 ["{} and {}"] format]]
-   [[[1️⃣ 2️⃣] 📣] [[sqlexpr] 🚜 ▶️ 🍫 ["{} or {}"] format]]
-   [[1️⃣ >] ["> {}" format]]
-   [[1️⃣ <] ["< {}" format]]]
+
+  [[sqlexpr [[[[[1️⃣ 2️⃣] 💯] [[sqlexpr] 🚜 ▶️ "{} and {}" 🔀 format]]
+              [[[1️⃣ 2️⃣] 📣] [[sqlexpr] 🚜 ▶️ "{} or {}" 🔀 format]]
+              [[1️⃣ >] ["> {}" 🔀 format]]
+              [[1️⃣ <] ["< {}" 🔀 format]]]
+
+             ;; for each entry convert pred to a destructure
+             [[0] [[1️⃣ ⛏️ 🗑️ 👥] 🎒] update] 🚜 ▶️ 
+             decide]]]
+  [4 [[[6 >] [10 <]] 💯] sqlexpr]
+  ;[4 [6 >] sqlexpr]
+  let ▶️ 
+
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+"> 6 and < 10" [[[6 >]
+                 [10 <]]
+                💯]
+4
+#+end_src
+
+#+begin_src kcats
+[[[6 >] [10 <]] 💯] [[1️⃣ 2️⃣] 💯]  ⛏️ 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+🔳 [[6 >]
+   [10 <]]
+#+end_src
+
+#+begin_src kcats
+1 association
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[actual 1]
+ [asked [sized]]
+ [handled 🔳]
+ [reason "type mismatch"]
+ [type error]
+ [unwound [association]]]
+1
 #+end_src
