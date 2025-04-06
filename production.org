@@ -1710,7 +1710,7 @@ internally, to keep track of things like the stack, program, lists etc.
               None
           } else {
               let lm = self.mutate();
-            
+
               lm.pop_front()
           }
       }
@@ -2148,6 +2148,8 @@ internally, to keep track of things like the stack, program, lists etc.
           self.into_iter()
       }
   }
+
+  impl IntoList for Vec<Item> {}
 
   mod serde {
       use super::{Dispenser, Receptacle, Sized};
@@ -3126,6 +3128,10 @@ internally, to keep track of things like the stack, program, lists etc.
           e
       }
 
+      pub fn actual(&self) -> Option<&Item> {
+          self.data.get(&(Word::derive("actual").fit()))
+      }
+
       pub fn len(&self) -> usize {
           self.data.len()
       }
@@ -3403,9 +3409,8 @@ internally, to keep track of things like the stack, program, lists etc.
       }
 
       pub fn contains_key(&self, key: &assoc::KeyItem) -> bool {
-          types::Word::try_derive(key.clone()).is_ok_and(|ref w| {
-              matches!(w.fit(), "examples" | "spec" | "definition" | "doc")
-          })
+          types::Word::try_derive(key.clone())
+              .is_ok_and(|ref w| matches!(w.fit(), "examples" | "spec" | "definition" | "doc"))
       }
   }
 
@@ -3499,9 +3504,8 @@ internally, to keep track of things like the stack, program, lists etc.
       }
 
       pub fn contains_key(&self, key: &assoc::KeyItem) -> bool {
-          types::Word::try_derive(key.clone()).is_ok_and(|ref w| {
-              matches!(w.fit(), "modules" | "words" | "lingo")
-          })
+          types::Word::try_derive(key.clone())
+              .is_ok_and(|ref w| matches!(w.fit(), "modules" | "words" | "lingo"))
       }
 
       /// Produce an [Words] map that is pre-resolved using the
@@ -4112,9 +4116,8 @@ internally, to keep track of things like the stack, program, lists etc.
       /// Returns true if the [Environment] contains the given key,
       /// which is only true for its fixed fields.
       pub fn contains_key(&self, key: &assoc::KeyItem) -> bool {
-          Word::try_derive(key.clone()).is_ok_and(|ref w| {
-              matches!(w.fit(), "stack" | "program" | "dictionary")
-          })
+          Word::try_derive(key.clone())
+              .is_ok_and(|ref w| matches!(w.fit(), "stack" | "program" | "dictionary"))
       }
 
       /// Inserts the key/value into the [Environment]. If the key is
@@ -4301,9 +4304,7 @@ internally, to keep track of things like the stack, program, lists etc.
               env.load_core_modules()
                   .expect("failed to load core modules");
               // add core module as default module
-              env.dictionary
-                  .modules
-                  .push(*dict::CORE.get().unwrap());
+              env.dictionary.modules.push(*dict::CORE.get().unwrap());
               env.dictionary.resolve();
               //println!("Dict has {} words", env.dictionary.entries.len());
               let mut env = [
@@ -5483,21 +5484,23 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   /// A higher order function that executes a simpler function `f`,
   /// where `f` takes a stack item and returns a [Result] of another
   /// stack item.
-  fn f_stack1<T, U, R>(f: fn(U) -> Result<T, R>) -> impl Fn(Environment) -> Future<Environment>
+  fn f_stack1<Output, SpecInput, R>(
+      f: fn(SpecInput) -> Result<Output, R>,
+  ) -> impl Fn(Environment) -> Future<Environment>
   where
-      T: Fit<Item>,
-      U: TryDerive<Item>,
-      U::Error: Fit<Error>,
+      Output: Fit<Item>,
+      SpecInput: TryDerive<Item> + Fit<Item> + Clone,
+      SpecInput::Error: Fit<Error>,
       R: Fit<Error>,
   {
       move |mut env: Environment| {
           let x = env
               .tos()
               .ok_or_else(Error::stack_underflow)
-              .and_then(|x| U::try_derive(x.clone()).map_err(Fit::fit));
+              .and_then(|x| SpecInput::try_derive(x.clone()).map_err(Fit::fit));
           match x {
-              Ok(x) => {
-                  let res = f(x);
+              Ok(i) => {
+                  let res = f(i.clone());
                   match res {
                       Ok(r) => {
                           env.pop_prog();
@@ -5521,29 +5524,31 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   /// A higher order function that executes a simpler function `f`,
   /// where `f` takes two stack items and returns a [Result] of another
   /// stack item.
-  fn f_stack2<T, U, V, R>(f: fn(U, V) -> Result<T, R>) -> impl Fn(Environment) -> Future<Environment>
+  fn f_stack2<Output, SpecInputY, SpecInputX, R>(
+      f: fn(SpecInputY, SpecInputX) -> Result<Output, R>,
+  ) -> impl Fn(Environment) -> Future<Environment>
   where
-      T: Fit<Item>,
-      U: TryDerive<Item>,
-      U::Error: Fit<Error>,
-      V: TryDerive<Item>,
-      V::Error: Fit<Error>,
+      Output: Fit<Item>,
+      SpecInputY: TryDerive<Item> + Fit<Item> + Clone,
+      SpecInputY::Error: Fit<Error>,
+      SpecInputX: TryDerive<Item> + Fit<Item> + Clone,
+      SpecInputX::Error: Fit<Error>,
       R: Fit<Error>,
   {
       move |mut env: Environment| {
           let x = env
               .tos()
               .ok_or_else(Error::stack_underflow)
-              .and_then(|x| V::try_derive(x.clone()).map_err(Fit::fit));
+              .and_then(|x| SpecInputX::try_derive(x.clone()).map_err(Fit::fit));
           let y = env
               .stack
               .get(1)
               .ok_or_else(Error::stack_underflow)
-              .and_then(|y| U::try_derive(y.clone()).map_err(Fit::fit));
+              .and_then(|y| SpecInputY::try_derive(y.clone()).map_err(Fit::fit));
 
           match (x, y) {
               (Ok(x), Ok(y)) => {
-                  let res = f(y, x);
+                  let res = f(y.clone(), x.clone());
                   match res {
                       Ok(r) => {
                           env.pop_prog();
@@ -5570,34 +5575,34 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   /// A higher order function that executes a simpler function `f`,
   /// where `f` takes 3 stack items and returns a [Result] of another
   /// stack item.
-  fn f_stack3<T, U, V, W, R>(
-      f: fn(U, V, W) -> Result<T, R>,
+  fn f_stack3<Output, SpecInputZ, SpecInputY, SpecInputX, R>(
+      f: fn(SpecInputZ, SpecInputY, SpecInputX) -> Result<Output, R>,
   ) -> impl Fn(Environment) -> Future<Environment>
   where
-      T: Fit<Item>,
-      U: TryDerive<Item>,
-      U::Error: Fit<Error>,
-      V: TryDerive<Item>,
-      V::Error: Fit<Error>,
-      W: TryDerive<Item>,
-      W::Error: Fit<Error>,
+      Output: Fit<Item>,
+      SpecInputZ: TryDerive<Item>,
+      SpecInputZ::Error: Fit<Error>,
+      SpecInputY: TryDerive<Item>,
+      SpecInputY::Error: Fit<Error>,
+      SpecInputX: TryDerive<Item>,
+      SpecInputX::Error: Fit<Error>,
       R: Fit<Error>,
   {
       move |mut env: Environment| {
           let x = env
               .tos()
               .ok_or_else(Error::stack_underflow)
-              .and_then(|x| W::try_derive(x.clone()).map_err(Fit::fit));
+              .and_then(|x| SpecInputX::try_derive(x.clone()).map_err(Fit::fit));
           let y = env
               .stack
               .get(1)
               .ok_or_else(Error::stack_underflow)
-              .and_then(|y| V::try_derive(y.clone()).map_err(Fit::fit));
+              .and_then(|y| SpecInputY::try_derive(y.clone()).map_err(Fit::fit));
           let z = env
               .stack
               .get(2)
               .ok_or_else(Error::stack_underflow)
-              .and_then(|z| U::try_derive(z.clone()).map_err(Fit::fit));
+              .and_then(|z| SpecInputZ::try_derive(z.clone()).map_err(Fit::fit));
           match (x, y, z) {
               (Ok(x), Ok(y), Ok(z)) => {
                   let res = f(z, y, x);
@@ -6675,9 +6680,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       }
                   } else {
                       //let w = word.clone();
-                      if *word == Word::derive("times5") {
-                          println!("Failed dict lookup: {:?} ", env.dictionary.lingo);
-                      }
                       env.push(Error::undefined(word.clone().fit()));
                       env.fit()
                   }
@@ -7747,7 +7749,8 @@ rust project or some other language through FFI.
               //println!("Getting platform config: {:?}", config);
               config
                   .as_ref()
-                  .ok_or(Error::expected("initialization", None::<Item>)).cloned()
+                  .ok_or(Error::expected("initialization", None::<Item>))
+                  .cloned()
           }
       }
       /// If we call this function it's because kcats is running as a binary
