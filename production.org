@@ -7430,12 +7430,20 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           };
       }
 
+      fn match_err<T, U>(a: T, b: U) -> Error
+      where
+          T: Fit<Item>,
+          U: Fit<Item>,
+      {
+          Error::create(list![a, b, "="], "match failed", Option::<Item>::None)
+      }
+
       fn destructure(
           data: &Item,
           pattern: &Item,
-          acc_assoc: &mut HashMap<Word, Item>,
-          acc_seq: &mut PositionalParams<Item>,
-      ) -> bool {
+          mut acc_assoc: HashMap<Word, Item>,
+          mut acc_seq: PositionalParams<Item>,
+      ) -> Result<(HashMap<Word, Item>, PositionalParams<Item>), Error> {
           // see if both are maps
           //println!("Destructure: {:?} with {:?}", data, pattern);
           let data = coll::Sized::try_derive(data.clone());
@@ -7466,18 +7474,17 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                                               // match! but not a variable so continue
                                           } else {
                                               // pattern does not match. bail out of list processing
-                                              return false;
+                                              return Err(match_err(w.clone(), v));
                                           }
                                       }
                                       p => {
-                                          if !destructure(
-                                              &v,
-                                              p,
-                                              &mut potential_updates_map,
-                                              &mut potential_updates_list,
-                                          ) {
-                                              return false;
-                                          };
+                                          (potential_updates_map, potential_updates_list) =
+                                              destructure(
+                                                  &v,
+                                                  p,
+                                                  potential_updates_map,
+                                                  potential_updates_list,
+                                              )?
                                       }
                                   },
                                   // past end of list
@@ -7488,7 +7495,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                           }
                           acc_assoc.extend(potential_updates_map);
                           let _ = acc_seq.merge(&potential_updates_list);
-                          return true;
+                          return Ok((acc_assoc, acc_seq));
                       }
                       (coll::Sized::Associative(data), coll::Sized::Associative(pattern)) => {
                           //println!("destructuring map: {:?}", data_map);
@@ -7507,37 +7514,66 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                                           let _ = potential_updates_list.set(idx, vd);
                                       } else if is_map_variable(&w) {
                                           potential_updates_map.insert(strip_variable(&w), vd);
-                                      } else if !destructure(
-                                          &vd,
-                                          &v,
-                                          &mut potential_updates_map,
-                                          &mut potential_updates_list,
-                                      ) {
-                                          return false;
+                                      } else {
+                                          (potential_updates_map, potential_updates_list) =
+                                              destructure(
+                                                  &vd,
+                                                  &v,
+                                                  potential_updates_map,
+                                                  potential_updates_list,
+                                              )?
                                       }
                                   } else {
                                       // value is not a word
-                                      if !destructure(
+                                      (potential_updates_map, potential_updates_list) = destructure(
                                           &vd,
                                           v,
-                                          &mut potential_updates_map,
-                                          &mut potential_updates_list,
-                                      ) {
-                                          return false;
-                                      }
+                                          potential_updates_map,
+                                          potential_updates_list,
+                                      )?
                                   }
                               }
                           }
                           acc_assoc.extend(potential_updates_map);
                           let _ = acc_seq.merge(&potential_updates_list);
-                          return true;
+                          return Ok((acc_assoc, acc_seq));
                       }
-                      (a, b) => a == b,
+                      (a, b) => {
+                          if a == b {
+                              Ok((acc_assoc, acc_seq))
+                          } else {
+                              Err(match_err(a, b))
+                          }
+                      }
                   }
               }
-              (Err(de), Err(pe)) => de.actual().unwrap() == pe.actual().unwrap(),
-              (Ok(d), Err(pe)) => Item::derive(d) == *pe.actual().unwrap(),
-              (Err(de), Ok(p)) => *de.actual().unwrap() == Item::derive(p),
+              (Err(de), Err(pe)) => {
+                  let d = de.actual().unwrap();
+                  let p = pe.actual().unwrap();
+                  if *d == *p {
+                      Ok((acc_assoc, acc_seq))
+                  } else {
+                      Err(match_err(p.clone(), d.clone()))
+                  }
+              }
+              (Ok(d), Err(pe)) => {
+                  let d = Item::derive(d);
+                  let p = pe.actual().unwrap();
+                  if d == *p {
+                      Ok((acc_assoc, acc_seq))
+                  } else {
+                      Err(match_err(p.clone(), d))
+                  }
+              }
+              (Err(de), Ok(p)) => {
+                  let p = Item::derive(p);
+                  let d = de.actual().unwrap();
+                  if p == *d {
+                      Ok((acc_assoc, acc_seq))
+                  } else {
+                      Err(match_err(p, d.clone()))
+                  }
+              }
           }
       }
       let pattern = env.pop();
@@ -7545,7 +7581,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let mut matches_map: HashMap<Word, Item> = Default::default();
       let mut matches_list: PositionalParams<Item> = Default::default();
 
-      destructure(&data, &pattern, &mut matches_map, &mut matches_list);
+      (matches_map, matches_list) = destructure(&data, &pattern, matches_map, matches_list)?;
       let res_map: assoc::AssociationContent = matches_map
           .into_iter()
           .map(|(k, v)| (assoc::KeyItem::derive(k), v))
