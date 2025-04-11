@@ -808,16 +808,10 @@ fn interpret_atom(atom: &[char]) -> Result<Value, ParserError> {
                             Ok(Value::Symbol(Symbol::from_name(&char_slice_to_str(name))))
                         }
                     }
-                    [namespace, name] => {
-                        if starts_like_number(namespace) {
-                            Err(ParserError::InvalidSymbol)
-                        } else {
-                            Ok(Value::Symbol(Symbol::from_namespace_and_name(
-                                &char_slice_to_str(namespace),
-                                &char_slice_to_str(name),
-                            )))
-                        }
-                    }
+                    [namespace, name] => Ok(Value::Symbol(Symbol::from_namespace_and_name(
+                        &char_slice_to_str(namespace),
+                        &char_slice_to_str(name),
+                    ))),
                     _ => Err(ParserError::CannotHaveMoreThanOneSlashInSymbol),
                 }
             }
