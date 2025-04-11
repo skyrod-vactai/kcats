@@ -3260,6 +3260,7 @@ internally, to keep track of things like the stack, program, lists etc.
   use std::collections::HashSet;
   use std::convert::Infallible;
   use std::hash::Hash;
+  use std::mem;
   use std::ptr;
   use std::sync::Arc;
   use std::sync::OnceLock;
@@ -3560,6 +3561,14 @@ internally, to keep track of things like the stack, program, lists etc.
           //println!("resolve: contains? {:?}", cache.get(&"contains?".fit()));
           self.lingo = cache;
           //println!("After resolve: {:?}", self);
+      }
+
+      pub fn using(&mut self, mut namespaces: Vec<Namespace>) {
+          // Swap so that we're putting the new namespaces as higher priority
+          // by making them first in the vec
+          mem::swap(&mut self.modules, &mut namespaces);
+          self.modules.extend(namespaces);
+          self.resolve();
       }
   }
 
@@ -5695,9 +5704,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   lazy_static! {
       pub static ref BUILTIN_FUNCTIONS: HashMap<Word, dict::Executable> = {
-      #[cfg(not(feature = "database"))]
-      let mut entries: Vec<(&str, &'static StepFn)>;
-      #[cfg(feature = "database")]
+
+      #![allow(unused_mut)]
       let mut entries: Vec<(&str, &'static StepFn)> = vec![
           ("*", Box::leak(Box::new(f_stack2(mult)))),
           ("+", Box::leak(Box::new(f_stack2(plus)))),
@@ -6667,32 +6675,42 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       w.quoted = false;
                       env.push(w);
                       env.fit()
-                  } else if let Some(dfn) = env.dictionary.lingo.get(word) {
-                      {
-                          if let Some(spec) = &dfn.spec {
-                              //println!("Checking spec for {:?}: {:?}", word, spec.0);
-                              if let Err(e) = env.check_input_spec(&spec.0) {
-                                  env.push(e);
-                                  return env.fit();
-                              }
-                          } else {
-                              //  println!("No spec for {}!", word);
-                          }
-
-                          match &dfn.definition {
-                              dict::Executable::Axiom(a) => (*a.f)(env),
-                              dict::Executable::Derived(d) => {
-                                  let items = d.clone();
-                                  env.pop_prog();
-                                  env.program.prepend(items);
-                                  env.fit()
-                              }
-                          }
-                      }
                   } else {
-                      //let w = word.clone();
-                      env.push(Error::undefined(word.clone().fit()));
-                      env.fit()
+                      let definition = {
+                          if word.namespace.is_some() {
+                              // namespace specified, look up in wider dictionary
+                              env.dictionary.words.get(word)
+                          } else {
+                              env.dictionary.lingo.get(word)
+                          }
+                      };
+                      if let Some(dfn) = definition {
+                          {
+                              if let Some(spec) = &dfn.spec {
+                                  //println!("Checking spec for {:?}: {:?}", word, spec.0);
+                                  if let Err(e) = env.check_input_spec(&spec.0) {
+                                      env.push(e);
+                                      return env.fit();
+                                  }
+                              } else {
+                                  //  println!("No spec for {}!", word);
+                              }
+
+                              match &dfn.definition {
+                                  dict::Executable::Axiom(a) => (*a.f)(env),
+                                  dict::Executable::Derived(d) => {
+                                      let items = d.clone();
+                                      env.pop_prog();
+                                      env.program.prepend(items);
+                                      env.fit()
+                                  }
+                              }
+                          }
+                      } else {
+                          //let w = word.clone();
+                          env.push(Error::undefined(word.clone().fit()));
+                          env.fit()
+                      }
                   }
               }
               _ => {
@@ -7241,11 +7259,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   fn using(env: &mut Environment) -> Result<(), Error> {
-      let mut namespaces: Vec<dict::Namespace> = env.pop().try_fit()?;
+      let namespaces: Vec<dict::Namespace> = env.pop().try_fit()?;
       let mut inner_env: Environment = env.pop().try_fit()?;
       env.pop_prog();
-      mem::swap(&mut inner_env.dictionary.modules, &mut namespaces);
-      inner_env.dictionary.modules.extend(namespaces);
+      inner_env.dictionary.using(namespaces);
       env.push(inner_env);
       Ok(())
   }
