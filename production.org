@@ -1068,6 +1068,7 @@ internally, to keep track of things like the stack, program, lists etc.
   pub mod environment;
   pub mod error;
   pub mod pipe;
+  pub mod program;
 
   use futures::FutureExt;
 
@@ -1075,6 +1076,7 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::traits::*;
   use crate::types::container::error::Nested;
   use crate::types::container::pipe::FutureTake;
+  use crate::types::container::program::Program;
   use crate::types::number::{Int, Number};
   use crate::types::*;
 
@@ -1388,6 +1390,7 @@ internally, to keep track of things like the stack, program, lists etc.
               Self::String(s) => s.len(),
               Self::Bytes(b) => b.len(),
               Self::Set(s) => s.len(),
+              Self::Program(p) => p.count(),
           }
       }
   }
@@ -1436,6 +1439,7 @@ internally, to keep track of things like the stack, program, lists etc.
               Sized::String(ref mut s) => s.take_simple().map(Item::derive),
               Sized::Bytes(ref mut b) => b.take_simple().map(Item::derive),
               Sized::Set(ref mut s) => s.take_simple(),
+              Sized::Program(ref mut p) => p.take_simple(),
           }
       }
   }
@@ -1576,6 +1580,9 @@ internally, to keep track of things like the stack, program, lists etc.
       Associative(assoc::Associative),
       /// List containers have multiple Items in a specific order.
       List(List),
+      /// Program containers are optimized for execution of programs, but
+      /// also act like Lists
+      Program(Program),
       /// Set containers have multiple Items in no particular order, and
       /// each Item can only appear once.
       Set(Set),
@@ -1596,6 +1603,7 @@ internally, to keep track of things like the stack, program, lists etc.
               Sized::Set(s) => write!(f, "{:?}", s),
               Sized::String(s) => write!(f, "{:?}", s),
               Sized::Bytes(b) => write!(f, "{:?}", b),
+              Sized::Program(p) => write!(f, "{:?}", p),
           }
       }
   }
@@ -1771,6 +1779,10 @@ internally, to keep track of things like the stack, program, lists etc.
                   }
                   (Sized::Set(s), i.map(Item::derive))
               }
+              Sized::Program(mut p) => {
+                  let i = p.pop().cloned();
+                  (Sized::Program(p), i)
+              }
           }
       }
 
@@ -1796,6 +1808,10 @@ internally, to keep track of things like the stack, program, lists etc.
                   s
               })),
               (Sized::String(_), i) => Err(Error::expected("char", i)),
+              (Sized::Program(mut p), i) => {
+                  p.extend(list![i]);
+                  Ok(Sized::Program(p))
+              }
           }
       }
 
@@ -1812,6 +1828,7 @@ internally, to keep track of things like the stack, program, lists etc.
               Sized::Set(_) => Sized::Set(Set::default()),
               Sized::String(_) => Sized::String(String::new()),
               Sized::Bytes(_) => Sized::Bytes(vec![]),
+              Sized::Program(_) => Sized::Program(Program::default()),
           }
       }
   }
@@ -1857,6 +1874,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   let items: Vec<_> = s.iter().cloned().map(|i| i.fit()).collect();
                   Box::new(items.into_iter())
               }
+              Sized::Program(p) => Box::new(List::derive(p).into_iter()),
           }
       }
   }
@@ -2136,7 +2154,7 @@ internally, to keep track of things like the stack, program, lists etc.
   impl IntoList for Vec<Item> {}
 
   mod serde {
-      use super::{Dispenser, Receptacle, Sized};
+      use super::{Dispenser, List, Receptacle, Sized};
       use crate::serialize::Display;
       use crate::traits::*;
       use crate::types::container::associative as assoc;
@@ -2194,6 +2212,16 @@ internally, to keep track of things like the stack, program, lists etc.
                       }
                       seq.end()
                   }
+
+                  Sized::Program(p) => {
+                      let l = List::derive(p.clone());
+                      // Serialize a list (sequence)
+                      let mut seq = serializer.serialize_seq(Some(l.len()))?;
+                      for element in l.iter() {
+                          seq.serialize_element(&element)?;
+                      }
+                      seq.end()
+                  }
                   Sized::Bytes(b) => serializer.serialize_bytes(b.as_slice()),
                   Sized::Set(s) => {
                       // Serialize a list (sequence)
@@ -2206,6 +2234,224 @@ internally, to keep track of things like the stack, program, lists etc.
                   Sized::String(s) => serializer.serialize_str(s.as_str()),
               }
           }
+      }
+  }
+#+end_src
+
+#+begin_src rust :tangle src/types/container/program.rs :mkdirp yes
+  use crate::traits::*;
+  use crate::types::container as cont;
+  use crate::types::container::error::Error;
+  use crate::types::container::SimpleTake;
+  use crate::types::{Item, Stack};
+
+  /// A struct to hold program execution data efficiently
+  #[derive(Clone, PartialEq, Debug)]
+  pub struct Frame {
+      snippet: Stack,
+      next_idx: usize,
+  }
+
+  impl Frame {
+      pub fn is_finished(&self) -> bool {
+          self.next_idx >= self.snippet.len()
+      }
+
+      pub fn would_be_finished(&self) -> bool {
+          self.next_idx + 1 >= self.snippet.len()
+      }
+
+      pub fn next<'a>(&'a mut self) -> Option<&'a Item> {
+          let i = self.snippet.get(self.next_idx);
+          self.next_idx += 1;
+          i
+      }
+
+      pub fn peek<'a>(&'a self) -> Option<&'a Item> {
+          if self.is_finished() {
+              None
+          } else {
+              self.snippet.get(self.next_idx)
+          }
+      }
+
+      pub fn remaining<'a>(&'a mut self) -> Stack {
+          let last = self.snippet.len() - 1;
+          self.snippet.slice(self.next_idx..last)
+      }
+  }
+
+  #[derive(Clone, PartialEq, Default, Debug)]
+  pub struct Program(Vec<Frame>);
+
+  impl Program {
+      fn clean(&mut self) {
+          println!("Cleaning");
+          while self.0.last().map(|f| f.is_finished()).unwrap_or(false) {
+              self.0.pop();
+              // advance the next frame if there is one
+              if let Some(newtopframe) = self.0.last_mut() {
+                  println!("Snippet finished, advancing {:?}", newtopframe);
+                  newtopframe.next();
+              }
+          }
+      }
+      ///return a reference to the current instruction and advance to
+      /// next
+      pub fn pop<'a>(&'a mut self) -> Option<&'a Item> {
+          self.clean();
+          // Next instruction is ready to go
+          let next = self.0.last_mut().and_then(|f| f.next());
+
+          next
+      }
+
+      ///return a reference to the current instruction and advance to
+      /// next
+      pub fn peek<'a>(&'a self) -> Option<&'a Item> {
+          // might be in unclean state, and we don't want to mutate here
+          // so we search for the next instruction without cleaning first
+          let mut frameindex = self.0.len() - 1;
+          let mut parent_finished = false;
+          loop {
+              if let Some(f) = self.0.get(frameindex) {
+                  println!("Peeking frame: {:?}", f);
+                  if f.is_finished() {
+                      println!("Frame is finished");
+                      frameindex -= 1;
+                      parent_finished = true;
+                  } else {
+                      println!("Frame not finished");
+                      if parent_finished {
+                          if f.would_be_finished() {
+                              frameindex -= 1;
+                          } else {
+                              return Some(&f.snippet[f.next_idx + 1]);
+                          }
+                      } else {
+                          return f.peek();
+                      };
+                  }
+              } else {
+                  return None;
+              }
+          }
+      }
+
+      pub fn is_empty(&self) -> bool {
+          self.peek().is_some()
+      }
+
+      pub fn prepend(&mut self, snippet: Stack) {
+          self.0.push(Frame {
+              snippet,
+              next_idx: 0,
+          })
+      }
+
+      pub fn extend(&mut self, snippet: Stack) {
+          self.0.insert(
+              0,
+              Frame {
+                  snippet,
+                  next_idx: 0,
+              },
+          )
+      }
+
+      pub fn stacktrace(&self) -> Stack {
+          self.0
+              .iter()
+              .map(|frame| frame.peek().cloned().unwrap())
+              .collect()
+      }
+      /// TODO: this is probably not accurate
+      pub fn count(&self) -> usize {
+          self.0
+              .iter()
+              .fold(0, |acc, f| acc + (f.snippet.len() - f.next_idx))
+              - self.0.len() // Words whose definitions are being executed
+              + 1
+      }
+
+      pub fn last(&self) -> Option<&Item> {
+          self.0.get(0).and_then(|f| f.snippet.last())
+      }
+  }
+
+  impl Derive<Stack> for Program {
+      fn derive(s: Stack) -> Program {
+          Program(vec![Frame {
+              snippet: s,
+              next_idx: 0,
+          }])
+      }
+  }
+
+  impl Derive<Program> for Stack {
+      fn derive(mut p: Program) -> Stack {
+          let mut r = Stack::new();
+          for f in p.0.iter_mut() {
+              r.append(f.remaining())
+          }
+          r
+      }
+  }
+
+  impl Derive<Program> for Item {
+      fn derive(p: Program) -> Item {
+          Item::derive(Stack::derive(p))
+      }
+  }
+
+  impl TryDerive<Item> for Program {
+      type Error = Error;
+      fn try_derive(i: Item) -> Result<Program, Self::Error> {
+          let s: cont::Sized = i.try_fit()?;
+          match s {
+              cont::Sized::Program(p) => Ok(p),
+              s => Ok(Program::derive(cont::List::try_derive(s)?)),
+          }
+      }
+  }
+  impl SimpleTake for Program {
+      type Item = Item;
+      fn take_simple(&mut self) -> Option<Self::Item> {
+          self.pop().cloned()
+      }
+  }
+
+  #[cfg(test)]
+  mod tests {
+      use super::*;
+      use crate::types::*;
+
+      #[test]
+      fn test_simple() {
+          let mut p = Program(vec![Frame {
+              snippet: list!["foo", "bar"],
+              next_idx: 0,
+          }]);
+
+          assert_eq!(p.pop().cloned(), Some(Item::Word("foo".fit())));
+          assert_eq!(p.peek().cloned(), Some(Item::Word("bar".fit())));
+      }
+
+      #[test]
+      fn test_layers() {
+          let mut p = Program(vec![
+              Frame {
+                  snippet: list!["foo", "bar", "baz"],
+                  next_idx: 1,
+              },
+              Frame {
+                  snippet: list!["quuz", "blork", "stoon"],
+                  next_idx: 2,
+              },
+          ]);
+
+          assert_eq!(p.pop().cloned(), Some(Item::Word("stoon".fit())));
+          assert_eq!(p.peek().cloned(), Some(Item::Word("bar".fit())));
       }
   }
 #+end_src
@@ -4041,7 +4287,8 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::serialize;
   use crate::traits::*;
   use crate::types::container::dictionary::Dict;
-  use crate::types::container::{self as coll, Mutey, Ordered};
+  use crate::types::container::program::Program;
+  use crate::types::container::{self as coll, Mutey};
   use crate::types::number::Number;
   use crate::types::*;
 
@@ -4074,7 +4321,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
       /// Pops an [Item] from the front of the program.
       pub fn pop_prog(&mut self) -> Item {
-          self.program.pop_front().unwrap()
+          self.program.pop().cloned().unwrap()
       }
 
       /// Returns a reference to the top stack [Item], or [None] if it's
@@ -4139,11 +4386,11 @@ internally, to keep track of things like the stack, program, lists etc.
                           }
                       }
                       "program" => {
-                          let l = coll::List::try_derive(v.clone());
-                          match l {
+                          let p = Program::try_derive(v.clone());
+                          match p {
                               Ok(l) => {
                                   let old = self.program.clone();
-                                  self.program = l;
+                                  self.program = l.fit();
                                   (assoc::Associative::Env(self), Some(old.fit()))
                               }
                               Err(_) => demote(self, k, v),
@@ -4299,13 +4546,13 @@ internally, to keep track of things like the stack, program, lists etc.
               env.dictionary.resolve();
               //println!("Dict has {} words", env.dictionary.entries.len());
               let mut env = [
-                  "errors",
-                  "encode",
-                  "time", // good candidate for lib
-                  "pipes",
-                  "methods",
-                  "generators",
-                  "debug",
+                  // "errors",
+                  // "encode",
+                  // "time", // good candidate for lib
+                  // "pipes",
+                  // "methods",
+                  // "generators",
+                  // "debug",
                   //"more-generators",
                   //"database",
               ]
@@ -4419,7 +4666,7 @@ internally, to keep track of things like the stack, program, lists etc.
       type Error = Error;
       fn try_derive(iter: Box<dyn Iterator<Item = Item>>) -> Result<Self, Error> {
           let mut stack: Option<coll::List> = None;
-          let mut program: Option<coll::List> = None;
+          let mut program: Option<Program> = None;
           let mut dictionary: Option<dict::Dictionary> = None;
           for i in iter {
               let (k, v): (assoc::KeyItem, Item) = i.try_fit()?;
@@ -6192,9 +6439,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       match coll::List::try_derive(env.pop()) {
           Ok(program) => {
               let mut item = env.pop();
-              env.program.pop_front();
+              env.program.pop();
               dip_quote(&mut item);
-              env.program.push_front(item);
+              env.program.prepend(list![item].fit());
               env.program.prepend(program)
           }
           Err(e) => env.push(e),
@@ -6207,11 +6454,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           Ok(program) => {
               let mut item1 = env.pop();
               let mut item2 = env.pop();
-              env.program.pop_front();
+              env.program.pop();
               dip_quote(&mut item1);
               dip_quote(&mut item2);
-              env.program.push_front(item1);
-              env.program.push_front(item2);
+              env.program.prepend(list![item2, item1].fit());
               env.program.prepend(program)
           }
           Err(e) => env.push(e),
@@ -6303,10 +6549,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               // prepare the next iteration, even if the iterator is now
               // empty. step is still the next instruction, so we don't
               // pop it off.
-              env.program.push_front(p.clone().fit());
-              env.program.push_front(dispenser.fit());
+              env.program.prepend(list![dispenser, p.clone()]);
               env.program.prepend(p);
-
               env.push(litem);
           } else {
               // if the container is empty, just pop off 'step' and we're done
@@ -6327,35 +6571,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   //[(concat rec1
   //         [[pred then rec1 rec2 'recur]] rec2)
   // then pred]])
-
-  pub fn recur(mut env: Environment) -> Future<Environment> {
-      let rec2 = coll::List::try_derive(env.pop()).unwrap();
-      let mut rec1 = coll::List::try_derive(env.pop()).unwrap();
-      let then = coll::List::try_derive(env.pop()).unwrap();
-      let pred = coll::List::try_derive(env.pop()).unwrap();
-      env.pop_prog();
-      env.push_prog("if".fit());
-      let r: coll::List = list!(
-          pred.clone(),
-          then.clone(),
-          rec1.clone(),
-          rec2.clone(),
-          "recur",
-      )
-      .fit();
-      // I think i did this right - used to create a new list and extend
-      // it with rec1, then push r, then extend again with rec2. now
-      // start with rec1 (copied on write), then push r, then extend
-      // with rec2.  That should be equivalent.
-
-      rec1.push_back(r.clone().fit());
-      rec1.extend(rec2.clone());
-      //env.pop_expr();
-      env.push(pred);
-      env.push(then);
-      env.push(rec1);
-      env.fit()
-  }
 
   //(fn [{[l & others] 'stack :as env}]
   //            (assoc env 'stack (apply list (vec others) l)))
@@ -6630,7 +6845,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   pub fn eval_step(mut env: Environment) -> Future<Environment> {
       //println!("{:?}", env);
       //println!("Dictionary size: {}", env.dictionary.len());
-      let next_item = env.program.front();
+      let next_item = env.program.peek();
 
       if let Some(val) = next_item {
           match val {
@@ -6779,7 +6994,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
               assoc::Associative::Error(mut e),
           ))) => {
-              let mut next = env.program.front();
+              let mut next = env.program.peek();
               let data = e.data.mutate();
               let mut unwound: coll::List = data
                   .remove(&"unwound".fit())
@@ -6789,7 +7004,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               while next.is_some() && next.unwrap() != handle {
                   let i = env.pop_prog();
                   unwound.push_back(i);
-                  next = env.program.front();
+                  next = env.program.peek();
               }
               if next.is_some() {
                   // didn't unwind the whole program, handled error
@@ -7821,7 +8036,6 @@ rust project or some other language through FFI.
       use crate::serialize::Emit;
       use crate::traits::*;
       use crate::types::container as coll;
-      use crate::types::container::Ordered;
       use crate::types::container::{environment::Environment, error::Error};
       use crate::types::{Item, Word};
 
@@ -8110,6 +8324,7 @@ We'll also define how to run unit tests.
   use kcats::serialize::{self, Emit};
   pub use kcats::traits::*;
   use kcats::types::container::environment::Environment;
+  use kcats::types::container::List;
   use std::io::{self, BufRead, Read, Write};
 
   fn print_result(env: Environment) {
@@ -8122,7 +8337,7 @@ We'll also define how to run unit tests.
           println!(
               "stack: {}\nprogram: {}",
               serialize::auto_format(env.stack.iter().emit().as_str(), 20, 80),
-              serialize::auto_format(env.program.iter().emit().as_str(), 20, 80)
+              serialize::auto_format(List::derive(env.program).iter().emit().as_str(), 20, 80)
           )
       }
   }
