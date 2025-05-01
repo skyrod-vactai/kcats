@@ -88,12 +88,14 @@ the location where you installed the kcats binary.
   rand = "0.8.5"
 
   [dependencies]
+  # immutable data structures
+  im = "15.1"
+
   # serialization
   edn-format = {path = "./edn-format"}
   serde = "1"
   serde_json = "1"
 
-  #edn-format = { path = "../edn-format" }
   base64 = "0.22"
 
   # String literals
@@ -103,7 +105,6 @@ the location where you installed the kcats binary.
   num-integer = "0"
 
   # String format
-  # dyn-fmt = "0.4.0" 
   dynfmt = { version = "0", features = ["curly"] }
 
   # crypto stuff
@@ -116,8 +117,6 @@ the location where you installed the kcats binary.
   futures = "0"
   tokio = { version = "1", features = ["full"] }
   # multiple-consumer channels
-  #crossbeam-channel = "0.5" # doesn't support async send/recv
-  #async-channel = "1.8.0"
   flume = "0"
 
   # debugging
@@ -300,14 +299,14 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::types::container::dictionary as dict;
   use crate::types::container::environment as env;
   use crate::types::container::error::Error;
-  use crate::types::container::Mutey;
 
   use core::default::Default;
   use core::fmt;
+  use im;
   use internment::Intern;
   use lazy_static::lazy_static;
   use number::Number;
-  use std::collections::{HashMap, VecDeque};
+  use std::collections::HashMap;
 
   use std::hash::Hash;
   use std::marker::Sync;
@@ -513,9 +512,7 @@ internally, to keep track of things like the stack, program, lists etc.
                           match l {
                               Ok(mut l) => {
                                   if l.len() == 1 {
-                                      let lm = l.mutate();
-
-                                      let i = lm.pop_front().unwrap();
+                                      let i = l.pop_front().unwrap();
                                       i.try_fit()
                                   } else {
                                       Err(Error::expected("word", l))
@@ -1082,20 +1079,20 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::types::*;
 
   use core::fmt;
+  use im;
   use std::convert::Infallible;
   use std::{collections::HashSet, future, sync};
   use sync::Arc;
 
   /// A generic List type
-  pub type Listy<I> = VecDeque<I>;
+  pub type Listy<I> = im::Vector<I>;
 
   /// A generic Set type
   pub type Setty<I> = HashSet<I>;
 
   /// A specific List type
-  pub type ListContent = Listy<Item>;
+  pub type List = Listy<Item>;
 
-  pub type List = Arc<ListContent>;
   pub type Set = Arc<Setty<assoc::KeyItem>>;
 
   impl Derive<HashSet<assoc::KeyItem>> for Set {
@@ -1104,15 +1101,9 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  impl Derive<ListContent> for List {
-      fn derive(l: ListContent) -> List {
-          Arc::new(l)
-      }
-  }
-
-  impl Derive<ListContent> for Item {
-      fn derive(l: ListContent) -> Item {
-          List::derive(l).fit()
+  impl Derive<List> for Item {
+      fn derive(l: List) -> Item {
+          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(l)))
       }
   }
 
@@ -1121,7 +1112,7 @@ internally, to keep track of things like the stack, program, lists etc.
       where
           I: IntoIterator<Item = Item>,
       {
-          Arc::new(iter.into_iter().collect::<VecDeque<Item>>())
+          im::Vector::from_iter(iter)
       }
   }
 
@@ -1130,11 +1121,7 @@ internally, to keep track of things like the stack, program, lists etc.
       where
           I: IntoIterator<Item = Char>,
       {
-          Arc::new(
-              iter.into_iter()
-                  .map(Item::derive)
-                  .collect::<VecDeque<Item>>(),
-          )
+          iter.into_iter().map(Item::derive).collect::<List>()
       }
   }
 
@@ -1198,8 +1185,7 @@ internally, to keep track of things like the stack, program, lists etc.
       type Error = Infallible;
       fn join(mut self, rhs: List) -> Result<Self::Output, Self::Error> {
           //println!("Joining list to list");
-          let am = self.mutate();
-          am.extend(rhs.iter().cloned());
+          self.extend(rhs.iter().cloned());
           Ok(self)
       }
   }
@@ -1228,7 +1214,7 @@ internally, to keep track of things like the stack, program, lists etc.
               }
               Err(_) => {
                   // join as list
-                  self.mutate().extend(rhs.chars().map(Item::derive));
+                  self.extend(rhs.chars().map(Item::derive));
                   Ok(Sized::List(self))
               }
           }
@@ -1250,7 +1236,7 @@ internally, to keep track of things like the stack, program, lists etc.
               Err(_) => {
                   // join as list
                   let mut sl: List = self.fit();
-                  sl.mutate().extend(rhs.iter().cloned());
+                  sl.extend(rhs.iter().cloned());
                   Ok(Sized::List(sl))
               }
           }
@@ -1520,20 +1506,19 @@ internally, to keep track of things like the stack, program, lists etc.
   //impl Take for
 
   impl Ordered for List {
-      fn prepend(&mut self, items: List) {
-          self.prepend_iter(items.iter().cloned());
+      fn prepend(&mut self, mut items: List) {
+          items.append(self.clone());
+          ,*self = items;
       }
 
       fn prepend_iter<T: IntoIterator<Item = Item>>(&mut self, items: T) {
-          let m = self.mutate();
-          let ct = m.len();
-          m.extend(items);
-          m.rotate_left(ct);
+          let iv: im::Vector<Item> = items.into_iter().collect();
+          self.prepend(iv)
       }
 
       fn reverse(&mut self) {
-          let m = self.mutate();
-          m.make_contiguous().reverse();
+          let r = self.iter().cloned().rev().collect();
+          ,*self = r;
       }
   }
 
@@ -1706,9 +1691,7 @@ internally, to keep track of things like the stack, program, lists etc.
           if self.is_empty() {
               None
           } else {
-              let lm = self.mutate();
-
-              lm.pop_front()
+              self.pop_front()
           }
       }
   }
@@ -1769,8 +1752,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   (Sized::Associative(a), v)
               }
               Sized::List(mut l) => {
-                  let lm = l.mutate();
-                  let i = lm.pop_back();
+                  let i = l.pop_back();
                   (Sized::List(l), i)
               }
               Sized::String(mut s) => s
@@ -1796,7 +1778,7 @@ internally, to keep track of things like the stack, program, lists etc.
       pub fn put(self, other: Item) -> Result<Sized, Error> {
           match (self, other) {
               (Sized::List(mut c), i) => {
-                  c.mutate().push_back(i);
+                  c.push_back(i);
                   Ok(Sized::List(c))
               }
               (Sized::Associative(a), l) => Ok(Sized::Associative(a.put(l)?)),
@@ -1975,7 +1957,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn try_derive(i: Item) -> Result<Self, Self::Error> {
           match i {
               Item::Dispenser(l) => Sized::try_derive(l.clone())
-                  .caused(Error::expected("list", l))
+                  .caused(|| Error::expected("list", l))
                   .and_then(List::try_derive),
               Item::Receptacle(l) => Sized::try_derive(l).and_then(List::try_derive),
               i => Err(Error::expected("list", i)),
@@ -1990,7 +1972,7 @@ internally, to keep track of things like the stack, program, lists etc.
           match item {
               Item::Dispenser(c) => c.try_fit(),
               Item::Receptacle(p) => Dispenser::try_derive(p.clone())
-                  .caused(Error::expected("sized", p))?
+                  .caused(|| Error::expected("sized", p))?
                   .try_fit(),
               i => {
                   // let bt = backtrace::Backtrace::new();
@@ -2072,12 +2054,6 @@ internally, to keep track of things like the stack, program, lists etc.
   impl Derive<Sized> for Dispenser {
       fn derive(s: Sized) -> Self {
           Dispenser::Sized(s)
-      }
-  }
-
-  impl Derive<List> for Item {
-      fn derive(l: List) -> Self {
-          Item::Dispenser(Dispenser::Sized(Sized::List(l)))
       }
   }
 
@@ -2273,18 +2249,16 @@ internally, to keep track of things like the stack, program, lists etc.
   pub type Entry = (KeyItem, Item);
 
   pub type KeyListContent = coll::Listy<KeyItem>;
-  pub type KeyList = coll::Arc<KeyListContent>;
+  pub type KeyList = KeyListContent;
 
   impl TryDeriveIterator<Item> for KeyList {
       fn try_from_iter<I>(l: I) -> Result<Self, Error>
       where
           I: IntoIterator<Item = Item>,
       {
-          Ok(sync::Arc::new(
-              l.into_iter()
-                  .map(KeyItem::try_derive)
-                  .collect::<Result<VecDeque<KeyItem>, Error>>()?,
-          ))
+          Ok(l.into_iter()
+              .map(KeyItem::try_derive)
+              .collect::<Result<KeyList, Error>>()?)
       }
   }
 
@@ -2785,11 +2759,7 @@ internally, to keep track of things like the stack, program, lists etc.
       where
           I: IntoIterator<Item = Entry>,
       {
-          coll::Arc::new(
-              iter.into_iter()
-                  .map(|e| e.fit())
-                  .collect::<VecDeque<Item>>(),
-          )
+          iter.into_iter().map(|e| e.fit()).collect::<coll::List>()
       }
   }
 
@@ -2798,7 +2768,7 @@ internally, to keep track of things like the stack, program, lists etc.
       where
           I: IntoIterator<Item = KeyItem>,
       {
-          sync::Arc::new(iter.into_iter().collect::<VecDeque<KeyItem>>())
+          iter.into_iter().collect::<KeyList>()
       }
   }
 
@@ -3029,22 +2999,31 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   pub trait Nested {
-      fn caused(self, other: Error) -> Self;
+      fn caused<F>(self, other_fn: F) -> Self
+      where
+          F: FnOnce() -> Error;
   }
 
   impl<T, E> Nested for Result<T, E>
   where
       E: Nested,
   {
-      fn caused(self, other: Error) -> Self {
-          self.map_err(|e| e.caused(other))
+      fn caused<F>(self, other_fn: F) -> Self
+      where
+          F: FnOnce() -> Error,
+      {
+          self.map_err(|e| e.caused(other_fn))
       }
   }
 
   impl Nested for Error {
-      fn caused(self, mut e: Error) -> Error {
-          e.data.mutate().insert("cause".fit(), self.fit());
-          e
+      fn caused<F>(mut self, other_fn: F) -> Error
+      where
+          F: FnOnce() -> Error,
+      {
+          let other = other_fn();
+          self.data.mutate().insert("cause".fit(), other.fit());
+          self
       }
   }
 
@@ -4077,31 +4056,25 @@ internally, to keep track of things like the stack, program, lists etc.
   #[derive(Clone, PartialEq)]
   pub struct Environment {
       pub stack: Stack,
-      pub program: Stack,
+      pub program: Program,
       pub dictionary: dict::Dictionary,
   }
 
   impl Environment {
       /// Push the [Item] onto the top of the stack.
       pub fn push<T: Fit<Item>>(&mut self, i: T) {
-          coll::Arc::mutate(&mut self.stack).push_front(i.fit());
+          self.stack.push_front(i.fit());
       }
 
       /// Pop the top [Item] from the stack, panicking if the stack is
       /// empty.
       pub fn pop(&mut self) -> Item {
-          coll::Arc::mutate(&mut self.stack).pop_front().unwrap()
-      }
-
-      /// Pushes one item onto the front of the program (so that it
-      /// executes first).
-      pub fn push_prog(&mut self, i: Item) {
-          coll::Arc::mutate(&mut self.program).push_front(i);
+          self.stack.pop_front().unwrap()
       }
 
       /// Pops an [Item] from the front of the program.
       pub fn pop_prog(&mut self) -> Item {
-          coll::Arc::mutate(&mut self.program).pop_front().unwrap()
+          self.program.pop_front().unwrap()
       }
 
       /// Returns a reference to the top stack [Item], or [None] if it's
@@ -4291,6 +4264,7 @@ internally, to keep track of things like the stack, program, lists etc.
           "▶️",
           "•🗑️"
       ));
+      //println!("Env: {:?}", env);
       //println!("Dictionary: {:?}", env.dictionary);
       let mut new_env = futures::executor::block_on(async move { axiom::eval(env).await });
       //println!("Env: {:?}", new_env);
@@ -4955,7 +4929,6 @@ example, in order to read/write to/from disk).
   //! one custom tag is used for encoding byte arrays, but this is
   //! subject to change.
   use crate::traits::*;
-  use crate::types::container::Mutey;
   use crate::types::container::{
       self as coll, associative as assoc, environment::Environment, error::Error,
   };
@@ -4967,10 +4940,8 @@ example, in order to read/write to/from disk).
   use edn_format::ParserOptions;
   use internment::Intern;
 
-  use std::collections::VecDeque;
   use std::fmt;
   use std::string;
-  use std::sync::Arc;
 
   pub trait Display {
       fn representation(&self) -> Item;
@@ -4987,7 +4958,7 @@ example, in order to read/write to/from disk).
               coll::List::derive_iter(
                   v.iter()
                       .map(to_item)
-                      .collect::<Result<VecDeque<Item>, Error>>()?,
+                      .collect::<Result<coll::List, Error>>()?,
               )
               .fit()
           }),
@@ -5129,7 +5100,6 @@ example, in order to read/write to/from disk).
       };
 
       // Collect items until we hit the end or can't parse anymore
-      let forms = obj_buffer.mutate();
 
       loop {
           // Save iterator state before attempting parse
@@ -5137,7 +5107,7 @@ example, in order to read/write to/from disk).
 
           match parser.next() {
               Some(Ok(v)) => {
-                  forms.push_back(to_item(&v)?);
+                  obj_buffer.push_back(to_item(&v)?);
               }
               Some(Err(edn_format::ParserError::UnexpectedEndOfInput)) => {
                   // Restore iterator to state before failed parse
@@ -5404,9 +5374,8 @@ example, in order to read/write to/from disk).
   /// string, if it parses, returns the env with the input added to the
   /// program. Otherwise returns Error.
   pub fn parse_input(env: &mut Environment, input: String) -> Result<(), Error> {
-      let mut parsed = parse(input)?;
-      let expr = Arc::make_mut(&mut env.program);
-      expr.extend(Arc::make_mut(&mut parsed).drain(..));
+      let parsed = parse(input)?;
+      env.program.extend(parsed);
       Ok(())
   }
 
@@ -5472,7 +5441,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   use lazy_static::lazy_static;
   use std::cmp::max;
   use std::collections::HashMap;
-  use std::collections::VecDeque;
   use std::convert::Infallible;
   use std::default::Default;
   use std::mem;
@@ -6050,7 +6018,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   fn swap2(mut env: Environment, offset: usize) -> Future<Environment> {
-      env.stack.mutate().swap(offset, offset + 1);
+      env.stack.swap(offset, offset + 1);
       env.fit()
   }
 
@@ -6065,17 +6033,15 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn sink(mut env: Environment) -> Future<Environment> {
-      let stack = env.stack.mutate();
-      stack.swap(0, 2);
-      stack.swap(0, 1);
+      env.stack.swap(0, 2);
+      env.stack.swap(0, 1);
       env.pop_prog();
       env.fit()
   }
 
   pub fn float(mut env: Environment) -> Future<Environment> {
-      let stack = env.stack.mutate();
-      stack.swap(0, 2);
-      stack.swap(1, 2);
+      env.stack.swap(0, 2);
+      env.stack.swap(1, 2);
       env.pop_prog();
       env.fit()
   }
@@ -6226,10 +6192,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       match coll::List::try_derive(env.pop()) {
           Ok(program) => {
               let mut item = env.pop();
-              let expr = env.program.mutate();
-              expr.pop_front();
+              env.program.pop_front();
               dip_quote(&mut item);
-              expr.push_front(item);
+              env.program.push_front(item);
               env.program.prepend(program)
           }
           Err(e) => env.push(e),
@@ -6242,12 +6207,11 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           Ok(program) => {
               let mut item1 = env.pop();
               let mut item2 = env.pop();
-              let prog = env.program.mutate();
-              prog.pop_front();
+              env.program.pop_front();
               dip_quote(&mut item1);
               dip_quote(&mut item2);
-              prog.push_front(item1);
-              prog.push_front(item2);
+              env.program.push_front(item1);
+              env.program.push_front(item2);
               env.program.prepend(program)
           }
           Err(e) => env.push(e),
@@ -6264,15 +6228,15 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           Ok(d) => Box::pin(async move {
               let (i, c) = d.take().await;
               env.pop_prog();
-              let stack = Arc::make_mut(&mut env.stack);
-              stack.push_front(c.fit());
-              stack.push_front(coll::result_to_option(i).unwrap_or_default());
+
+              env.stack.push_front(c.fit());
+              env.stack
+                  .push_front(coll::result_to_option(i).unwrap_or_default());
               env
           }),
           Err(e) => {
-              let stack = Arc::make_mut(&mut env.stack);
-              stack.push_front(i2);
-              stack.push_front(e.fit());
+              env.stack.push_front(i2);
+              env.stack.push_front(e.fit());
               env.fit()
           }
       }
@@ -6336,12 +6300,11 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       Box::pin(async move {
           let (r, dispenser) = dispenser.take().await;
           if let Some(litem) = coll::result_to_option(r) {
-              let prog = env.program.mutate();
               // prepare the next iteration, even if the iterator is now
               // empty. step is still the next instruction, so we don't
               // pop it off.
-              prog.push_front(p.clone().fit());
-              prog.push_front(dispenser.fit());
+              env.program.push_front(p.clone().fit());
+              env.program.push_front(dispenser.fit());
               env.program.prepend(p);
 
               env.push(litem);
@@ -6366,13 +6329,13 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   // then pred]])
 
   pub fn recur(mut env: Environment) -> Future<Environment> {
-      let mut rec2 = coll::List::try_derive(env.pop()).unwrap();
+      let rec2 = coll::List::try_derive(env.pop()).unwrap();
       let mut rec1 = coll::List::try_derive(env.pop()).unwrap();
       let then = coll::List::try_derive(env.pop()).unwrap();
       let pred = coll::List::try_derive(env.pop()).unwrap();
       env.pop_prog();
       env.push_prog("if".fit());
-      let r = list!(
+      let r: coll::List = list!(
           pred.clone(),
           then.clone(),
           rec1.clone(),
@@ -6384,9 +6347,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       // it with rec1, then push r, then extend again with rec2. now
       // start with rec1 (copied on write), then push r, then extend
       // with rec2.  That should be equivalent.
-      let rm = Arc::make_mut(&mut rec1);
-      rm.push_back(r);
-      rm.extend(Arc::make_mut(&mut rec2).drain(..));
+
+      rec1.push_back(r.clone().fit());
+      rec1.extend(rec2.clone());
       //env.pop_expr();
       env.push(pred);
       env.push(then);
@@ -6407,17 +6370,21 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   fn assoc_in(i: Option<Item>, ks: &[assoc::KeyItem], v: Item) -> Result<Item, Error> {
       fn assoc_vec(mut l: coll::List, ks: &[assoc::KeyItem], k: Int, v: Item) -> Result<Item, Error> {
-          let lm = Arc::make_mut(&mut l);
           let idx = k as usize;
+          let current_len = l.len();
+
           // extend the size of the vector to be big enough
-          if lm.len() <= idx {
-              lm.resize(idx + 1, Item::default());
+          if idx >= current_len {
+              // Extend with copies of the value
+              for _ in current_len..idx + 1 {
+                  l.push_back(Item::default());
+              }
           }
 
-          lm[idx] = if ks.is_empty() {
+          l[idx] = if ks.is_empty() {
               v
           } else {
-              assoc_in(lm.get(idx).cloned(), ks, v)?
+              assoc_in(l.get(idx).cloned(), ks, v)?
           };
 
           Ok(l.fit())
@@ -6463,7 +6430,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
               // An int key for a non-sized type means we're overwriting
               // whatever it is with a list, with the value at that index
-              (_, assoc::KeyItem::Int(k)) => assoc_vec(coll::List::fresh(), ks, *k, v),
+              (_, assoc::KeyItem::Int(k)) => assoc_vec(coll::List::new(), ks, *k, v),
 
               // Where there was nothing at a given index/key, and a non-int
               // key, create a map
@@ -6489,7 +6456,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       match i {
           coll::Sized::List(mut l) => {
               if let Some(pos) = l.iter().position(|x| *x == k) {
-                  l.mutate().remove(pos);
+                  l.remove(pos);
               }
 
               Ok(l.fit())
@@ -6517,14 +6484,13 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(mut l))),
                       assoc::KeyItem::Int(k),
                   ) => {
-                      let lm = l.mutate();
-                      let old_value = if let Some(item) = lm.get_mut(*k as usize) {
+                      let old_value = if let Some(item) = l.get_mut(*k as usize) {
                           mem::take(item)
                       } else {
                           return Err(Error::short_list(*k));
                       };
                       let new_value = unassoc_in(old_value, ks)?;
-                      lm[*k as usize] = new_value;
+                      l[*k as usize] = new_value;
                       Ok(l.fit())
                   }
                   (a, k) => {
@@ -6553,18 +6519,24 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   pub fn assign(m: Item, ks: Item, v: Item) -> ItemResult {
       //println!("Assign! {:?}", m);
       let kit = coll::List::try_derive(ks)?;
-      let mut ksvec: assoc::KeyList = assoc::KeyList::try_from_iter(kit.iter().cloned())?;
-      ksvec.mutate().make_contiguous();
-      let (ks, _) = ksvec.as_slices();
-      assoc_in(Some(m), ks, v)
+      let ksvec: Vec<assoc::KeyItem> = kit
+          .iter()
+          .cloned()
+          .map(assoc::KeyItem::try_derive)
+          .collect::<Result<_, Error>>()?;
+
+      assoc_in(Some(m), &ksvec, v)
   }
 
   pub fn unassign(m: Item, ks: Item) -> ItemResult {
       let kit = coll::List::try_derive(ks)?;
-      let mut ksvec: assoc::KeyList = assoc::KeyList::try_from_iter(kit.iter().cloned())?;
-      ksvec.mutate().make_contiguous();
-      let (ks, _) = ksvec.as_slices();
-      unassoc_in(m, ks)
+      let ksvec: Vec<assoc::KeyItem> = kit
+          .iter()
+          .cloned()
+          .map(assoc::KeyItem::try_derive)
+          .collect::<Result<_, Error>>()?;
+
+      unassoc_in(m, &ksvec)
   }
 
   pub fn lookup(i: coll::Sized, k: assoc::KeyItem) -> ItemResult {
@@ -6696,9 +6668,11 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                               match &dfn.definition {
                                   dict::Executable::Axiom(a) => (*a.f)(env),
                                   dict::Executable::Derived(d) => {
+                                      //println!("Adding to program {:?}, {:?}", d, env);
                                       let items = d.clone();
                                       env.pop_prog();
                                       env.program.prepend(items);
+                                      //println!("New env {:?}", env);
                                       env.fit()
                                   }
                               }
@@ -6807,12 +6781,11 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ))) => {
               let mut next = env.program.front();
               let data = e.data.mutate();
-              let mut unwound_arc: coll::List = data
+              let mut unwound: coll::List = data
                   .remove(&"unwound".fit())
                   .unwrap_or_default()
                   .try_fit()
                   .unwrap_or_else(|_| list!());
-              let unwound = unwound_arc.mutate();
               while next.is_some() && next.unwrap() != handle {
                   let i = env.pop_prog();
                   unwound.push_back(i);
@@ -6825,7 +6798,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   e.is_handled = true;
               }
               let em = Arc::make_mut(&mut e.data);
-              em.insert("unwound".fit(), unwound_arc.fit());
+              em.insert("unwound".fit(), unwound.fit());
               e.fit()
           }
           i => i,
@@ -6917,7 +6890,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   /// no-op.
   fn handle(mut env: Environment) -> Future<Environment> {
       env.pop_prog();
-      match env.stack.mutate().pop_front() {
+      match env.stack.pop_front() {
           None => {}
           Some(i) => match i {
               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
@@ -7121,9 +7094,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   fn as_pair(i: Item) -> Result<(Item, assoc::KeyItem), Error> {
       let mut i = coll::List::try_derive(i)?;
-      let im = i.mutate();
-      let j = im.pop_front().ok_or(Error::short_list(1))?;
-      let k = im
+      let j = i.pop_front().ok_or(Error::short_list(1))?;
+      let k = i
           .pop_front()
           .ok_or(Error::short_list(2))
           .and_then(assoc::KeyItem::try_derive)?;
@@ -7170,14 +7142,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               .get(start as usize..end as usize)
               .map(|a| a.to_string())
               .fit()),
-          coll::Sized::List(arr) => {
-              let owned_subset: VecDeque<Item> = arr
-                  .iter()
-                  .skip(start as usize)
-                  .take(end as usize - start as usize)
-                  .cloned()
-                  .collect();
-              Ok(coll::List::derive(owned_subset).fit())
+          coll::Sized::List(mut arr) => {
+              let sliced = arr.slice(start as usize..end as usize);
+              Ok(sliced.fit())
           }
           i => Err(Error::expected("ordered", i)),
       }
@@ -7191,8 +7158,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   fn format(fstr: Item, items: Item) -> ItemResult {
       let fstr = String::try_derive(fstr)?;
       let items = coll::List::try_derive(items)?;
+      let vecitems: Vec<Item> = items.into_iter().collect();
       Ok(SimpleCurlyFormat
-          .format(fstr.as_str(), &*items)?
+          .format(fstr.as_str(), &vecitems)?
           .into_owned()
           .fit())
   }
@@ -9541,7 +9509,7 @@ Implement the =handoff= type
                   s.iter().map(|i| Item::derive(i.clone())),
               )?,
               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(l))) => {
-                  self.insert_iter(Some((id, attribute)), (*l).clone())?
+                  self.insert_iter(Some((id, attribute)), l)?
               }
               i => {
                   self.conn.execute(q, params![id, attribute, i])?;
@@ -9591,7 +9559,7 @@ Implement the =handoff= type
                   }
               }
               coll::Sized::List(l) => {
-                  self.insert_iter(None, (*l).clone())?;
+                  self.insert_iter(None, l)?;
               }
               s => return Err(Error::expected("db-object", s)),
           }
