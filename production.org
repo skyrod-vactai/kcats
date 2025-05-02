@@ -2257,10 +2257,6 @@ internally, to keep track of things like the stack, program, lists etc.
           self.next_idx >= self.snippet.len()
       }
 
-      pub fn would_be_finished(&self) -> bool {
-          self.next_idx + 1 >= self.snippet.len()
-      }
-
       pub fn next<'a>(&'a mut self) -> Option<&'a Item> {
           let i = self.snippet.get(self.next_idx);
           self.next_idx += 1;
@@ -2276,7 +2272,7 @@ internally, to keep track of things like the stack, program, lists etc.
       }
 
       pub fn remaining<'a>(&'a mut self) -> Stack {
-          let last = self.snippet.len() - 1;
+          let last = self.snippet.len();
           self.snippet.slice(self.next_idx..last)
       }
   }
@@ -2286,24 +2282,18 @@ internally, to keep track of things like the stack, program, lists etc.
 
   impl Program {
       fn clean(&mut self) {
-          println!("Cleaning");
           while self.0.last().map(|f| f.is_finished()).unwrap_or(false) {
               self.0.pop();
-              // advance the next frame if there is one
-              if let Some(newtopframe) = self.0.last_mut() {
-                  println!("Snippet finished, advancing {:?}", newtopframe);
-                  newtopframe.next();
-              }
+              //println!("dropping frame: {:?}", x);
           }
       }
       ///return a reference to the current instruction and advance to
       /// next
       pub fn pop<'a>(&'a mut self) -> Option<&'a Item> {
+          //println!("program: {:?}", self.0);
           self.clean();
           // Next instruction is ready to go
-          let next = self.0.last_mut().and_then(|f| f.next());
-
-          next
+          self.0.last_mut().and_then(|f| f.next())
       }
 
       ///return a reference to the current instruction and advance to
@@ -2311,26 +2301,23 @@ internally, to keep track of things like the stack, program, lists etc.
       pub fn peek<'a>(&'a self) -> Option<&'a Item> {
           // might be in unclean state, and we don't want to mutate here
           // so we search for the next instruction without cleaning first
+          if self.0.is_empty() {
+              return None;
+          }
           let mut frameindex = self.0.len() - 1;
-          let mut parent_finished = false;
           loop {
               if let Some(f) = self.0.get(frameindex) {
-                  println!("Peeking frame: {:?}", f);
+                  //println!("Peeking frame: {:?}", f);
                   if f.is_finished() {
-                      println!("Frame is finished");
-                      frameindex -= 1;
-                      parent_finished = true;
-                  } else {
-                      println!("Frame not finished");
-                      if parent_finished {
-                          if f.would_be_finished() {
-                              frameindex -= 1;
-                          } else {
-                              return Some(&f.snippet[f.next_idx + 1]);
-                          }
+                      //println!("Frame is finished");
+                      if frameindex == 0 {
+                          return None;
                       } else {
-                          return f.peek();
+                          frameindex -= 1
                       };
+                  } else {
+                      //println!("Frame not finished");
+                      return f.peek();
                   }
               } else {
                   return None;
@@ -2339,24 +2326,29 @@ internally, to keep track of things like the stack, program, lists etc.
       }
 
       pub fn is_empty(&self) -> bool {
-          self.peek().is_some()
+          self.peek().is_none()
       }
 
       pub fn prepend(&mut self, snippet: Stack) {
-          self.0.push(Frame {
-              snippet,
-              next_idx: 0,
-          })
+          self.clean();
+          if !snippet.is_empty() {
+              self.0.push(Frame {
+                  snippet,
+                  next_idx: 0,
+              })
+          }
       }
 
       pub fn extend(&mut self, snippet: Stack) {
-          self.0.insert(
-              0,
-              Frame {
-                  snippet,
-                  next_idx: 0,
-              },
-          )
+          if !snippet.is_empty() {
+              self.0.insert(
+                  0,
+                  Frame {
+                      snippet,
+                      next_idx: 0,
+                  },
+              )
+          }
       }
 
       pub fn stacktrace(&self) -> Stack {
@@ -2370,8 +2362,6 @@ internally, to keep track of things like the stack, program, lists etc.
           self.0
               .iter()
               .fold(0, |acc, f| acc + (f.snippet.len() - f.next_idx))
-              - self.0.len() // Words whose definitions are being executed
-              + 1
       }
 
       pub fn last(&self) -> Option<&Item> {
@@ -2449,9 +2439,12 @@ internally, to keep track of things like the stack, program, lists etc.
                   next_idx: 2,
               },
           ]);
-
+          assert_eq!(p.count(), 3);
           assert_eq!(p.pop().cloned(), Some(Item::Word("stoon".fit())));
+          assert_eq!(p.count(), 2);
           assert_eq!(p.peek().cloned(), Some(Item::Word("bar".fit())));
+          assert_eq!(p.pop().cloned(), Some(Item::Word("bar".fit())));
+          assert_eq!(p.0.len(), 1);
       }
   }
 #+end_src
@@ -4319,7 +4312,8 @@ internally, to keep track of things like the stack, program, lists etc.
           self.stack.pop_front().unwrap()
       }
 
-      /// Pops an [Item] from the front of the program.
+      /// Advances the program, returning the next [Item]. Panics if the
+      /// program is empty.
       pub fn pop_prog(&mut self) -> Item {
           self.program.pop().cloned().unwrap()
       }
@@ -4503,6 +4497,7 @@ internally, to keep track of things like the stack, program, lists etc.
       //println!("Loading module {}", *module);
       //println!("Cache: {:?}", env.dictionary.lingo);
       env.push(Word::derive(*module));
+      //println!("Loading module (should be empty?): {:?}", env.program);
       env.program.prepend(list!(
           "dictionary",
           "🔀",
@@ -4546,13 +4541,13 @@ internally, to keep track of things like the stack, program, lists etc.
               env.dictionary.resolve();
               //println!("Dict has {} words", env.dictionary.entries.len());
               let mut env = [
-                  // "errors",
-                  // "encode",
-                  // "time", // good candidate for lib
-                  // "pipes",
-                  // "methods",
-                  // "generators",
-                  // "debug",
+                  "errors",
+                  "encode",
+                  "time", // good candidate for lib
+                  "pipes",
+                  "methods",
+                  "generators",
+                  "debug",
                   //"more-generators",
                   //"database",
               ]
@@ -4611,6 +4606,12 @@ internally, to keep track of things like the stack, program, lists etc.
               w,
               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(_)))
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::List(_))),
+          ) if *w == *S_LIST || *w == *S_PROGRAM => Ok(()),
+
+          (
+              w,
+              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Program(_)))
+              | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Program(_))),
           ) if *w == *S_LIST || *w == *S_PROGRAM => Ok(()),
 
           (
@@ -5684,6 +5685,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   use cache::cache;
   use dynfmt::{Format, SimpleCurlyFormat};
   use futures::future::FutureExt;
+  use im::vector;
   use internment::Intern;
   use lazy_static::lazy_static;
   use std::cmp::max;
@@ -6439,10 +6441,11 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       match coll::List::try_derive(env.pop()) {
           Ok(program) => {
               let mut item = env.pop();
-              env.program.pop();
+              env.pop_prog();
               dip_quote(&mut item);
-              env.program.prepend(list![item].fit());
-              env.program.prepend(program)
+              env.program.prepend(vector![item]);
+              env.program.prepend(program);
+              //println!("Dip: {:?}", env.program);
           }
           Err(e) => env.push(e),
       }
@@ -6457,7 +6460,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               env.program.pop();
               dip_quote(&mut item1);
               dip_quote(&mut item2);
-              env.program.prepend(list![item2, item1].fit());
+              env.program.prepend(vector![item2, item1]);
               env.program.prepend(program)
           }
           Err(e) => env.push(e),
@@ -6843,7 +6846,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn eval_step(mut env: Environment) -> Future<Environment> {
-      //println!("{:?}", env);
+      //println!("{:?}", env.program);
       //println!("Dictionary size: {}", env.dictionary.len());
       let next_item = env.program.peek();
 
@@ -6885,7 +6888,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                                   dict::Executable::Derived(d) => {
                                       //println!("Adding to program {:?}, {:?}", d, env);
                                       let items = d.clone();
-                                      env.pop_prog();
+                                      env.program.pop();
                                       env.program.prepend(items);
                                       //println!("New env {:?}", env);
                                       env.fit()
@@ -7024,6 +7027,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub async fn eval(mut env: Environment) -> Environment {
       loop {
+          //println!("Eval: {:?}", env);
           if let Some(err) = get_error(&env) {
               if !err.is_handled {
                   env = unwind(env); // TODO: this should be done in eval_step
