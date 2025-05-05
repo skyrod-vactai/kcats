@@ -1386,7 +1386,6 @@ internally, to keep track of things like the stack, program, lists etc.
               Self::Bytes(b) => b.len(),
               Self::Set(s) => s.len(),
               Self::Program(p) => p.count(),
-              Self::Stack(s) => s.len(),
           }
       }
   }
@@ -1436,7 +1435,6 @@ internally, to keep track of things like the stack, program, lists etc.
               Sized::Bytes(ref mut b) => b.take_simple().map(Item::derive),
               Sized::Set(ref mut s) => s.take_simple(),
               Sized::Program(ref mut p) => p.take_simple(),
-              Sized::Stack(ref mut p) => p.take_simple(),
           }
       }
   }
@@ -1580,8 +1578,6 @@ internally, to keep track of things like the stack, program, lists etc.
       /// Program containers are optimized for execution of programs, but
       /// also act like Lists
       Program(Program),
-      /// Stack data from an environment
-      Stack(env::Stack),
       /// Set containers have multiple Items in no particular order, and
       /// each Item can only appear once.
       Set(Set),
@@ -1603,7 +1599,6 @@ internally, to keep track of things like the stack, program, lists etc.
               Sized::String(s) => write!(f, "{:?}", s),
               Sized::Bytes(b) => write!(f, "{:?}", b),
               Sized::Program(p) => write!(f, "{:?}", p),
-              Sized::Stack(p) => write!(f, "{:?}", p),
           }
       }
   }
@@ -1611,25 +1606,11 @@ internally, to keep track of things like the stack, program, lists etc.
   /// Empty Sized containers are equal to each other.
   impl PartialEq for Sized {
       fn eq(&self, other: &Self) -> bool {
-          fn stack_list(a: &env::Stack, b: &List) -> bool {
-              // Check if lengths match first for early return
-              if a.len() != b.len() {
-                  return false;
-              }
-
-              // Compare Stack elements in reverse with List elements -
-              // stack's iterator goes in reverse by default
-              a.iter()
-                  .zip(b.iter())
-                  .all(|(stack_item, list_item)| stack_item == list_item)
-          }
           match (self, other) {
               (Sized::Associative(a), Sized::Associative(b)) => a == b,
               (Sized::List(a), Sized::List(b)) => a == b,
               (Sized::String(a), Sized::String(b)) => a == b,
               (Sized::Bytes(a), Sized::Bytes(b)) => a == b,
-              (Sized::Stack(a), Sized::List(b)) => stack_list(a, b),
-              (Sized::List(a), Sized::Stack(b)) => stack_list(b, a),
               (Sized::Set(a), Sized::Set(b)) => a == b,
               _ => self.is_empty() && other.is_empty(),
           }
@@ -1797,10 +1778,6 @@ internally, to keep track of things like the stack, program, lists etc.
                   let i = p.pop().cloned();
                   (Sized::Program(p), i)
               }
-              Sized::Stack(mut s) => {
-                  let i = s.pop();
-                  (Sized::Stack(s), i)
-              }
           }
       }
 
@@ -1830,10 +1807,6 @@ internally, to keep track of things like the stack, program, lists etc.
                   p.extend(list![i]);
                   Ok(Sized::Program(p))
               }
-              (Sized::Stack(mut s), i) => {
-                  s.push(i);
-                  Ok(Sized::Stack(s))
-              }
           }
       }
 
@@ -1851,7 +1824,6 @@ internally, to keep track of things like the stack, program, lists etc.
               Sized::String(_) => Sized::String(String::new()),
               Sized::Bytes(_) => Sized::Bytes(vec![]),
               Sized::Program(_) => Sized::Program(Program::default()),
-              Sized::Stack(_) => Sized::Stack(env::Stack::default()),
           }
       }
   }
@@ -1898,7 +1870,6 @@ internally, to keep track of things like the stack, program, lists etc.
                   Box::new(items.into_iter())
               }
               Sized::Program(p) => Box::new(List::derive(p).into_iter()),
-              Sized::Stack(s) => Box::new(s.0.into_iter()),
           }
       }
   }
@@ -1933,7 +1904,6 @@ internally, to keep track of things like the stack, program, lists etc.
           match s {
               Sized::List(l) => Ok(l),
               Sized::Associative(a) => Ok(List::derive_iter(a.to_iter().map(Item::derive))),
-              Sized::Stack(s) => Ok(List::derive(s)),
               i => Err(Error::expected("list", i)),
           }
       }
@@ -2239,14 +2209,6 @@ internally, to keep track of things like the stack, program, lists etc.
                       // Serialize a list (sequence)
                       let mut seq = serializer.serialize_seq(Some(l.len()))?;
                       for element in l.iter() {
-                          seq.serialize_element(&element)?;
-                      }
-                      seq.end()
-                  }
-                  Sized::Stack(ref s) => {
-                      // Serialize a list (sequence)
-                      let mut seq = serializer.serialize_seq(Some(s.len()))?;
-                      for element in s.0.iter() {
                           seq.serialize_element(&element)?;
                       }
                       seq.end()
@@ -4340,93 +4302,13 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::traits::*;
   use crate::types::container::dictionary::Dict;
   use crate::types::container::program::Program;
-  use crate::types::container::{self as coll, Mutey, SimpleTake};
+  use crate::types::container::{self as coll, Mutey};
   use crate::types::number::Number;
   use crate::types::*;
 
   use once_cell::sync::Lazy;
   use std::future;
-  use std::iter::Rev;
   use std::ops::Range;
-  use std::slice::Iter;
-  /// Represents a stack (the part of an
-  /// [crate::types::container::environment::Environment] that holds the data
-  /// values being manipulated by the program).
-  #[derive(Clone, PartialEq, Default, Debug)]
-  pub struct Stack(pub Vec<Item>);
-
-  impl Stack {
-      fn index(&self, i: usize) -> usize {
-          self.len() - i - 1
-      }
-
-      pub fn push(&mut self, i: Item) {
-          self.0.push(i);
-      }
-
-      pub fn pop(&mut self) -> Option<Item> {
-          self.0.pop()
-      }
-
-      pub fn top(&self) -> Option<&Item> {
-          self.0.last()
-      }
-
-      pub fn get(&self, idx: usize) -> Option<&Item> {
-          // get(1) with 4 means: 4 - 1 -1 = 2 v[2] = 2nd to last
-          self.0.get(self.index(idx))
-      }
-
-      pub fn swap(&mut self, i1: usize, i2: usize) {
-          let i1 = self.index(i1);
-          let i2 = self.index(i2);
-          self.0.swap(i1, i2);
-      }
-
-      pub fn len(&self) -> usize {
-          self.0.len()
-      }
-
-      pub fn iter(&self) -> Rev<Iter<'_, Item>> {
-          self.0.iter().rev()
-      }
-  }
-
-  impl Derive<Stack> for Item {
-      fn derive(s: Stack) -> Item {
-          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Stack(s)))
-      }
-  }
-
-  impl Derive<coll::List> for Stack {
-      fn derive(l: coll::List) -> Stack {
-          Stack(l.into_iter().rev().collect())
-      }
-  }
-
-  impl Derive<Stack> for coll::List {
-      fn derive(s: Stack) -> coll::List {
-          s.0.into_iter().rev().collect()
-      }
-  }
-
-  impl TryDerive<Item> for Stack {
-      type Error = Error;
-      fn try_derive(i: Item) -> Result<Stack, Self::Error> {
-          let s = coll::Sized::try_derive(i)?;
-          match s {
-              coll::Sized::Stack(s) => Ok(s),
-              s => Ok((coll::List::try_derive(s)?).fit()),
-          }
-      }
-  }
-
-  impl SimpleTake for Stack {
-      type Item = Item;
-      fn take_simple(&mut self) -> Option<Self::Item> {
-          self.pop()
-      }
-  }
 
   /// A struct to hold the state of an executing kcats program. The
   /// `stack` is the data being manipulated, the `program` is program
@@ -4752,9 +4634,7 @@ internally, to keep track of things like the stack, program, lists etc.
               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(_)))
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::List(_)))
               | Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Program(_)))
-              | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Program(_)))
-              | Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Stack(_)))
-              | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Stack(_))),
+              | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Program(_))),
           ) if *w == *S_LIST || *w == *S_PROGRAM => Ok(()),
 
           (
@@ -5412,13 +5292,6 @@ example, in order to read/write to/from disk).
               v.sort();
               edn_format::Value::Vector(v.into_iter().map(|ki| (&Item::derive(ki)).into()).collect())
           }
-          coll::Sized::Stack(s) => edn_format::Value::Vector(
-              s.0.iter()
-                  .cloned()
-                  .rev()
-                  .map(|i| (&i).into())
-                  .collect::<Vec<edn_format::Value>>(),
-          ),
           v => edn_format::Value::Vector(
               v.clone()
                   .into_iter()
