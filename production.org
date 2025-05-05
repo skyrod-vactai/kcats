@@ -292,13 +292,12 @@ internally, to keep track of things like the stack, program, lists etc.
 #+begin_src rust :tangle src/types.rs :mkdirp yes
   //! Defines kcats internal data types.
   use crate::axiom;
-  use crate::list;
   use crate::serialize::Emit;
   use crate::traits::*;
-  use crate::types::container as coll;
   use crate::types::container::dictionary as dict;
   use crate::types::container::environment as env;
   use crate::types::container::error::Error;
+  use crate::types::container::{self as coll};
 
   use core::default::Default;
   use core::fmt;
@@ -313,6 +312,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
   use std::pin::Pin;
 
+  #[macro_use]
   pub mod container;
   pub mod number;
 
@@ -507,7 +507,7 @@ internally, to keep track of things like the stack, program, lists etc.
                           match l {
                               Ok(mut l) => {
                                   if l.len() == 1 {
-                                      let i = l.pop_front().unwrap();
+                                      let i = l.pop().unwrap();
                                       i.try_fit()
                                   } else {
                                       Err(Error::expected("word", l))
@@ -628,22 +628,6 @@ internally, to keep track of things like the stack, program, lists etc.
           it.map(T::try_derive).collect()
       }
   }
-
-  /// A macro to build a kcats List, accepts any values that are
-  /// convertible to [Item].
-  #[macro_export]
-  macro_rules! list {
-        ( $( $x:expr ),* $(,)? ) => {
-            {
-                use $crate::traits::*;
-                use $crate::types::Item;
-                let v: Vec<Item> = vec![
-                    $( $x.fit(), )*
-                ];
-                $crate::types::container::List::derive(v)
-            }
-        };
-    }
 
   mod serde {
       //! Support for json serialization of kcats objects
@@ -1068,6 +1052,7 @@ internally, to keep track of things like the stack, program, lists etc.
   use futures::FutureExt;
 
   use self::associative as assoc;
+  use crate::list;
   use crate::traits::*;
   use crate::types::container::error::Nested;
   use crate::types::container::pipe::FutureTake;
@@ -1076,19 +1061,183 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::types::*;
 
   use core::fmt;
+  use core::ops::Range;
   use im;
   use std::convert::Infallible;
   use std::{collections::HashSet, future, sync};
   use sync::Arc;
 
   /// A generic List type
-  pub type Listy<I> = im::Vector<I>;
+  #[derive(Clone, Default, PartialEq, Debug, Hash, PartialOrd, Eq, Ord)]
+  pub struct Listy<I: Clone>(pub im::Vector<Box<I>>);
 
   /// A generic Set type
   pub type Setty<I> = HashSet<I>;
 
   /// A specific List type
   pub type List = Listy<Item>;
+
+  impl<T: Clone + PartialEq> Listy<T> {
+      pub fn new() -> Self {
+          Self(im::Vector::new())
+      }
+
+      // Implement other Vec-like methods as needed
+      pub fn len(&self) -> usize {
+          self.0.len()
+      }
+
+      pub fn last(&self) -> Option<&T> {
+          self.0.last().map(|i| i.as_ref())
+      }
+
+      pub fn append(&mut self, other: Self) {
+          self.0.append(other.0)
+      }
+
+      pub fn is_empty(&self) -> bool {
+          self.0.is_empty()
+      }
+
+      pub fn swap(&mut self, a: usize, b: usize) {
+          self.0.swap(a, b)
+      }
+
+      pub fn remove(&mut self, i: usize) -> T {
+          ,*self.0.remove(i)
+      }
+
+      pub fn slice(&mut self, range: Range<usize>) -> Self {
+          Listy::<T>(self.0.slice(range))
+      }
+
+      pub fn front(&self) -> Option<&T> {
+          self.0.front().map(|i| &**i)
+      }
+
+      pub fn front_mut(&mut self) -> Option<&mut T> {
+          self.0.front_mut().map(|i| i.as_mut())
+      }
+
+      pub fn push(&mut self, item: T) {
+          self.0.push_front(Box::new(item));
+      }
+
+      pub fn pop(&mut self) -> Option<T> {
+          self.0.pop_front().map(|i| *i)
+      }
+
+      pub fn pop_back(&mut self) -> Option<T> {
+          self.0.pop_back().map(|i| *i)
+      }
+
+      pub fn push_back(&mut self, item: T) {
+          self.0.push_back(Box::new(item));
+      }
+
+      pub fn get(&self, index: usize) -> Option<&T> {
+          self.0.get(index).map(|boxed_item| boxed_item.as_ref())
+      }
+
+      pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+          self.0.get_mut(index).map(|boxed_item| boxed_item.as_mut())
+      }
+
+      pub fn iter(&self) -> impl Iterator<Item = &T> {
+          self.0.iter().map(|boxed_item| boxed_item.as_ref())
+      }
+
+      pub fn extend<I>(&mut self, other: I)
+      where
+          I: IntoIterator<Item = T>,
+      {
+          self.0.extend(other.into_iter().map(Box::new))
+      }
+
+      pub fn contains(&self, item: &T) -> bool {
+          self.0.iter().any(|boxed_item| **boxed_item == *item)
+      }
+  }
+
+  //impl<T: Clone> IntoList for Listy<T> {}
+  //impl IntoList for im::Vector<Box<Item>> {}
+
+  impl<T: Clone> IntoIterator for Listy<T> {
+      type Item = T;
+      //type IntoIter = im::vector::ConsumingIter<Item>;
+      type IntoIter = std::iter::Map<im::vector::ConsumingIter<Box<T>>, fn(Box<T>) -> T>;
+      fn into_iter(self) -> Self::IntoIter {
+          self.0.into_iter().map(|i| *i)
+      }
+  }
+
+  impl<T: Clone> FromIterator<T> for Listy<T> {
+      fn from_iter<I>(iter: I) -> Self
+      where
+          I: IntoIterator<Item = T>,
+      {
+          // Box each item and collect into an im::Vector
+          let boxed_items = iter.into_iter().map(Box::new).collect();
+
+          Listy::<T>(boxed_items)
+      }
+  }
+
+  impl ToIterator for Listy<Item> {
+      type Item = Item;
+      type IntoIter = Box<dyn Iterator<Item = Item>>;
+
+      fn to_iter<'a>(self) -> Self::IntoIter {
+          Box::new(self.into_iter())
+      }
+  }
+
+  use std::ops::{Index, IndexMut};
+
+  // Implement indexing for read access
+  impl<T: Clone> Index<usize> for Listy<T> {
+      type Output = T;
+
+      fn index(&self, index: usize) -> &Self::Output {
+          // This will panic if index is out of bounds, just like Vec does
+          &self.0[index]
+      }
+  }
+
+  // Implement mutable indexing for write access
+  impl<T: Clone> IndexMut<usize> for Listy<T> {
+      fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+          // This will panic if index is out of bounds, just like Vec does
+          &mut self.0[index]
+      }
+  }
+
+  impl Derive<im::Vector<Box<Item>>> for Item {
+      fn derive(x: im::Vector<Box<Item>>) -> Item {
+          Listy(x).fit()
+      }
+  }
+
+  // Example usage:
+  // let item = &mylist^5^;       // Read using Index
+  // mylist^5^ = some_item;       // Write using IndexMut
+  /// A macro to build a kcats List, accepts any values that are
+  /// convertible to [Item].
+  #[macro_export]
+  macro_rules! list {
+        ( $( $x:expr ),* $(,)? ) => {
+            {
+                //use $crate::traits::*;
+                use $crate::types::container::Listy;
+                //use im::{vector, Vector};
+                use $crate::types::Item;
+                let v: im::Vector<Box<Item>> = im::vector![
+                    $( Box::new($x.fit()), )*
+                ];
+                Listy::<Item>((v))
+            }
+        };
+    }
 
   pub type Set = Arc<Setty<assoc::KeyItem>>;
 
@@ -1109,7 +1258,7 @@ internally, to keep track of things like the stack, program, lists etc.
       where
           I: IntoIterator<Item = Item>,
       {
-          im::Vector::from_iter(iter)
+          Listy::<Item>(im::Vector::from_iter(iter.into_iter().map(Box::new)))
       }
   }
 
@@ -1182,7 +1331,7 @@ internally, to keep track of things like the stack, program, lists etc.
       type Error = Infallible;
       fn join(mut self, rhs: List) -> Result<Self::Output, Self::Error> {
           //println!("Joining list to list");
-          self.extend(rhs.iter().cloned());
+          self.append(rhs);
           Ok(self)
       }
   }
@@ -1511,13 +1660,13 @@ internally, to keep track of things like the stack, program, lists etc.
       }
 
       fn prepend_iter<T: IntoIterator<Item = Item>>(&mut self, items: T) {
-          let iv: im::Vector<Item> = items.into_iter().collect();
+          let iv: List = items.into_iter().collect();
           self.prepend(iv)
       }
 
       fn reverse(&mut self) {
-          let r = self.iter().cloned().rev().collect();
-          ,*self = r;
+          let r: im::Vector<Box<Item>> = self.0.iter().cloned().rev().collect();
+          ,*self = Listy(r);
       }
   }
 
@@ -1694,7 +1843,7 @@ internally, to keep track of things like the stack, program, lists etc.
           if self.is_empty() {
               None
           } else {
-              self.pop_front()
+              self.pop()
           }
       }
   }
@@ -2427,8 +2576,8 @@ internally, to keep track of things like the stack, program, lists etc.
   #[cfg(test)]
   mod tests {
       use super::*;
+      use crate::list;
       use crate::types::*;
-
       #[test]
       fn test_simple() {
           let mut p = Program(vec![Frame {
@@ -2500,8 +2649,7 @@ internally, to keep track of things like the stack, program, lists etc.
   /// An Entry is a single pairing in an Associative type
   pub type Entry = (KeyItem, Item);
 
-  pub type KeyListContent = coll::Listy<KeyItem>;
-  pub type KeyList = KeyListContent;
+  pub type KeyList = coll::Listy<KeyItem>;
 
   impl TryDeriveIterator<Item> for KeyList {
       fn try_from_iter<I>(l: I) -> Result<Self, Error>
@@ -4324,19 +4472,19 @@ internally, to keep track of things like the stack, program, lists etc.
   impl Environment {
       /// Push the [Item] onto the top of the stack.
       pub fn push<T: Fit<Item>>(&mut self, i: T) {
-          self.stack.push_front(i.fit());
+          self.stack.push(i.fit());
       }
 
       pub fn push_err(&mut self, mut err: Error) {
           let trace = self.program.stacktrace();
           err.add_trace(trace);
-          self.stack.push_front(err.fit());
+          self.stack.push(err.fit());
       }
 
       /// Pop the top [Item] from the stack, panicking if the stack is
       /// empty.
       pub fn pop(&mut self) -> Item {
-          self.stack.pop_front().unwrap()
+          self.stack.pop().unwrap()
       }
 
       /// Advances the program, returning the next [Item]. Panics if the
@@ -5701,14 +5849,14 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   use crate::types::container::pipe::db;
   use crate::types::container::{
       self as coll, associative as assoc, dictionary as dict, environment::Environment, error::Error,
-      pipe, Container, Count, Join, Mutey, Ordered, Take,
+      pipe, program::Program, Container, Count, Join, Mutey, Ordered, Take,
   };
   use crate::types::number::{Float, Int, Number};
+
   use crate::types::*;
   use cache::cache;
   use dynfmt::{Format, SimpleCurlyFormat};
   use futures::future::FutureExt;
-  use im::vector;
   use internment::Intern;
   use lazy_static::lazy_static;
   use std::cmp::max;
@@ -5854,12 +6002,12 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               .stack
               .get(1)
               .ok_or_else(Error::stack_underflow)
-              .and_then(|y| SpecInputY::try_derive(y.clone()).map_err(Fit::fit));
+              .and_then(|y| SpecInputY::try_derive((y).clone()).map_err(Fit::fit));
           let z = env
               .stack
               .get(2)
               .ok_or_else(Error::stack_underflow)
-              .and_then(|z| SpecInputZ::try_derive(z.clone()).map_err(Fit::fit));
+              .and_then(|z| SpecInputZ::try_derive((z).clone()).map_err(Fit::fit));
           match (x, y, z) {
               (Ok(x), Ok(y), Ok(z)) => {
                   let res = f(z, y, x);
@@ -6471,7 +6619,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               env.pop_prog();
               dip_quote(&mut item);
               //println!("Dip item: {:?}", item);
-              env.program.prepend(vector![item]);
+              env.program.prepend(list![item]);
               env.program.prepend(program);
               //println!("Dip: {:?}", env.program);
           }
@@ -6488,7 +6636,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               env.program.pop();
               dip_quote(&mut item1);
               dip_quote(&mut item2);
-              env.program.prepend(vector![item2, item1]);
+              env.program.prepend(list![item2, item1]);
               env.program.prepend(program)
           }
           Err(e) => env.push(e),
@@ -6706,7 +6854,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   fn remove(i: coll::Sized, k: Item) -> Result<Item, Error> {
       match i {
           coll::Sized::List(mut l) => {
-              if let Some(pos) = l.iter().position(|x| *x == k) {
+              let pos = l.iter().position(|x| *x == k);
+              if let Some(pos) = pos {
                   l.remove(pos);
               }
 
@@ -7360,9 +7509,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   fn as_pair(i: Item) -> Result<(Item, assoc::KeyItem), Error> {
       let mut i = coll::List::try_derive(i)?;
-      let j = i.pop_front().ok_or(Error::short_list(1))?;
+      let j = i.pop().ok_or(Error::short_list(1))?;
       let k = i
-          .pop_front()
+          .pop()
           .ok_or(Error::short_list(2))
           .and_then(assoc::KeyItem::try_derive)?;
       Ok((j, k))
@@ -7409,7 +7558,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               .map(|a| a.to_string())
               .fit()),
           coll::Sized::List(mut arr) => {
-              let sliced = arr.slice(start as usize..end as usize);
+              let sliced = arr.0.slice(start as usize..end as usize);
               Ok(sliced.fit())
           }
           i => Err(Error::expected("ordered", i)),
