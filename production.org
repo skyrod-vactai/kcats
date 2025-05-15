@@ -483,10 +483,15 @@ internally, to keep track of things like the stack, program, lists etc.
   impl TryDerive<Item> for String {
       type Error = Error;
       fn try_derive(i: Item) -> Result<Self, Self::Error> {
-          let s = coll::Sized::try_derive(i)?;
-          match s {
-              coll::Sized::String(i) => Ok(i),
-              i => Err(Error::expected("string", i)),
+          match i {
+              Item::Word(w) => Ok(w.data.as_str().to_string().fit()),
+              i => {
+                  let s = coll::Sized::try_derive(i)?;
+                  match s {
+                      coll::Sized::String(i) => Ok(i),
+                      i => Err(Error::expected("string", i)),
+                  }
+              }
           }
       }
   }
@@ -1409,7 +1414,7 @@ internally, to keep track of things like the stack, program, lists etc.
           //println!("Has: {:?}\n{:?}", self, other);
           match (self, other) {
               (Sized::Associative(a), other) => {
-                  assoc::KeyItem::try_derive(other.clone()).map_or(false, |k| a.contains_key(&k))
+                  assoc::KeyItem::try_derive(other.clone()).is_ok_and(|k| a.contains_key(&k))
               }
               (Sized::List(l), other) => l.contains(other),
               (Sized::Set(s), Item::Dispenser(Dispenser::Sized(Sized::Set(other)))) => {
@@ -1419,7 +1424,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   other.is_subset(s)
               }
               (Sized::Set(s), other) => {
-                  assoc::KeyItem::try_derive(other.clone()).map_or(false, |k| s.contains(&k))
+                  assoc::KeyItem::try_derive(other.clone()).is_ok_and(|k| s.contains(&k))
               }
               (Sized::String(container), other) => match other {
                   Item::Char(c) => container.has(c),
@@ -1705,8 +1710,8 @@ internally, to keep track of things like the stack, program, lists etc.
               None
           } else {
               let lm = self.mutate();
-              let i = lm.pop_front();
-              i
+
+              lm.pop_front()
           }
       }
   }
@@ -1738,7 +1743,18 @@ internally, to keep track of things like the stack, program, lists etc.
       type Item = Item;
       fn take_simple(&mut self) -> Option<Self::Item> {
           let sm = self.mutate();
-          sm.iter().next().map(|v| v.clone().fit())
+
+          // First identify an item to remove (if any)
+          let to_remove = match sm.iter().next() {
+              Some(item) => item.clone(),
+              None => return None,
+          };
+
+          // Remove the identified item
+          sm.remove(&to_remove);
+
+          // Return the removed item after applying fit()
+          Some(to_remove.fit())
       }
   }
 
@@ -1939,7 +1955,7 @@ internally, to keep track of things like the stack, program, lists etc.
           let v = l
               .iter()
               .cloned()
-              .map(|i| Char::try_derive(i))
+              .map(Char::try_derive)
               .collect::<Result<Vec<Char>, Error>>()?;
           Ok(v.iter().collect::<String>())
       }
@@ -2143,6 +2159,8 @@ internally, to keep track of things like the stack, program, lists etc.
           self.into_iter()
       }
   }
+
+  impl IntoList for Vec<Item> {}
 
   mod serde {
       use super::{Dispenser, Receptacle, Sized};
@@ -3121,6 +3139,10 @@ internally, to keep track of things like the stack, program, lists etc.
           e
       }
 
+      pub fn actual(&self) -> Option<&Item> {
+          self.data.get(&(Word::derive("actual").fit()))
+      }
+
       pub fn len(&self) -> usize {
           self.data.len()
       }
@@ -3238,6 +3260,7 @@ internally, to keep track of things like the stack, program, lists etc.
   use std::collections::HashSet;
   use std::convert::Infallible;
   use std::hash::Hash;
+  use std::mem;
   use std::ptr;
   use std::sync::Arc;
   use std::sync::OnceLock;
@@ -3398,9 +3421,8 @@ internally, to keep track of things like the stack, program, lists etc.
       }
 
       pub fn contains_key(&self, key: &assoc::KeyItem) -> bool {
-          types::Word::try_derive(key.clone()).map_or(false, |ref w| {
-              matches!(w.fit(), "examples" | "spec" | "definition" | "doc")
-          })
+          types::Word::try_derive(key.clone())
+              .is_ok_and(|ref w| matches!(w.fit(), "examples" | "spec" | "definition" | "doc"))
       }
   }
 
@@ -3494,9 +3516,8 @@ internally, to keep track of things like the stack, program, lists etc.
       }
 
       pub fn contains_key(&self, key: &assoc::KeyItem) -> bool {
-          types::Word::try_derive(key.clone()).map_or(false, |ref w| {
-              matches!(w.fit(), "modules" | "words" | "lingo")
-          })
+          types::Word::try_derive(key.clone())
+              .is_ok_and(|ref w| matches!(w.fit(), "modules" | "words" | "lingo"))
       }
 
       /// Produce an [Words] map that is pre-resolved using the
@@ -3507,7 +3528,7 @@ internally, to keep track of things like the stack, program, lists etc.
               let mut grouped: HashMap<Namespace, Vec<(types::Word, Entry)>> = HashMap::new();
 
               for (k, v) in words.iter() {
-                  grouped.entry(k.namespace).or_insert_with(Vec::new).push((
+                  grouped.entry(k.namespace).or_default().push((
                       {
                           // Block out the namespace, since we want to
                           // find the word using no namespace
@@ -3540,6 +3561,14 @@ internally, to keep track of things like the stack, program, lists etc.
           //println!("resolve: contains? {:?}", cache.get(&"contains?".fit()));
           self.lingo = cache;
           //println!("After resolve: {:?}", self);
+      }
+
+      pub fn using(&mut self, mut namespaces: Vec<Namespace>) {
+          // Swap so that we're putting the new namespaces as higher priority
+          // by making them first in the vec
+          mem::swap(&mut self.modules, &mut namespaces);
+          self.modules.extend(namespaces);
+          self.resolve();
       }
   }
 
@@ -3619,7 +3648,7 @@ internally, to keep track of things like the stack, program, lists etc.
           for r in Box::new(items.iter().cloned()) {
               let (k, def): (assoc::KeyItem, Item) = r.try_fit().unwrap();
               let mut word: Word = k.try_fit().unwrap();
-              word.namespace = core.clone();
+              word.namespace = *core;
               let iter: Box<dyn Iterator<Item = Item>> = def.try_fit().unwrap();
               let new_entry: Entry = iter.try_fit().unwrap();
               let new_entry2 = new_entry.clone();
@@ -3629,7 +3658,7 @@ internally, to keep track of things like the stack, program, lists etc.
                       e.examples = new_entry.examples;
                       e.spec = new_entry.spec;
                       e.doc = new_entry.doc;
-                      e.namespace = core.clone();
+                      e.namespace = *core;
                       // Don't overwrite the definition, this should be
                       // an axiom word where we've left the
                       // spec/examples temporarily blank and we're
@@ -3655,7 +3684,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   doc: None,
               };
               let mut bw = bw.clone();
-              bw.namespace = core.clone();
+              bw.namespace = *core;
               dict.insert(Word::derive(bw.clone()), entry);
           }
           Arc::new(dict)
@@ -3679,7 +3708,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   examples: None,
                   spec: None,
                   definition: Executable::Derived(list!(err, "fail")),
-                  namespace: word.namespace.clone(),
+                  namespace: word.namespace,
                   doc: None,
               };
               (word, entry)
@@ -4107,9 +4136,8 @@ internally, to keep track of things like the stack, program, lists etc.
       /// Returns true if the [Environment] contains the given key,
       /// which is only true for its fixed fields.
       pub fn contains_key(&self, key: &assoc::KeyItem) -> bool {
-          Word::try_derive(key.clone()).map_or(false, |ref w| {
-              matches!(w.fit(), "stack" | "program" | "dictionary")
-          })
+          Word::try_derive(key.clone())
+              .is_ok_and(|ref w| matches!(w.fit(), "stack" | "program" | "dictionary"))
       }
 
       /// Inserts the key/value into the [Environment]. If the key is
@@ -4296,9 +4324,7 @@ internally, to keep track of things like the stack, program, lists etc.
               env.load_core_modules()
                   .expect("failed to load core modules");
               // add core module as default module
-              env.dictionary
-                  .modules
-                  .push(dict::CORE.get().unwrap().clone());
+              env.dictionary.modules.push(*dict::CORE.get().unwrap());
               env.dictionary.resolve();
               //println!("Dict has {} words", env.dictionary.entries.len());
               let mut env = [
@@ -4562,7 +4588,7 @@ crate so we can use it at both build time and runtime.
           pub fn new(path: PathBuf) -> Result<Self, Error> {
               if path.exists() && path.is_dir() {
                   fs::create_dir_all(&path)?;
-                  Ok(Cache { path: path })
+                  Ok(Cache { path })
               } else {
                   Err(Error::new(io::ErrorKind::NotFound, "Cache dir not found"))
               }
@@ -4576,9 +4602,9 @@ crate so we can use it at both build time and runtime.
                   Key::Alias(word) => word.to_string(),
               };
 
-              let file = self.path.join(filename);
+            
 
-              file
+              self.path.join(filename)
           }
 
           pub fn get(&self, key: &Key) -> Result<Bytes, Error> {
@@ -4591,8 +4617,7 @@ crate so we can use it at both build time and runtime.
               match key {
                   Key::Hash(h) => Ok(h.clone()),
                   Key::Alias(a) => self
-                      .target(a.clone())
-                      .and_then(|t| Ok(base64::decode_config(t, base64::URL_SAFE_NO_PAD).unwrap())),
+                      .target(a.clone()).map(|t| base64::decode_config(t, base64::URL_SAFE_NO_PAD).unwrap()),
               }
           }
 
@@ -4611,7 +4636,7 @@ crate so we can use it at both build time and runtime.
           }
 
           pub fn put(&self, content: &Bytes, alias: Option<String>) -> Result<Bytes, Error> {
-              let hash = sha2::Sha256::digest(&content);
+              let hash = sha2::Sha256::digest(content);
               let hashfilename = base64::encode_config(hash, base64::URL_SAFE_NO_PAD);
               let target = self.path.join(hashfilename.clone());
               // only write the file if it doesn't exist
@@ -4649,7 +4674,7 @@ crate so we can use it at both build time and runtime.
 
               // Compute the final hash and rename the file according to the hash
               let hash = hasher.finalize();
-              let file_name = base64::encode_config(&hash, URL_SAFE_NO_PAD);
+              let file_name = base64::encode_config(hash, URL_SAFE_NO_PAD);
               let final_path = self.path.join(file_name.clone());
 
               // Move to final destination, overwriting anything there
@@ -4973,9 +4998,9 @@ example, in order to read/write to/from disk).
               data: Intern::new(s.name().to_string()),
               namespace: s
                   .namespace()
-                  .map(|ns| BASE64_URL_SAFE_NO_PAD.decode(ns.to_string()))
+                  .map(|ns| BASE64_URL_SAFE_NO_PAD.decode(ns))
                   .transpose()?
-                  .map(|decoded| Intern::new(decoded)),
+                  .map(Intern::new),
               quoted: false,
           })),
           // we don't have booleans in kcats, so if we see 'false' that
@@ -5040,7 +5065,7 @@ example, in order to read/write to/from disk).
   /// Serializes the item deterministically. Certain data is lost in
   /// serialization, including the type of container (sets/maps/lists
   /// all are serialized as vectors)
-  impl<'a> From<&'a Item> for edn_format::Value {
+  impl From<&Item> for edn_format::Value {
       fn from(item: &Item) -> Self {
           match item {
               // dictionaries are big and it's ugly to print them for
@@ -5171,7 +5196,7 @@ example, in order to read/write to/from disk).
       fn emit(self) -> String;
   }
 
-  impl<'a> Emit for &'a Item {
+  impl Emit for &Item {
       fn emit(self) -> String {
           edn_format::emit_str(&(self).into())
       }
@@ -5479,21 +5504,23 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   /// A higher order function that executes a simpler function `f`,
   /// where `f` takes a stack item and returns a [Result] of another
   /// stack item.
-  fn f_stack1<T, U, R>(f: fn(U) -> Result<T, R>) -> impl Fn(Environment) -> Future<Environment>
+  fn f_stack1<Output, SpecInput, E>(
+      f: fn(SpecInput) -> Result<Output, E>,
+  ) -> impl Fn(Environment) -> Future<Environment>
   where
-      T: Fit<Item>,
-      U: TryDerive<Item>,
-      U::Error: Fit<Error>,
-      R: Fit<Error>,
+      SpecInput: TryDerive<Item> + Fit<Item> + Clone,
+      SpecInput::Error: Fit<Error>,
+      E: Fit<Error>,
+      Output: Fit<Item>,
   {
       move |mut env: Environment| {
           let x = env
               .tos()
               .ok_or_else(Error::stack_underflow)
-              .and_then(|x| U::try_derive(x.clone()).map_err(Fit::fit));
+              .and_then(|x| SpecInput::try_derive(x.clone()).map_err(Fit::fit));
           match x {
-              Ok(x) => {
-                  let res = f(x);
+              Ok(i) => {
+                  let res = f(i.clone());
                   match res {
                       Ok(r) => {
                           env.pop_prog();
@@ -5517,29 +5544,31 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   /// A higher order function that executes a simpler function `f`,
   /// where `f` takes two stack items and returns a [Result] of another
   /// stack item.
-  fn f_stack2<T, U, V, R>(f: fn(U, V) -> Result<T, R>) -> impl Fn(Environment) -> Future<Environment>
+  fn f_stack2<Output, SpecInputY, SpecInputX, E>(
+      f: fn(SpecInputY, SpecInputX) -> Result<Output, E>,
+  ) -> impl Fn(Environment) -> Future<Environment>
   where
-      T: Fit<Item>,
-      U: TryDerive<Item>,
-      U::Error: Fit<Error>,
-      V: TryDerive<Item>,
-      V::Error: Fit<Error>,
-      R: Fit<Error>,
+      SpecInputX: TryDerive<Item> + Fit<Item> + Clone,
+      SpecInputX::Error: Fit<Error>,
+      SpecInputY: TryDerive<Item> + Fit<Item> + Clone,
+      SpecInputY::Error: Fit<Error>,
+      E: Fit<Error>,
+      Output: Fit<Item>,
   {
       move |mut env: Environment| {
           let x = env
               .tos()
               .ok_or_else(Error::stack_underflow)
-              .and_then(|x| V::try_derive(x.clone()).map_err(Fit::fit));
+              .and_then(|x| SpecInputX::try_derive(x.clone()).map_err(Fit::fit));
           let y = env
               .stack
               .get(1)
               .ok_or_else(Error::stack_underflow)
-              .and_then(|y| U::try_derive(y.clone()).map_err(Fit::fit));
+              .and_then(|y| SpecInputY::try_derive(y.clone()).map_err(Fit::fit));
 
           match (x, y) {
               (Ok(x), Ok(y)) => {
-                  let res = f(y, x);
+                  let res = f(y.clone(), x.clone());
                   match res {
                       Ok(r) => {
                           env.pop_prog();
@@ -5566,34 +5595,34 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   /// A higher order function that executes a simpler function `f`,
   /// where `f` takes 3 stack items and returns a [Result] of another
   /// stack item.
-  fn f_stack3<T, U, V, W, R>(
-      f: fn(U, V, W) -> Result<T, R>,
+  fn f_stack3<Output, SpecInputZ, SpecInputY, SpecInputX, E>(
+      f: fn(SpecInputZ, SpecInputY, SpecInputX) -> Result<Output, E>,
   ) -> impl Fn(Environment) -> Future<Environment>
   where
-      T: Fit<Item>,
-      U: TryDerive<Item>,
-      U::Error: Fit<Error>,
-      V: TryDerive<Item>,
-      V::Error: Fit<Error>,
-      W: TryDerive<Item>,
-      W::Error: Fit<Error>,
-      R: Fit<Error>,
+      SpecInputX: TryDerive<Item>,
+      SpecInputX::Error: Fit<Error>,
+      SpecInputY: TryDerive<Item>,
+      SpecInputY::Error: Fit<Error>,
+      SpecInputZ: TryDerive<Item>,
+      SpecInputZ::Error: Fit<Error>,
+      E: Fit<Error>,
+      Output: Fit<Item>,
   {
       move |mut env: Environment| {
           let x = env
               .tos()
               .ok_or_else(Error::stack_underflow)
-              .and_then(|x| W::try_derive(x.clone()).map_err(Fit::fit));
+              .and_then(|x| SpecInputX::try_derive(x.clone()).map_err(Fit::fit));
           let y = env
               .stack
               .get(1)
               .ok_or_else(Error::stack_underflow)
-              .and_then(|y| V::try_derive(y.clone()).map_err(Fit::fit));
+              .and_then(|y| SpecInputY::try_derive(y.clone()).map_err(Fit::fit));
           let z = env
               .stack
               .get(2)
               .ok_or_else(Error::stack_underflow)
-              .and_then(|z| U::try_derive(z.clone()).map_err(Fit::fit));
+              .and_then(|z| SpecInputZ::try_derive(z.clone()).map_err(Fit::fit));
           match (x, y, z) {
               (Ok(x), Ok(y), Ok(z)) => {
                   let res = f(z, y, x);
@@ -5675,11 +5704,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   lazy_static! {
       pub static ref BUILTIN_FUNCTIONS: HashMap<Word, dict::Executable> = {
-  #[cfg(not(feature = "database"))]
-      let entries: Vec<(&str, &'static StepFn)>;
-      #[cfg(feature = "database")]
-      let mut entries: Vec<(&str, &'static StepFn)>;
-      entries = vec![
+
+      #![allow(unused_mut)]
+      let mut entries: Vec<(&str, &'static StepFn)> = vec![
           ("*", Box::leak(Box::new(f_stack2(mult)))),
           ("+", Box::leak(Box::new(f_stack2(plus)))),
           ("get", Box::leak(Box::new(f_stack2(lookup)))),
@@ -5811,6 +5838,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               "receiver",
               Box::leak(Box::new(f_stack1(crate::types::container::pipe::channel::receiver))),
           ),
+          ("remove", Box::leak(Box::new(f_stack2(remove)))),
           //("recur", Box::leak(Box::new(recur))),
           ("resolve", Box::leak(Box::new(resolve))),
           ("resume", Box::leak(Box::new(identity))),
@@ -5854,6 +5882,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("unnamespace", Box::leak(Box::new(unnamespace))),
           ("📤", Box::leak(Box::new(take))),
           ("🍫", Box::leak(Box::new(unwrap))),
+          ("⛏️", Box::leak(Box::new(f_result(unpack)))),
           ("using", Box::leak(Box::new(f_result(using)))),
           (
               "verify",
@@ -6152,7 +6181,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   pub fn execute(mut env: Environment) -> Future<Environment> {
       let i = env.pop();
       if let Item::Builtin(b) = i {
-          return (*b.f)(env).fit();
+          (*b.f)(env).fit()
       } else {
           match coll::List::try_derive(i) {
               Ok(program) => {
@@ -6403,7 +6432,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           k: &assoc::KeyItem,
           v: Item,
       ) -> Result<Item, Error> {
-          let inner = a.get(&k).clone();
+          let inner = a.get(k).clone();
           if ks.is_empty() {
               Ok(a.insert(k.clone(), v).0.fit())
           } else {
@@ -6459,6 +6488,27 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }
   }
 
+  fn remove(i: coll::Sized, k: Item) -> Result<Item, Error> {
+      match i {
+          coll::Sized::List(mut l) => {
+              if let Some(pos) = l.iter().position(|x| *x == k) {
+                  l.mutate().remove(pos);
+              }
+
+              Ok(l.fit())
+          }
+          coll::Sized::Set(mut s) => {
+              s.mutate().remove(&assoc::KeyItem::try_derive(k)?);
+              Ok(s.fit())
+          }
+          coll::Sized::Associative(a) => {
+              let (a, _) = a.remove(&assoc::KeyItem::try_derive(k)?);
+              Ok(a.fit())
+          }
+          i => Err(Error::expected("simple-container", i)),
+      }
+  }
+
   fn unassoc_in(i: Item, ks: &[assoc::KeyItem]) -> Result<Item, Error> {
       if let [k, ks @ ..] = ks {
           if ks.is_empty() {
@@ -6474,7 +6524,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       let old_value = if let Some(item) = lm.get_mut(*k as usize) {
                           mem::take(item)
                       } else {
-                          return Err(Error::short_list(*k)); // replace with your error
+                          return Err(Error::short_list(*k));
                       };
                       let new_value = unassoc_in(old_value, ks)?;
                       lm[*k as usize] = new_value;
@@ -6626,7 +6676,15 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       env.push(w);
                       env.fit()
                   } else {
-                      if let Some(dfn) = env.dictionary.lingo.get(&word) {
+                      let definition = {
+                          if word.namespace.is_some() {
+                              // namespace specified, look up in wider dictionary
+                              env.dictionary.words.get(word)
+                          } else {
+                              env.dictionary.lingo.get(word)
+                          }
+                      };
+                      if let Some(dfn) = definition {
                           {
                               if let Some(spec) = &dfn.spec {
                                   //println!("Checking spec for {:?}: {:?}", word, spec.0);
@@ -6650,9 +6708,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                           }
                       } else {
                           //let w = word.clone();
-                          if *word == Word::derive("times5") {
-                              println!("Failed dict lookup: {:?} ", env.dictionary.lingo);
-                          }
                           env.push(Error::undefined(word.clone().fit()));
                           env.fit()
                       }
@@ -7141,18 +7196,13 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   fn format(fstr: Item, items: Item) -> ItemResult {
       let fstr = String::try_derive(fstr)?;
       let items = coll::List::try_derive(items)?;
-      let strings = items
-          .iter()
-          .cloned()
-          .map(String::try_derive)
-          .collect::<Result<Vec<String>, Error>>()?;
       Ok(SimpleCurlyFormat
-          .format(fstr.as_str(), strings.as_slice())?
+          .format(fstr.as_str(), &*items)?
           .into_owned()
           .fit())
   }
 
-  impl<'a> From<dynfmt::Error<'a>> for Error {
+  impl From<dynfmt::Error<'_>> for Error {
       fn from(err: dynfmt::Error) -> Error {
           Error::create(list!("format"), &err.to_string(), Option::<Item>::None)
       }
@@ -7198,7 +7248,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let mut w: Word = env.pop().try_fit().unwrap();
 
       if let Some(e) = env.dictionary.lingo.get(&w) {
-          w.namespace = e.namespace.clone();
+          w.namespace = e.namespace;
       }
       env.push(w);
       env.fit()
@@ -7209,37 +7259,36 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   fn using(env: &mut Environment) -> Result<(), Error> {
-      let mut namespaces: Vec<dict::Namespace> = env.pop().try_fit()?;
+      let namespaces: Vec<dict::Namespace> = env.pop().try_fit()?;
       let mut inner_env: Environment = env.pop().try_fit()?;
       env.pop_prog();
-      mem::swap(&mut inner_env.dictionary.modules, &mut namespaces);
-      inner_env.dictionary.modules.extend(namespaces);
+      inner_env.dictionary.using(namespaces);
       env.push(inner_env);
       Ok(())
+  }
+
+  fn stackpoint(w: &Word) -> Option<(usize, bool)> {
+      let s = String::derive(w.clone());
+
+      // Define mappings for number emojis
+      const NUMBER_EMOJIS: [&str; 9] = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣"];
+
+      // Check for splice (scissors + number)
+      if let Some(rest) = s.strip_prefix("✂️") {
+          if let Some(position) = NUMBER_EMOJIS.iter().position(|&emoji| emoji == rest) {
+              return Some((position + 1, true));
+          }
+      // Check for just the number (insert operation)
+      } else if let Some(position) = NUMBER_EMOJIS.iter().position(|&emoji| emoji == s) {
+          return Some((position + 1, false));
+      }
+
+      None
   }
 
   fn pack(env: &mut Environment) -> Result<(), Error> {
       let template: coll::List = env.pop().try_fit()?;
       let mut last_stack_item_used = 0;
-
-      fn stackpoint(w: Word) -> Option<(usize, bool)> {
-          let s = String::derive(w.clone());
-
-          // Define mappings for number emojis
-          const NUMBER_EMOJIS: [&str; 9] = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣"];
-
-          // Check for splice (scissors + number)
-          if let Some(rest) = s.strip_prefix("✂️") {
-              if let Some(position) = NUMBER_EMOJIS.iter().position(|&emoji| emoji == rest) {
-                  return Some((position + 1, true));
-              }
-          // Check for just the number (insert operation)
-          } else if let Some(position) = NUMBER_EMOJIS.iter().position(|&emoji| emoji == s) {
-              return Some((position + 1, false));
-          }
-
-          None
-      }
 
       /// Takes an accumulator that is a pair of the stack and the
       /// compiled result so far, and then an item to incorporate. If
@@ -7252,31 +7301,21 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           match acc {
               Ok((stack, last_stack_item_used, mut list)) => match i {
                   Item::Word(w) => {
-                      if let Some((n, is_splice)) = stackpoint(w.clone()) {
+                      if let Some((n, is_splice)) = stackpoint(&w) {
                           ,*last_stack_item_used = max(n, *last_stack_item_used);
-                          let r = stack
+                          stack
                               .get(n - 1)
                               .ok_or_else(|| Error::list_count(n as Int))
-                              .cloned();
-                          match r {
-                              Ok(item) => {
+                              .cloned()
+                              .and_then(|item| {
                                   if is_splice {
-                                      match item {
-                                          Item::Dispenser(coll::Dispenser::Sized(s)) => {
-                                              list.extend(s)
-                                          }
-                                          Item::Receptacle(coll::Receptacle::Sized(s)) => {
-                                              list.extend(s)
-                                          }
-                                          i => return Err(Error::expected("sized", i)),
-                                      }
+                                      let s = coll::Sized::try_derive(item)?;
+                                      list.extend(s)
                                   } else {
                                       list.push(item);
                                   }
                                   Ok((stack, last_stack_item_used, list))
-                              }
-                              Err(e) => Err(e),
-                          }
+                              })
                       } else {
                           list.push(Item::Word(w.clone()));
                           Ok((stack, last_stack_item_used, list))
@@ -7310,6 +7349,274 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           env.pop();
       }
       env.push(coll::List::derive(filled));
+      Ok(())
+  }
+
+  /// A struct to keep track of destructured values from the function
+  /// unpack. Can only have max 9 params because it's meant to go on the
+  /// stack - more than that and it's recommended to use named params
+  /// that get returned as an association.
+  #[derive(Debug, Clone, Default)]
+  struct PositionalParams<T> {
+      values: [Option<T>; 9],
+  }
+
+  impl<T: Clone> PositionalParams<T>
+  where
+      T: Fit<Item> + std::fmt::Debug,
+  {
+      // Set a value at position (1-9)
+      fn set(&mut self, position: usize, value: T) -> Result<(), String> {
+          //println!("Setting {} to {:?}", position, value);
+          if position < 1 || position > 9 {
+              return Err(format!("Position must be between 1-9, got {}", position));
+          }
+
+          // Convert to 0-based index
+          let idx = position - 1;
+
+          // Check if already set
+          if self.values[idx].is_some() {
+              return Err(format!("Position {} already has a value", position));
+          }
+
+          self.values[idx] = Some(value);
+          Ok(())
+      }
+
+      // Get a value at position (1-9)
+      #[allow(dead_code)]
+      fn get(&self, position: usize) -> Option<&T> {
+          if position < 1 || position > 9 {
+              return None;
+          }
+          self.values[position - 1].as_ref()
+      }
+
+      // Merge with another set of positional parameters
+      fn merge(&mut self, other: &Self) -> Result<(), Error> {
+          //let mut result = self.clone();
+
+          for i in 0..9 {
+              if let Some(value) = &other.values[i] {
+                  if self.values[i].is_some() {
+                      return Err(Error::create(
+                          list!("assign-param"),
+                          "Pattern matching params can't be used more than once",
+                          Some(value.clone()),
+                      ));
+                  }
+                  self.values[i] = Some(value.clone());
+              }
+          }
+
+          Ok(())
+      }
+
+      // Convert to a vector, useful for pushing onto stack
+      fn to_vec(&self) -> Vec<T>
+      where
+          T: Clone,
+      {
+          //println!("postional params {:?}", self);
+          self.values.iter().filter_map(|opt| opt.clone()).collect()
+      }
+  }
+
+  const TAG_EMOJI: &str = "🏷️";
+  const WILDCARD: &str = "_";
+
+  /// Destructuring (inverse of pack). Takes a Sized input item to
+  /// unpack, and a pattern. The pattern should contain stack markers
+  /// like 1️⃣. Anywhere those markers occur in the pattern, the
+  /// corresponding value will be extracted from the input and placed at
+  /// that location on the stack.
+  fn unpack(env: &mut Environment) -> Result<(), Error> {
+      fn is_map_variable(w: &Word) -> bool {
+          String::derive(w.clone()).starts_with(TAG_EMOJI)
+      }
+
+      fn is_wildcard(w: &Word) -> bool {
+          String::derive(w.clone()) == WILDCARD
+      }
+
+      fn strip_variable(w: &Word) -> Word {
+          let wc = w.clone();
+          let s = String::derive(wc);
+
+          if s.starts_with(TAG_EMOJI) {
+              s[TAG_EMOJI.len()..].fit()
+          } else {
+              w.clone()
+          }
+      }
+
+      fn match_err<T, U>(a: T, b: U) -> Error
+      where
+          T: Fit<Item>,
+          U: Fit<Item>,
+      {
+          Error::create(list![a, b, "="], "match failed", Option::<Item>::None)
+      }
+
+      fn destructure(
+          data: &Item,
+          pattern: &Item,
+          mut acc_assoc: HashMap<Word, Item>,
+          mut acc_seq: PositionalParams<Item>,
+      ) -> Result<(HashMap<Word, Item>, PositionalParams<Item>), Error> {
+          // see if both are maps
+          //println!("Destructure: {:?} with {:?}", data, pattern);
+          let data = coll::Sized::try_derive(data.clone());
+          let pattern = coll::Sized::try_derive(pattern.clone());
+          match (data, pattern) {
+              (Ok(data), Ok(pattern)) => {
+                  // We got containers
+                  match (data, pattern) {
+                      (coll::Sized::List(data_list), coll::Sized::List(pattern_list)) => {
+                          //println!("destructuring list: {:?}", data_list);
+
+                          let mut potential_updates_map: HashMap<Word, Item> = Default::default();
+                          let mut potential_updates_list: PositionalParams<Item> = Default::default();
+                          for i in 0..(pattern_list.len()) {
+                              let p = pattern_list.get(i);
+                              let v = data_list.get(i).cloned().unwrap_or_default();
+                              match p {
+                                  Some(p) => match p {
+                                      Item::Word(w) => {
+                                          if let Some((idx, _)) = stackpoint(&w) {
+                                              let _ = potential_updates_list.set(idx, v);
+                                          } else if is_map_variable(&w) {
+                                              acc_assoc.insert(strip_variable(w), v);
+                                          } else if is_wildcard(w) || Item::Word(w.clone()) == v {
+                                              // match! but not a variable so continue
+                                          } else {
+                                              // pattern does not match. bail out of list processing
+                                              return Err(match_err(w.clone(), v));
+                                          }
+                                      }
+                                      p => {
+                                          (potential_updates_map, potential_updates_list) =
+                                              destructure(
+                                                  &v,
+                                                  p,
+                                                  potential_updates_map,
+                                                  potential_updates_list,
+                                              )?
+                                      }
+                                  },
+                                  // past end of list
+                                  None => {
+                                      break;
+                                  }
+                              }
+                          }
+                          acc_assoc.extend(potential_updates_map);
+                          let _ = acc_seq.merge(&potential_updates_list);
+                          return Ok((acc_assoc, acc_seq));
+                      }
+                      (coll::Sized::Associative(data), coll::Sized::Associative(pattern)) => {
+                          //println!("destructuring map: {:?}", data_map);
+                          //map destructure
+                          // Iterate over the entries
+                          let mut potential_updates_map: HashMap<Word, Item> = Default::default();
+                          let mut potential_updates_list: PositionalParams<Item> = Default::default();
+                          for (k, ref v) in pattern.to_iter() {
+                              // look up k in data
+                              let vd = data.get(&k.fit());
+                              // if v is a placeholder, vd is our target
+                              if let Some(vd) = vd {
+                                  let r = Word::try_derive(v.clone());
+                                  if let Ok(w) = r {
+                                      if let Some((idx, _)) = stackpoint(&w) {
+                                          let _ = potential_updates_list.set(idx, vd);
+                                      } else if is_map_variable(&w) {
+                                          potential_updates_map.insert(strip_variable(&w), vd);
+                                      } else {
+                                          (potential_updates_map, potential_updates_list) =
+                                              destructure(
+                                                  &vd,
+                                                  &v,
+                                                  potential_updates_map,
+                                                  potential_updates_list,
+                                              )?
+                                      }
+                                  } else {
+                                      // value is not a word
+                                      (potential_updates_map, potential_updates_list) = destructure(
+                                          &vd,
+                                          v,
+                                          potential_updates_map,
+                                          potential_updates_list,
+                                      )?
+                                  }
+                              }
+                          }
+                          acc_assoc.extend(potential_updates_map);
+                          let _ = acc_seq.merge(&potential_updates_list);
+                          return Ok((acc_assoc, acc_seq));
+                      }
+                      (a, b) => {
+                          if a == b {
+                              Ok((acc_assoc, acc_seq))
+                          } else {
+                              Err(match_err(a, b))
+                          }
+                      }
+                  }
+              }
+              (Err(de), Err(pe)) => {
+                  let d = de.actual().unwrap();
+                  let p = pe.actual().unwrap();
+                  if *d == *p
+                      || Word::try_derive(p.clone())
+                          .map(|w| is_wildcard(&w))
+                          .unwrap_or_else(|_| false)
+                  {
+                      Ok((acc_assoc, acc_seq))
+                  } else {
+                      Err(match_err(p.clone(), d.clone()))
+                  }
+              }
+              (Ok(d), Err(pe)) => {
+                  let d = Item::derive(d);
+                  let p = pe.actual().unwrap();
+                  if d == *p
+                      || Word::try_derive(p.clone())
+                          .map(|w| is_wildcard(&w))
+                          .unwrap_or_else(|_| false)
+                  {
+                      Ok((acc_assoc, acc_seq))
+                  } else {
+                      Err(match_err(p.clone(), d))
+                  }
+              }
+              (Err(de), Ok(p)) => {
+                  let p = Item::derive(p);
+                  let d = de.actual().unwrap();
+                  if p == *d {
+                      Ok((acc_assoc, acc_seq))
+                  } else {
+                      Err(match_err(p, d.clone()))
+                  }
+              }
+          }
+      }
+      let pattern = env.pop();
+      let data = env.pop();
+      let mut matches_map: HashMap<Word, Item> = Default::default();
+      let mut matches_list: PositionalParams<Item> = Default::default();
+
+      (matches_map, matches_list) = destructure(&data, &pattern, matches_map, matches_list)?;
+      let res_map: assoc::AssociationContent = matches_map
+          .into_iter()
+          .map(|(k, v)| (assoc::KeyItem::derive(k), v))
+          .collect();
+      let res_list = matches_list.to_vec();
+      //println!("Got unpack result list {:?}", res_list);
+      env.pop_prog();
+      env.push(coll::List::derive(res_list));
+      env.push(Item::derive(res_map));
       Ok(())
   }
 #+end_src
@@ -7516,7 +7823,7 @@ rust project or some other language through FFI.
               config
                   .as_ref()
                   .ok_or(Error::expected("initialization", None::<Item>))
-                  .map(|c| c.clone())
+                  .cloned()
           }
       }
       /// If we call this function it's because kcats is running as a binary
@@ -7648,6 +7955,7 @@ rust project or some other language through FFI.
       #[test_case("assemble")]
       #[test_case("assign")]
       #[test_case("association")]
+      #[test_case("assocify")]
       #[test_case("association?" ; "is_association")]
       #[test_case("bail")]
       #[test_case("bailer")]
@@ -7664,6 +7972,7 @@ rust project or some other language through FFI.
       #[test_case("•👥" ; "clonedown")]
       #[test_case("••👥" ; "clonedeep")]
       #[test_case("collect")]
+      //#[test_case("combinations")]
       #[test_case("compare")]
       #[test_case("compare-by")]
       #[test_case("🎭" ; "complement")]
@@ -7734,6 +8043,7 @@ rust project or some other language through FFI.
       #[test_case("🌀"; "_loop")]
       #[test_case("log")]
       #[test_case("🚜" ; "map")]
+      #[test_case("🧤" ; "_match")]
       #[test_case("max")]
       #[test_case("max-by")]
       #[test_case("min")]
@@ -7765,6 +8075,7 @@ rust project or some other language through FFI.
       #[test_case("reap")]
       #[test_case("🩹" ; "recovery")]
       #[test_case("🪆" ; "recur")]
+      #[test_case("remove")]
       #[test_case("repetition")]
       #[test_case("rest")]
       #[test_case("resolve")]
@@ -7799,6 +8110,7 @@ rust project or some other language through FFI.
       #[test_case("under")]
       #[test_case("unnamespace")]
       #[test_case("until")]
+      #[test_case("⛏️" ; "unpack")]
       #[test_case("🍫" ; "unwrap")]
       #[test_case("update")]
       #[test_case("value")]
@@ -8457,13 +8769,11 @@ How to interact with files on disk
   impl crate::serialize::Display for StaticFile {
       fn representation(&self) -> Item {
           assoc::Association::derive_iter([
-              ("type".fit(), "tunnel".fit()),
+              ("type".fit(), "pipe".fit()),
+              ("in".fit(), "bytes".fit()),
+              ("out".fit(), "bytes".fit()),
               (
-                  "values".fit(),
-                  assoc::Association::derive_iter([("type".fit(), "bytes".fit())]).fit(),
-              ),
-              (
-                  "to".fit(),
+                  "endpoint".fit(),
                   assoc::Association::derive_iter([("file".fit(), self.path.clone().fit())]).fit(),
               ),
           ])
@@ -8616,11 +8926,25 @@ How to interact with the network (TCP/IP sockets)
 
   impl crate::serialize::Display for ServerSocket {
       fn representation(&self) -> Item {
+          let r = self.socket.local_addr();
           assoc::Association::derive_iter([
               ("type".fit(), "pipe".fit()),
+              ("realm".fit(), "tcp".fit()),
+              ("produces".fit(), "socket".fit()),
+              ("pipe-type".fit(), "serversocket".fit()),
               (
-                  "serversocket".fit(),
-                  "todo: fix serversocket local addr async issue".fit(), //Item::String(self.socket.lock().await.local_addr().unwrap().to_string()),
+                  "address".fit(),
+                  match r {
+                      Ok(a) => a.ip().to_string().as_str().fit(),
+                      Err(_) => "unknown".fit(),
+                  },
+              ),
+              (
+                  "port".fit(),
+                  match r {
+                      Ok(a) => a.port().to_string().as_str().fit(),
+                      Err(_) => "unknown".fit(),
+                  },
               ),
           ])
           .fit()
@@ -8643,26 +8967,23 @@ How to interact with the network (TCP/IP sockets)
 
   pub fn server_socket(i: Item, j: Item) -> types::Future<ItemResult> {
       match socket_addr(i, j) {
-          Ok(addr) => {
-              Box::pin(TcpListener::bind(addr).map(|l| {
-                  Ok(super::Out::ServerSocket(Arc::new(RwLock::new(ServerSocket {
-                      socket: l.unwrap(),
-                  })))
-                  .fit())
-              }))
-          }
+          Ok(addr) => Box::pin(TcpListener::bind(addr).map(|r| match r {
+              Ok(s) => Ok(
+                  super::Out::ServerSocket(Arc::new(RwLock::new(ServerSocket { socket: s }))).fit(),
+              ),
+              Err(e) => Err(e.into()),
+          })),
           Err(e) => Box::pin(future::ready(Err(e))),
       }
   }
 
   pub fn socket(i: Item, j: Item) -> types::Future<ItemResult> {
       match host_addr(i, j) {
-          Ok(addr) => Box::pin(TcpStream::connect(addr.clone()).map(move |s| {
-              Ok(super::Tunnel::Socket(Arc::new(RwLock::new(Socket {
-                  socket: s.unwrap(),
-                  addr,
-              })))
-              .fit())
+          Ok(addr) => Box::pin(TcpStream::connect(addr.clone()).map(move |r| match r {
+              Ok(s) => {
+                  Ok(super::Tunnel::Socket(Arc::new(RwLock::new(Socket { socket: s, addr }))).fit())
+              }
+              Err(e) => Err(e.into()),
           })),
           Err(e) => Box::pin(future::ready(Err(e))),
       }
@@ -8702,6 +9023,12 @@ How to interact with the network (TCP/IP sockets)
 
   pub struct Time;
 
+  impl Default for Time {
+      fn default() -> Self {
+          Self::new()
+      }
+  }
+
   impl Time {
       pub fn new() -> Self {
           Time
@@ -8720,10 +9047,10 @@ How to interact with the network (TCP/IP sockets)
   }
   pub fn representation() -> Item {
       assoc::Association::derive_iter([
-          ("type".fit(), "out".fit()),
-          ("from".fit(), "systemtime".fit()),
+          ("type".fit(), "pipe".fit()),
+          ("endpoint".fit(), "systemtime".fit()),
           (
-              "values".fit(),
+              "out".fit(),
               assoc::Association::derive_iter([
                   ("type".fit(), "integer".fit()),
                   ("units".fit(), "milliseconds".fit()),
@@ -8767,8 +9094,10 @@ How to interact with the network (TCP/IP sockets)
 
   pub fn representation() -> Item {
       assoc::Association::derive_iter([
-          ("type".fit(), "tunnel".fit()),
-          ("peer".fit(), "standard".fit()),
+          ("type".fit(), "pipe".fit()),
+          ("in".fit(), "bytes".fit()),
+          ("out".fit(), "bytes".fit()),
+          ("endpoint".fit(), "standard".fit()),
       ])
       .fit()
   }
@@ -8894,17 +9223,47 @@ Implement the =handoff= type
 
   impl crate::serialize::Display for Handoff<Item> {
       fn representation(&self) -> Item {
-          let t = match (&self.sender, &self.receiver) {
-              (Some(_), Some(_)) => "tunnel",
-              (Some(_), None) => "in",
-              (None, Some(_)) => "out",
-              (None, None) => "closed",
-          };
-          assoc::Association::derive_iter([
-              ("type".fit(), t.fit()),
-              ("handoff".fit(), (self.id as Int).fit()),
-          ])
-          .fit()
+          let mut props = [
+              ("type".fit(), "pipe".fit()),
+              (
+                  "senders".fit(),
+                  self.sender
+                      .as_ref()
+                      .map(|s| s.sender_count() as Int)
+                      .unwrap_or_default()
+                      .fit(),
+              ),
+              (
+                  "receivers".fit(),
+                  self.sender
+                      .as_ref()
+                      .map(|s| s.receiver_count() as Int)
+                      .unwrap_or_default()
+                      .fit(),
+              ),
+              (
+                  "endpoint".fit(),
+                  assoc::Association::derive_iter([("handoff".fit(), (self.id as Int).fit())]).fit(),
+              ),
+          ]
+          .to_vec();
+
+          if self.sender.is_some() {
+              props.push(("in".fit(), "item".fit()));
+              props.push((
+                  "capacity".fit(),
+                  (self.sender.as_ref().unwrap().capacity().unwrap_or_default() as Int).fit(),
+              ));
+          }
+          if self.receiver.is_some() {
+              props.push(("out".fit(), "item".fit()));
+              props.push((
+                  "capacity".fit(),
+                  (self.sender.as_ref().unwrap().capacity().unwrap_or_default() as Int).fit(),
+              ));
+          }
+
+          assoc::Association::derive_iter(props).fit()
       }
   }
 
@@ -8989,12 +9348,12 @@ Implement the =handoff= type
               let idx_clone = idx;
               match item {
                   ChannelOp::Receive(r) => {
-                      selector = selector.recv(&r, move |i| {
+                      selector = selector.recv(r, move |i| {
                           (i.map(Some).map_err(error::Error::from), idx_clone)
                       });
                   }
                   ChannelOp::Send(s, i) => {
-                      selector = selector.send(&s, i.clone(), move |i| {
+                      selector = selector.send(s, i.clone(), move |i| {
                           (i.map(|_| None).map_err(error::Error::from), idx)
                       });
                   }
@@ -9365,7 +9724,8 @@ Implement the =handoff= type
   }
 #+end_src
 * Issues
-** INPROGRESS Interactive mode                                       :tools:
+** DONE Interactive mode                                             :tools:
+- State "DONE"       from "INPROGRESS" [2025-03-17 Mon 18:36]
 run with =kcats -i= for interactive, where you get a repl-like
 prompt. Each prompt accepts kcats items as input, and updates the
 state accordingly. There are special commands to print the current
@@ -9381,7 +9741,8 @@ state, clear it, write to file, etc.
 + snapshot?
 + drop
 + sink / float
-** INPROGRESS Implement pipes                                       :stdlib:
+** DONE Implement pipes                                             :stdlib:
+- State "DONE"       from "INPROGRESS" [2025-03-19 Wed 16:29]
 *** DONE Write to a file
 #+begin_src kcats
   [[file "/tmp/bar4"]] pipe-in
@@ -9615,8 +9976,10 @@ that offers list items until the list is exhausted and then returns pipe closed 
 #+RESULTS:
 : 1 [[type pipe] [filled todo: id-or-hash here]]
 
-*** INPROGRESS Object pipes
-**** INPROGRESS Generator re-splitting
+*** DONE Object pipes
+- State "DONE"       from "INPROGRESS" [2025-03-17 Mon 18:39]
+**** CANCELED Generator re-splitting
+- State "CANCELED"   from "INPROGRESS" [2025-03-17 Mon 18:39]
 - State "INPROGRESS" from "TODO"       [2023-10-19 Thu 21:10]
 These pipes should send serialized kcats objects and each put/take
 should transfer 1 object. Maybe use protocol buffers or similar
@@ -9810,7 +10173,8 @@ otherwise generate and repeat.
   [read first] each
   collect
 #+end_src
-**** TODO Another take on re-splitting
+**** CANCELED Another take on re-splitting
+- State "CANCELED"   from "TODO"       [2025-03-17 Mon 18:39]
 A more generic version of the re-splitter:
 
 Take as input a buffer (probably of Bytes), and a function of that
@@ -9968,6 +10332,115 @@ Then the resplitting generator becomes:
                [examples [[["" #b64 "aGni" parse-utf8] ["hi" #b64 "4g"]]
                           [["" #b64 "aGVsbG8" parse-utf8] ["hello" #b64 ""]]]]]]
   #+end_src
+**** DONE Now that we have generic parser finish the job
+- State "DONE"       from "INPROGRESS" [2025-03-17 Mon 18:38]
+- State "INPROGRESS" from "TODO"       [2025-03-17 Mon 18:37]
+#+begin_src kcats
+     1 7 1 range  [1 🔀 inc 1 range 🎁 emit] 🚜 ▶️
+     handoff ;; create a channel between two envs
+     [liberator [parse-edn] "" parse collect] 
+     future 
+     ;; now that the receiver is active, start sending
+     [🔀 [📮] 🪜 ▶️
+      🗑️] ;; drop the channel to signal the other side we're done
+     🪄
+     📤 ;; the result of the future
+#+end_src
+
+well that's lovely we can pass serialized data through a
+handoff. Let's pass it through a network pipe, in two separate processes!
+
+the sender
+#+begin_src kcats
+   ;; now connect to the server and send it
+   "localhost" 9998 socket
+   ;; data to send
+   1 200 1 range  [1 🔀 inc 1 range 🎁 emit encode] 🚜 ▶️
+   [📮] 🪜 ▶️ ;; put it all into pipe
+   🗑️ ;; close connection
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+#+end_src
+
+the receiver - let's make a server that runs forever accepting
+connections and parsing what's sent.
+#+begin_src kcats :tangle /tmp/server.kcats
+  "127.0.0.1" 9999 serversocket ;; listen for network connections
+  liberator ;; make a generator of client connections
+
+  [liberator ;; generator of byte array coming from client
+   [string] each
+   [parse-edn] "" parse
+   collect emit print] ;; print out the value
+  each  ;; do that all for each client connection
+  ;collect
+  drain ▶️ ;; drive the generator forward, dropping the connections once finished
+#+end_src
+
+More interesting would be a repl server, that maintains state in an
+inner environment.
+
+#+begin_src kcats :tangle /tmp/repl-server.kcats
+  "127.0.0.1" 9999 serversocket ;; listen for network connections
+  [📤]
+  [👥 🎁 ;; [s] s
+   [liberator ;; generator of byte array coming from client
+    [string] each
+    [parse-edn] "" parse [🎁] each
+    [] environment ;; e parser*
+    evaluator
+    [[stack] 🔍] 
+    each] 💉 ▶️ ;; make wrapped gen
+   extractor
+   [emit 🎁 "-> {}\n\n" 🔀 format encode
+    ⚓ [📮] •🪄]
+   each drain ▶️
+   🗑️ 🗑️] ;; the parser and sockets 
+  ⏳ ▶️
+#+end_src
+
+First write a repl generator: one that takes input from the parent,
+calls evaluate on the environment state, yields the new env
+#+begin_src kcats
+    [[1 1 +] [3 3 *] [+]]
+    liberator
+    [] environment ; e g
+    [[▶️] 🐋]
+    [[program] 🔀 assign evaluate]
+    [ ;🗑️
+     []]
+    [over] 🪆 
+   [[stack] 🔍] each collect
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[2] [9 2]
+ [11]]
+[[dictionary [[lingo 273_entries]
+              [modules [#b64 "core"]]
+              [words 273_entries]]]
+ [program 🔳]
+ [stack [11]]]
+🔳
+#+end_src
+
+now write an adapter to make a wrapped generator a regular one:
+
+#+begin_src kcats
+  [] [[1 2 3 4 5] liberator] 💉 ▶️
+  [[▶️] 💉 ▶️ 📤]
+  []
+  [[]]
+  [🔀] 🪆 collect
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[1 2 3 4 5] [🔳]
+#+end_src
 
 *** DONE Time pipe
 Each take from the pipe return the current unix time in ms.  Should be
@@ -10024,7 +10497,7 @@ return an error. May need to resolve this inconsistency.
 | take Items    | Item    | Item    | Bytes   | Bytes      |
 | take Past EOF | Nothing | Nothing | Nothing | Nothing    |
 | step Past EOF | Exit    | Exit    | Exit    | Exit       |
-** INPROGRESS COMMENT Use a single word for all derivation/conversion       :stdlib:
+** INPROGRESS [#C] Use a single word for all derivation/conversion  :stdlib:
 Right now there's different words for converting bytes to string
 (string) or string to bytes (bytes). Proposing a more composable
 mechanism here, where there's a single action word that derives one
@@ -11874,7 +12347,8 @@ greater
 ✅
 #+end_src
 
-** TODO Stream transformation
+** DONE Stream transformation
+- State "DONE"       from "TODO"       [2025-03-19 Wed 16:29]
 Problem: kcats doesn't speak http or https or various other protocols
 and formats, but rust does. We want to be able to use the complicated
 bits of rust, but let kcats decide how to combine them.
@@ -14159,9 +14633,7 @@ CREATE INDEX idx_valuestring ON EAV (ValueString);
 
 #+RESULTS:
 #+begin_src kcats
-[[[Entity #b64 "oGAP/g0nSc6LRwQJJti3HA=="]
-  [Value "Butters"]
-  [Attribute name]]]
+[[":attr" name]] "select * from EAV where Attribute=:attr;"
 #+end_src
 
 *** Implementation and experiments
@@ -14203,17 +14675,17 @@ we need to choose somehow. Variables that are only used in one place
      from EAV as c1
      join EAV as c2 ON c1.entity = c2.entity AND c1.attribute = \"w|subjects\" AND c1.value = \"w|adventure\" AND c2.attribute = \"w|title\"
      join EAV as c3 ON c1.entity = c3.entity AND c3.attribute = \"w|author-last\" 
-   " database 
+   " [] database 
 #+end_src
 
 #+RESULTS:
 #+begin_src kcats
-[[[title "The Lord of the Rings"]
-  [author "Tolkien"]]
- [[title "Adventures of Huckleberry Finn"]
-  [author "Twain"]]
- [[title "Don Quixote"]
-  [author "Cervantes"]]]
+[[[author "Tolkien"]
+  [title "The Lord of the Rings"]]
+ [[author "Twain"]
+  [title "Adventures of Huckleberry Finn"]]
+ [[author "Cervantes"]
+  [title "Don Quixote"]]]
 #+end_src
 
 #+begin_src kcats
@@ -14224,22 +14696,22 @@ we need to choose somehow. Variables that are only used in one place
   [authorName title]
 #+end_src
 
+#+RESULTS:
+#+begin_src kcats
+t
+#+end_src
+
 #+begin_src kcats
 "select c4.value, c2.value
  from EAV as c1 
  join EAV as c2 ON c1.entity = c2.entity AND c2.attribute = \"w|title\" AND c1.attribute = \"w|author\"
  join EAV as c3 ON c1.value = c3.entity AND c3.attribute = \"w|birthYear\" AND c3.value = 1945
- join EAV as c4 ON c1.value = c4.entity AND c4.attribute = \"w|name\"" database
+ join EAV as c4 ON c1.value = c4.entity AND c4.attribute = \"w|name\"" [] database
 #+end_src
 
 #+RESULTS:
 #+begin_src kcats
-[[unwound [database]]
- [asked [consume]]
- [reason "not enough items on stack"]
- [type error]
- [handled yes]]
-"select c4.value, c2.value\n from EAV as c1 \n join EAV as c2 ON c1.entity = c2.entity AND c2.attribute = \"w|title\" AND c1.attribute = \"w|author\"\n join EAV as c3 ON c1.value = c3.entity AND c3.attribute = \"w|birthYear\" AND c3.value = 1945\n join EAV as c4 ON c1.value = c4.entity AND c4.attribute = \"w|name\""
+🔳
 #+end_src
 
 Let's copy the input/output here:
@@ -15001,6 +15473,7 @@ We need to rewrite the link-finding logic so that it does everything in one pass
  [author? [value 3]]]
 #+end_src
 
+
 *** Tests database module
 #+begin_src kcats
   dictionary [debug-step] [decache inscribe] step 
@@ -15102,6 +15575,169 @@ write unnest-envs, so we can execute nested envs serially
  [resolver []]
  [stack []]]
 []
+#+end_src
+
+*** Rewriting query builder
+We need to rewrite in the updated kcats, and also deal with the performance issues of link finding.
+
+So here's the old definition, we'll update one function at a time (hopefully remembering what each did):
+
+#+begin_src kcats
+  [[]] []
+  [[fork [[▶️] 🚜]]
+   [triangle [[🔳 [[📤] 🪄 🔀 [[📮] 🛡️ ⚓ 🔀 pair] bail] collect] •🛡️]]
+   [indexed-as-property [🔀 indexed
+                         [🍫 ⚓ assign] 🚜 •🗑️]]
+   [join-all [[first empty] 🛡️ 🔀 [🔗] 🪜]]
+   [selectkeys [set [1️⃣ [first] 🐋 contains?] 🎒 🧲]]
+   [invert [[reverse] 🚜 association]]
+
+   ;; datalog variables
+   [variable? [[[word?]
+                [string last \? =]] [▶️] 💯]]
+   [variable= [[[pair [variable?] 💯] [=]] [▶️] 💯]] 
+
+   ;; datalog constraints
+   [slots [[entity attribute value]]]
+   [slot-combos [slots [slots [pair] 🚜] 🚜 join-all]]
+   [constraint [🍫 slots reverse label]] 
+
+   ;; links between datalog constraints
+   [links [slot-combos
+           [[🎁] 🚜 🍫 •🔀 
+            [[[🔍] 💉] both] pairwise 
+            variable=]
+           🧲    
+           [🍫 pair ⚓ pair
+            [[index] 🔍] 🚜 🔀 zip]
+           🚜]]
+   [all-links [🔳 ⚓
+               [[[[index] 🔍] 🛡️] both ;; lookup the indices of both constraints
+                [•🔀] 🪄 ⚓ ;; move the indices under the constraints
+                [links] •🛡️
+                🔀 [•🗑️ •🗑️ 🔗] 🪄] 
+
+               🪜 🗑️]]
+   [format-link [[🔗] 💉 🍫 [string] 🚜
+                 "c{0}.{1} = c{2}.{3}" 🔀 format]] 
+
+   ;; formatting pieces of query data into text
+   [anded-together [" AND " interpose join-all]]
+
+   ;; where clause data processing
+   [where-data [[[index] 🔍] 🛡️ 🔀 
+                [[[second variable? ☯️]
+                  [first [index] 🍫 = ☯️]] [▶️] 💯] 🧲 
+                [🔀 prepend] 🚜 •🗑️]]
+   [format-where [[string] 🚜 
+                  "c{0}.{1} = :c{0}{1}" 🔀 format]]
+   [make-where [first [where] 🔍 anded-together]]
+   [format-join [[[[on] 🔍]
+                  [[where] 🔍]
+                  [[index] 🔍 string]] [▶️] 🚜
+                 [🔗 anded-together] 💉 
+                 "JOIN EAV c{1} ON {0}" 🔀 format]]
+   [make-query [rest [[on]
+                      [[format-link] 🚜] update
+                      [format-join] 🛡️ [🔗] 🔀 assign] 🚜]]
+
+   ;; SQL parameters for rusqlite
+   [param-name [[string] 🚜 ":c{0}{1}" 🔀 format]]
+   [extract-params [🔳 association 🔀 [[params] 🔍 🔗] 🪜]]
+
+
+   ;; SELECT clause
+   [wordval? [second word?]]
+   [invert [[reverse] 🚜 association]]
+   [validate [[[second ☯️]
+               [first "All selected query variables must appear somewhere in constraints"
+                [reason variable] label fail]
+               when] 🚜]]
+   [select-data [🔀
+                 [[slots selectkeys invert] 🛡️
+                  [wordval?] 🧲 🔗 association] 🚜
+                 🔀
+                 [[[[index 1️⃣] selectkeys] 🎒 ;; make the program to cut down 
+                   🚜 
+                   [📏 2 =] 🧲 first [second] 🚜
+                   [first number?] [reverse] when] ;; items are in random order due to coming from association, fix the order
+                  🚜]
+                 🛡️ ••🗑️ zip
+                 validate]]
+
+   ;; query 
+   [extract-data [[[[🍫 all-links]
+                    [first where-data   ; [🔗] 💉 🍫
+                     ;; build the query param 🚜
+                     [[🔳 🔀
+                       [[param-name] 🛡️ [last] 🪄 🎁 🔀 assign]
+                       🪜]
+                      ;; build the actual query where clauses
+                      [[format-where] 🚜]]
+                     fork]]
+                   fork] 🛡️
+                  ;; combine extracted items
+
+                  [first] 🪄 ;; keep the original constraint to add properties to
+                  🍫 🍫 [where params on] label 🔗]]
+   [format-select [[🍫 🔀
+                    string butlast ;; remove the ? from the variable name for result column
+                    📮
+                    [string] 🚜 %
+                    "c{1}.{0} as {2}" 🔀 format] 🚜 ", " interpose join-all]]]
+
+  [🔀
+     ;; expand all combinations of constraints
+     [constraint] 🚜
+     ;;🔳 prepend ;; an empty constraint to represent the orignal EAV table we're joining with
+     [index] indexed-as-property
+     triangle
+     ;; for each pair of constraints, build the "ON" clause data for the JOIN
+     [extract-data] 🚜
+     [[extract-params]
+      [make-query]
+      [make-where]
+      [🔀 select-data]] fork 
+     •🗑️ ;; don't need original anymore
+     🍫 🛟
+     [[🔗] 🔍] 🚜  
+     🔀 format-select 
+     [" " interpose join-all] 🪄 triplet reverse
+     "SELECT {0} from EAV as c0 {1} WHERE {2}" 🔀 format
+     🔀 ••🗑️]
+  let ▶️ 
+
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[actual [[📤 🔀 [🔗] 👥 •🪄 🪜 ▶️]
+          🔳 ↔️]]
+ [asked [string]]
+ [handled 🔳]
+ [reason "type mismatch"]
+ [type error]
+ [unwound [format 🔀 ••🗑️]]]
+[[[📤 🔀 [🔗] 👥 •🪄 🪜 ▶️]
+  🔳 ↔️]
+ [[📤 🔀 [🔗] 👥 •🪄 🪜 ▶️]
+  🔳 ↔️]
+ [[🔀 [🍫 🔀 string butlast 📮 [string] 🚜 % "c{1}.{0} as {2}" 🔀 format]
+   •🛡️ 🪄 🔀 📮]
+  🪜 🔳]]
+"SELECT {0} from EAV as c0 {1} WHERE {2}" [📸 🧦 [first empty]
+                                           🪄 🧦 first]
+" " 🔳 [📸 🧦 [first empty]
+       🪄 🧦 first]
+", " 🔳 🔳 [[🔀 [[🔗] 🔍]
+           •🛡️ 🪄 🔀 📮]
+          🪜 🔳 ⚓ ▶️]
+▶️ ⚓ 🪜 [🔀 [▶️] •🛡️ 🪄 🔀 📮] [[🔀 [extract-data] •🛡️ 🪄 🔀 📮] 🪜 🔳 ⚓ ▶️] [📸 🧦 [🔳 [[📤] 🪄
+                                                                           🔀 [[📮] 🛡️ ⚓ 🔀 pair] bail]
+                                                                        collect]
+                                                                   🪄 🧦 •🗑️ first]
+[[🔀 [🍫 ⚓ assign] •🛡️ 🪄 🔀 📮] 🪜 🔳 ⚓ ▶️] [index] [🔳]
+🔳
 #+end_src
 
 ** TODO Reduce CPU cost of `shield` :optimization:
@@ -15508,7 +16144,8 @@ Will be an axiom word.
 
 ** INPROGRESS Emoji
 - State "INPROGRESS" from "TODO"       [2024-12-04 Wed 20:16]
-*** INPROGRESS Choose emoji aliases for combinators
+*** DONE Choose emoji aliases for combinators
+- State "DONE"       from "INPROGRESS" [2025-03-18 Tue 20:45]
 - State "INPROGRESS" from "TODO"       [2024-11-09 Sat 22:03]
 
   Choices:
@@ -15855,8 +16492,9 @@ Will be an axiom word.
 I think there's a lot of merit for =shielded=, but I don't think the
 same value applies to =dip=. I think generally you want to execute it
 immediately.
-*** INPROGRESS Emit emoji for empty list
+*** DONE Emit emoji for empty list
 
+- State "DONE"       from "INPROGRESS" [2025-03-18 Tue 20:45]
 - State "INPROGRESS" from "TODO"       [2024-12-04 Wed 20:17]
 ** DONE Change yes to nonempty container
 - State "DONE"       from "TODO"       [2024-12-03 Tue 19:21]
@@ -15892,10 +16530,12 @@ Can also add words =anything= and =nothing= as aliases for these, that we
 can use in default branch for =decide= and other places.
 
 Also consider ✅ for 'yes'
-** INPROGRESS Combinators
+** DONE Combinators
+- State "DONE"       from "INPROGRESS" [2025-03-19 Wed 16:28]
 - State "INPROGRESS" from "TODO"       [2024-11-13 Wed 09:11]
 
-*** TODO Discussion
+*** DONE Discussion
+- State "DONE"       from "TODO"       [2025-03-19 Wed 16:28]
 Let's think about what the language would look like if combinators
 that take programs didn't actually execute them but rather spit out
 new programs. Here's =looped=:
@@ -16371,7 +17011,8 @@ redefine while in terms of recur?
 0 1 2 3
 #+end_src
 
-*** INPROGRESS Update generators to compose more naturally
+*** CANCELED Update generators to compose more naturally
+- State "CANCELED"   from "INPROGRESS" [2025-03-19 Wed 16:28]
 - State "INPROGRESS" from "TODO"       [2024-11-16 Sat 18:52]
 
  The problem previously was that generators left a bunch of machinery
@@ -16737,7 +17378,8 @@ body 2nd.
 ✅ 12
 #+end_src
 
-*** INPROGRESS  Recover
+*** DONE Recover
+- State "DONE"       from "INPROGRESS" [2025-03-19 Wed 16:27]
 - State "INPROGRESS" from "TODO"       [2024-11-23 Sat 19:56]
 
   #+begin_src kcats
@@ -16790,7 +17432,8 @@ body 2nd.
 Most of these no longer matter since they're emojis but there are some english stragglers.
 ** DONE Support 'doc' field of dictionary entries
 - State "DONE"       from "TODO"       [2024-12-03 Tue 19:08]
-** INPROGRESS Back to stacking generators with optional encapsulation
+** DONE Back to stacking generators with optional encapsulation
+- State "DONE"       from "INPROGRESS" [2025-03-19 Wed 16:27]
 - State "INPROGRESS" from "TODO"       [2024-12-11 Wed 20:12]
 *** INPROGRESS See if we can wrap state with generator
 
@@ -17261,7 +17904,8 @@ deprecate?
 #+begin_src kcats
 "defghijklm"
 #+end_src
-** TODO max-by min-by
+** DONE max-by min-by
+- State "DONE"       from "TODO"       [2025-03-19 Wed 16:26]
 #+begin_src kcats
   [[price 25] [name bar]] [[price 15] [name foo]]
   [[price] lookup]
@@ -17274,3 +17918,243 @@ deprecate?
 [[price 25]
  [name bar]]
 #+end_src
+** DONE Fix panic on network connection refused
+- State "DONE"       from "INPROGRESS" [2025-03-17 Mon 19:35]
+- State "INPROGRESS" from "TODO"       [2025-03-17 Mon 19:04]
+Running kcats...
+
+thread 'main' panicked at src/types/container/pipe/net.rs:156:27:
+called `Result::unwrap()` on an `Err` value: Os { code: 111, kind: ConnectionRefused, message: "Connection refused" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+--- Process exited abnormally with code 101 ---
+** DONE Fix the way serversocket and other pipes get printed
+- State "DONE"       from "INPROGRESS" [2025-03-19 Wed 16:26]
+- State "INPROGRESS" from "TODO"       [2025-03-17 Mon 19:58]
+currently =[[serversocket todo: fix serversocket local addr async issue] [type pipe]]=.
+
+#+begin_src kcats
+"127.0.0.1" 8899 serversocket 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[address 127.0.0.1]
+ [pipe-type serversocket]
+ [port 8899]
+ [produces socket]
+ [type pipe]]
+#+end_src
+
+#+begin_src kcats
+  [[type pipe]
+   [destination [[type file]
+                 [path "/foo/bar"]]]
+   [in [[type bytes]]]
+   [out [[type bytes]]]]
+
+  [[type pipe]
+   [destination [[type serversocket]
+                 [port 9999]]]
+   [out [[type socket]]]]
+
+#+end_src
+
+#+begin_src kcats
+  handoff 👥 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[capacity 0]
+ [endpoint [[handoff 0]]]
+ [in item]
+ [out item]
+ [receivers 2]
+ [senders 2]
+ [type pipe]]
+[[capacity 0]
+ [endpoint [[handoff 0]]]
+ [in item]
+ [out item]
+ [receivers 2]
+ [senders 2]
+ [type pipe]]
+#+end_src
+
+#+begin_src kcats
+  1000 timer 📤 🗑️ 📤 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+#+end_src
+
+#+begin_src kcats
+  timestamps 📤
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+1742385892702 [[endpoint systemtime]
+               [out [[type integer]
+                     [units milliseconds]]]
+               [type pipe]]
+#+end_src
+
+#+begin_src kcats
+standard
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[peer standard]
+ [type tunnel]]
+#+end_src
+** INPROGRESS Pattern matching and destructuring
+- State "INPROGRESS" from "TODO"       [2025-04-02 Wed 19:50]
+Pattern match is fairly simple if you specify paths:
+
+#+begin_src kcats
+  [[foo [[bar [[splook zoop]]]]]
+   [baz [item1 item2 item3]]
+   [quux [[bloop toop] [foop gloop]]]]
+  [[foo bar] [baz 2] [quux foop]] [🔍] 🚜 ▶️
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[[splook zoop]] item3 gloop] [[foo [[bar [[splook zoop]]]]]
+                               [baz [item1 item2 item3]]
+                               [quux [[bloop toop]
+                                      [foop gloop]]]]
+#+end_src
+
+the trick is specifying an actual pattern.
+
+#+begin_src kcats
+  [[foo [[bar [[splook zoop]]]]]
+   [baz [item1 item2 item3]]
+   [quux [[bloop toop] [foop gloop]]]]
+  [[foo [[bar 1️⃣]]]
+   [baz [_ _ 2️⃣]]
+   [quux [[foop 3️⃣]]]]
+  match
+#+end_src
+
+#+begin_src kcats
+  [[foo bar]
+   [baz quux]
+   [goop [[a b]
+          [c d]]]]
+  [[foo thing?]
+   [goop [[a bee?]]]
+   [barx other?]]
+  unpack
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[bee? b]
+ [thing? bar]]
+#+end_src
+
+#+begin_src kcats
+[a b c] [_ b 1️⃣] unpack
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[1️⃣ c]]
+#+end_src
+
+
+#+begin_src kcats
+  [anything
+   [foo [this is a] 12]
+   [5 [this is b] 5]
+   []
+   thisisc]
+  [_
+   [_ 📨a 12]
+   [5 📨b 5]
+   []
+   📨c] 
+  unpack
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[a [this is a]]
+ [b [this is b]]
+ [c thisisc]]
+#+end_src
+
+#+begin_src kcats
+  [[a [[b 12]
+       [c 15]]]
+   [d [[e []]
+       [f [5 4 3 2 1]]]]] assocify
+  ;[[a 📨a]
+  ; [d [[f [_ 1️⃣ 📨b]]]]] 
+ ; ⛏️
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+  [[a [[b 12]
+       [c 15]]]
+   [d [[e 🔳]
+       [f [5 4 3 2 1]]]]] [a] 🍫 get type
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+list
+#+end_src
+
+** INPROGRESS Match semantics
+#+begin_src kcats
+
+      [[sqlexpr [[[[[1️⃣ 2️⃣] 💯] [[sqlexpr] 🚜 ▶️ "{} and {}" 🔀 format]]
+                  [[[1️⃣ 2️⃣] 📣] [[sqlexpr] 🚜 ▶️ "{} or {}" 🔀 format]]
+                  [[1️⃣ >] ["> {}" 🔀 format]]
+                  [[1️⃣ <] ["< {}" 🔀 format]]]
+
+                 ;; for each entry convert pred to a destructure
+                 [[0] [[1️⃣ [⛏️ 🗑️] [🗑️ []] 🩹 ▶️] 🎒] update] 🚜 ▶️ 
+                 decide]]]
+      [4 [[[6 >] [10 <]] 💯] sqlexpr]
+      ;[4 [6 >] sqlexpr]
+      let ▶️ 
+
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+"> 6 and < 10" [[[6 >]
+                 [10 <]]
+                💯]
+4
+#+end_src
+
+#+begin_src kcats
+[[[6 >] [10 <]] 💯] [[1️⃣ 2️⃣] 💯]  ⛏️ 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+🔳 [[6 >]
+   [10 <]]
+#+end_src
+
+#+begin_src kcats
+[[a b]] association type
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+
+#+end_src
+

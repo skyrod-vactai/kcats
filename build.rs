@@ -22,16 +22,16 @@ impl std::error::Error for MyError {}
 
 fn main() -> Result<(), Box<dyn Error>> {
     // Print the current directory for debugging
-    println!("cargo:warning=Current dir: {:?}", std::env::current_dir()?);
+    println!("Current dir: {:?}", std::env::current_dir()?);
 
     // Create a fallback cache directory in the target directory
     let cache_dir = if let Some(project_dirs) = ProjectDirs::from("org", "skyrod", "kcats") {
         let dir = project_dirs.data_dir().join("cache");
-        println!("cargo:warning=Using project cache dir: {:?}", dir);
+        println!("Using project cache dir: {:?}", dir);
         dir
     } else {
         let dir = Path::new("target").join("build_cache");
-        println!("cargo:warning=Using fallback cache dir: {:?}", dir);
+        println!("Using fallback cache dir: {:?}", dir);
         dir
     };
 
@@ -44,8 +44,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let src_stdlib_path = Path::new(src);
 
     // Add debug information
-    println!("cargo:warning=Stdlib path: {:?}", src_stdlib_path);
-    println!("cargo:warning=Stdlib exists: {}", src_stdlib_path.exists());
+    println!("Stdlib path: {:?}", src_stdlib_path);
+    println!("Stdlib exists: {}", src_stdlib_path.exists());
 
     if src_stdlib_path.exists() && src_stdlib_path.is_dir() {
         let entries = fs::read_dir(src_stdlib_path)?;
@@ -54,7 +54,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let path = entry.path();
             if path.is_file() && path.file_name().is_some() {
                 let module_name = path.file_stem().unwrap().to_str().unwrap();
-                println!("cargo:warning=Processing module: {}", module_name);
+                println!("cargo:print=Processing module: {}", module_name);
                 cache.put_from_path(&path, Some(module_name.to_string()))?;
             }
         }
