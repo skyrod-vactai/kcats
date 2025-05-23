@@ -1,5 +1,6 @@
 use cache::cache;
 use directories::ProjectDirs;
+use edn_format;
 use std::error::Error;
 use std::fs::{self};
 use std::path::Path;
@@ -53,9 +54,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_file() && path.file_name().is_some() {
+                let formatted = std::fs::read_to_string(path.clone())?;
+
                 let module_name = path.file_stem().unwrap().to_str().unwrap();
                 println!("cargo:print=Processing module: {}", module_name);
-                cache.put_from_path(&path, Some(module_name.to_string()))?;
+                let canonical = edn_format::canonicalize(formatted)?;
+                cache.put(
+                    &canonical.as_bytes().to_vec(),
+                    Some(module_name.to_string()),
+                )?;
+                //cache.put_from_path(&path, Some(module_name.to_string()))?;
             }
         }
         Ok(())

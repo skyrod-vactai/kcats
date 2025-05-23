@@ -1504,6 +1504,20 @@ pub fn emit_str(value: &Value) -> String {
     format!("{}", value)
 }
 
+/// Canonicalize the EDN string, removing indentation, whitespace and
+/// comments.
+pub fn canonicalize(s: String) -> Result<String, ParserError> {
+    let parser = Parser::from_iter(s.chars(), ParserOptions::default());
+    Ok(parser
+        .map(|r| match r {
+            Ok(v) => Ok(emit_str(&v)),
+            Err(e) => Err(e),
+        })
+        .collect::<Result<Vec<String>, ParserError>>()?
+        .into_iter()
+        .join(" "))
+}
+
 /// Parser which can yield multiple forms from a single iterator of
 /// chars
 pub struct Parser<Iter: Iterator<Item = char>> {
