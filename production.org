@@ -6103,7 +6103,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("remove", Box::leak(Box::new(f_stack2(remove)))),
           //("recur", Box::leak(Box::new(recur))),
           ("resolve", Box::leak(Box::new(resolve))),
-          ("resume", Box::leak(Box::new(identity))),
           ("reverse", Box::leak(Box::new(f_stack1(reverse)))),
           ("round", Box::leak(Box::new(f_stack1(round)))),
           ("second", Box::leak(Box::new(f_stack1(second)))),
@@ -6282,26 +6281,23 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn put(mut env: Environment) -> Future<Environment> {
-      let j = env.pop();
-      let i = env.pop();
-      let i2 = i.clone();
-      let pr = coll::Receptacle::try_derive(i);
-      match pr {
-          Ok(p) => Box::pin(p.put(j).map(|f| {
-              match f {
-                  Ok(p) => {
-                      env.pop_prog();
-                      env.push(Item::Receptacle(p))
-                  }
-                  Err(e) => {
-                      env.push(i2);
-                      env.push(e)
-                  }
-              };
-              env
-          })),
+      match coll::Receptacle::try_derive(env.stack.get(1).unwrap()) {
+          Ok(p) => {
+              let i = env.tos().cloned().unwrap();
+              Box::pin(p.put(i).map(|f| {
+                  match f {
+                      Ok(p) => {
+                          env.pop_prog();
+                          env.pop(); // i
+                          env.pop(); // old receptacle
+                          env.push(Item::Receptacle(p))
+                      }
+                      Err(e) => env.push(e),
+                  };
+                  env
+              }))
+          }
           Err(e) => {
-              env.push(i2);
               env.push(e);
               env.fit()
           }
@@ -6466,9 +6462,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn unwrap(mut env: Environment) -> Future<Environment> {
       //println!("Unwrap: {:?} {:?}", env.stack, env.program.stacktrace());
-      match coll::List::try_derive(env.pop()) {
+      match coll::List::try_derive(env.tos().unwrap()) {
           Ok(l) => {
               env.pop_prog();
+              env.pop();
               for item in l.iter().cloned() {
                   env.push(item);
               }
@@ -6900,6 +6897,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       )))
   }
 
+  /// Inner function of the interpreter, each call to this function
+  /// advances the [Environment] one step of execution.
   pub fn eval_step(mut env: Environment) -> Future<Environment> {
       //println!("{:?}", env.stack);
       //println!("Dictionary size: {}", env.dictionary.len());
@@ -7014,7 +7013,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   fn string(i: Item) -> Result<String, Error> {
-      match coll::Sized::try_derive(i.clone()) {
+      match coll::Sized::try_derive(&i) {
           Ok(s) => {
               if s.is_empty() {
                   Ok("".to_string())
@@ -7124,11 +7123,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn evaluate(mut env: Environment) -> Future<Environment> {
-      let tos = env.pop();
-      let inner_env = Environment::try_derive(tos);
-      match inner_env {
+      match Environment::try_derive(env.tos().unwrap()) {
           Ok(inner) => Box::pin(eval(inner).map(|inner_done| {
               env.pop_prog();
+              env.pop();
               env.push(inner_done);
               env
           })),
@@ -7137,11 +7135,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               env.fit()
           }
       }
-  }
-
-  pub fn identity(mut env: Environment) -> Future<Environment> {
-      env.pop_prog();
-      env.fit()
   }
 
   pub fn dictionary(mut env: Environment) -> Future<Environment> {
