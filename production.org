@@ -617,6 +617,20 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  /// Try to convert any reference to Item to T, and don't destroy the
+  /// original in case it fails (so the caller could try again if
+  /// needed.)
+  impl<T: TryDerive<Item, Error = E>, E> TryDerive<&Item> for T
+  where
+      T: TryDerive<Item>,
+      E: Fit<Error>,
+  {
+      type Error = Error;
+      fn try_derive(value: &Item) -> Result<Self, Self::Error> {
+          T::try_derive(value.clone()).map_err(Fit::fit)
+      }
+  }
+
   /// A generic impl to convert an Item to a vec of the given
   /// type. Assumes the Item is some sort of container and converts each
   /// item in the container.
@@ -5753,8 +5767,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       f: fn(SpecInput) -> Result<Output, E>,
   ) -> impl Fn(Environment) -> Future<Environment>
   where
-      SpecInput: TryDerive<Item> + Fit<Item> + Clone,
-      SpecInput::Error: Fit<Error>,
+      SpecInput: for<'a> TryDerive<&'a Item> + Fit<Item> + Clone,
+      for<'a> <SpecInput as TryDerive<&'a Item>>::Error: Fit<Error>,
       E: Fit<Error>,
       Output: Fit<Item>,
   {
@@ -5762,7 +5776,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           let x = env
               .tos()
               .ok_or_else(Error::stack_underflow)
-              .and_then(|x| SpecInput::try_derive(x.clone()).map_err(Fit::fit));
+              .and_then(|x| SpecInput::try_derive(x).map_err(Fit::fit));
           match x {
               Ok(i) => {
                   let res = f(i.clone());
@@ -5793,10 +5807,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       f: fn(SpecInputY, SpecInputX) -> Result<Output, E>,
   ) -> impl Fn(Environment) -> Future<Environment>
   where
-      SpecInputX: TryDerive<Item> + Fit<Item> + Clone,
-      SpecInputX::Error: Fit<Error>,
-      SpecInputY: TryDerive<Item> + Fit<Item> + Clone,
-      SpecInputY::Error: Fit<Error>,
+      SpecInputX: for<'a> TryDerive<&'a Item> + Fit<Item> + Clone,
+      for<'a> <SpecInputX as TryDerive<&'a Item>>::Error: Fit<Error>,
+      SpecInputY: for<'b> TryDerive<&'b Item> + Fit<Item> + Clone,
+      for<'b> <SpecInputY as TryDerive<&'b Item>>::Error: Fit<Error>,
       E: Fit<Error>,
       Output: Fit<Item>,
   {
@@ -5804,12 +5818,12 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           let x = env
               .tos()
               .ok_or_else(Error::stack_underflow)
-              .and_then(|x| SpecInputX::try_derive(x.clone()).map_err(Fit::fit));
+              .and_then(|x| SpecInputX::try_derive(x).map_err(Fit::fit));
           let y = env
               .stack
               .get(1)
               .ok_or_else(Error::stack_underflow)
-              .and_then(|y| SpecInputY::try_derive(y.clone()).map_err(Fit::fit));
+              .and_then(|y| SpecInputY::try_derive(y).map_err(Fit::fit));
 
           match (x, y) {
               (Ok(x), Ok(y)) => {
@@ -5844,12 +5858,14 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       f: fn(SpecInputZ, SpecInputY, SpecInputX) -> Result<Output, E>,
   ) -> impl Fn(Environment) -> Future<Environment>
   where
-      SpecInputX: TryDerive<Item>,
-      SpecInputX::Error: Fit<Error>,
-      SpecInputY: TryDerive<Item>,
-      SpecInputY::Error: Fit<Error>,
-      SpecInputZ: TryDerive<Item>,
-      SpecInputZ::Error: Fit<Error>,
+      SpecInputX: for<'a> TryDerive<&'a Item> + Fit<Item> + Clone,
+      for<'a> <SpecInputX as TryDerive<&'a Item>>::Error: Fit<Error>,
+      SpecInputY: for<'b> TryDerive<&'b Item> + Fit<Item> + Clone,
+      for<'b> <SpecInputY as TryDerive<&'b Item>>::Error: Fit<Error>,
+      SpecInputZ: for<'c> TryDerive<&'c Item> + Fit<Item> + Clone,
+      for<'c> <SpecInputZ as TryDerive<&'c Item>>::Error: Fit<Error>,
+      E: Fit<Error>,
+
       E: Fit<Error>,
       Output: Fit<Item>,
   {
@@ -5857,17 +5873,17 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           let x = env
               .tos()
               .ok_or_else(Error::stack_underflow)
-              .and_then(|x| SpecInputX::try_derive(x.clone()).map_err(Fit::fit));
+              .and_then(|x| SpecInputX::try_derive(x).map_err(Fit::fit));
           let y = env
               .stack
               .get(1)
               .ok_or_else(Error::stack_underflow)
-              .and_then(|y| SpecInputY::try_derive(y.clone()).map_err(Fit::fit));
+              .and_then(|y| SpecInputY::try_derive(y).map_err(Fit::fit));
           let z = env
               .stack
               .get(2)
               .ok_or_else(Error::stack_underflow)
-              .and_then(|z| SpecInputZ::try_derive(z.clone()).map_err(Fit::fit));
+              .and_then(|z| SpecInputZ::try_derive(z).map_err(Fit::fit));
           match (x, y, z) {
               (Ok(x), Ok(y), Ok(z)) => {
                   let res = f(z, y, x);
@@ -6474,8 +6490,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn dip(mut env: Environment) -> Future<Environment> {
-      match coll::List::try_derive(env.pop()) {
+      match coll::List::try_derive(env.tos().unwrap()) {
           Ok(program) => {
+              env.pop();
               let mut item = env.pop();
               env.pop_prog();
               dip_quote(&mut item);
@@ -6490,8 +6507,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn dipdown(mut env: Environment) -> Future<Environment> {
-      match coll::List::try_derive(env.pop()) {
+      match coll::List::try_derive(env.tos().unwrap()) {
           Ok(program) => {
+              env.pop();
               let mut item1 = env.pop();
               let mut item2 = env.pop();
               env.program.pop();
@@ -6507,20 +6525,16 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn take(mut env: Environment) -> Future<Environment> {
       // TODO: handle Nothing case
-      let i = env.pop();
-      let i2 = i.clone();
-      let r = coll::Dispenser::try_derive(i);
-      match r {
+      match coll::Dispenser::try_derive(env.tos().unwrap()) {
           Ok(d) => Box::pin(async move {
               let (i, c) = d.take().await;
               env.pop_prog();
-
+              env.pop();
               env.push(c);
               env.push(coll::result_to_option(i).unwrap_or_default());
               env
           }),
           Err(e) => {
-              env.push(i2);
               env.push(e);
               env.fit()
           }
@@ -6528,19 +6542,15 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn pop(mut env: Environment) -> Future<Environment> {
-      let i = env.pop();
-      let i2 = i.clone();
-      let s = coll::Sized::try_derive(i);
-
-      match s {
+      match coll::Sized::try_derive(env.tos().unwrap()) {
           Ok(it) => {
               let (c, i) = it.pop();
               env.pop_prog();
+              env.pop();
               env.push(c);
               env.push(i.unwrap_or_default());
           }
           Err(e) => {
-              env.push(i2);
               env.push(e);
           }
       }
@@ -6557,11 +6567,13 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn branch(mut env: Environment) -> Future<Environment> {
       match (
-          coll::List::try_derive(env.pop()),
-          coll::List::try_derive(env.pop()),
+          coll::List::try_derive(env.tos().unwrap()),
+          coll::List::try_derive(env.stack.get(1).unwrap()),
       ) {
           (Ok(false_branch), Ok(true_branch)) => {
               env.pop_prog();
+              env.pop();
+              env.pop();
               let b = env.tos().unwrap();
 
               let selected_branch = if is_truthy(b) {
@@ -6585,9 +6597,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       Box::pin(async move {
           let (r, dispenser) = dispenser.take().await;
           if let Some(litem) = coll::result_to_option(r) {
-              // prepare the next iteration, even if the iterator is now
-              // empty. step is still the next instruction, so we don't
-              // pop it off.
+              // prepare the next iteration. First we execute p, then we
+              // push the remaining dispenser and a new copy of p. Do
+              // this even if the dispenser is currently empty. step is
+              // still the next instruction, so we don't pop it off.
               env.program.prepend(list![dispenser, p.clone()]);
               env.program.prepend(p);
               env.push(litem);
@@ -15774,6 +15787,9 @@ construct the param name so that it's unique.
 #+begin_src kcats
 "1_value_and_0"
 #+end_src
+** INPROGRESS tryderive on references
+- State "INPROGRESS" from "TODO"       [2025-06-06 Fri 15:48]
+then we don't have to destroy the item, and can try to convert again.
 ** INPROGRESS module loading improvements
 - State "INPROGRESS" from "TODO"       [2025-06-03 Tue 19:39]
   #+begin_src kcats
