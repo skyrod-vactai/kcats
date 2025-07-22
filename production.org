@@ -4333,7 +4333,6 @@ internally, to keep track of things like the stack, program, lists etc.
 
   use once_cell::sync::Lazy;
   use std::future;
-  use std::ops::Range;
 
   /// A struct to hold the state of an executing kcats program. The
   /// `stack` is the data being manipulated, the `program` is program
@@ -4522,19 +4521,39 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
-      /// Returns an error if the stack doesn't match the given input spec.
+      /// Returns an error if the stack doesn't match the given input
+      /// spec. Gives helpful feedback where possible
       pub fn check_input_spec(&self, specs: &dict::StackSpec) -> Result<(), Error> {
+          fn all_ok(res: &Vec<(&dict::SpecElement, &Item, bool)>) -> bool {
+              res.iter().map(|(_, _, is_pass)| is_pass).all(move |x| *x)
+          }
           self.check_stack_depth(specs.len())?;
-          let indexes = Range {
-              start: 0,
-              end: specs.len(),
-          };
 
-          indexes.into_iter().try_for_each(|i| {
-              let item = self.stack.get(i).unwrap();
-              let spec = specs.get(i).unwrap();
-              check_type(item, &spec.elemtype)
-          })
+          let res: Vec<_> = specs
+              .iter()
+              .enumerate()
+              .map(|(i, spec)| {
+                  let item = self.stack.get(i).unwrap();
+                  (spec, item, check_type(item, &spec.elemtype))
+              })
+              .collect();
+
+          if all_ok(&res) {
+              Ok(())
+          } else {
+              //create an item to use as 'actual' in the error
+              let actual: Vec<Item> = res
+                  .into_iter()
+                  .map(|(spec, item, pass)| {
+                      Item::derive(list!(spec.clone(), list!(pass, item.clone())))
+                  })
+                  .collect();
+              {
+                  //println!("Type check failed! wanted {} got {:?}", w.data, i);
+
+                  Err(Error::expected("match-input-spec?", actual))
+              }
+          }
       }
 
       pub fn is_finished(&self) -> bool {
@@ -4621,31 +4640,31 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  /// Returns an error if the [Item] is not of the type specified by
+  /// Returns false if the [Item] is not of the type specified by
   /// [Word] `w`. This allows specs to have their own little type
   /// hierarchy, eg, `integer` is a `number`, `list` is a `sized` etc.
-  fn check_type(i: &Item, w: &Word) -> Result<(), Error> {
+  fn check_type(i: &Item, w: &Word) -> bool {
       //println!("Check {:?} is {:?}", w, i);
       match (w, i) {
-          (w, _) if *w == *S_ITEM => Ok(()),
-          (w, Item::Dispenser(_) | Item::Receptacle(_)) if *w == *S_DISPENSER => Ok(()),
-          (w, Item::Receptacle(_) | Item::Dispenser(_)) if *w == *S_RECEPTACLE => Ok(()),
-          (w, Item::Number(Number::Int(_))) if *w == *S_INTEGER || *w == *S_NUMBER => Ok(()),
-          (w, Item::Number(Number::Float(_))) if *w == *S_FLOAT || *w == *S_NUMBER => Ok(()),
-          (w, Item::Char(_)) if *w == *S_CHAR => Ok(()),
+          (w, _) if *w == *S_ITEM => true,
+          (w, Item::Dispenser(_) | Item::Receptacle(_)) if *w == *S_DISPENSER => true,
+          (w, Item::Receptacle(_) | Item::Dispenser(_)) if *w == *S_RECEPTACLE => true,
+          (w, Item::Number(Number::Int(_))) if *w == *S_INTEGER || *w == *S_NUMBER => true,
+          (w, Item::Number(Number::Float(_))) if *w == *S_FLOAT || *w == *S_NUMBER => true,
+          (w, Item::Char(_)) if *w == *S_CHAR => true,
           // TODO: also handle cases where bytes/string is a list
           (
               w,
               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(_)))
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(_))),
-          ) if *w == *S_BYTES || *w == *S_ORDERED => Ok(()),
+          ) if *w == *S_BYTES || *w == *S_ORDERED => true,
 
           (
               w,
               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(_)))
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::String(_))),
-          ) if *w == *S_STRING => Ok(()),
-          (w, Item::Word(_)) if *w == *S_WORD => Ok(()),
+          ) if *w == *S_STRING => true,
+          (w, Item::Word(_)) if *w == *S_WORD => true,
 
           (
               w,
@@ -4653,7 +4672,7 @@ internally, to keep track of things like the stack, program, lists etc.
               | Item::Dispenser(coll::Dispenser::Tunnel(_))
               | Item::Receptacle(coll::Receptacle::Tunnel(_))
               | Item::Receptacle(coll::Receptacle::In(_)),
-          ) if *w == *S_PIPE => Ok(()),
+          ) if *w == *S_PIPE => true,
 
           (
               w,
@@ -4661,13 +4680,13 @@ internally, to keep track of things like the stack, program, lists etc.
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::List(_)))
               | Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Program(_)))
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Program(_))),
-          ) if *w == *S_LIST || *w == *S_PROGRAM => Ok(()),
+          ) if *w == *S_LIST || *w == *S_PROGRAM => true,
 
           (
               w,
               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(_)))
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(_))),
-          ) if *w == *S_ASSOC => Ok(()),
+          ) if *w == *S_ASSOC => true,
 
           (
               w,
@@ -4677,7 +4696,7 @@ internally, to keep track of things like the stack, program, lists etc.
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(
                   assoc::Associative::Error(_),
               ))),
-          ) if *w == *S_ERROR => Ok(()),
+          ) if *w == *S_ERROR => true,
 
           (
               w,
@@ -4687,13 +4706,13 @@ internally, to keep track of things like the stack, program, lists etc.
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(
                   assoc::Associative::Dictionary(_),
               ))),
-          ) if *w == *S_DICTIONARY => Ok(()),
+          ) if *w == *S_DICTIONARY => true,
 
           (
               w,
               Item::Dispenser(coll::Dispenser::Sized(_))
               | Item::Receptacle(coll::Receptacle::Sized(_)),
-          ) if *w == *S_SIZED || *w == *S_ORDERED => Ok(()),
+          ) if *w == *S_SIZED || *w == *S_ORDERED => true,
 
           (
               w,
@@ -4703,12 +4722,8 @@ internally, to keep track of things like the stack, program, lists etc.
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(
                   assoc::Associative::Env(_),
               ))),
-          ) if *w == *S_ENVIRONMENT => Ok(()),
-          (w, i) => {
-              //println!("Type check failed! wanted {} got {:?}", w.data, i);
-              let expected = format!("{}?", w.data);
-              Err(Error::expected(expected.as_str(), i.clone()))
-          }
+          ) if *w == *S_ENVIRONMENT => true,
+          (_, _) => false,
       }
   }
 
