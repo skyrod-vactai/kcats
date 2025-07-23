@@ -147,7 +147,8 @@
         ("while" "⏳")
         ("wrap" "🎁")
         ("nothing" "🔳")
-        ("yes" "✅")))
+        ("yes" "✅")
+        ("tag" "🏷️")))
 (define-abbrev-table 'kcats-mode-abbrev-table kcats-abbrevs)
 
 (add-hook 'kcats-mode-hook 'abbrev-mode)
