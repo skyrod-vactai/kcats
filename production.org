@@ -3372,6 +3372,14 @@ internally, to keep track of things like the stack, program, lists etc.
           Error::create(list!(expected, "<="), "number too large", Some(actual))
       }
 
+      pub fn out_of_range(actual: Int, min: Int, max: Int) -> Error {
+          Error::create(
+              list!(min, max, "range?"),
+              "number out of range",
+              Some(actual),
+          )
+      }
+
       pub fn parse(reason: &str) -> Error {
           Error::create(list!("read"), reason, Option::<Item>::None)
       }
@@ -3721,6 +3729,7 @@ internally, to keep track of things like the stack, program, lists etc.
       pub words: Words,
       pub lingo: Words,
       pub modules: Vec<Namespace>,
+      pub loaded_modules: HashSet<Namespace>,
   }
 
   /// A namespace for the core functions
@@ -3791,7 +3800,6 @@ internally, to keep track of things like the stack, program, lists etc.
                       v.clone(),
                   ));
               }
-
               grouped
           }
           let by_ns = group_by_namespace(&self.words);
@@ -3805,6 +3813,7 @@ internally, to keep track of things like the stack, program, lists etc.
               mcache.extend(by_ns.get(module).cloned().unwrap_or_default())
           }
 
+          self.loaded_modules = by_ns.keys().cloned().collect();
           // println!(
           //     "Cache now selected {} words. modules: {:?}",
           //     cache.len(),
@@ -4204,6 +4213,7 @@ internally, to keep track of things like the stack, program, lists etc.
               words,
               modules,
               lingo: Default::default(),
+              loaded_modules: Default::default(),
           };
           dict.resolve();
           Ok(dict)
@@ -4330,7 +4340,6 @@ internally, to keep track of things like the stack, program, lists etc.
 
   use once_cell::sync::Lazy;
   use std::future;
-  use std::ops::Range;
 
   /// A struct to hold the state of an executing kcats program. The
   /// `stack` is the data being manipulated, the `program` is program
@@ -4519,19 +4528,39 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
 
-      /// Returns an error if the stack doesn't match the given input spec.
+      /// Returns an error if the stack doesn't match the given input
+      /// spec. Gives helpful feedback where possible
       pub fn check_input_spec(&self, specs: &dict::StackSpec) -> Result<(), Error> {
+          fn all_ok(res: &Vec<(&dict::SpecElement, &Item, bool)>) -> bool {
+              res.iter().map(|(_, _, is_pass)| is_pass).all(move |x| *x)
+          }
           self.check_stack_depth(specs.len())?;
-          let indexes = Range {
-              start: 0,
-              end: specs.len(),
-          };
 
-          indexes.into_iter().try_for_each(|i| {
-              let item = self.stack.get(i).unwrap();
-              let spec = specs.get(i).unwrap();
-              check_type(item, &spec.elemtype)
-          })
+          let res: Vec<_> = specs
+              .iter()
+              .enumerate()
+              .map(|(i, spec)| {
+                  let item = self.stack.get(i).unwrap();
+                  (spec, item, check_type(item, &spec.elemtype))
+              })
+              .collect();
+
+          if all_ok(&res) {
+              Ok(())
+          } else {
+              //create an item to use as 'actual' in the error
+              let actual: Vec<Item> = res
+                  .into_iter()
+                  .map(|(spec, item, pass)| {
+                      Item::derive(list!(spec.clone(), list!(pass, item.clone())))
+                  })
+                  .collect();
+              {
+                  //println!("Type check failed! wanted {} got {:?}", w.data, i);
+
+                  Err(Error::expected("match-input-spec?", actual))
+              }
+          }
       }
 
       pub fn is_finished(&self) -> bool {
@@ -4578,6 +4607,7 @@ internally, to keep track of things like the stack, program, lists etc.
                       words: dict::Words::builtins(),
                       modules: Default::default(),
                       lingo: dict::Words::fresh(),
+                      loaded_modules: Default::default(),
                   },
                   stack: Default::default(),
                   program: Default::default(),
@@ -4617,31 +4647,31 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  /// Returns an error if the [Item] is not of the type specified by
+  /// Returns false if the [Item] is not of the type specified by
   /// [Word] `w`. This allows specs to have their own little type
   /// hierarchy, eg, `integer` is a `number`, `list` is a `sized` etc.
-  fn check_type(i: &Item, w: &Word) -> Result<(), Error> {
+  fn check_type(i: &Item, w: &Word) -> bool {
       //println!("Check {:?} is {:?}", w, i);
       match (w, i) {
-          (w, _) if *w == *S_ITEM => Ok(()),
-          (w, Item::Dispenser(_) | Item::Receptacle(_)) if *w == *S_DISPENSER => Ok(()),
-          (w, Item::Receptacle(_) | Item::Dispenser(_)) if *w == *S_RECEPTACLE => Ok(()),
-          (w, Item::Number(Number::Int(_))) if *w == *S_INTEGER || *w == *S_NUMBER => Ok(()),
-          (w, Item::Number(Number::Float(_))) if *w == *S_FLOAT || *w == *S_NUMBER => Ok(()),
-          (w, Item::Char(_)) if *w == *S_CHAR => Ok(()),
+          (w, _) if *w == *S_ITEM => true,
+          (w, Item::Dispenser(_) | Item::Receptacle(_)) if *w == *S_DISPENSER => true,
+          (w, Item::Receptacle(_) | Item::Dispenser(_)) if *w == *S_RECEPTACLE => true,
+          (w, Item::Number(Number::Int(_))) if *w == *S_INTEGER || *w == *S_NUMBER => true,
+          (w, Item::Number(Number::Float(_))) if *w == *S_FLOAT || *w == *S_NUMBER => true,
+          (w, Item::Char(_)) if *w == *S_CHAR => true,
           // TODO: also handle cases where bytes/string is a list
           (
               w,
               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(_)))
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(_))),
-          ) if *w == *S_BYTES || *w == *S_ORDERED => Ok(()),
+          ) if *w == *S_BYTES || *w == *S_ORDERED => true,
 
           (
               w,
               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(_)))
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::String(_))),
-          ) if *w == *S_STRING => Ok(()),
-          (w, Item::Word(_)) if *w == *S_WORD => Ok(()),
+          ) if *w == *S_STRING => true,
+          (w, Item::Word(_)) if *w == *S_WORD => true,
 
           (
               w,
@@ -4649,7 +4679,7 @@ internally, to keep track of things like the stack, program, lists etc.
               | Item::Dispenser(coll::Dispenser::Tunnel(_))
               | Item::Receptacle(coll::Receptacle::Tunnel(_))
               | Item::Receptacle(coll::Receptacle::In(_)),
-          ) if *w == *S_PIPE => Ok(()),
+          ) if *w == *S_PIPE => true,
 
           (
               w,
@@ -4657,13 +4687,13 @@ internally, to keep track of things like the stack, program, lists etc.
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::List(_)))
               | Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Program(_)))
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Program(_))),
-          ) if *w == *S_LIST || *w == *S_PROGRAM => Ok(()),
+          ) if *w == *S_LIST || *w == *S_PROGRAM => true,
 
           (
               w,
               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(_)))
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(_))),
-          ) if *w == *S_ASSOC => Ok(()),
+          ) if *w == *S_ASSOC => true,
 
           (
               w,
@@ -4673,7 +4703,7 @@ internally, to keep track of things like the stack, program, lists etc.
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(
                   assoc::Associative::Error(_),
               ))),
-          ) if *w == *S_ERROR => Ok(()),
+          ) if *w == *S_ERROR => true,
 
           (
               w,
@@ -4683,13 +4713,13 @@ internally, to keep track of things like the stack, program, lists etc.
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(
                   assoc::Associative::Dictionary(_),
               ))),
-          ) if *w == *S_DICTIONARY => Ok(()),
+          ) if *w == *S_DICTIONARY => true,
 
           (
               w,
               Item::Dispenser(coll::Dispenser::Sized(_))
               | Item::Receptacle(coll::Receptacle::Sized(_)),
-          ) if *w == *S_SIZED || *w == *S_ORDERED => Ok(()),
+          ) if *w == *S_SIZED || *w == *S_ORDERED => true,
 
           (
               w,
@@ -4699,12 +4729,8 @@ internally, to keep track of things like the stack, program, lists etc.
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(
                   assoc::Associative::Env(_),
               ))),
-          ) if *w == *S_ENVIRONMENT => Ok(()),
-          (w, i) => {
-              //println!("Type check failed! wanted {} got {:?}", w.data, i);
-              let expected = format!("{}?", w.data);
-              Err(Error::expected(expected.as_str(), i.clone()))
-          }
+          ) if *w == *S_ENVIRONMENT => true,
+          (_, _) => false,
       }
   }
 
@@ -6623,7 +6649,19 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn range(from: Int, to: Int, stepby: Int) -> coll::List {
-      coll::List::derive_iter((from..to).step_by(stepby as usize).map(Item::derive))
+      //allow stepping backwards eg 20 15 -2 range = [20 18 16]
+      // to = -20 from = -10 step -2
+      if stepby < 0 {
+          let mut v = coll::List::derive_iter(
+              ((to - stepby)..(from + 1))
+                  .step_by(-stepby as usize)
+                  .map(Item::derive),
+          );
+          v.reverse();
+          v
+      } else {
+          coll::List::derive_iter((from..to).step_by(stepby as usize).map(Item::derive))
+      }
   }
 
   // (effect [rec2 rec1 then pred]
@@ -7399,21 +7437,17 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       //let arr = coll::Sized::try_derive(arr)?;
       //let mut start = Int::try_derive(start)?;
       //let mut end = Int::try_derive(end)?;
+
       if start < 0 {
           start += arr.count() as i64;
       }
-      if end <= 0 {
+      if end <= 0 && end != start {
           end += arr.count() as i64;
       }
-      if start < 0 {
-          return Err(Error::negative(start));
-      }
-      if end < 0 {
-          return Err(Error::negative(end));
-      }
-      if start > end {
+
+      if start > end || start < 0 || end > arr.count() as i64 {
           return Err(Error::create(
-              list!("<="),
+              list!("range?"),
               "invalid index range",
               Some(pair(start.fit(), end.fit())),
           ));
@@ -7546,6 +7580,27 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       None
   }
 
+  fn key(w: &Word) -> Option<(Word, bool)> {
+      let s = String::derive(w.clone());
+
+      // Check for splice (scissors + tag + word)
+      if let Some(rest) = s.strip_prefix("✂️") {
+          if let Some(k) = rest.strip_prefix("🏷️") {
+              Some((Word::derive(k), true))
+          } else {
+              None
+          }
+
+          // Check for just the tag
+      } else {
+          if let Some(k) = s.strip_prefix("🏷️") {
+              Some((Word::derive(k), false))
+          } else {
+              None
+          }
+      }
+  }
+
   fn pack(env: &mut Environment) -> Result<(), Error> {
       let template: coll::List = env.pop().try_fit()?;
       let mut last_stack_item_used = 0;
@@ -7626,10 +7681,11 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       T: Fit<Item> + std::fmt::Debug,
   {
       // Set a value at position (1-9)
-      fn set(&mut self, position: usize, value: T) -> Result<(), String> {
+      fn set(&mut self, position: usize, value: T) -> Result<(), Error> {
           //println!("Setting {} to {:?}", position, value);
           if !(1..=9).contains(&position) {
-              return Err(format!("Position must be between 1-9, got {}", position));
+              return Err(Error::out_of_range(position as Int, 1, 10));
+              //return Err(format!("Position must be between 1-9, got {}", position));
           }
 
           // Convert to 0-based index
@@ -7637,7 +7693,11 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
           // Check if already set
           if self.values[idx].is_some() {
-              return Err(format!("Position {} already has a value", position));
+              return Err(Error::create(
+                  list!("set-position"),
+                  "Position is already set",
+                  Some(position as Int),
+              ));
           }
 
           self.values[idx] = Some(value);
@@ -7700,6 +7760,12 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           String::derive(w.clone()) == WILDCARD
       }
 
+      fn is_catch_all(w: &Word) -> bool {
+          stackpoint(w)
+              .and_then(|(_, splice)| Some(splice))
+              .unwrap_or(false)
+      }
+
       fn strip_variable(w: &Word) -> Word {
           let wc = w.clone();
           let s = String::derive(wc);
@@ -7733,8 +7799,23 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               (Ok(data), Ok(pattern)) => {
                   // We got containers
                   match (data, pattern) {
-                      (coll::Sized::List(data_list), coll::Sized::List(pattern_list)) => {
+                      (coll::Sized::List(mut data_list), coll::Sized::List(pattern_list)) => {
+                          let plen = pattern_list.len();
+                          let dlen = data_list.len();
+
                           //println!("destructuring list: {:?}", data_list);
+                          if pattern_list.len() != data_list.len() {
+                              let is_catch = pattern_list
+                                  .get(plen - 1)
+                                  .and_then(|i| Word::try_derive(i).ok())
+                                  .map(|w| is_catch_all(&w))
+                                  .unwrap_or(false);
+
+                              if !(is_catch && plen <= dlen + 1) {
+                                  // short pattern doesn't match without a catch-all
+                                  return Err(Error::create(list!("short-pattern"), "Pattern shorter than list can't match without a catch-all like ✂️1️⃣ at the end of the pattern.", Some(*pattern_list)));
+                              }
+                          }
 
                           let mut potential_updates_map: HashMap<Word, Item> = Default::default();
                           let mut potential_updates_list: PositionalParams<Item> = Default::default();
@@ -7742,29 +7823,43 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                               let p = pattern_list.get(i);
                               let v = data_list.get(i).cloned().unwrap_or_default();
                               match p {
-                                  Some(p) => match p {
-                                      Item::Word(w) => {
-                                          if let Some((idx, _)) = stackpoint(w) {
-                                              let _ = potential_updates_list.set(idx, v);
-                                          } else if is_map_variable(w) {
-                                              acc_assoc.insert(strip_variable(w), v);
-                                          } else if is_wildcard(w) || Item::Word(w.clone()) == v {
-                                              // match! but not a variable so continue
-                                          } else {
-                                              // pattern does not match. bail out of list processing
-                                              return Err(match_err(w.clone(), v));
+                                  Some(p) => {
+                                      match p {
+                                          Item::Word(w) => {
+                                              if let Some((slot, is_catch)) = stackpoint(w) {
+                                                  //if last pattern item is catch_all
+                                                  if i == pattern_list.len() - 1 && is_catch {
+                                                      // gather the rest of the data
+                                                      let rest = data_list.slice(i..);
+                                                      potential_updates_list.set(slot, rest.fit())?;
+                                                  } else if is_catch {
+                                                      // catchall not allowed except at end.
+                                                      return Err(
+                                                          Error::create(list!("catch-all"), "Catch-all placeholder is only allowed at the end of the pattern.", Some(*pattern_list))
+                                                         );
+                                                  } else {
+                                                      potential_updates_list.set(slot, v)?;
+                                                  }
+                                              } else if is_map_variable(w) {
+                                                  acc_assoc.insert(strip_variable(w), v);
+                                              } else if is_wildcard(w) || Item::Word(w.clone()) == v {
+                                                  // match! but not a variable so continue
+                                              } else {
+                                                  // pattern does not match. bail out of list processing
+                                                  return Err(match_err(w.clone(), v));
+                                              }
+                                          }
+                                          p => {
+                                              (potential_updates_map, potential_updates_list) =
+                                                  destructure(
+                                                      &v,
+                                                      p,
+                                                      potential_updates_map,
+                                                      potential_updates_list,
+                                                  )?
                                           }
                                       }
-                                      p => {
-                                          (potential_updates_map, potential_updates_list) =
-                                              destructure(
-                                                  &v,
-                                                  p,
-                                                  potential_updates_map,
-                                                  potential_updates_list,
-                                              )?
-                                      }
-                                  },
+                                  }
                                   // past end of list
                                   None => {
                                       break;
@@ -7772,7 +7867,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                               }
                           }
                           acc_assoc.extend(potential_updates_map);
-                          let _ = acc_seq.merge(&potential_updates_list);
+                          acc_seq.merge(&potential_updates_list)?;
                           Ok((acc_assoc, acc_seq))
                       }
                       (coll::Sized::Associative(data), coll::Sized::Associative(pattern)) => {
@@ -7809,6 +7904,15 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                                           potential_updates_map,
                                           potential_updates_list,
                                       )?
+                                  }
+                              } else {
+                                  // key not present
+                                  // if pattern value is placeholder, we need to return a []
+                                  let r = Word::try_derive(v.clone());
+                                  if let Ok(w) = r {
+                                      if let Some((idx, _)) = stackpoint(&w) {
+                                          let _ = potential_updates_list.set(idx, Default::default());
+                                      }
                                   }
                               }
                           }
@@ -8222,6 +8326,7 @@ rust project or some other language through FFI.
       #[test_case("association?" ; "is_association")]
       #[test_case("bail")]
       #[test_case("bailer")]
+      #[test_case("between?"; "is_between")]
       #[test_case("bits")]
       #[test_case("both?" ; "is_both")]
       #[test_case("both")]
@@ -16039,33 +16144,52 @@ to write aliases.
 Claude suggested this format, with examples of a word grouped in a single entry
 #+begin_src js
   {"messages":
-   [{"role": "user", "content": "Here are examples of the 🗑️ operation:\n\n[1 2 3 🗑️] → [1 2] (Drop integer on ToS)\n[1 2 3 [a b c] 🗑️] → [1 2 3] (Drop list on ToS)\n[🔳 🗑️] → 🔳 (Drop Nothing value)\n[\"hello\" 🗑️] → 🔳 (Drop string)\n[42.5 🗑️] → 🔳 (Drop float)\n[✅ 🗑️] → 🔳 (Drop boolean)\n[[1 [2 3] 4] 🗑️] → 🔳 (Drop complex nested structure)\n[[[🔳]] 🗑️] → 🔳 (Drop deeply nested empty lists)\n[1 2 3 🗑️ 🗑️] → [1] (Drop multiple times)\n[1 2 3 🗑️ 4 🗑️] → [1 2] (Interleaved drops with pushes)\n[🔳 🗑️] → 🔳 (Drop empty list)\n[\"\" 🗑️] → 🔳 (Drop empty string)\n[1 2 [🗑️] 🗑️] → [1 2] (Drop list containing trash symbol)\n[[🗑️] → [🗑️ \"Nothing to drop\"] 🩹 ▶️] → [\"Nothing to drop\"] (Empty stack results in error)\n[[1 🗑️ 🗑️] → [🗑️ \"Nothing to drop\"] 🩹 ▶️] → [\"Nothing to drop\"] (Multiple drops on nonempty stack)\n\nWhat does 🗑️ do?"}, {"role": "assistant", "content": "The 🗑️ operation drops (removes) the top element from the stack. It works with any data type and when the stack becomes empty after dropping, the result is 🔳. If applied to an empty stack, it produces an error \"Nothing to drop\"."}]}
+   [{"role": "user",
+     "content": "Here are examples of the 🗑️ operation:\n\n[1 2 3 🗑️] → [1 2] (Drop integer on ToS)\n[1 2 3 [a b c] 🗑️] → [1 2 3] (Drop list on ToS)\n[🔳 🗑️] → 🔳 (Drop Nothing value)\n[\"hello\" 🗑️] → 🔳 (Drop string)\n[42.5 🗑️] → 🔳 (Drop float)\n[✅ 🗑️] → 🔳 (Drop boolean)\n[[1 [2 3] 4] 🗑️] → 🔳 (Drop complex nested structure)\n[[[🔳]] 🗑️] → 🔳 (Drop deeply nested empty lists)\n[1 2 3 🗑️ 🗑️] → [1] (Drop multiple times)\n[1 2 3 🗑️ 4 🗑️] → [1 2] (Interleaved drops with pushes)\n[🔳 🗑️] → 🔳 (Drop empty list)\n[\"\" 🗑️] → 🔳 (Drop empty string)\n[1 2 [🗑️] 🗑️] → [1 2] (Drop list containing trash symbol)\n[[🗑️] → [🗑️ \"Nothing to drop\"] 🩹 ▶️] → [\"Nothing to drop\"] (Empty stack results in error)\n[[1 🗑️ 🗑️] → [🗑️ \"Nothing to drop\"] 🩹 ▶️] → [\"Nothing to drop\"] (Multiple drops on nonempty stack)\n\nWhat does 🗑️ do?"}, {"role": "assistant", "content": "The 🗑️ operation drops (removes) the top element from the stack. It works with any data type and when the stack becomes empty after dropping, the result is 🔳. If applied to an empty stack, it produces an error \"Nothing to drop\"."}]}
+
+  {
+    "instruction": "Demonstrate what the 🗑️ function does. Given a program using 🗑️, show a simpler program that gives the same stack result, and summarize the use case.",
+    "input": "[1 2 3 🗑️]",
+    "output": "Output: [1 2]\n\nDrop integer on ToS."
+  }
 #+end_src
 
 #+begin_src kcats
   dictionary lingo
-  [[1️⃣ [[examples 2️⃣]]] #️⃣⛏️ ;; destructure 
+  [[2️⃣ [[examples 1️⃣]]] assocify #️⃣⛏️  ;; destructure 
    ;; format examples as string
-   [] 🚜 ▶️
-  ]
+   [3 "" pad  ; add an empty docstring if there isn't one
+     ;; serialize the in/out programs
+     [[🎁 emit] both] 💉 ▶️ 
+    "{} gives the same result as {} ({})" format]
+   🚜 ▶️]
   🚜 ▶️
-#+end_src
-
-#+begin_src kcats
-[foo bar] "{} {} {}" format
 #+end_src
 
 #+RESULTS:
 #+begin_src kcats
-[[asked [format]]
- [handled 🔳]
- [reason "missing argument: 2"]
- [trace ["{} {} {}"]]
- [type error]
- [unwound [format]]]
-"{} {} {}" [foo bar]
 #+end_src
-** INPROGRESS have pad support left or right
+
+#+begin_src kcats
+[foo bar] 3 "" pad ; "{} {} {}" format
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[foo bar ""]
+#+end_src
+
+#+begin_src kcats
+  [foo ] [[this []] [that []]] assocify 📮 [2️⃣ [[examples 1️⃣]]] assocify #️⃣⛏️ 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+🔳 foo
+#+end_src
+
+** DONE have pad support left or right
+- State "DONE"       from "INPROGRESS" [2025-07-03 Thu 18:33]
 - State "INPROGRESS" from "TODO"       [2025-07-03 Thu 18:02]
   #+begin_src kcats
     [1 2 3 4 5] -6 0 
@@ -16084,3 +16208,118 @@ Claude suggested this format, with examples of a word grouped in a single entry
   #+begin_src kcats
   [0 1 2 3 4 5]
   #+end_src
+
+** DONE Make input spec check errors more helpful
+- State "DONE"       from "INPROGRESS" [2025-07-15 Tue 16:05]
+- State "INPROGRESS" from "TODO"       [2025-07-15 Tue 16:05]
+Right now we get outputs like this:
+
+#+RESULTS:
+#+begin_src kcats
+[[actual -0.5]
+ [asked [integer?]]
+ [handled 🔳]
+ [reason "type mismatch"]
+ [trace [-0.5]]
+ [type error]
+ [unwound [range]]]
+-0.5 10 0
+#+end_src
+
+and I think it should look more like this (where info from the spec is included
+
+#+begin_src kcats
+  [[actual [[[integer start] [✅ 0] 
+             [integer end] [✅ 10] 
+             [integer step] [[] 0.5]]]]
+   [asked [match-input-spec?]]
+   [handled 🔳]
+   [reason "type mismatch"]
+   [trace [-0.5]]
+   [type error]
+   [unwound [range]]]
+
+  -0.5 10 0
+
+#+end_src
+
+trying first cut at impl:
+
+#+begin_src kcats
+0 10 0.5 range
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[actual [[[integer start]
+           [🔳 0.5]]
+          [[integer end]
+           [✅ 10]]
+          [[integer step]
+           [✅ 0]]]]
+ [asked [match-input-spec?]]
+ [handled 🔳]
+ [reason "type mismatch"]
+ [trace [0.5]]
+ [type error]
+ [unwound [range]]]
+0.5 10 0
+#+end_src
+
+#+begin_src kcats
+  [foo] [bar] [baz] "quux" 🪆
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[actual [[[program combinator]
+           [🔳 "quux"]]
+          [[program exit]
+           [✅ [baz]]]
+          [[program body]
+           [✅ [bar]]]
+          [[program pred]
+           [✅ [foo]]]]]
+ [asked [match-input-spec?]]
+ [handled 🔳]
+ [reason "type mismatch"]
+ [trace ["quux"]]
+ [type error]
+ [unwound [🪆]]]
+"quux" [baz] [bar] [foo]
+#+end_src
+
+looks ok, but we broke a test for =pair?= which introspects errors:
+
+#+begin_src kcats
+  [7 8] [📏 2 =]
+  [[actual 0 0] 🔍 [sized] 🍫 =]
+  [🗑️ 🗑️ 🔳]
+  [🔳] ⚖️ 🩹 ▶️
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+✅
+#+end_src
+
+** TODO Empty words or with spaces, should not be allowed
+#+begin_src kcats
+1 "a b c" word 2
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+2 a b c 1
+#+end_src
+
+#+begin_src kcats
+1 "" word 2
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+2  1
+#+end_src
+
+converting str -> word should be try_derive, not derive, since not all strings are convertible to word.
