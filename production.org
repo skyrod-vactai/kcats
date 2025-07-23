@@ -3372,6 +3372,14 @@ internally, to keep track of things like the stack, program, lists etc.
           Error::create(list!(expected, "<="), "number too large", Some(actual))
       }
 
+      pub fn out_of_range(actual: Int, min: Int, max: Int) -> Error {
+          Error::create(
+              list!(min, max, "range?"),
+              "number out of range",
+              Some(actual),
+          )
+      }
+
       pub fn parse(reason: &str) -> Error {
           Error::create(list!("read"), reason, Option::<Item>::None)
       }
@@ -7572,6 +7580,27 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       None
   }
 
+  fn key(w: &Word) -> Option<(Word, bool)> {
+      let s = String::derive(w.clone());
+
+      // Check for splice (scissors + tag + word)
+      if let Some(rest) = s.strip_prefix("✂️") {
+          if let Some(k) = rest.strip_prefix("🏷️") {
+              Some((Word::derive(k), true))
+          } else {
+              None
+          }
+
+          // Check for just the tag
+      } else {
+          if let Some(k) = s.strip_prefix("🏷️") {
+              Some((Word::derive(k), false))
+          } else {
+              None
+          }
+      }
+  }
+
   fn pack(env: &mut Environment) -> Result<(), Error> {
       let template: coll::List = env.pop().try_fit()?;
       let mut last_stack_item_used = 0;
@@ -7652,10 +7681,11 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       T: Fit<Item> + std::fmt::Debug,
   {
       // Set a value at position (1-9)
-      fn set(&mut self, position: usize, value: T) -> Result<(), String> {
+      fn set(&mut self, position: usize, value: T) -> Result<(), Error> {
           //println!("Setting {} to {:?}", position, value);
           if !(1..=9).contains(&position) {
-              return Err(format!("Position must be between 1-9, got {}", position));
+              return Err(Error::out_of_range(position as Int, 1, 10));
+              //return Err(format!("Position must be between 1-9, got {}", position));
           }
 
           // Convert to 0-based index
@@ -7663,7 +7693,11 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
           // Check if already set
           if self.values[idx].is_some() {
-              return Err(format!("Position {} already has a value", position));
+              return Err(Error::create(
+                  list!("set-position"),
+                  "Position is already set",
+                  Some(position as Int),
+              ));
           }
 
           self.values[idx] = Some(value);
@@ -7726,6 +7760,12 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           String::derive(w.clone()) == WILDCARD
       }
 
+      fn is_catch_all(w: &Word) -> bool {
+          stackpoint(w)
+              .and_then(|(_, splice)| Some(splice))
+              .unwrap_or(false)
+      }
+
       fn strip_variable(w: &Word) -> Word {
           let wc = w.clone();
           let s = String::derive(wc);
@@ -7759,8 +7799,23 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               (Ok(data), Ok(pattern)) => {
                   // We got containers
                   match (data, pattern) {
-                      (coll::Sized::List(data_list), coll::Sized::List(pattern_list)) => {
+                      (coll::Sized::List(mut data_list), coll::Sized::List(pattern_list)) => {
+                          let plen = pattern_list.len();
+                          let dlen = data_list.len();
+
                           //println!("destructuring list: {:?}", data_list);
+                          if pattern_list.len() != data_list.len() {
+                              let is_catch = pattern_list
+                                  .get(plen - 1)
+                                  .and_then(|i| Word::try_derive(i).ok())
+                                  .map(|w| is_catch_all(&w))
+                                  .unwrap_or(false);
+
+                              if !(is_catch && plen <= dlen + 1) {
+                                  // short pattern doesn't match without a catch-all
+                                  return Err(Error::create(list!("short-pattern"), "Pattern shorter than list can't match without a catch-all like ✂️1️⃣ at the end of the pattern.", Some(*pattern_list)));
+                              }
+                          }
 
                           let mut potential_updates_map: HashMap<Word, Item> = Default::default();
                           let mut potential_updates_list: PositionalParams<Item> = Default::default();
@@ -7768,29 +7823,43 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                               let p = pattern_list.get(i);
                               let v = data_list.get(i).cloned().unwrap_or_default();
                               match p {
-                                  Some(p) => match p {
-                                      Item::Word(w) => {
-                                          if let Some((idx, _)) = stackpoint(w) {
-                                              let _ = potential_updates_list.set(idx, v);
-                                          } else if is_map_variable(w) {
-                                              acc_assoc.insert(strip_variable(w), v);
-                                          } else if is_wildcard(w) || Item::Word(w.clone()) == v {
-                                              // match! but not a variable so continue
-                                          } else {
-                                              // pattern does not match. bail out of list processing
-                                              return Err(match_err(w.clone(), v));
+                                  Some(p) => {
+                                      match p {
+                                          Item::Word(w) => {
+                                              if let Some((slot, is_catch)) = stackpoint(w) {
+                                                  //if last pattern item is catch_all
+                                                  if i == pattern_list.len() - 1 && is_catch {
+                                                      // gather the rest of the data
+                                                      let rest = data_list.slice(i..);
+                                                      potential_updates_list.set(slot, rest.fit())?;
+                                                  } else if is_catch {
+                                                      // catchall not allowed except at end.
+                                                      return Err(
+                                                          Error::create(list!("catch-all"), "Catch-all placeholder is only allowed at the end of the pattern.", Some(*pattern_list))
+                                                         );
+                                                  } else {
+                                                      potential_updates_list.set(slot, v)?;
+                                                  }
+                                              } else if is_map_variable(w) {
+                                                  acc_assoc.insert(strip_variable(w), v);
+                                              } else if is_wildcard(w) || Item::Word(w.clone()) == v {
+                                                  // match! but not a variable so continue
+                                              } else {
+                                                  // pattern does not match. bail out of list processing
+                                                  return Err(match_err(w.clone(), v));
+                                              }
+                                          }
+                                          p => {
+                                              (potential_updates_map, potential_updates_list) =
+                                                  destructure(
+                                                      &v,
+                                                      p,
+                                                      potential_updates_map,
+                                                      potential_updates_list,
+                                                  )?
                                           }
                                       }
-                                      p => {
-                                          (potential_updates_map, potential_updates_list) =
-                                              destructure(
-                                                  &v,
-                                                  p,
-                                                  potential_updates_map,
-                                                  potential_updates_list,
-                                              )?
-                                      }
-                                  },
+                                  }
                                   // past end of list
                                   None => {
                                       break;
@@ -7798,7 +7867,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                               }
                           }
                           acc_assoc.extend(potential_updates_map);
-                          let _ = acc_seq.merge(&potential_updates_list);
+                          acc_seq.merge(&potential_updates_list)?;
                           Ok((acc_assoc, acc_seq))
                       }
                       (coll::Sized::Associative(data), coll::Sized::Associative(pattern)) => {
@@ -8257,6 +8326,7 @@ rust project or some other language through FFI.
       #[test_case("association?" ; "is_association")]
       #[test_case("bail")]
       #[test_case("bailer")]
+      #[test_case("between?"; "is_between")]
       #[test_case("bits")]
       #[test_case("both?" ; "is_both")]
       #[test_case("both")]
@@ -16232,3 +16302,24 @@ looks ok, but we broke a test for =pair?= which introspects errors:
 #+begin_src kcats
 ✅
 #+end_src
+
+** TODO Empty words or with spaces, should not be allowed
+#+begin_src kcats
+1 "a b c" word 2
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+2 a b c 1
+#+end_src
+
+#+begin_src kcats
+1 "" word 2
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+2  1
+#+end_src
+
+converting str -> word should be try_derive, not derive, since not all strings are convertible to word.
