@@ -293,13 +293,13 @@ internally, to keep track of things like the stack, program, lists etc.
 #+begin_src rust :tangle src/types.rs :mkdirp yes
   //! Defines kcats internal data types.
   use crate::axiom;
-  use crate::list;
-  use crate::serialize::Emit;
+  use crate::serialize::{self, Emit};
   use crate::traits::*;
   use crate::types::container as coll;
   use crate::types::container::dictionary as dict;
   use crate::types::container::environment as env;
   use crate::types::container::error::Error;
+  use crate::{fit, list};
 
   use core::default::Default;
   use core::fmt;
@@ -308,7 +308,6 @@ internally, to keep track of things like the stack, program, lists etc.
   use lazy_static::lazy_static;
   use number::Number;
   use std::collections::HashMap;
-
   use std::hash::Hash;
   use std::marker::Sync;
 
@@ -337,19 +336,44 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  impl Derive<String> for Word {
-      fn derive(s: String) -> Self {
-          Word::derive(s.as_str())
+  // these are wrong, not every string is a valid word
+  impl TryDerive<String> for Word {
+      type Error = Error;
+      fn try_derive(s: String) -> Result<Self, Self::Error> {
+          serialize::parse(s).and_then(|mut l| {
+              if l.len() == 1 {
+                  match l.pop_front().unwrap() {
+                      Item::Word(w) => Ok(w),
+                      _ => Err(Error::parse("Words cannot contain delimiters")),
+                  }
+              } else if l.len() == 0 {
+                  Err(Error::parse("Words cannot be empty"))
+              } else {
+                  Err(Error::parse("Words cannot contain whitespace"))
+              }
+          })
       }
   }
 
-  impl Derive<&str> for Word {
-      fn derive(s: &str) -> Self {
-          Word {
-              data: Intern::<String>::from(s),
-              quoted: false,
-              namespace: None,
-          }
+  /// A macro for creating Word Items from literal strings in code,
+  /// panics if the strings are not valid Words. But that should happen
+  /// at compile time because it can only be used on literals.
+  #[macro_export] // make it usable from other crates too
+  macro_rules! fit {
+      // accept exactly one literal, with an optional trailing comma
+      ($lit:literal $(,)?) => {{
+          // bring the trait into scope so the method call is found
+          use $crate::traits::TryFit as _;
+
+          // do what `"literal".try_fit().unwrap()` used to do
+          ($lit).try_fit().unwrap()
+      }};
+  }
+
+  impl TryDerive<&str> for Word {
+      type Error = Error;
+      fn try_derive(s: &str) -> Result<Self, Self::Error> {
+          Word::try_derive(s.to_string())
       }
   }
 
@@ -365,6 +389,18 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  impl Word {
+      /// Strips prefix from the data part of the word (leaves namespace
+      /// unaffected). Works just like the String version of this method
+      pub fn strip_prefix(&self, prefix: &str) -> Option<Word> {
+          self.data.strip_prefix(prefix).map(|d| Word {
+              data: Intern::new(d.to_string()),
+              namespace: self.namespace,
+              quoted: self.quoted,
+          })
+      }
+  }
+
   /// A byte array type
   pub type Bytes = Vec<u8>;
 
@@ -373,26 +409,26 @@ internally, to keep track of things like the stack, program, lists etc.
 
   // Some static values for commonly used words
   lazy_static! {
-      pub static ref S_ASSOC: Word = "association".fit();
-      pub static ref S_BOOLEAN: Word = "boolean".fit();
-      pub static ref S_BYTES: Word = "bytes".fit();
-      pub static ref S_CHAR: Word = "character".fit();
-      pub static ref S_DICTIONARY: Word = "dictionary".fit();
-      pub static ref S_DISPENSER: Word = "dispenser".fit();
-      pub static ref S_ENVIRONMENT: Word = "environment".fit();
-      pub static ref S_ERROR: Word = "error".fit();
-      pub static ref S_FLOAT: Word = "float".fit();
-      pub static ref S_INTEGER: Word = "integer".fit();
-      pub static ref S_ITEM: Word = "item".fit();
-      pub static ref S_LIST: Word = "list".fit();
-      pub static ref S_NUMBER: Word = "number".fit();
-      pub static ref S_ORDERED: Word = "ordered".fit();
-      pub static ref S_PIPE: Word = "pipe".fit();
-      pub static ref S_PROGRAM: Word = "program".fit();
-      pub static ref S_RECEPTACLE: Word = "receptacle".fit();
-      pub static ref S_SIZED: Word = "sized".fit();
-      pub static ref S_STRING: Word = "string".fit();
-      pub static ref S_WORD: Word = "word".fit();
+      pub static ref S_ASSOC: Word = fit!("association");
+      pub static ref S_BOOLEAN: Word = fit!("boolean");
+      pub static ref S_BYTES: Word = fit!("bytes");
+      pub static ref S_CHAR: Word = fit!("character");
+      pub static ref S_DICTIONARY: Word = fit!("dictionary");
+      pub static ref S_DISPENSER: Word = fit!("dispenser");
+      pub static ref S_ENVIRONMENT: Word = fit!("environment");
+      pub static ref S_ERROR: Word = fit!("error");
+      pub static ref S_FLOAT: Word = fit!("float");
+      pub static ref S_INTEGER: Word = fit!("integer");
+      pub static ref S_ITEM: Word = fit!("item");
+      pub static ref S_LIST: Word = fit!("list");
+      pub static ref S_NUMBER: Word = fit!("number");
+      pub static ref S_ORDERED: Word = fit!("ordered");
+      pub static ref S_PIPE: Word = fit!("pipe");
+      pub static ref S_PROGRAM: Word = fit!("program");
+      pub static ref S_RECEPTACLE: Word = fit!("receptacle");
+      pub static ref S_SIZED: Word = fit!("sized");
+      pub static ref S_STRING: Word = fit!("string");
+      pub static ref S_WORD: Word = fit!("word");
   }
 
   /// A kcats data value.
@@ -484,7 +520,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   let s = coll::Sized::try_derive(i)?;
                   match s {
                       coll::Sized::String(i) => Ok(i),
-                      i => Err(Error::expected("string", i)),
+                      i => Err(Error::expected(fit!("string"), i)),
                   }
               }
           }
@@ -501,7 +537,7 @@ internally, to keep track of things like the stack, program, lists etc.
               i => {
                   let s = coll::Sized::try_derive(i)?;
                   match s {
-                      coll::Sized::String(s) => Ok(s.fit()),
+                      coll::Sized::String(s) => s.try_fit(),
                       s => {
                           let i2 = s.clone();
                           let l = coll::List::try_derive(s);
@@ -511,10 +547,10 @@ internally, to keep track of things like the stack, program, lists etc.
                                       let i = l.pop_front().unwrap();
                                       i.try_fit()
                                   } else {
-                                      Err(Error::expected("word", l))
+                                      Err(Error::expected(fit!("word"), l))
                                   }
                               }
-                              Err(_) => Err(Error::expected("word", i2)),
+                              Err(_) => Err(Error::expected(fit!("word"), i2)),
                           }
                       }
                   }
@@ -529,7 +565,7 @@ internally, to keep track of things like the stack, program, lists etc.
           let s = coll::Sized::try_derive(i)?;
           match s {
               coll::Sized::Bytes(b) => Ok(b),
-              b => Err(Error::expected("bytes", b)),
+              b => Err(Error::expected(fit!("bytes"), b)),
           }
       }
   }
@@ -541,9 +577,9 @@ internally, to keep track of things like the stack, program, lists etc.
               Item::Char(c) => Ok(c),
               Item::Number(Number::Int(i)) => match char::from_u32(i as u32) {
                   Some(c) => Ok(c),
-                  None => Err(Error::expected("character-encoding", i)),
+                  None => Err(Error::expected(fit!("character-encoding"), i)),
               },
-              b => Err(Error::expected("character", b)),
+              b => Err(Error::expected(fit!("character"), b)),
           }
       }
   }
@@ -556,7 +592,7 @@ internally, to keep track of things like the stack, program, lists etc.
   impl Derive<bool> for Item {
       fn derive(b: bool) -> Item {
           if b {
-              "✅".fit()
+              fit!("✅")
           } else {
               Item::default()
           }
@@ -569,9 +605,10 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  impl Derive<&str> for Item {
-      fn derive(i: &str) -> Self {
-          Item::Word(Word::derive(i))
+  impl TryDerive<&str> for Item {
+      type Error = Error;
+      fn try_derive(i: &str) -> Result<Self, Self::Error> {
+          Ok(Item::Word(Word::try_derive(i)?))
       }
   }
 
@@ -646,19 +683,48 @@ internally, to keep track of things like the stack, program, lists etc.
 
   /// A macro to build a kcats List, accepts any values that are
   /// convertible to [Item].
+  // #[macro_export]
+  // macro_rules! list {
+
+  //       ( $( $x:expr ),* $(,)? ) => {
+  //           {
+  //               use $crate::traits::*;
+  //               use $crate::types::Item;
+  //               let v: Vec<Item> = vec![
+  //                   $( $x.fit(), )*
+  //               ];
+  //               $crate::types::container::List::derive(v)
+  //           }
+  //       };
+  //   }
+
   #[macro_export]
   macro_rules! list {
-        ( $( $x:expr ),* $(,)? ) => {
-            {
-                use $crate::traits::*;
-                use $crate::types::Item;
-                let v: Vec<Item> = vec![
-                    $( $x.fit(), )*
-                ];
-                $crate::types::container::List::derive(v)
-            }
-        };
-    }
+      /* public entry point -------------------------------------------------- */
+      ( $( $elem:expr ),* $(,)? ) => {{
+          //use $crate::traits::{Fit, TryFit as _};   // methods in scope
+          use $crate::types::{Item, container::List};
+
+          // turn every element into an Item, one by one
+          let v: Vec<Item> = vec![
+              $( list!(@conv $elem) ,)*
+          ];
+
+          List::derive(v)
+      }};
+
+      /* helper: convert one element ----------------------------------------- */
+
+      /* literal → try_fit().unwrap() */
+      (@conv $lit:literal) => {
+          ($lit).try_fit().unwrap()
+      };
+
+      /* anything else → fit() */
+      (@conv $expr:expr) => {
+          ($expr).fit()
+      };
+  }
 
   mod serde {
       //! Support for json serialization of kcats objects
@@ -800,6 +866,7 @@ internally, to keep track of things like the stack, program, lists etc.
   //! Support for numbers in kcats. Currently just [i64] and [f64], but
   //! this module will eventually support bignums and autopromotion.
   use super::container::error::Error;
+  use crate::fit;
   use crate::traits::*;
   use crate::types::container as cont;
   use crate::types::Item;
@@ -953,7 +1020,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn try_derive(i: Number) -> Result<Self, Self::Error> {
           match i {
               Number::Float(i) => Ok(i),
-              i => Err(Error::expected("float", i)),
+              i => Err(Error::expected(fit!("float"), i)),
           }
       }
   }
@@ -963,7 +1030,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn try_derive(i: Number) -> Result<Self, Self::Error> {
           match i {
               Number::Int(i) => Ok(i),
-              i => Err(Error::expected("integer", i)),
+              i => Err(Error::expected(fit!("integer"), i)),
           }
       }
   }
@@ -1009,7 +1076,7 @@ internally, to keep track of things like the stack, program, lists etc.
               Item::Char(c) => Ok(Number::Int(c as Int)),
               Item::Dispenser(cont::Dispenser::Sized(cont::Sized::String(s))) => fromstr(s),
               Item::Receptacle(cont::Receptacle::Sized(cont::Sized::String(s))) => fromstr(s),
-              i => Err(Error::expected("number", i)),
+              i => Err(Error::expected(fit!("number"), i)),
           }
       }
   }
@@ -1019,7 +1086,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn try_derive(i: Item) -> Result<Self, Self::Error> {
           match Number::try_derive(i)? {
               Number::Int(i) => Ok(i),
-              i => Err(Error::expected("integer", i)),
+              i => Err(Error::expected(fit!("integer"), i)),
           }
       }
   }
@@ -1029,7 +1096,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn try_derive(i: Item) -> Result<Self, Self::Error> {
           match Number::try_derive(i)? {
               Number::Float(i) => Ok(i),
-              i => Err(Error::expected("float", i)),
+              i => Err(Error::expected(fit!("float"), i)),
           }
       }
   }
@@ -1345,7 +1412,7 @@ internally, to keep track of things like the stack, program, lists etc.
               }
               (Sized::String(s), Sized::List(l)) => s.join(*l).unwrap(),
               (Sized::List(l), Sized::String(s)) => l.join(s).unwrap(),
-              (s, other) => Err(Error::expected("joinable", list!(s, other)))?,
+              (s, other) => Err(Error::expected(fit!("joinable"), list!(s, other)))?,
           })
       }
   }
@@ -1812,12 +1879,12 @@ internally, to keep track of things like the stack, program, lists etc.
                   b.push(i as u8);
                   Ok(Sized::Bytes(b))
               }
-              (Sized::Bytes(_), i) => Err(Error::expected("integer", i)),
+              (Sized::Bytes(_), i) => Err(Error::expected(fit!("integer"), i)),
               (Sized::String(mut s), Item::Char(c)) => Ok(Sized::String({
                   s.push(c);
                   s
               })),
-              (Sized::String(_), i) => Err(Error::expected("char", i)),
+              (Sized::String(_), i) => Err(Error::expected(fit!("char"), i)),
               (Sized::Program(mut p), i) => {
                   p.extend(list![i]);
                   Ok(Sized::Program(p))
@@ -1896,7 +1963,7 @@ internally, to keep track of things like the stack, program, lists etc.
           //println!("from iterable {:?}", c);
           match c {
               Dispenser::Sized(s) => Ok(s),
-              i => Err(Error::expected("sized", i)),
+              i => Err(Error::expected(fit!("sized"), i)),
           }
       }
   }
@@ -1907,7 +1974,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn try_derive(c: Receptacle) -> Result<Self, Self::Error> {
           match c {
               Receptacle::Sized(s) => Ok(s),
-              i => Err(Error::expected("sized", Item::Receptacle(i))),
+              i => Err(Error::expected(fit!("sized"), Item::Receptacle(i))),
           }
       }
   }
@@ -1919,7 +1986,7 @@ internally, to keep track of things like the stack, program, lists etc.
           match s {
               Sized::List(l) => Ok(*l),
               Sized::Associative(a) => Ok(List::derive_iter(a.to_iter().map(Item::derive))),
-              i => Err(Error::expected("list", i)),
+              i => Err(Error::expected(fit!("list"), i)),
           }
       }
   }
@@ -1991,10 +2058,10 @@ internally, to keep track of things like the stack, program, lists etc.
       fn try_derive(i: Item) -> Result<Self, Self::Error> {
           match i {
               Item::Dispenser(l) => Sized::try_derive(l.clone())
-                  .caused(|| Error::expected("list", l))
+                  .caused(|| Error::expected(fit!("list"), l))
                   .and_then(List::try_derive),
               Item::Receptacle(l) => Sized::try_derive(l).and_then(List::try_derive),
-              i => Err(Error::expected("list", i)),
+              i => Err(Error::expected(fit!("list"), i)),
           }
       }
   }
@@ -2006,12 +2073,12 @@ internally, to keep track of things like the stack, program, lists etc.
           match item {
               Item::Dispenser(c) => c.try_fit(),
               Item::Receptacle(p) => Dispenser::try_derive(p.clone())
-                  .caused(|| Error::expected("sized", p))?
+                  .caused(|| Error::expected(fit!("sized"), p))?
                   .try_fit(),
               i => {
                   // let bt = backtrace::Backtrace::new();
                   // println!("try from item {:?},\n {:?}", i, bt);
-                  Err(Error::expected("sized", i))
+                  Err(Error::expected(fit!("sized"), i))
               }
           }
       }
@@ -2024,7 +2091,7 @@ internally, to keep track of things like the stack, program, lists etc.
           match item {
               Item::Receptacle(p) => Ok(p),
               Item::Dispenser(c) => c.try_fit(),
-              i => Err(Error::expected("receptacle", i)),
+              i => Err(Error::expected(fit!("receptacle"), i)),
           }
       }
   }
@@ -2036,7 +2103,7 @@ internally, to keep track of things like the stack, program, lists etc.
           match c {
               Dispenser::Sized(s) => Ok(Receptacle::Sized(s)),
               Dispenser::Tunnel(t) => Ok(Receptacle::Tunnel(t)),
-              i => Err(Error::expected("receptacle", i)),
+              i => Err(Error::expected(fit!("receptacle"), i)),
           }
       }
   }
@@ -2048,7 +2115,7 @@ internally, to keep track of things like the stack, program, lists etc.
           match c {
               Receptacle::Sized(s) => Ok(Dispenser::Sized(s)),
               Receptacle::Tunnel(t) => Ok(Dispenser::Tunnel(t)),
-              i => Err(Error::expected("iterable", Item::Receptacle(i))),
+              i => Err(Error::expected(fit!("iterable"), Item::Receptacle(i))),
           }
       }
   }
@@ -2122,7 +2189,7 @@ internally, to keep track of things like the stack, program, lists etc.
           match item {
               Item::Dispenser(c) => Ok(c),
               Item::Receptacle(p) => Ok(Dispenser::try_derive(p)?),
-              i => Err(Error::expected("iterable", i)),
+              i => Err(Error::expected(fit!("iterable"), i)),
           }
       }
   }
@@ -2442,6 +2509,7 @@ internally, to keep track of things like the stack, program, lists etc.
   #[cfg(test)]
   mod tests {
       use super::*;
+      use crate::fit;
       use crate::types::*;
 
       #[test]
@@ -2451,8 +2519,8 @@ internally, to keep track of things like the stack, program, lists etc.
               next_idx: 0,
           }]);
 
-          assert_eq!(p.pop().cloned(), Some(Item::Word("foo".fit())));
-          assert_eq!(p.peek().cloned(), Some(Item::Word("bar".fit())));
+          assert_eq!(p.pop().cloned(), Some(Item::Word(fit!("foo"))));
+          assert_eq!(p.peek().cloned(), Some(Item::Word(fit!("bar"))));
       }
 
       #[test]
@@ -2468,10 +2536,10 @@ internally, to keep track of things like the stack, program, lists etc.
               },
           ]);
           assert_eq!(p.count(), 3);
-          assert_eq!(p.pop().cloned(), Some(Item::Word("stoon".fit())));
+          assert_eq!(p.pop().cloned(), Some(Item::Word(fit!("stoon"))));
           assert_eq!(p.count(), 2);
-          assert_eq!(p.peek().cloned(), Some(Item::Word("bar".fit())));
-          assert_eq!(p.pop().cloned(), Some(Item::Word("bar".fit())));
+          assert_eq!(p.peek().cloned(), Some(Item::Word(fit!("bar"))));
+          assert_eq!(p.pop().cloned(), Some(Item::Word(fit!("bar"))));
           assert_eq!(p.0.len(), 1);
       }
   }
@@ -2566,9 +2634,10 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  impl Derive<&str> for KeyItem {
-      fn derive(i: &str) -> Self {
-          KeyItem::Word(Word::derive(i))
+  impl TryDerive<&str> for KeyItem {
+      type Error = Error;
+      fn try_derive(i: &str) -> Result<Self, Self::Error> {
+          Word::try_derive(i).map(KeyItem::Word)
       }
   }
 
@@ -2595,7 +2664,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   }
                   s => {
                       println!("Bad keyitem {:?}", s);
-                      Err(Error::expected("KeyItem", s))
+                      Err(Error::expected(fit!("KeyItem"), s))
                   }
               },
           }
@@ -2607,8 +2676,8 @@ internally, to keep track of things like the stack, program, lists etc.
       fn try_derive(k: KeyItem) -> Result<Self, Self::Error> {
           match k {
               KeyItem::Word(w) => Ok(w),
-              KeyItem::String(s) => Ok(s.fit()),
-              i => Err(Error::expected("word", i)),
+              KeyItem::String(s) => s.try_fit(),
+              i => Err(Error::expected(fit!("word"), i)),
           }
       }
   }
@@ -2976,8 +3045,8 @@ internally, to keep track of things like the stack, program, lists etc.
       fn try_derive(s: coll::Sized) -> Result<Self, Error> {
           match s {
               coll::Sized::Associative(a) => Ok(a),
-              coll::Sized::String(i) => Err(Error::expected("associative", i)),
-              coll::Sized::Bytes(i) => Err(Error::expected("associative", i)),
+              coll::Sized::String(i) => Err(Error::expected(fit!("associative"), i)),
+              coll::Sized::Bytes(i) => Err(Error::expected(fit!("associative"), i)),
               s => Ok(Associative::Assoc(Association::try_from_iter(s)?)),
           }
       }
@@ -3052,7 +3121,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn try_derive(i: Item) -> Result<Self, Error> {
           let s = coll::Sized::try_derive(i)?;
           if s.count() != 2 {
-              Err(Error::expected("pair", s))
+              Err(Error::expected(fit!("pair"), s))
           } else {
               let mut iter = s.into_iter();
               let key: KeyItem = iter.next().unwrap().try_fit()?;
@@ -3247,11 +3316,11 @@ internally, to keep track of things like the stack, program, lists etc.
 **** Error types
 #+begin_src rust :tangle src/types/container/error.rs :mkdirp yes
   use super::associative as assoc;
-  use crate::list;
   use crate::traits::*;
   use crate::types::container::{self as coll, Mutey};
   use crate::types::number::Int;
   use crate::types::{Item, Word};
+  use crate::{fit, list};
   use std::convert::Infallible;
 
   /// Represents a runtime error type. Contains generic fields to hold
@@ -3290,7 +3359,7 @@ internally, to keep track of things like the stack, program, lists etc.
           F: FnOnce() -> Error,
       {
           let other = other_fn();
-          self.data.mutate().insert("cause".fit(), other.fit());
+          self.data.mutate().insert(fit!("cause"), other.fit());
           self
       }
   }
@@ -3300,13 +3369,13 @@ internally, to keep track of things like the stack, program, lists etc.
       pub fn create<T: Fit<Item>>(asked: coll::List, reason: &str, actual: Option<T>) -> Error {
           // let bt = backtrace::Backtrace::new();
           let mut data: Vec<(assoc::KeyItem, Item)> = vec![
-              ("type".fit(), "error".fit()),
-              ("asked".fit(), asked.fit()),
-              ("reason".fit(), reason.to_string().fit()),
+              (fit!("type"), fit!("error")),
+              (fit!("asked"), asked.fit()),
+              (fit!("reason"), reason.to_string().fit()),
               //("backtrace".fit(), Item::String(format!("{:?}", bt))),
           ];
           if let Some(actual) = actual {
-              data.push(("actual".fit(), actual.fit()));
+              data.push((fit!("actual"), actual.fit()));
           }
           Error {
               is_handled: false,
@@ -3340,7 +3409,7 @@ internally, to keep track of things like the stack, program, lists etc.
           Error::create(list!("/"), "division by zero", Option::<Item>::None)
       }
 
-      pub fn expected<T: Fit<Item>>(typestr: &str, actual: T) -> Error {
+      pub fn expected<T: Fit<Item>>(typestr: Word, actual: T) -> Error {
           Error::type_mismatch(list!(typestr), Some(actual))
       }
 
@@ -3391,12 +3460,13 @@ internally, to keep track of things like the stack, program, lists etc.
       ) -> Error {
           let mut e = Error::create(program, "assertion failed", Some(actual_stack));
           let d = e.data.mutate();
-          d.insert("expected-program".fit(), expected_prog.fit());
+          d.insert(fit!("expected-program"), expected_prog.fit());
           e
       }
 
       pub fn actual(&self) -> Option<&Item> {
-          self.data.get(&(Word::derive("actual").fit()))
+          self.data
+              .get(&(assoc::KeyItem::Word(Word::try_derive("actual").unwrap())))
       }
 
       pub fn len(&self) -> usize {
@@ -3408,7 +3478,7 @@ internally, to keep track of things like the stack, program, lists etc.
       }
 
       pub fn add_trace(&mut self, trace: coll::List) {
-          self.data.mutate().insert("trace".fit(), trace.fit());
+          self.data.mutate().insert(fit!("trace"), trace.fit());
       }
   }
 
@@ -3441,10 +3511,10 @@ internally, to keep track of things like the stack, program, lists etc.
               | Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(_)))
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::String(_)))
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(_))) => {
-                  Err(Error::expected("error", Item::default()))
+                  Err(Error::expected(fit!("error"), Item::default()))
               }
               Item::Dispenser(coll::Dispenser::Sized(c)) => c.into_iter().try_fit(),
-              i => Err(Error::expected("error", i)),
+              i => Err(Error::expected(fit!("error"), i)),
           }
       }
   }
@@ -3468,8 +3538,8 @@ internally, to keep track of things like the stack, program, lists etc.
           match a {
               assoc::Associative::Error(e) => Ok(e),
               assoc::Associative::Assoc(a) => {
-                  if a.get(&assoc::KeyItem::derive("type")) != Some(&Item::derive("error")) {
-                      Err(Error::expected("error", a))
+                  if a.get(&fit!("type")) != Some(&fit!("error")) {
+                      Err(Error::expected(fit!("error"), a))
                   } else {
                       Ok(Error {
                           data: a.clone(),
@@ -3477,7 +3547,7 @@ internally, to keep track of things like the stack, program, lists etc.
                       })
                   }
               }
-              i => Err(Error::expected("error", i)),
+              i => Err(Error::expected(fit!("error"), i)),
           }
       }
   }
@@ -3497,7 +3567,7 @@ internally, to keep track of things like the stack, program, lists etc.
               .data
               .iter()
               .map(|(k, v)| (k.clone(), v.clone()))
-              .chain(std::iter::once(("handled".fit(), self.is_handled.fit())))
+              .chain(std::iter::once((fit!("handled"), self.is_handled.fit())))
               .collect();
           Box::new(items.into_iter())
       }
@@ -3508,12 +3578,12 @@ internally, to keep track of things like the stack, program, lists etc.
   use super::associative as assoc;
   use crate::axiom;
   use crate::axiom::BUILTIN_FUNCTIONS;
-  use crate::list;
   use crate::serialize;
   use crate::traits::*;
   use crate::types::container::associative::Convert;
   use crate::types::container::{self as coll, Count, Mutey};
   use crate::types::{self, Bytes, Error, Item, Word};
+  use crate::{fit, list};
   use core::fmt;
   use internment::Intern;
   use std::collections::HashMap;
@@ -3709,7 +3779,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   if s.is_empty() {
                       Ok(Default::default())
                   } else {
-                      Err(Error::expected("namespace", s))
+                      Err(Error::expected(fit!("namespace"), s))
                   }
               }
           }
@@ -3970,7 +4040,7 @@ internally, to keep track of things like the stack, program, lists etc.
               let err = Error::create(
                   list!(types::Word::derive(word.clone())),
                   "word removed by module",
-                  Some("access-denied"),
+                  Some::<Item>(fit!("access-denied")),
               );
               let entry = Entry {
                   examples: None,
@@ -4111,23 +4181,23 @@ internally, to keep track of things like the stack, program, lists etc.
       type IntoIter = Box<dyn Iterator<Item = assoc::Entry>>;
 
       fn into_iter(self) -> Self::IntoIter {
-          let mut v: Vec<(assoc::KeyItem, Item)> = vec![("definition".fit(), {
+          let mut v: Vec<(assoc::KeyItem, Item)> = vec![(fit!("definition"), {
               match self.definition {
                   Executable::Derived(l) => l.fit(),
                   Executable::Axiom(a) => a.clone().fit(),
               }
           })];
           if let Some(e) = self.examples {
-              v.push(("examples".fit(), e.fit()));
+              v.push((fit!("examples"), e.fit()));
           }
           if let Some(s) = self.spec {
-              v.push(("spec".fit(), s.fit()))
+              v.push((fit!("spec"), s.fit()))
           }
           if let Some(d) = self.doc {
-              v.push(("doc".fit(), d.fit()))
+              v.push((fit!("doc"), d.fit()))
           }
           if let Some(n) = self.namespace {
-              v.push(("namespace".fit(), n.as_ref().clone().fit()))
+              v.push((fit!("namespace"), n.as_ref().clone().fit()))
           }
           Box::new(v.into_iter())
       }
@@ -4139,8 +4209,8 @@ internally, to keep track of things like the stack, program, lists etc.
 
       fn into_iter(self) -> Self::IntoIter {
           let v: Vec<(assoc::KeyItem, Item)> = vec![
-              ("words".fit(), self.words.fit()),
-              ("modules".fit(), self.modules.fit()),
+              (fit!("words"), self.words.fit()),
+              (fit!("modules"), self.modules.fit()),
               //("lingo".fit(), self.lingo.fit()),
           ];
           Box::new(v.into_iter())
@@ -4158,15 +4228,15 @@ internally, to keep track of things like the stack, program, lists etc.
           for i in iter {
               let (k, v): (assoc::KeyItem, Item) = i.try_fit()?;
               //println!("k: {:?}, v: {:?}", k, v);
-              if k == "examples".fit() {
+              if k == fit!("examples") {
                   examples = Some(v.try_fit()?);
-              } else if k == "definition".fit() {
+              } else if k == fit!("definition") {
                   definition = Some(v.try_fit()?);
-              } else if k == "spec".fit() {
+              } else if k == fit!("spec") {
                   spec = v.try_fit().ok();
-              } else if k == "namespace".fit() {
+              } else if k == fit!("namespace") {
                   namespace = v.try_fit().unwrap_or_default();
-              } else if k == "doc".fit() {
+              } else if k == fit!("doc") {
                   doc = v.try_fit().ok();
               } else {
                   continue;
@@ -4201,9 +4271,9 @@ internally, to keep track of things like the stack, program, lists etc.
           for i in iter {
               let (k, v): (assoc::KeyItem, Item) = i.try_fit()?;
               //println!("k: {:?}, v: {:?}", k, v);
-              if k == "words".fit() {
+              if k == fit!("words") {
                   words = v.try_fit()?;
-              } else if k == "modules".fit() {
+              } else if k == fit!("ss modules") {
                   modules = v.try_fit()?;
               } else {
                   continue;
@@ -4242,13 +4312,13 @@ internally, to keep track of things like the stack, program, lists etc.
       fn derive(d: Entry) -> assoc::Associative {
           let mut assoc = assoc::Association::fresh();
           let a = assoc.mutate();
-          d.examples.and_then(|l| a.insert("examples".fit(), l.fit()));
-          d.spec.and_then(|l| a.insert("spec".fit(), l.fit()));
-          d.doc.and_then(|l| a.insert("doc".fit(), l.fit()));
+          d.examples.and_then(|l| a.insert(fit!("examples"), l.fit()));
+          d.spec.and_then(|l| a.insert(fit!("spec"), l.fit()));
+          d.doc.and_then(|l| a.insert(fit!("doc"), l.fit()));
           d.namespace
-              .and_then(|l| a.insert("namespace".fit(), l.as_ref().clone().fit()));
+              .and_then(|l| a.insert(fit!("namespace"), l.as_ref().clone().fit()));
           if let Executable::Derived(d) = d.definition {
-              a.insert("definition".fit(), d.fit());
+              a.insert(fit!("definition"), d.fit());
           }
 
           assoc::Associative::Assoc(assoc)
@@ -4273,7 +4343,7 @@ internally, to keep track of things like the stack, program, lists etc.
           match s {
               assoc::Associative::Dictionary(d) => Ok(*d),
               //assoc::Associative::Assoc(a) => a.into_iter().try_fit(),
-              a => Err(Error::expected("dictionary", a)),
+              a => Err(Error::expected(fit!("dictionary"), a)),
           }
       }
   }
@@ -4314,7 +4384,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn try_derive(i: Item) -> Result<Self, Self::Error> {
           let s = coll::Sized::try_derive(i)?;
           if s.count() != 2 {
-              Err(Error::expected("pair", s))
+              Err(Error::expected(fit!("pair"), s))
           } else {
               let mut iter = s.into_iter();
               let key: types::Word = iter.next().unwrap().try_fit()?;
@@ -4424,8 +4494,8 @@ internally, to keep track of things like the stack, program, lists etc.
           };
           match k {
               assoc::KeyItem::Word(ref w) => {
-                  let w: &str = w.fit();
-                  match w {
+                  let s: &str = w.fit();
+                  match s {
                       "stack" => {
                           let l = coll::List::try_derive(v.clone());
                           match l {
@@ -4460,7 +4530,7 @@ internally, to keep track of things like the stack, program, lists etc.
                           }
                       }
 
-                      k => demote(self, k.fit(), v),
+                      _ => demote(self, w.clone().fit(), v),
                   }
               }
               _ => demote(self, k, v),
@@ -4510,7 +4580,7 @@ internally, to keep track of things like the stack, program, lists etc.
               match self.dictionary.words.insert_core_module(lexicon.clone()) {
                   Ok(_) => {}
                   Err(mut e) => {
-                      e.push("content".fit(), lexicon.fit());
+                      e.push(fit!("content"), lexicon.fit());
                       return Err(e);
                   }
               }
@@ -4558,7 +4628,7 @@ internally, to keep track of things like the stack, program, lists etc.
               {
                   //println!("Type check failed! wanted {} got {:?}", w.data, i);
 
-                  Err(Error::expected("match-input-spec?", actual))
+                  Err(Error::expected(fit!("match-input-spec?"), actual))
               }
           }
       }
@@ -4571,10 +4641,10 @@ internally, to keep track of things like the stack, program, lists etc.
   /// A reducing function that loads modules one at a time. Takes an
   /// existing env, loads the given module and returns the new env with
   /// the dictionary that the module built on the stack.
-  fn load_module(mut env: Environment, module: &&str) -> Environment {
+  fn load_module(mut env: Environment, module: &Word) -> Environment {
       //println!("Loading module {}", *module);
       //println!("Cache: {:?}", env.dictionary.lingo);
-      env.push(Word::derive(*module));
+      env.push(module.clone());
       //println!("Loading module (should be empty?): {:?}", env.program);
       env.program.prepend(list!(
           "dictionary",
@@ -4620,13 +4690,13 @@ internally, to keep track of things like the stack, program, lists etc.
               env.dictionary.resolve();
               //println!("Dict has {} words", env.dictionary.entries.len());
               let mut env = [
-                  "errors",
-                  "encode",
-                  "time", // good candidate for lib
-                  "pipes",
-                  "methods",
-                  "generators",
-                  "debug",
+                  fit!("errors"),
+                  fit!("encode"),
+                  fit!("time"), // good candidate for lib
+                  fit!("pipes"),
+                  fit!("methods"),
+                  fit!("generators"),
+                  fit!("debug"),
                   //"more-generators",
                   //"database",
               ]
@@ -4742,11 +4812,11 @@ internally, to keep track of things like the stack, program, lists etc.
           let mut dictionary: Option<dict::Dictionary> = None;
           for i in iter {
               let (k, v): (assoc::KeyItem, Item) = i.try_fit()?;
-              if k == "stack".fit() {
+              if k == fit!("stack") {
                   stack = Some(v.try_fit()?)
-              } else if k == "program".fit() {
+              } else if k == fit!("program") {
                   program = Some(v.try_fit()?)
-              } else if k == "dictionary".fit() {
+              } else if k == fit!("dictionary") {
                   let mut d = dict::Dictionary::try_derive(v)?;
                   d.resolve();
                   dictionary = Some(d);
@@ -4794,9 +4864,9 @@ internally, to keep track of things like the stack, program, lists etc.
 
       fn into_iter(self) -> Self::IntoIter {
           let v: Vec<(assoc::KeyItem, Item)> = vec![
-              ("stack".fit(), self.stack.fit()),
-              ("program".fit(), self.program.fit()),
-              ("dictionary".fit(), self.dictionary.fit()),
+              (fit!("stack"), self.stack.fit()),
+              (fit!("program"), self.program.fit()),
+              (fit!("dictionary"), self.dictionary.fit()),
           ];
           Box::new(v.into_iter())
       }
@@ -5080,6 +5150,7 @@ We'll implement certain cryptography functions in rust and make kcats
 words for them (hashing, encryption, signing)
 #+begin_src rust :tangle src/crypto.rs :mkdirp yes
   use crate::axiom::ItemResult;
+  use crate::fit;
   use crate::traits::*;
   use crate::types::container::{associative as assoc, error::Error};
   use crate::types::number::Int;
@@ -5152,9 +5223,9 @@ words for them (hashing, encryption, signing)
           salt: sbs,
       });
       Ok(assoc::Association::derive_iter([
-          ("type".fit(), "elliptic-curve-key".fit()),
-          ("secret".fit(), kp.secret.as_ref().to_vec().fit()),
-          ("public".fit(), kp.public.as_ref().to_vec().fit()),
+          (fit!("type"), fit!("elliptic-curve-key")),
+          (fit!("secret"), kp.secret.as_ref().to_vec().fit()),
+          (fit!("public"), kp.public.as_ref().to_vec().fit()),
       ])
       .fit())
   }
@@ -5175,17 +5246,17 @@ words for them (hashing, encryption, signing)
       type Error = Error;
       fn try_derive(i: Item) -> Result<Self, Self::Error> {
           let a = assoc::Associative::try_derive(i)?;
-          if a.get(&"type".fit()) == Some("elliptic-curve-key".fit()) {
+          if a.get(&fit!("type")) == Some(fit!("elliptic-curve-key")) {
               let sk = signing::SecretKey::from_bytes(
                   &Bytes::try_derive(
-                      a.get(&"secret".fit())
-                          .ok_or_else(|| Error::expected("secret", None::<Item>))?,
+                      a.get(&fit!("secret"))
+                          .ok_or_else(|| Error::expected(fit!("secret"), None::<Item>))?,
                   )?[..],
               )
-              .map_err(|_e| Error::expected("valid-secret-key", None::<Item>))?;
+              .map_err(|_e| Error::expected(fit!("valid-secret-key"), None::<Item>))?;
               Ok(sk)
           } else {
-              Err(Error::expected("keypair", a))
+              Err(Error::expected(fit!("keypair"), a))
           }
       }
   }
@@ -5194,17 +5265,17 @@ words for them (hashing, encryption, signing)
       type Error = Error;
       fn try_derive(i: Item) -> Result<Self, Self::Error> {
           let a = assoc::Associative::try_derive(i)?;
-          if a.get(&"type".fit()) == Some("elliptic-curve-key".fit()) {
+          if a.get(&fit!("type")) == Some(fit!("elliptic-curve-key")) {
               let pk = signing::PublicKey::from_bytes(
                   &Bytes::try_derive(
-                      a.get(&"public".fit())
-                          .ok_or_else(|| Error::expected("public", None::<Item>))?,
+                      a.get(&fit!("public"))
+                          .ok_or_else(|| Error::expected(fit!("public"), None::<Item>))?,
                   )?[..],
               )
-              .map_err(|_e| Error::expected("valid-public-key", None::<Item>))?;
+              .map_err(|_e| Error::expected(fit!("valid-public-key"), None::<Item>))?;
               Ok(pk)
           } else {
-              Err(Error::expected("public-key", a))
+              Err(Error::expected(fit!("public-key"), a))
           }
       }
   }
@@ -5223,7 +5294,7 @@ words for them (hashing, encryption, signing)
       let mbs: Bytes = m.try_fit()?;
       let sbs: Bytes = s.try_fit()?;
       let sig = signing::Signature::from_bytes(&sbs)
-          .map_err(|_e| Error::expected("signature", None::<Item>))?;
+          .map_err(|_e| Error::expected(fit!("signature"), None::<Item>))?;
       Ok(pk.verify(&mbs, &sig).map(|_| mret).unwrap_or_default())
   }
 
@@ -5247,6 +5318,7 @@ example, in order to read/write to/from disk).
   //! containers from edn are used, no lists, maps or sets). Currently
   //! one custom tag is used for encoding byte arrays, but this is
   //! subject to change.
+  use crate::fit;
   use crate::traits::*;
   use crate::types::container::{
       self as coll, associative as assoc, environment::Environment, error::Error,
@@ -5293,7 +5365,7 @@ example, in order to read/write to/from disk).
           // we don't have booleans in kcats, so if we see 'false' that
           // is the word false which is not defined in the base
           // language, but might be user-defined later.
-          edn_format::Value::Boolean(b) => Ok(if *b { "yes".fit() } else { "false".fit() }),
+          edn_format::Value::Boolean(b) => Ok(if *b { fit!("yes") } else { fit!("false") }),
           edn_format::Value::String(s) => Ok(s.to_string().fit()),
           edn_format::Value::Float(f) => Ok(Item::Number(Number::Float(f.into_inner()))),
           edn_format::Value::TaggedElement(tag, e) => {
@@ -5740,9 +5812,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 #+begin_src rust :tangle src/axiom.rs :mkdirp yes
   //! All the core functions of kcats: Words that are implemented in
   //! rust, instead of in terms of other kcats words.
-  use crate::list;
   use crate::serialize::{self, Emit};
   use crate::traits::*;
+  use crate::{fit, list};
 
   use crate::config;
   #[cfg(feature = "database")]
@@ -5753,6 +5825,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   };
   use crate::types::number::{Float, Int, Number};
   use crate::types::*;
+
   use cache::cache;
   use dynfmt::{Format, SimpleCurlyFormat};
   use futures::future::FutureExt;
@@ -6205,7 +6278,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           entries.push(("database", Box::leak(Box::new(f_stack2(db::query)))));
           entries.push(("persist", Box::leak(Box::new(f_stack1(db::insert_object)))));
       }
-          HashMap::from_iter(entries.into_iter().map(|(s, f)| (Word::derive(s), dict::Executable::Axiom(Box::leak(Box::new(Builtin {name: s, f}))))))
+          HashMap::from_iter(entries.into_iter().map(|(s, f)| (Word::try_derive(s).unwrap(), dict::Executable::Axiom(Box::leak(Box::new(Builtin {name: s, f}))))))
       };
   }
 
@@ -6788,7 +6861,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               let (a, _) = a.remove(&assoc::KeyItem::try_derive(k)?);
               Ok(a.fit())
           }
-          i => Err(Error::expected("simple-container", i)),
+          i => Err(Error::expected(fit!("simple-container"), i)),
       }
   }
 
@@ -7022,7 +7095,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           }),
           coll::Sized::String(s) => Ok(s.chars().rev().collect::<String>().fit()),
           coll::Sized::Bytes(b) => Ok(b.into_iter().rev().collect::<Vec<u8>>().fit()),
-          s => Err(Error::expected("ordered", s)),
+          s => Err(Error::expected(fit!("ordered"), s)),
       }
   }
 
@@ -7090,7 +7163,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   fn unwind(mut env: Environment) -> Environment {
       let err = env.pop();
-      let handle: &Item = &"handle".fit();
+      let handle: &Item = &fit!("handle");
 
       let err = match err {
           Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
@@ -7099,7 +7172,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               let mut next = env.program.peek();
               let data = e.data.mutate();
               let mut unwound: coll::List = data
-                  .remove(&"unwound".fit())
+                  .remove(&fit!("unwound"))
                   .unwrap_or_default()
                   .try_fit()
                   .unwrap_or_else(|_| list!());
@@ -7115,7 +7188,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   e.is_handled = true;
               }
               let em = Arc::make_mut(&mut e.data);
-              em.insert("unwound".fit(), unwound.fit());
+              em.insert(fit!("unwound"), unwound.fit());
               e.fit()
           }
           i => i,
@@ -7300,7 +7373,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               env.pop_prog();
               Ok(())
           }
-          i => Err(Error::expected("bytes", i)),
+          i => Err(Error::expected(fit!("bytes"), i)),
       }
   }
 
@@ -7346,7 +7419,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(i))),
               Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(j))),
           ) => Ok(xor_(i, j).fit()),
-          (i, j) => Err(Error::expected("integers", pair(i, j))),
+          (i, j) => Err(Error::expected(fit!("integers"), pair(i, j))),
       }
   }
 
@@ -7387,10 +7460,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   pub fn compare(i: Item, j: Item) -> ItemResult {
       fn res(r: Option<std::cmp::Ordering>, i: Item, j: Item) -> ItemResult {
           match r {
-              Some(std::cmp::Ordering::Less) => Ok("less".fit()),
-              Some(std::cmp::Ordering::Equal) => Ok("equal".fit()),
-              Some(std::cmp::Ordering::Greater) => Ok("greater".fit()),
-              None => Err(Error::expected("comparable", pair(i, j))),
+              Some(std::cmp::Ordering::Less) => Ok(fit!("less")),
+              Some(std::cmp::Ordering::Equal) => Ok(fit!("equal")),
+              Some(std::cmp::Ordering::Greater) => Ok(fit!("greater")),
+              None => Err(Error::expected(fit!("comparable"), pair(i, j))),
           }
       }
       match (i, j) {
@@ -7465,7 +7538,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               let sliced = arr.slice(start as usize..end as usize);
               Ok(sliced.fit())
           }
-          i => Err(Error::expected("ordered", i)),
+          i => Err(Error::expected(fit!("ordered"), i)),
       }
   }
 
@@ -7581,20 +7654,18 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   fn key(w: &Word) -> Option<(Word, bool)> {
-      let s = String::derive(w.clone());
-
       // Check for splice (scissors + tag + word)
-      if let Some(rest) = s.strip_prefix("✂️") {
+      if let Some(rest) = w.strip_prefix("✂️") {
           if let Some(k) = rest.strip_prefix("🏷️") {
-              Some((Word::derive(k), true))
+              Some((k, true))
           } else {
               None
           }
 
           // Check for just the tag
       } else {
-          if let Some(k) = s.strip_prefix("🏷️") {
-              Some((Word::derive(k), false))
+          if let Some(k) = w.strip_prefix("🏷️") {
+              Some((k, false))
           } else {
               None
           }
@@ -7767,10 +7838,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }
 
       fn strip_variable(w: &Word) -> Word {
-          let wc = w.clone();
-          let s = String::derive(wc);
-
-          if let Some(stripped) = s.strip_prefix(TAG_EMOJI) {
+          if let Some(stripped) = w.strip_prefix(TAG_EMOJI) {
               stripped.fit()
           } else {
               w.clone()
@@ -8141,6 +8209,7 @@ rust project or some other language through FFI.
   }
 
   pub mod config {
+      use crate::fit;
       use crate::types::container::error::Error;
       use crate::types::Item;
       use cache::cache;
@@ -8186,7 +8255,7 @@ rust project or some other language through FFI.
               //println!("Getting platform config: {:?}", config);
               config
                   .as_ref()
-                  .ok_or(Error::expected("initialization", None::<Item>))
+                  .ok_or(Error::expected(fit!("initialization"), None::<Item>))
                   .cloned()
           }
       }
@@ -8504,7 +8573,7 @@ rust project or some other language through FFI.
           crate::config::configure_platform();
           let e = Environment::default();
 
-          let r = test_word(e.clone(), word.fit());
+          let r = test_word(e.clone(), word.try_fit().unwrap());
           assert!(r.is_empty(), "{:?}", r);
       }
   }
@@ -8705,6 +8774,7 @@ can be impure. Everything else is a value.
 The basic pipe contracts.
 #+begin_src rust :tangle src/types/container/pipe.rs :mkdirp yes
   use super::error::Error;
+  use crate::fit;
   use crate::traits::*;
   use crate::types::container::{self as coll, SimpleTake};
   use crate::types::{self, Item};
@@ -9016,11 +9086,9 @@ The basic pipe contracts.
   ,*/
 
   fn closed_error(on_take: bool) -> Error {
+      let take_or_put: Item = if on_take { fit!("take") } else { fit!("put") };
       Error::create(
-          coll::List::derive_iter([
-              Item::derive("close"),
-              if on_take { "take" } else { "put" }.fit(),
-          ]),
+          coll::List::derive_iter([fit!("close"), take_or_put]),
           "attempt to use closed pipe",
           Option::<Item>::None,
       )
@@ -9051,7 +9119,7 @@ The basic pipe contracts.
               Item::Receptacle(coll::Receptacle::In(i)) => Ok(i),
               Item::Receptacle(coll::Receptacle::Tunnel(t)) => Ok(t.fit()),
               Item::Dispenser(coll::Dispenser::Tunnel(t)) => Ok(t.fit()),
-              i => Err(Error::expected("pipe", i)),
+              i => Err(Error::expected(fit!("pipe"), i)),
           }
       }
   }
@@ -9063,7 +9131,7 @@ The basic pipe contracts.
               Item::Dispenser(coll::Dispenser::Out(o)) => Ok(o),
               Item::Dispenser(coll::Dispenser::Tunnel(t)) => Ok(t.fit()),
               Item::Receptacle(coll::Receptacle::Tunnel(t)) => Ok(t.fit()),
-              i => Err(Error::expected("pipe", i)),
+              i => Err(Error::expected(fit!("pipe"), i)),
           }
       }
   }
@@ -9146,12 +9214,12 @@ How to interact with files on disk
   impl crate::serialize::Display for StaticFile {
       fn representation(&self) -> Item {
           assoc::Association::derive_iter([
-              ("type".fit(), "pipe".fit()),
-              ("in".fit(), "bytes".fit()),
-              ("out".fit(), "bytes".fit()),
+              (fit!("type"), fit!("pipe")),
+              (fit!("in"), fit!("bytes")),
+              (fit!("out"), fit!("bytes")),
               (
-                  "endpoint".fit(),
-                  assoc::Association::derive_iter([("file".fit(), self.path.clone().fit())]).fit(),
+                  fit!("endpoint"),
+                  assoc::Association::derive_iter([(fit!("file"), self.path.clone().fit())]).fit(),
               ),
           ])
           .fit()
@@ -9192,7 +9260,6 @@ How to interact with files on disk
 How to interact with the network (TCP/IP sockets)
 #+begin_src rust :tangle src/types/container/pipe/net.rs :mkdirp yes
   use crate::axiom::ItemResult;
-  use crate::list;
   use crate::traits::*;
   use crate::types::container as cont;
   use crate::types::container::associative as assoc;
@@ -9200,6 +9267,7 @@ How to interact with the network (TCP/IP sockets)
   use crate::types::container::pipe::{self, FutureTake};
   use crate::types::number::Int;
   use crate::types::{self, Bytes, Item};
+  use crate::{fit, list};
   use futures::future::FutureExt;
   use std::future::{self};
   use std::net::{Ipv4Addr, SocketAddrV4};
@@ -9261,10 +9329,10 @@ How to interact with the network (TCP/IP sockets)
   impl crate::serialize::Display for Socket {
       fn representation(&self) -> Item {
           assoc::Association::derive_iter([
-              ("type".fit(), "tunnel".fit()),
-              ("realm".fit(), "tcp".fit()),
-              ("address".fit(), self.addr.0.to_string().fit()),
-              ("port".fit(), self.addr.1.to_string().fit()),
+              (fit!("type"), fit!("tunnel")),
+              (fit!("realm"), fit!("tcp")),
+              (fit!("address"), self.addr.0.to_string().fit()),
+              (fit!("port"), self.addr.1.to_string().fit()),
           ])
           .fit()
       }
@@ -9305,22 +9373,22 @@ How to interact with the network (TCP/IP sockets)
       fn representation(&self) -> Item {
           let r = self.socket.local_addr();
           assoc::Association::derive_iter([
-              ("type".fit(), "pipe".fit()),
-              ("realm".fit(), "tcp".fit()),
-              ("produces".fit(), "socket".fit()),
-              ("pipe-type".fit(), "serversocket".fit()),
+              (fit!("type"), fit!("pipe")),
+              (fit!("realm"), fit!("tcp")),
+              (fit!("produces"), fit!("socket")),
+              (fit!("pipe-type"), fit!("serversocket")),
               (
-                  "address".fit(),
+                  fit!("address"),
                   match r {
-                      Ok(a) => a.ip().to_string().as_str().fit(),
-                      Err(_) => "unknown".fit(),
+                      Ok(a) => a.ip().to_string().fit(),
+                      Err(_) => fit!("unknown"),
                   },
               ),
               (
-                  "port".fit(),
+                  fit!("port"),
                   match r {
-                      Ok(a) => a.port().to_string().as_str().fit(),
-                      Err(_) => "unknown".fit(),
+                      Ok(a) => a.port().to_string().fit(),
+                      Err(_) => fit!("unknown"),
                   },
               ),
           ])
@@ -9424,13 +9492,13 @@ How to interact with the network (TCP/IP sockets)
   }
   pub fn representation() -> Item {
       assoc::Association::derive_iter([
-          ("type".fit(), "pipe".fit()),
-          ("endpoint".fit(), "systemtime".fit()),
+          (fit!("type"), fit!("pipe")),
+          (fit!("endpoint"), fit!("systemtime")),
           (
-              "out".fit(),
+              fit!("out"),
               assoc::Association::derive_iter([
-                  ("type".fit(), "integer".fit()),
-                  ("units".fit(), "milliseconds".fit()),
+                  (fit!("type"), fit!("integer")),
+                  (fit!("units"), fit!("milliseconds")),
               ])
               .fit(),
           ),
@@ -9471,10 +9539,10 @@ How to interact with the network (TCP/IP sockets)
 
   pub fn representation() -> Item {
       assoc::Association::derive_iter([
-          ("type".fit(), "pipe".fit()),
-          ("in".fit(), "bytes".fit()),
-          ("out".fit(), "bytes".fit()),
-          ("endpoint".fit(), "standard".fit()),
+          (fit!("type"), fit!("pipe")),
+          (fit!("in"), fit!("bytes")),
+          (fit!("out"), fit!("bytes")),
+          (fit!("endpoint"), fit!("standard")),
       ])
       .fit()
   }
@@ -9483,6 +9551,7 @@ How to interact with the network (TCP/IP sockets)
 Implement the =handoff= type
 #+begin_src rust :tangle src/types/container/pipe/channel.rs :mkdirp yes
   use crate::axiom;
+  use crate::fit;
   use crate::traits::*;
   use crate::types::container as coll;
   use crate::types::container::error::Error;
@@ -9601,9 +9670,9 @@ Implement the =handoff= type
   impl crate::serialize::Display for Handoff<Item> {
       fn representation(&self) -> Item {
           let mut props = [
-              ("type".fit(), "pipe".fit()),
+              (fit!("type"), fit!("pipe")),
               (
-                  "senders".fit(),
+                  fit!("senders"),
                   self.sender
                       .as_ref()
                       .map(|s| s.sender_count() as Int)
@@ -9611,7 +9680,7 @@ Implement the =handoff= type
                       .fit(),
               ),
               (
-                  "receivers".fit(),
+                  fit!("receivers"),
                   self.sender
                       .as_ref()
                       .map(|s| s.receiver_count() as Int)
@@ -9619,23 +9688,23 @@ Implement the =handoff= type
                       .fit(),
               ),
               (
-                  "endpoint".fit(),
-                  assoc::Association::derive_iter([("handoff".fit(), (self.id as Int).fit())]).fit(),
+                  fit!("endpoint"),
+                  assoc::Association::derive_iter([(fit!("handoff"), (self.id as Int).fit())]).fit(),
               ),
           ]
           .to_vec();
 
           if self.sender.is_some() {
-              props.push(("in".fit(), "item".fit()));
+              props.push((fit!("in"), fit!("item")));
               props.push((
-                  "capacity".fit(),
+                  fit!("capacity"),
                   (self.sender.as_ref().unwrap().capacity().unwrap_or_default() as Int).fit(),
               ));
           }
           if self.receiver.is_some() {
-              props.push(("out".fit(), "item".fit()));
+              props.push((fit!("out"), fit!("item")));
               props.push((
-                  "capacity".fit(),
+                  fit!("capacity"),
                   (self.sender.as_ref().unwrap().capacity().unwrap_or_default() as Int).fit(),
               ));
           }
@@ -9707,7 +9776,7 @@ Implement the =handoff= type
                               Arc::new(p.sender.clone().unwrap()),
                               i.clone(),
                           )),
-                          (p, _i) => Err(error::Error::expected("handoff", p.clone())),
+                          (p, _i) => Err(error::Error::expected(fit!("handoff"), p.clone())),
                       },
                       _ => Err(error::Error::short_list(2)),
                   }
@@ -9759,7 +9828,7 @@ Implement the =handoff= type
               Item::Receptacle(coll::Receptacle::In(pipe::In::Handoff(p))) => Ok(p),
               Item::Receptacle(coll::Receptacle::Tunnel(pipe::Tunnel::Handoff(p))) => Ok(p),
               Item::Dispenser(coll::Dispenser::Tunnel(pipe::Tunnel::Handoff(p))) => Ok(p),
-              i => Err(error::Error::expected("handoff", i)),
+              i => Err(error::Error::expected(fit!("handoff"), i)),
           }
       }
   }
@@ -9842,8 +9911,8 @@ Implement the =handoff= type
   impl crate::serialize::Display for Timer {
       fn representation(&self) -> Item {
           assoc::Association::derive_iter([
-              ("type".fit(), "pipe".fit()),
-              ("timeout".fit(), (self.duration.as_millis() as Int).fit()),
+              (fit!("type"), fit!("pipe")),
+              (fit!("timeout"), (self.duration.as_millis() as Int).fit()),
           ])
           .fit()
       }
@@ -9859,11 +9928,11 @@ Implement the =handoff= type
 #+begin_src rust :tangle src/types/container/pipe/db.rs :mkdirp yes
   use crate::axiom;
   use crate::config;
-  use crate::list;
   use crate::traits::*;
   use crate::types::container::{self as coll, associative as assoc, error::Error};
   use crate::types::number::Number;
   use crate::types::{self, Item};
+  use crate::{fit, list};
 
   use rusqlite::types::{ToSql, ToSqlOutput, Value, ValueRef};
   use rusqlite::{params, Connection, Error as DBError};
@@ -9900,8 +9969,9 @@ Implement the =handoff= type
                   .map(|column_index| {
                       let column_name = row.as_ref().column_name(column_index).unwrap().to_string();
                       let column_value: ValueRef = row.get_ref_unwrap(column_index);
-                      Item::try_derive(column_value)
-                          .map(|v| (assoc::KeyItem::derive(column_name.as_str()), v))
+                      Item::try_derive(column_value).and_then(|v| {
+                          assoc::KeyItem::try_derive(column_name.as_str()).map(|w| (w, v))
+                      })
                   })
                   .my_collect::<Result<assoc::Association, _>>()
                   .map(Item::derive)
@@ -9944,7 +10014,7 @@ Implement the =handoff= type
                           return Ok(());
                       }
                       None => {
-                          return Err(Error::expected("parent-link", v.clone()));
+                          return Err(Error::expected(fit!("parent-link"), v.clone()));
                       }
                   }
               } else {
@@ -9975,7 +10045,7 @@ Implement the =handoff= type
               coll::Sized::List(l) => {
                   self.insert_iter(None, *l)?;
               }
-              s => return Err(Error::expected("db-object", s)),
+              s => return Err(Error::expected(fit!("db-object"), s)),
           }
           Ok(Item::default())
       }
@@ -10002,7 +10072,7 @@ Implement the =handoff= type
       for (k, v) in params.to_iter() {
           match k {
               assoc::KeyItem::String(s) => boxed_params.push((s, v)),
-              k => return Err(Error::expected("string", k)),
+              k => return Err(Error::expected(fit!("string"), k)),
           }
       }
 
@@ -10036,7 +10106,7 @@ Implement the =handoff= type
   /// it should be when decoded.
   fn decode_string(s: String) -> axiom::ItemResult {
       if let Some(w) = s.strip_prefix("w|") {
-          Ok(Item::Word(w.fit()))
+          w.try_fit()
       } else if let Some(s) = s.strip_prefix("s|") {
           Ok(Item::Dispenser(coll::Dispenser::Sized(
               coll::Sized::String(s.to_string()),
@@ -10046,10 +10116,10 @@ Implement the =handoff= type
           if char_seq.chars().count() == 1 {
               Ok(Item::Char(char_seq.chars().next().unwrap()))
           } else {
-              Err(Error::expected("char", char_seq))
+              Err(Error::expected(fit!("char"), char_seq.to_string()))
           }
       } else {
-          Err(Error::expected("string", s))
+          Err(Error::expected(fit!("string"), s))
       }
   }
 
@@ -16303,7 +16373,9 @@ looks ok, but we broke a test for =pair?= which introspects errors:
 ✅
 #+end_src
 
-** TODO Empty words or with spaces, should not be allowed
+** DONE Empty words or with spaces, should not be allowed
+- State "DONE"       from "INPROGRESS" [2025-07-31 Thu 10:40]
+- State "INPROGRESS" from "TODO"       [2025-07-22 Tue 18:42]
 #+begin_src kcats
 1 "a b c" word 2
 #+end_src
@@ -16323,3 +16395,15 @@ looks ok, but we broke a test for =pair?= which introspects errors:
 #+end_src
 
 converting str -> word should be try_derive, not derive, since not all strings are convertible to word.
+
+Write me function that converts &str to  this type:
+
+pub struct Word {
+    pub data: Intern<String>,
+    pub quoted: bool,
+    pub namespace: dict::Namespace,
+}
+
+It's like a lisp or clojure symbol, but has slightly different rules for validity:
+
++ UTF8 and emoji are allowed
