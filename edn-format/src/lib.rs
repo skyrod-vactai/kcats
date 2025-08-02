@@ -887,7 +887,7 @@ fn parse_helper<Observer: ParseObserver, Iter: Iterator<Item = char> + Clone>(
                     } else if c == '#' {
                         s.next();
                         // Check if this is part of an emoji sequence
-                        if s.peek().map_or(false, |next_char| {
+                        if s.peek().is_some_and(|next_char| {
                             // Check for variation selector or zero-width joiner that could indicate emoji
                             //println!("Got next char: {}", next_char);
                             *next_char == '\u{FE0F}'
