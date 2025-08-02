@@ -1,6 +1,5 @@
 use cache::cache;
 use directories::ProjectDirs;
-use edn_format;
 use std::error::Error;
 use std::fs::{self};
 use std::path::Path;
