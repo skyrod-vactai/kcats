@@ -2321,16 +2321,19 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl Frame {
+      #[inline(always)]
       pub fn is_finished(&self) -> bool {
           self.next_idx >= self.snippet.len()
       }
 
+      #[inline(always)]
       pub fn next(&mut self) -> Option<&Item> {
           let i = self.snippet.get(self.next_idx);
           self.next_idx += 1;
           i
       }
 
+      #[inline(always)]
       pub fn peek(&self) -> Option<&Item> {
           if self.is_finished() {
               None
@@ -2364,6 +2367,7 @@ internally, to keep track of things like the stack, program, lists etc.
       }
       ///return a reference to the current instruction and advance to
       /// next
+      #[inline(always)]
       pub fn pop(&mut self) -> Option<&Item> {
           //println!("program: {:?}", self.0);
           self.clean();
@@ -2443,6 +2447,7 @@ internally, to keep track of things like the stack, program, lists etc.
               .fold(0, |acc, f| acc + (f.snippet.len() - f.next_idx))
       }
 
+      #[inline(always)]
       pub fn last(&self) -> Option<&Item> {
           self.0.first().and_then(|f| f.snippet.last())
       }
@@ -7635,6 +7640,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       None
   }
 
+  #[allow(dead_code)]
   fn key(w: &Word) -> Option<(Word, bool)> {
       // Check for splice (scissors + tag + word)
       if let Some(rest) = w.strip_prefix("✂️") {
@@ -10761,7 +10767,9 @@ significant bit position, eg 33 is 5
 : 253 #b64 "9xFLZf2AmWe7DRojlnYwLsBsq1Iz7mfo8BYH33X3FQ=="
 
 ** TODO Performance optimizations                             :optimization:
-*** TODO Compile programs
+*** CANCELED Compile programs
+- State "CANCELED"   from "TODO"       [2025-08-11 Mon 15:49] \\
+  I don't think we're going to do this - it's too complex and making it truly fast would likely interfere with the language's flexibility.
 Here is how it could maybe be done. We already have a type StepFn
 (which takes an env and returns a new one, in a future).
 
@@ -10843,6 +10851,96 @@ example program:
 
 So when printing out the program, we could cheat and only show the
 remaining program (instead of a stack of partially executed programs).
+*** TODO Program.rs
+**** TODO extend does an O(n) mem-move every time
+
+#+begin_src rust
+pub fn extend(&mut self, snippet: cont::List) {
+    if !snippet.is_empty() {
+        self.0.insert(0, Frame { … })   // ← shifts the whole Vec!
+    }
+}
+#+end_src
+Vec::insert(0, …) copies all existing frames one slot to the right for every call. If extend happens inside tight loops this quickly dwarfs everything else.
+
+Fixes
+
+Semantically swap the two operations:
+
+• push() for “execute this snippet next”
+• push_back() / VecDeque / keep a separate pending queue for “execute this snippet after the current call stack returns”
+
+or keep Vec and only ever push/pop at the back.
+***** TODO peek walks the frame stack every call
+#+begin_src rust
+let mut frameindex = self.0.len() - 1;
+loop {
+    if let Some(f) = self.0.get(frameindex) {
+         …
+#+end_src
+
+A branch-heavy loop plus bounds checks plus is_finished() for every
+level, only to read one reference. If the interpreter does “peek,
+dispatch, pop” thousands of times a second this is visible in perf.
+
+Idioms to remove that cost
+
+    Maintain the invariant “top frame is never finished”: clean one
+    frame right after you see that next() returned None instead of
+    calling clean() at the beginning of pop().  Then both peek and pop
+    are a single last() / last_mut().
+
+    Cache the pointer:
+
+  #+begin_src rust
+    if let Some(f) = self.0.last() {
+        f.peek()
+    } else {
+        None
+    }
+
+  #+end_src   
+(peek never needs to scan.)
+***** TODO Turn cont::List into an immutable slice
+
+Every call to
+
+#+begin_src rust
+self.snippet.get(self.next_idx)
+#+end_src
+
+
+goes through whatever abstraction cont::List implements. If that is a
+regular Vec<Item> behind a reference-counted handle you pay:
+
+  +  a bounds check in get
+  +  one Rc/Arc indirection to reach the buffer
+  +  another bounds check by LLVM because it cannot see through the method
+
+Change Frame to
+
+#+begin_src rust
+pub struct Frame<'a> {
+    code: &'a [Item],
+    ip:   usize,
+}
+#+end_src
+
+and pass around &'a [Item] when you construct a frame.  code[ip] then
+compiles down to one mov + one bounds check that LLVM can usually
+eliminate (because ip < code.len() is proven at push time).
+
+***** INPROGRESS Inline the tiny helpers
+
+- State "INPROGRESS" from "TODO"       [2025-08-11 Mon 16:06]
+Hot helpers like is_finished, next, peek, pop are two–three instructions each. Add
+
+#+begin_src rust
+#[inline(always)]
+#+end_src
+
+on them or mark the whole impl Frame block with #[inline].
+Without it Rust sometimes puts them out-of-line and you pay the call/ret overhead in the dispatch loop.
 
 ** INPROGRESS Generators                                            :stdlib:
 *** DONE Basic functionality and generators
@@ -16378,3 +16476,1440 @@ pub struct Word {
 It's like a lisp or clojure symbol, but has slightly different rules for validity:
 
 + UTF8 and emoji are allowed
+
+** TODO Performance redesign
+*** Chat with chatgpt
+**** Me
+:PROPERTIES:
+:CUSTOM_ID: message
+:END:
+
+I'm writing a stack based interpreter in rust similar to Joy. it's a
+pretty slow design overall, and i want to get as much performance as I
+can given the stack-based nature. My first attempt just basically uses a
+Vec to store the stack, and my stack values are an Item enum, with lots
+of different concrete types. To save memory I box the larger types (that
+aren't already references). But i'm thinking this design of "get a few
+stack items from the heap, work with them and put results back on the
+heap" might be slow (i really don't have a good sense of what perf
+bottlenecks really would be, maybe this is a non issue). And that some
+structure that lets me keep a few stack items nearer to the CPU would be
+much better because the top stack items are by definition the ones which
+will be needed next. it's only as items get buried deeper that they can
+be moved 'further away'. But standard Vec doesn't provide anything like
+that. Is there a rust lib or idiom that would help here?
+
+**** AI
+:PROPERTIES:
+:CUSTOM_ID: message
+:END:
+
+[[data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld2JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJ0YWJsZXItaWNvbiB0YWJsZXItaWNvbi1jb3B5Ij48cGF0aCBkPSJNNyA3bTAgMi42NjdhMi42NjcgMi42NjcgMCAwIDEgMi42NjcgLTIuNjY3aDguNjY2YTIuNjY3IDIuNjY3IDAgMCAxIDIuNjY3IDIuNjY3djguNjY2YTIuNjY3IDIuNjY3IDAgMCAxIC0yLjY2NyAyLjY2N2gtOC42NjZhMi42NjcgMi42NjcgMCAwIDEgLTIuNjY3IC0yLjY2N3oiIC8+PHBhdGggZD0iTTQuMDEyIDE2LjczN2EyLjAwNSAyLjAwNSAwIDAgMSAtMS4wMTIgLTEuNzM3di0xMGMwIC0xLjEgLjkgLTIgMiAtMmgxMGMuNzUgMCAxLjE1OCAuMzg1IDEuNSAxIiAvPjwvc3ZnPg==]]
+
+[[data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld2JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJ0YWJsZXItaWNvbiB0YWJsZXItaWNvbi1pbmZvLWNpcmNsZSI+PHBhdGggZD0iTTMgMTJhOSA5IDAgMSAwIDE4IDBhOSA5IDAgMCAwIC0xOCAwIiAvPjxwYXRoIGQ9Ik0xMiA5aC4wMSIgLz48cGF0aCBkPSJNMTEgMTJoMXY0aDEiIC8+PC9zdmc+]]
+
+The short version​
+
+1. Don't worry about “being near the CPU” -- a =Vec= *already keeps the
+   whole stack in one contiguous chunk of memory*, so the most-recent
+   elements are always in the last cache line you touched.
+2. What /does/ cost you is
+   • an extra indirection for every =Box=,\\
+   • unpredictable branches when you pattern-match a big =enum=, and\\
+   • heap allocations performed while the program is running.
+
+Therefore the usual recipe for a fast Joy / Forth-like interpreter in
+Rust is:
+
+• keep the stack as =Vec<Value>= (contiguous, cache-friendly)\\
+• make =Value= one machine word + a tag, so small scalars live inline
+and only the “big” things are boxed once and shared\\
+• optionally add a tiny register-sized “front buffer” to avoid even the
+=Vec= bounds checks.
+
+Below is the common layout and the optional front buffer.\\
+After the code you'll find the rationale and some crate suggestions.
+
+#+begin_src rust
+// src/value.rs
+use std::ptr::NonNull;
+
+#[repr(u8)]            // <= one byte tag
+pub enum Tag {
+    Int,
+    Float,
+    Bool,
+    Heap,              // everything that doesn’t fit in 56 bits
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Value(u64);
+
+impl Value {
+    const TAG_BITS: u64 = 0b111;            // low three bits
+    const PAYLOAD_MASK: u64 = !Self::TAG_BITS;
+
+    #[inline]
+    pub fn int(i: i64) -> Self {
+        // shift left so the tag fits
+        Value(((i as u64) << 3) | (Tag::Int as u64))
+    }
+    #[inline]
+    pub fn as_int(self) -> i64 {
+        (self.0 as i64) >> 3
+    }
+    // Similar helpers for f64, bool);
+    // For boxed things store the pointer as payload and set Tag::Heap.
+    #[inline]
+    pub fn ptr(p: NonNull<HeapObj>) -> Self {
+        debug_assert!(p.as_ptr() as usize & 0b111 == 0); // alignment
+        Value((p.as_ptr() as u64) | (Tag::Heap as u64))
+    }
+    #[inline]
+    pub fn tag(self) -> Tag {
+        unsafe { std::mem::transmute((self.0 & 0b111) as u8) }
+    }
+}
+
+//------------------------------------------------------------------------------
+// Optional register stack (front buffer)
+
+const FRONT: usize = 8;             // 8 values stay in registers/L1
+
+pub struct Stack {
+    front: [Value; FRONT],
+    len_front: usize,
+    spill: Vec<Value>,
+}
+
+impl Stack {
+    pub fn new() -> Self {
+        Self { front: [Value(0); FRONT], len_front: 0, spill: Vec::new() }
+    }
+
+    #[inline(always)]
+    pub fn push(&mut self, v: Value) {
+        if self.len_front < FRONT {
+            self.front[self.len_front] = v;
+            self.len_front += 1;
+        } else {
+            self.spill.push(v);
+        }
+    }
+
+    #[inline(always)]
+    pub fn pop(&mut self) -> Value {
+        if self.len_front > 0 {
+            self.len_front -= 1;
+            self.front[self.len_front]
+        } else {
+            self.spill.pop().expect("stack underflow")
+        }
+    }
+}
+#+end_example
+
+***** Why this is usually fast enough
+:PROPERTIES:
+:CUSTOM_ID: why-this-is-usually-fast-enough
+:END:
+Contiguous array = cache-friendly\\
+=Vec= stores elements back-to-back. When you =push=/=pop= the CPU will
+touch the last 1--2 cache lines repeatedly, exactly what you want.
+
+One word + tag = no per-value allocation\\
+=i64=, =f64=, =bool=, =char=, etc. are all represented /inside/ the
+64-bit slot. Anything that does not fit (=String=, user records, arrays)
+gets /one/ allocation and is referenced by pointer. You removed the
+“Box-per-value” overhead.
+
+No virtual dispatch\\
+=match v.tag()= on four variants is predicted well by modern CPUs. The
+expensive part is eliminated: dynamic trait objects and per-operation
+heap traffic.
+
+Optional front buffer\\
+Bounds checks on =Vec= are /very/ cheap (=llvm= usually eliminates
+them), but if you want to squeeze the last few percent you can keep a
+small fixed-size ring (4-8 entries) in the interpreter struct. Push/pop
+on that array needs no check at all and only spills when full.
+
+***** Useful crates / idioms
+:PROPERTIES:
+:CUSTOM_ID: useful-crates-idioms
+:END:
+smallvec / arrayvec -- give you an inline capacity for secondary data
+structures, not for the main value stack\\
+bytemuck -- for safe transmutation between =Value= and raw bits\\
+static-inline-global -- if you implement threaded code and want labels
+
+***** When to look elsewhere
+:PROPERTIES:
+:CUSTOM_ID: when-to-look-elsewhere
+:END:
+If you sample the interpreter with =perf= / =cargo‐flamegraph= and see
+that you are CPU-bound in instruction dispatch, switch from a =match=
+dispatch loop to
+
+• direct-threaded interpreter (computed-goto; doable in nightly Rust
+with the =experimental_inline_asm_sym= feature), or\\
+• “copy-the-bytecode into a big array of function pointers” and call
+through that (works on stable).
+
+Those bring larger wins than micro-tuning the stack once the obvious
+indirections are gone.
+
+***** Summary
+:PROPERTIES:
+:CUSTOM_ID: summary
+:END:
+Keep the stack contiguous, store scalars inline, box complex objects
+once, and profile before redesigning.\\
+The =Vec<Value>= approach with a tagged 64-bit =Value= is the prevailing
+idiom for fast toy VMs in Rust, C, Lua, JavaScriptCore, etc.
+
+[[data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld2JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJ0YWJsZXItaWNvbiB0YWJsZXItaWNvbi1jb3B5Ij48cGF0aCBkPSJNNyA3bTAgMi42NjdhMi42NjcgMi42NjcgMCAwIDEgMi42NjcgLTIuNjY3aDguNjY2YTIuNjY3IDIuNjY3IDAgMCAxIDIuNjY3IDIuNjY3djguNjY2YTIuNjY3IDIuNjY3IDAgMCAxIC0yLjY2NyAyLjY2N2gtOC42NjZhMi42NjcgMi42NjcgMCAwIDEgLTIuNjY3IC0yLjY2N3oiIC8+PHBhdGggZD0iTTQuMDEyIDE2LjczN2EyLjAwNSAyLjAwNSAwIDAgMSAtMS4wMTIgLTEuNzM3di0xMGMwIC0xLjEgLjkgLTIgMiAtMmgxMGMuNzUgMCAxLjE1OCAuMzg1IDEuNSAxIiAvPjwvc3ZnPg==]]
+
+[[data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld2JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJ0YWJsZXItaWNvbiB0YWJsZXItaWNvbi1pbmZvLWNpcmNsZSI+PHBhdGggZD0iTTMgMTJhOSA5IDAgMSAwIDE4IDBhOSA5IDAgMCAwIC0xOCAwIiAvPjxwYXRoIGQ9Ik0xMiA5aC4wMSIgLz48cGF0aCBkPSJNMTEgMTJoMXY0aDEiIC8+PC9zdmc+]]
+
+**** Me
+:PROPERTIES:
+:CUSTOM_ID: message
+:END:
+
+what do you mean by 'tagged 64 bit Value' - right now my enum is 48
+bytes, and it was as large as 224 because of not boxing and several
+levels of enum hierarchy that add 8 bytes each.
+
+**** AI
+:PROPERTIES:
+:CUSTOM_ID: message
+:END:
+
+[[data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld2JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJ0YWJsZXItaWNvbiB0YWJsZXItaWNvbi1jb3B5Ij48cGF0aCBkPSJNNyA3bTAgMi42NjdhMi42NjcgMi42NjcgMCAwIDEgMi42NjcgLTIuNjY3aDguNjY2YTIuNjY3IDIuNjY3IDAgMCAxIDIuNjY3IDIuNjY3djguNjY2YTIuNjY3IDIuNjY3IDAgMCAxIC0yLjY2NyAyLjY2N2gtOC42NjZhMi42NjcgMi42NjcgMCAwIDEgLTIuNjY3IC0yLjY2N3oiIC8+PHBhdGggZD0iTTQuMDEyIDE2LjczN2EyLjAwNSAyLjAwNSAwIDAgMSAtMS4wMTIgLTEuNzM3di0xMGMwIC0xLjEgLjkgLTIgMiAtMmgxMGMuNzUgMCAxLjE1OCAuMzg1IDEuNSAxIiAvPjwvc3ZnPg==]]
+
+[[data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld2JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJ0YWJsZXItaWNvbiB0YWJsZXItaWNvbi1pbmZvLWNpcmNsZSI+PHBhdGggZD0iTTMgMTJhOSA5IDAgMSAwIDE4IDBhOSA5IDAgMCAwIC0xOCAwIiAvPjxwYXRoIGQ9Ik0xMiA5aC4wMSIgLz48cGF0aCBkPSJNMTEgMTJoMXY0aDEiIC8+PC9zdmc+]]
+
+Think “Java-script value”, “Lua value”, or “NaN-boxed value”: every
+run-time value---an integer, a float, a pointer to a string, ...---fits
+in one 64-bit machine word. A few of its bits carry a /tag/ that says
+what it is, and the remaining bits are the payload.
+
+Why 64 bits?
+
+• On every desktop / server the pointer width is 64 bits, so one word is
+the natural unit.\\
+• A word is what the CPU can move, compare, or push/pop in a single
+instruction.\\
+• Keeping the interpreter's data path “one register wide” eliminates
+copies and indirections.
+
+Below is the conceptual picture and a concrete Rust layout.
+
+--------------
+
+***** 1 How many bits are actually free?
+:PROPERTIES:
+:CUSTOM_ID: how-many-bits-are-actually-free
+:END:
+• Heap pointers are always *aligned to at least 8 bytes* → their three
+least-significant bits are /zero/. We can re-use those bits as a tag.\\
+• IEEE-754 doubles reserve *2¹¹−2 patterns* for NaNs; libraries like
+LuaJIT and WebKit store pointers or integers in those otherwise
+“forbidden” bit patterns (this is called NaN boxing).\\
+• Small signed integers fit in 61 bits (2⁶¹ ≈ 2.3e18) once we steal
+three tag bits.
+
+So with one word you can encode
+
+Tag 000 → small signed int\\
+Tag 001 → =f64= whose pattern is /not/ a pointer (normal number)\\
+Tag 010 → boolean (payload bit = 0/1)\\
+Tag 111 → “heap object”; payload = pointer with the low bits zero
+
+You can of course pick any scheme.
+
+--------------
+
+***** 2 A minimal Rust implementation
+:PROPERTIES:
+:CUSTOM_ID: a-minimal-rust-implementation
+:END:
+#+begin_example rust
+// value.rs
+use std::ptr::NonNull;
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Tag { Int = 0, Float = 1, Bool = 2, Heap = 7 }
+
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct Value(u64);
+
+impl Value {
+    const TAG_MASK: u64 = 0b111;
+
+    /* constructors ------------------------------------------------------- */
+
+    pub fn int(i: i64) -> Self {
+        Value(((i as u64) << 3) | Tag::Int as u64)
+    }
+    pub fn float(f: f64) -> Self {               // plain cast keeps bits
+        Value(f.to_bits() & !Self::TAG_MASK | Tag::Float as u64)
+    }
+    pub fn boolean(b: bool) -> Self {
+        Value(((b as u64) << 3) | Tag::Bool as u64)
+    }
+    pub fn ptr<T>(p: NonNull<T>) -> Self {
+        // alignment ≥ 8 → ok to reuse bits
+        debug_assert!(p.as_ptr() as usize & 0b111 == 0);
+        Value(p.as_ptr() as u64 | Tag::Heap as u64)
+    }
+
+    /* accessors ---------------------------------------------------------- */
+
+    #[inline]
+    pub fn tag(self) -> Tag {
+        unsafe { std::mem::transmute((self.0 & Self::TAG_MASK) as u8) }
+    }
+    pub fn as_int(self)  -> i64 { (self.0 as i64) >> 3 }
+    pub fn as_bool(self) -> bool { (self.0 >> 3) & 1 != 0 }
+    pub fn as_float(self) -> f64 { f64::from_bits(self.0 & !Self::TAG_MASK) }
+    pub fn as_ptr<T>(self) -> NonNull<T> {
+        NonNull::new((self.0 & !Self::TAG_MASK) as *mut T).unwrap()
+    }
+}
+#+end_example
+
+=Value= is 8 bytes, trivially copyable, lives in registers, and the VM's
+operand stack is just =Vec<Value>=.
+
+--------------
+
+***** 3 Why your enum became 48--224 bytes
+:PROPERTIES:
+:CUSTOM_ID: why-your-enum-became-48224-bytes
+:END:
+=enum Item= in Rust is laid out like C/Swift “tagged unions”:
+
+size = max(size_of(variant_i)) rounded up for alignment\\
++ 1 discriminant (1--8 bytes)
+
+If one variant holds
+
+#+begin_example rust
+Array(Vec<Item>)        // Vec = 24 bytes on x86-64
+#+end_example
+
+and another holds
+
+#+begin_example rust
+Closure { env: Box<[Value]>, ip: usize }   // 16 bytes
+#+end_example
+
+then the /whole/ enum has to be at least 24 bytes. If you nest enums the
+large variant is repeated, which is how you reached 48, 96, 224, ...
+
+By moving “big” things behind a pointer and keeping only that pointer in
+the enum, the largest variant becomes a single word, so the enum itself
+shrinks to 16 bytes (pointer + tag). With the manual tagging above it
+drops to 8 bytes.
+
+--------------
+
+***** 4 Is this worth the trouble?
+:PROPERTIES:
+:CUSTOM_ID: is-this-worth-the-trouble
+:END:
+Almost always, yes:
+
+• Interpreter hot loops fit in L1/L2 cache.\\
+• Stack frames push/pop one word instead of touching the allocator.\\
+• =memcpy=/=copy_nonoverlapping= work on slices of =Value=s.\\
+• You get predictable performance close to LuaJIT / V8 “baseline”
+interpreters without going JIT.
+
+If you prefer less low-level code, a compromise is:
+
+#+begin_example rust
+#[repr(u8)]
+pub enum Value {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Ptr(NonNull<HeapObj>),
+}
+#+end_example
+
+This is 16 bytes---already a *3× shrink* from your 48-byte enum and
+requires no hand tagging. The single heap indirection is usually
+acceptable.
+
+--------------
+
+****** Take-away
+:PROPERTIES:
+:CUSTOM_ID: take-away
+:END:
+A “tagged 64-bit value” means: one 64-bit word whose low bits encode the
+type and whose high bits are the actual integer / float bits /or/ a
+pointer to heap data. Using it turns every stack slot into one register
+move and keeps the whole operand stack in a compact, cache-friendly
+array.
+
+[[data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld2JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJ0YWJsZXItaWNvbiB0YWJsZXItaWNvbi1jb3B5Ij48cGF0aCBkPSJNNyA3bTAgMi42NjdhMi42NjcgMi42NjcgMCAwIDEgMi42NjcgLTIuNjY3aDguNjY2YTIuNjY3IDIuNjY3IDAgMCAxIDIuNjY3IDIuNjY3djguNjY2YTIuNjY3IDIuNjY3IDAgMCAxIC0yLjY2NyAyLjY2N2gtOC42NjZhMi42NjcgMi42NjcgMCAwIDEgLTIuNjY3IC0yLjY2N3oiIC8+PHBhdGggZD0iTTQuMDEyIDE2LjczN2EyLjAwNSAyLjAwNSAwIDAgMSAtMS4wMTIgLTEuNzM3di0xMGMwIC0xLjEgLjkgLTIgMiAtMmgxMGMuNzUgMCAxLjE1OCAuMzg1IDEuNSAxIiAvPjwvc3ZnPg==]]
+
+[[data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld2JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJ0YWJsZXItaWNvbiB0YWJsZXItaWNvbi1pbmZvLWNpcmNsZSI+PHBhdGggZD0iTTMgMTJhOSA5IDAgMSAwIDE4IDBhOSA5IDAgMCAwIC0xOCAwIiAvPjxwYXRoIGQ9Ik0xMiA5aC4wMSIgLz48cGF0aCBkPSJNMTEgMTJoMXY0aDEiIC8+PC9zdmc+]]
+
+**** Me
+:PROPERTIES:
+:CUSTOM_ID: message
+:END:
+
+is there a crate to help manage the tagged values?
+
+**** AI
+:PROPERTIES:
+:CUSTOM_ID: message
+:END:
+
+[[data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld2JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJ0YWJsZXItaWNvbiB0YWJsZXItaWNvbi1jb3B5Ij48cGF0aCBkPSJNNyA3bTAgMi42NjdhMi42NjcgMi42NjcgMCAwIDEgMi42NjcgLTIuNjY3aDguNjY2YTIuNjY3IDIuNjY3IDAgMCAxIDIuNjY3IDIuNjY3djguNjY2YTIuNjY3IDIuNjY3IDAgMCAxIC0yLjY2NyAyLjY2N2gtOC42NjZhMi42NjcgMi42NjcgMCAwIDEgLTIuNjY3IC0yLjY2N3oiIC8+PHBhdGggZD0iTTQuMDEyIDE2LjczN2EyLjAwNSAyLjAwNSAwIDAgMSAtMS4wMTIgLTEuNzM3di0xMGMwIC0xLjEgLjkgLTIgMiAtMmgxMGMuNzUgMCAxLjE1OCAuMzg1IDEuNSAxIiAvPjwvc3ZnPg==]]
+
+[[data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld2JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJ0YWJsZXItaWNvbiB0YWJsZXItaWNvbi1pbmZvLWNpcmNsZSI+PHBhdGggZD0iTTMgMTJhOSA5IDAgMSAwIDE4IDBhOSA5IDAgMCAwIC0xOCAwIiAvPjxwYXRoIGQ9Ik0xMiA5aC4wMSIgLz48cGF0aCBkPSJNMTEgMTJoMXY0aDEiIC8+PC9zdmc+]]
+
+There is no “standard” crate that everyone depends on, but there are a
+handful of small crates that give you most of the plumbing for
+pointer-/NaN-tagging so you don't have to write the bit-twiddling
+yourself.
+
+***** Crates you can use right now
+:PROPERTIES:
+:CUSTOM_ID: crates-you-can-use-right-now
+:END:
+- =nanbox= -- safe façade over a 64-bit NaN-boxed value.\\
+  -- supports =i32=, =f64=, =bool=, =char=, and any =*mut T= pointer\\
+  -- gives you =enum NanBoxed { Int(i32), Float(f64), … }= plus
+  =into_raw()/from_raw()= if you want to keep it at the word level\\
+  -- no =unsafe= in user code unless you extend it with your own
+  payloads
+
+- =tagged_ptr= -- minimal pointer-tagging helper.\\
+  -- =TaggedPtr<T, const TAG_BITS: usize>= stores an aligned =*mut T=
+  plus =TAG_BITS= bits of metadata\\
+  -- you add your own enum and payload handling; good when you do /not/
+  want NaN boxing and prefer the “steal the low 3 bits” scheme
+
+- =enum_primitive_derive= or =num_enum= -- not about tagging per se, but
+  they derive cheap conversions between =u8= and your =Tag= enum, which
+  avoids the manual =transmute= dance.
+
+- =tinyvec= / =arrayvec= -- if you decide to keep a small inline buffer
+  for the operand stack these crates give you a safe “vector with N
+  inline slots, spill to =Vec= when full”.
+
+***** Choosing between them
+:PROPERTIES:
+:CUSTOM_ID: choosing-between-them
+:END:
+| use-case                                                                                                      | good choice |
+|---------------------------------------------------------------------------------------------------------------+-------------|
+| You want something that “just works” and already boxes =f64= → =nanbox=                                       |             |
+| You only need pointer tagging, floats stay as plain =f64= → =tagged_ptr=                                      |             |
+| You are happy to maintain 30 lines of unsafe but want zero deps → roll your own (like in the previous answer) |             |
+
+***** Caveats
+:PROPERTIES:
+:CUSTOM_ID: caveats
+:END:
+- All crates above rely on =unsafe= internally; read their docs about
+  soundness conditions (usually “pointers must keep the alignment they
+  were created with”).
+- NaN boxing breaks if you ever store signalling-NaNs or rely on exact
+  bit patterns for =f64=; that is rarely an issue in interpreters, but
+  good to be aware of.
+- The crates are small (sub-1.0) projects; if the VM is production
+  software you may still prefer an in-tree implementation you fully
+  control.
+
+In practice most hobby / research VMs end up in one of two camps:
+
+1. Copy 60 lines from LuaJIT/WebKit (your own implementation).
+2. Use =nanbox= for convenience during prototyping, then inline the code
+   once the design stabilises.
+
+Either way you get the same performance profile: one 64-bit word per
+value, no per-push allocation, and the whole operand stack packed inside
+a =Vec<Value>=.
+
+[[data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld2JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJ0YWJsZXItaWNvbiB0YWJsZXItaWNvbi1jb3B5Ij48cGF0aCBkPSJNNyA3bTAgMi42NjdhMi42NjcgMi42NjcgMCAwIDEgMi42NjcgLTIuNjY3aDguNjY2YTIuNjY3IDIuNjY3IDAgMCAxIDIuNjY3IDIuNjY3djguNjY2YTIuNjY3IDIuNjY3IDAgMCAxIC0yLjY2NyAyLjY2N2gtOC42NjZhMi42NjcgMi42NjcgMCAwIDEgLTIuNjY3IC0yLjY2N3oiIC8+PHBhdGggZD0iTTQuMDEyIDE2LjczN2EyLjAwNSAyLjAwNSAwIDAgMSAtMS4wMTIgLTEuNzM3di0xMGMwIC0xLjEgLjkgLTIgMiAtMmgxMGMuNzUgMCAxLjE1OCAuMzg1IDEuNSAxIiAvPjwvc3ZnPg==]]
+
+[[data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld2JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJ0YWJsZXItaWNvbiB0YWJsZXItaWNvbi1pbmZvLWNpcmNsZSI+PHBhdGggZD0iTTMgMTJhOSA5IDAgMSAwIDE4IDBhOSA5IDAgMCAwIC0xOCAwIiAvPjxwYXRoIGQ9Ik0xMiA5aC4wMSIgLz48cGF0aCBkPSJNMTEgMTJoMXY0aDEiIC8+PC9zdmc+]]
+
+**** Me
+:PROPERTIES:
+:CUSTOM_ID: message
+:END:
+
+hm ok good to know. And what about the constant push/pop of individual
+instructions from the program? is Vec ok for this? The frequent
+operations are, each interpreter loop pops off the next instruction,
+which may extend the Vec with a new list of instructions (to be executed
+first). I thought about changing to a design where program snippets are
+immutable and we just move a pointer. i implemented that, but it wasn't
+a performance bottleneck.
+
+**** AI
+:PROPERTIES:
+:CUSTOM_ID: message
+:END:
+
+[[data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld2JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJ0YWJsZXItaWNvbiB0YWJsZXItaWNvbi1jb3B5Ij48cGF0aCBkPSJNNyA3bTAgMi42NjdhMi42NjcgMi42NjcgMCAwIDEgMi42NjcgLTIuNjY3aDguNjY2YTIuNjY3IDIuNjY3IDAgMCAxIDIuNjY3IDIuNjY3djguNjY2YTIuNjY3IDIuNjY3IDAgMCAxIC0yLjY2NyAyLjY2N2gtOC42NjZhMi42NjcgMi42NjcgMCAwIDEgLTIuNjY3IC0yLjY2N3oiIC8+PHBhdGggZD0iTTQuMDEyIDE2LjczN2EyLjAwNSAyLjAwNSAwIDAgMSAtMS4wMTIgLTEuNzM3di0xMGMwIC0xLjEgLjkgLTIgMiAtMmgxMGMuNzUgMCAxLjE1OCAuMzg1IDEuNSAxIiAvPjwvc3ZnPg==]]
+
+[[data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld2JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJ0YWJsZXItaWNvbiB0YWJsZXItaWNvbi1pbmZvLWNpcmNsZSI+PHBhdGggZD0iTTMgMTJhOSA5IDAgMSAwIDE4IDBhOSA5IDAgMCAwIC0xOCAwIiAvPjxwYXRoIGQ9Ik0xMiA5aC4wMSIgLz48cGF0aCBkPSJNMTEgMTJoMXY0aDEiIC8+PC9zdmc+]]
+
+=Vec= is perfectly fine for the /data/ stack, but it is rarely the best
+shape for the /instruction/ stream. The usual pattern in byte-code or
+concatenative interpreters is
+
+1. keep the program in an immutable array (=Vec<Instr>= or
+   =Box<[Instr]>=)
+2. keep an instruction pointer (=ip: usize=)
+3. advance the pointer instead of =pop=-ing instructions out of the
+   vector, and
+4. when a word wants to execute an embedded quotation or splice in a new
+   phrase, push the *current* state on a /call stack/ and jump to the
+   new slice.
+
+That design avoids the =memmove= you pay every time you remove the first
+element of a =Vec=. The tiny pseudo-code below shows the idea.
+
+#+begin_example rust
+#[derive(Clone)]
+struct Frame<'prog> {
+    code: &'prog [Instr],   // immutable slice
+    ip:   usize,            // next instruction inside that slice
+}
+
+struct VM<'prog> {
+    run_stack: Vec<Frame<'prog>>,   // program / return stack
+    data_stack: Vec<Value>,         // operand stack from earlier messages
+}
+
+impl<'p> VM<'p> {
+    fn new(entry: &'p [Instr]) -> Self {
+        Self {
+            run_stack: vec![Frame { code: entry, ip: 0 }],
+            data_stack: Vec::new(),
+        }
+    }
+
+    fn step(&mut self) -> bool {
+        let Frame { code, ref mut ip } = self.run_stack
+            .last_mut()
+            .expect("empty run-stack = program finished");
+
+        let instr = match code.get(*ip) {
+            Some(i) => *i,
+            None    => { self.run_stack.pop(); return !self.run_stack.is_empty(); }
+        };
+        *ip += 1;
+
+        match instr {
+            Instr::PushInt(n) => self.data_stack.push(Value::int(n)),
+            Instr::Add        => { /* … */ }
+
+            // quotation ‑-> jump into a new slice, no copying
+            Instr::ExecQuote(q) => self.run_stack.push(Frame { code: q, ip: 0 }),
+        }
+        true
+    }
+}
+#+end_example
+
+Why this is fast
+
+• =code= is immutable, so it stays in a contiguous cache-friendly
+block.\\
+• Advancing =ip= is one addition; no element removal, no reallocation.\\
+• Splicing a quotation is a single =push= of a 16-byte =Frame= (two
+registers) --- cheaper than inserting at the front of a =Vec=.\\
+• Returning from a quotation is just =pop= on the run-stack.
+
+When would you choose something else?
+
+• If you really need constant-time insertion /at both ends/ of the
+program stream, =VecDeque= is the standard choice. (It is still a ring
+buffer in contiguous memory, but lets you pop from the front.)
+
+• If profile data show dispatch, not queue management, is the hottest
+spot, switch to direct-threading (computed gotos / function-pointer
+tape). That gives a larger speed-up than changing container types.
+
+But as long as you follow the immutable-code-with‐ip pattern, the
+container itself is not the bottleneck; the interpreter's dispatch and
+the value representation dominate.
+
+[[data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld2JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJ0YWJsZXItaWNvbiB0YWJsZXItaWNvbi1jb3B5Ij48cGF0aCBkPSJNNyA3bTAgMi42NjdhMi42NjcgMi42NjcgMCAwIDEgMi42NjcgLTIuNjY3aDguNjY2YTIuNjY3IDIuNjY3IDAgMCAxIDIuNjY3IDIuNjY3djguNjY2YTIuNjY3IDIuNjY3IDAgMCAxIC0yLjY2NyAyLjY2N2gtOC42NjZhMi42NjcgMi42NjcgMCAwIDEgLTIuNjY3IC0yLjY2N3oiIC8+PHBhdGggZD0iTTQuMDEyIDE2LjczN2EyLjAwNSAyLjAwNSAwIDAgMSAtMS4wMTIgLTEuNzM3di0xMGMwIC0xLjEgLjkgLTIgMiAtMmgxMGMuNzUgMCAxLjE1OCAuMzg1IDEuNSAxIiAvPjwvc3ZnPg==]]
+
+[[data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld2JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJ0YWJsZXItaWNvbiB0YWJsZXItaWNvbi1pbmZvLWNpcmNsZSI+PHBhdGggZD0iTTMgMTJhOSA5IDAgMSAwIDE4IDBhOSA5IDAgMCAwIC0xOCAwIiAvPjxwYXRoIGQ9Ik0xMiA5aC4wMSIgLz48cGF0aCBkPSJNMTEgMTJoMXY0aDEiIC8+PC9zdmc+]]
+
+**** Me
+:PROPERTIES:
+:CUSTOM_ID: message
+:END:
+
+ok that looks similar to what i implemented. see if you spot any perf
+issues with what i did:
+#+begin_src rust
+  use crate::traits::*; use
+  crate::types::container as cont; use
+  crate::types::container::error::Error; use
+  crate::types::container::SimpleTake; use crate::types::Item; /// A
+  struct to hold program execution data efficiently #[derive(Clone,
+  PartialEq, Debug)] pub struct Frame { snippet: cont::List, next_idx:
+  usize, } impl Frame { pub fn is_finished(&self) -> bool { self.next_idx
+  >= self.snippet.len() } pub fn next(&mut self) -> Option<&Item> { let i
+  = self.snippet.get(self.next_idx); self.next_idx += 1; i } pub fn
+  peek(&self) -> Option<&Item> { if self.is_finished() { None } else {
+  self.snippet.get(self.next_idx) } } pub fn current(&self) ->
+  Option<&Item> { if self.next_idx == 0 { return None; }
+  self.snippet.get(self.next_idx - 1) } pub fn remaining(&mut self) ->
+  cont::List { let last = self.snippet.len();
+  self.snippet.slice(self.next_idx..last) } } #[derive(Clone, PartialEq,
+  Default, Debug)] pub struct Program(Vec<Frame>); impl Program { fn
+  clean(&mut self) { while self.0.last().map(|f|
+  f.is_finished()).unwrap_or(false) { self.0.pop(); //println!("dropping
+  frame: {:?}", x); } } ///return a reference to the current instruction
+  and advance to /// next pub fn pop(&mut self) -> Option<&Item> {
+  //println!("program: {:?}", self.0); self.clean(); // Next instruction
+  is ready to go self.0.last_mut().and_then(|f| f.next()) } ///return a
+  reference to the next instruction pub fn peek(&self) -> Option<&Item> {
+  // might be in unclean state, and we don't want to mutate here // so we
+  search for the next instruction without cleaning first if
+  self.0.is_empty() { return None; } let mut frameindex = self.0.len() -
+  1; loop { if let Some(f) = self.0.get(frameindex) { //println!("Peeking
+  frame: {:?}", f); if f.is_finished() { //println!("Frame is finished");
+  if frameindex == 0 { return None; } else { frameindex -= 1 }; } else {
+  //println!("Frame not finished"); return f.peek(); } } else { return
+  None; } } } pub fn is_empty(&self) -> bool { self.peek().is_none() } pub
+  fn prepend(&mut self, snippet: cont::List) { self.clean(); if
+  !snippet.is_empty() { self.0.push(Frame { snippet, next_idx: 0, }) } }
+  pub fn extend(&mut self, snippet: cont::List) { if !snippet.is_empty() {
+  self.0.insert( 0, Frame { snippet, next_idx: 0, }, ) } } pub fn
+  stacktrace(&self) -> cont::List { let s = self .0 .iter() .rev()
+  .filter_map(|frame| frame.current().cloned()) .collect::<cont::List>();
+  //s.slice(0..(s.len() - 1)) s } /// TODO: this is probably not accurate
+  pub fn count(&self) -> usize { self.0 .iter() .fold(0, |acc, f| acc +
+  (f.snippet.len() - f.next_idx)) } pub fn last(&self) -> Option<&Item> {
+  self.0.first().and_then(|f| f.snippet.last()) } }
+
+#+end_src
+
+**** AI
+:PROPERTIES:
+:CUSTOM_ID: message
+:END:
+
+[[data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld2JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJ0YWJsZXItaWNvbiB0YWJsZXItaWNvbi1jb3B5Ij48cGF0aCBkPSJNNyA3bTAgMi42NjdhMi42NjcgMi42NjcgMCAwIDEgMi42NjcgLTIuNjY3aDguNjY2YTIuNjY3IDIuNjY3IDAgMCAxIDIuNjY3IDIuNjY3djguNjY2YTIuNjY3IDIuNjY3IDAgMCAxIC0yLjY2NyAyLjY2N2gtOC42NjZhMi42NjcgMi42NjcgMCAwIDEgLTIuNjY3IC0yLjY2N3oiIC8+PHBhdGggZD0iTTQuMDEyIDE2LjczN2EyLjAwNSAyLjAwNSAwIDAgMSAtMS4wMTIgLTEuNzM3di0xMGMwIC0xLjEgLjkgLTIgMiAtMmgxMGMuNzUgMCAxLjE1OCAuMzg1IDEuNSAxIiAvPjwvc3ZnPg==]]
+
+[[data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld2JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJ0YWJsZXItaWNvbiB0YWJsZXItaWNvbi1pbmZvLWNpcmNsZSI+PHBhdGggZD0iTTMgMTJhOSA5IDAgMSAwIDE4IDBhOSA5IDAgMCAwIC0xOCAwIiAvPjxwYXRoIGQ9Ik0xMiA5aC4wMSIgLz48cGF0aCBkPSJNMTEgMTJoMXY0aDEiIC8+PC9zdmc+]]
+
+The organisation is already “the right shape” (immutable code slices +
+stack of frames). The remaining costs are mostly small, but since you
+asked for a review, here is what sticks out in descending order of
+potential impact.
+
+***** 1 =extend= does an O(n) mem-move every time
+:PROPERTIES:
+:CUSTOM_ID: extend-does-an-on-mem-move-every-time
+:END:
+#+begin_example rust
+pub fn extend(&mut self, snippet: cont::List) {
+    if !snippet.is_empty() {
+        self.0.insert(0, Frame { … })   // ← shifts the whole Vec!
+    }
+}
+#+end_example
+
+=Vec::insert(0, …)= copies all existing frames one slot to the right for
+every call. If =extend= happens inside tight loops this quickly dwarfs
+everything else.
+
+Fixes
+
+- Semantically swap the two operations:
+
+  • =push()= for “execute this snippet *next*”\\
+  • =push_back()= / =VecDeque= / keep a separate /pending/ queue for
+  “execute this snippet *after* the current call stack returns”
+
+- or keep =Vec= and only ever push/pop at the back.
+
+***** 2 =peek= walks the frame stack /every/ call
+:PROPERTIES:
+:CUSTOM_ID: peek-walks-the-frame-stack-every-call
+:END:
+#+begin_example rust
+let mut frameindex = self.0.len() - 1;
+loop {
+    if let Some(f) = self.0.get(frameindex) {
+         …
+#+end_example
+
+A branch-heavy loop plus bounds checks plus =is_finished()= for every
+level, only to read one reference. If the interpreter does “peek,
+dispatch, pop” thousands of times a second this is visible in =perf=.
+
+Idioms to remove that cost
+
+1. Maintain the invariant “top frame is never finished”: clean one frame
+   *right after* you see that =next()= returned =None= instead of
+   calling =clean()= at the beginning of =pop()=.\\
+   Then both =peek= and =pop= are a single =last()= / =last_mut()=.
+
+2. Cache the pointer:
+
+   #+begin_example rust
+if let Some(f) = self.0.last() {
+       f.peek()
+   } else {
+       None
+   }
+   #+end_example
+
+   (=peek= never needs to scan.)
+
+***** 3 Turn =cont::List= into an /immutable slice/
+:PROPERTIES:
+:CUSTOM_ID: turn-contlist-into-an-immutable-slice
+:END:
+Every call to
+
+#+begin_example rust
+self.snippet.get(self.next_idx)
+#+end_example
+
+goes through whatever abstraction =cont::List= implements. If that is a
+regular =Vec<Item>= behind a reference-counted handle you pay:
+
+- a bounds check in =get=
+- one =Rc=/=Arc= indirection to reach the buffer
+- another bounds check by LLVM because it cannot see through the method
+
+Change =Frame= to
+
+#+begin_example rust
+pub struct Frame<'a> {
+    code: &'a [Item],
+    ip:   usize,
+}
+#+end_example
+
+and pass around =&'a [Item]= when you construct a frame.\\
+=code[ip]= then compiles down to one =mov= + one bounds check that LLVM
+can usually eliminate (because =ip < code.len()= is proven at push
+time).
+
+***** 4 Inline the tiny helpers
+:PROPERTIES:
+:CUSTOM_ID: inline-the-tiny-helpers
+:END:
+Hot helpers like =is_finished=, =next=, =peek=, =pop= are two--three
+instructions each. Add
+
+#+begin_example rust
+#[inline(always)]
+#+end_example
+
+on them or mark the whole =impl Frame= block with =#[inline]=.\\
+Without it Rust sometimes puts them out-of-line and you pay the call/ret
+overhead in the dispatch loop.
+
+***** 5 Return the value, not =&Item=
+:PROPERTIES:
+:CUSTOM_ID: return-the-value-not-item
+:END:
+=pop= returns =Option<&Item>=. That forces the snippet slice to stay
+borrowed until the VM finishes using the reference, preventing you from
+mutating the program in the same step without resorting to =unsafe= or
+=RefCell=. Returning =Item= by value (it is an enum ≤ 16 bytes after the
+tagging work) removes the lifetime juggling and lets the optimiser hoist
+loads out of matches.
+
+#+begin_example rust
+pub fn pop(&mut self) -> Option<Item> {
+    self.clean();
+    self.0.last_mut().and_then(|f| {
+        let out = f.next_idx < f.snippet.len()
+               .then(|| f.snippet[f.next_idx].clone());
+        f.next_idx += 1;
+        out
+    })
+}
+#+end_example
+
+***** 6 Micro-cleanups (low impact but free)
+:PROPERTIES:
+:CUSTOM_ID: micro-cleanups-low-impact-but-free
+:END:
+- =is_finished()= can avoid the branch by returning the boolean
+  directly:
+
+  #+begin_example rust
+#[inline(always)]
+  pub fn is_finished(&self) -> bool {
+      self.next_idx == self.snippet.len()
+  }
+  #+end_example
+
+- =count()= divides into zero if the current frame is finished; guard
+  the subtraction.
+
+- If you need =stacktrace= only for error reporting, build it on demand
+  instead of every =Instr::Trace= instruction.
+
+***** Bottom line
+:PROPERTIES:
+:CUSTOM_ID: bottom-line
+:END:
+Profiling shows that in stack interpreters the big wins come from
+representation and dispatch. After you
+
+1. shrink =Item= to one word,
+2. ensure frames are pushed/popped at the back (no front insertion), and
+3. remove the repeated scan in =peek=,
+
+the remaining overhead of using plain =Vec= is in the low single-digit
+percent range---almost always cheaper than the complexity of writing
+your own container.
+
+[[data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld2JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJ0YWJsZXItaWNvbiB0YWJsZXItaWNvbi1jb3B5Ij48cGF0aCBkPSJNNyA3bTAgMi42NjdhMi42NjcgMi42NjcgMCAwIDEgMi42NjcgLTIuNjY3aDguNjY2YTIuNjY3IDIuNjY3IDAgMCAxIDIuNjY3IDIuNjY3djguNjY2YTIuNjY3IDIuNjY3IDAgMCAxIC0yLjY2NyAyLjY2N2gtOC42NjZhMi42NjcgMi42NjcgMCAwIDEgLTIuNjY3IC0yLjY2N3oiIC8+PHBhdGggZD0iTTQuMDEyIDE2LjczN2EyLjAwNSAyLjAwNSAwIDAgMSAtMS4wMTIgLTEuNzM3di0xMGMwIC0xLjEgLjkgLTIgMiAtMmgxMGMuNzUgMCAxLjE1OCAuMzg1IDEuNSAxIiAvPjwvc3ZnPg==]]
+
+[[data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld2JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJ0YWJsZXItaWNvbiB0YWJsZXItaWNvbi1pbmZvLWNpcmNsZSI+PHBhdGggZD0iTTMgMTJhOSA5IDAgMSAwIDE4IDBhOSA5IDAgMCAwIC0xOCAwIiAvPjxwYXRoIGQ9Ik0xMiA5aC4wMSIgLz48cGF0aCBkPSJNMTEgMTJoMXY0aDEiIC8+PC9zdmc+]]
+
+**** Me
+:PROPERTIES:
+:CUSTOM_ID: message
+:END:
+
+ok thanks for that. Another issue that's been a real pain: as I
+mentioned i created an enum hierarchy to let me group functionality
+(like, an enum for container, map, pipe, etc and abstract functionality
+behind those). But there's the memory overhead, and enums do not support
+overlapping functionality like traits do. However traits have their own
+issues - object safety, difficulty starting with an Item, getting a
+trait object and then doing all needed operations just with that, and
+then converting back to Item which requires knowing the concrete type.
+it can be done but it's difficult. Boxing helps but that can hurt
+performance and casting between dyn<A + B> to dyn<A> isn't possible etc.
+what do you recommend? I thought of making a big enum of all the
+concrete types (40+) and using traits to operate on them. Have helper
+functions to try to convert Item to the proper trait object. advice?
+
+**** AI
+:PROPERTIES:
+:CUSTOM_ID: message
+:END:
+
+[[data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld2JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJ0YWJsZXItaWNvbiB0YWJsZXItaWNvbi1jb3B5Ij48cGF0aCBkPSJNNyA3bTAgMi42NjdhMi42NjcgMi42NjcgMCAwIDEgMi42NjcgLTIuNjY3aDguNjY2YTIuNjY3IDIuNjY3IDAgMCAxIDIuNjY3IDIuNjY3djguNjY2YTIuNjY3IDIuNjY3IDAgMCAxIC0yLjY2NyAyLjY2N2gtOC42NjZhMi42NjcgMi42NjcgMCAwIDEgLTIuNjY3IC0yLjY2N3oiIC8+PHBhdGggZD0iTTQuMDEyIDE2LjczN2EyLjAwNSAyLjAwNSAwIDAgMSAtMS4wMTIgLTEuNzM3di0xMGMwIC0xLjEgLjkgLTIgMiAtMmgxMGMuNzUgMCAxLjE1OCAuMzg1IDEuNSAxIiAvPjwvc3ZnPg==]]
+
+[[data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld2JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJ0YWJsZXItaWNvbiB0YWJsZXItaWNvbi1pbmZvLWNpcmNsZSI+PHBhdGggZD0iTTMgMTJhOSA5IDAgMSAwIDE4IDBhOSA5IDAgMCAwIC0xOCAwIiAvPjxwYXRoIGQ9Ik0xMiA5aC4wMSIgLz48cGF0aCBkPSJNMTEgMTJoMXY0aDEiIC8+PC9zdmc+]]
+
+The moment you want
+
+• /in-place/ storage (no extra allocation)\\
+• /overlapping/ capabilities (a list is both “indexable” /and/
+“printable”)\\
+• and *zero run-time indirection*
+
+plain trait objects cease to be attractive; a single, †flat†
+=enum Value= plus pattern-matching is what almost every high-performance
+interpreter ends up with:
+
+#+begin_example rust
+#[derive(Clone)]
+pub enum Value {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Str(Rc<String>),       // already on the heap, keep pointer inline
+    List(Rc<Vec<Value>>),
+    Dict(Rc<HashMap<Value, Value>>),
+    // …
+}
+#+end_example
+
+Size: 16 bytes (8-byte payload + 1-byte tag padded to the next word).
+
+--------------
+
+***** Why not deep enums?
+:PROPERTIES:
+:CUSTOM_ID: why-not-deep-enums
+:END:
+#+begin_example
+Copy codeenum Container { List(List), Dict(Dict) }
+enum Item      { Scalar(Scalar), Container(Container), … }
+#+end_example
+
+Every extra layer forces the compiler to align the *largest* inner
+variant, so you multiply the size and lose the cache locality you just
+won back.
+
+--------------
+
+***** But I need “methods” like =len=, =index=, =display=!
+:PROPERTIES:
+:CUSTOM_ID: but-i-need-methods-like-len-index-display
+:END:
+Implement them /on the enum/ and delegate:
+
+#+begin_example rust
+impl Value {
+    #[inline]
+    pub fn len(&self) -> Option<usize> {
+        match self {
+            Value::Str(s)  => Some(s.len()),
+            Value::List(v) => Some(v.len()),
+            Value::Dict(m) => Some(m.len()),
+            _              => None,
+        }
+    }
+
+    #[inline]
+    pub fn add(&self, rhs: &Value) -> Result<Value, Error> {
+        match (self, rhs) {
+            (Value::Int(a),   Value::Int(b))   => Ok(Value::Int(a + b)),
+            (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
+            (Value::Str(a),   Value::Str(b))   => {
+                let mut s = (**a).clone(); s.push_str(b); Ok(Value::Str(s.into()))
+            }
+            _ => Err(Error::Type("add")),
+        }
+    }
+}
+#+end_example
+
+The compiler turns each =match= into a jump table that is /fully
+branch-predictable/ (four-to-six entries), so the cost is a couple of
+nanoseconds---much cheaper than chasing a fat pointer to a vtable.
+
+If the boiler-plate annoys you, generate it:
+
+#+begin_example rust
+use enum_dispatch::enum_dispatch;
+
+#[enum_dispatch(Show, Length)]
+#[derive(Clone)]
+pub enum Value { … }
+
+trait Show   { fn show(&self) -> String; }
+trait Length { fn len(&self) -> Option<usize>; }
+
+impl Show   for i64             { … }
+impl Show   for Rc<String>      { … }
+impl Length for Rc<String>      { … }
+impl Length for Rc<Vec<Value>>  { … }
+#+end_example
+
+=enum_dispatch= expands this to exactly the same =match= code but keeps
+your source tidy and *remains static dispatch*---no =dyn=, no boxing.
+
+Other helpers: =strum=, =impl_enum::impl_enum=, =paste=.
+
+--------------
+
+***** When you really do want trait objects
+:PROPERTIES:
+:CUSTOM_ID: when-you-really-do-want-trait-objects
+:END:
+Some objects are /open-ended/ (user-defined classes, native calls, ...).
+For them store a single pointer-sized variant:
+
+#+begin_example rust
+pub enum Value {
+    …,
+    Obj(NonNull<dyn Object>),   // 8 bytes (pointer) + tag
+}
+#+end_example
+
+Where =Object= is your “everything lives on the heap” trait.
+
+Operations that could land on either side look like
+
+#+begin_example rust
+fn length(v: &Value) -> Result<usize, Error> {
+    match v {
+        Value::Str(s)  => Ok(s.len()),
+        Value::List(l) => Ok(l.len()),
+        Value::Obj(o)  => unsafe { o.as_ref().length() }, // 1 indirect call
+        _              => Err(Error::Type("len")),
+    }
+}
+#+end_example
+
+All built-ins are still zero-indirection; /only/ user objects pay the
+dynamic-dispatch cost, which is usually acceptable.
+
+--------------
+
+***** Converting “back and forth”
+:PROPERTIES:
+:CUSTOM_ID: converting-back-and-forth
+:END:
+You almost never need /=Item= → =&dyn Trait= → =Item=/ again:
+
+- read operands from the stack as =&Value=
+- =match= once to pick the fast path
+- push a /new/ =Value= on return
+
+No allocation, no down-cast, no double bookkeeping.
+
+If you /do/ want it (e.g. heterogeneous collections), use =Any=:
+
+#+begin_example rust
+if let Value::Obj(ptr) = value {
+    let obj = unsafe { ptr.as_ref() };
+    if let Some(s) = obj.as_any().downcast_ref::<String>() {
+        …
+    }
+}
+#+end_example
+
+where every heap object implements
+
+#+begin_example rust
+trait Object {
+    fn as_any(&self) -> &dyn Any;
+}
+#+end_example
+
+---still one pointer + tag in the interpreter core.
+
+--------------
+
+***** Recommendation in one sentence
+:PROPERTIES:
+:CUSTOM_ID: recommendation-in-one-sentence
+:END:
+Flatten the enum, keep scalars inline, store /one/ pointer for
+everything that must live on the heap, and dispatch with =match=; use
+crates like =enum_dispatch= only to cut down on repetitious code, not as
+a replacement for the flat value enum.
+
+[[data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld2JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJ0YWJsZXItaWNvbiB0YWJsZXItaWNvbi1jb3B5Ij48cGF0aCBkPSJNNyA3bTAgMi42NjdhMi42NjcgMi42NjcgMCAwIDEgMi42NjcgLTIuNjY3aDguNjY2YTIuNjY3IDIuNjY3IDAgMCAxIDIuNjY3IDIuNjY3djguNjY2YTIuNjY3IDIuNjY3IDAgMCAxIC0yLjY2NyAyLjY2N2gtOC42NjZhMi42NjcgMi42NjcgMCAwIDEgLTIuNjY3IC0yLjY2N3oiIC8+PHBhdGggZD0iTTQuMDEyIDE2LjczN2EyLjAwNSAyLjAwNSAwIDAgMSAtMS4wMTIgLTEuNzM3di0xMGMwIC0xLjEgLjkgLTIgMiAtMmgxMGMuNzUgMCAxLjE1OCAuMzg1IDEuNSAxIiAvPjwvc3ZnPg==]]
+
+[[data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld2JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJ0YWJsZXItaWNvbiB0YWJsZXItaWNvbi1pbmZvLWNpcmNsZSI+PHBhdGggZD0iTTMgMTJhOSA5IDAgMSAwIDE4IDBhOSA5IDAgMCAwIC0xOCAwIiAvPjxwYXRoIGQ9Ik0xMiA5aC4wMSIgLz48cGF0aCBkPSJNMTEgMTJoMXY0aDEiIC8+PC9zdmc+]]
+
+**** Me
+:PROPERTIES:
+:CUSTOM_ID: message
+:END:
+
+ok, flatten the enum. but when would i use Any? seems like i don't need
+it, since my collection is technically homogenous by storing Values (the
+flat enum).
+
+**** AI
+:PROPERTIES:
+:CUSTOM_ID: message
+:END:
+
+[[data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld2JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJ0YWJsZXItaWNvbiB0YWJsZXItaWNvbi1jb3B5Ij48cGF0aCBkPSJNNyA3bTAgMi42NjdhMi42NjcgMi42NjcgMCAwIDEgMi42NjcgLTIuNjY3aDguNjY2YTIuNjY3IDIuNjY3IDAgMCAxIDIuNjY3IDIuNjY3djguNjY2YTIuNjY3IDIuNjY3IDAgMCAxIC0yLjY2NyAyLjY2N2gtOC42NjZhMi42NjcgMi42NjcgMCAwIDEgLTIuNjY3IC0yLjY2N3oiIC8+PHBhdGggZD0iTTQuMDEyIDE2LjczN2EyLjAwNSAyLjAwNSAwIDAgMSAtMS4wMTIgLTEuNzM3di0xMGMwIC0xLjEgLjkgLTIgMiAtMmgxMGMuNzUgMCAxLjE1OCAuMzg1IDEuNSAxIiAvPjwvc3ZnPg==]]
+
+[[data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld2JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJ0YWJsZXItaWNvbiB0YWJsZXItaWNvbi1pbmZvLWNpcmNsZSI+PHBhdGggZD0iTTMgMTJhOSA5IDAgMSAwIDE4IDBhOSA5IDAgMCAwIC0xOCAwIiAvPjxwYXRoIGQ9Ik0xMiA5aC4wMSIgLz48cGF0aCBkPSJNMTEgMTJoMXY0aDEiIC8+PC9zdmc+]]
+
+Exactly---if every run-time slot is already a =Value= you do *not* need
+=Any= inside the core interpreter. =Any= (or any other
+run-time-type-information mechanism) only becomes useful when /outside/
+code needs to peek behind the “one pointer + tag” abstraction.
+
+Typical scenarios where =Any= (or an equivalent down-cast) shows up
+
+1. *Foreign-function interface / plug-ins*\\
+   You keep a variant such as\\
+   =Value::Native(NonNull<dyn NativeObject>)=.\\
+   A host callback receives that =&dyn NativeObject= and wants to
+   recover the original Rust type it registered with the VM:
+
+   #+begin_example rust
+fn host_callback(o: &dyn NativeObject) {
+       // down-cast from the trait object to the concrete host type
+       if let Some(sock) = o.as_any().downcast_ref::<TcpStream>() {
+           // work with the socket …
+       }
+   }
+   #+end_example
+
+2. *Embedding* the VM in a larger Rust program where parts of the
+   application share real Rust structs and want zero-copy access.\\
+   Example: a GUI toolkit stores =Rc<Widget>= inside the VM so that Joy
+   scripts can manipulate widgets. Host code still wants to see a
+   =Widget=, not just an opaque pointer.
+
+3. *Introspection / debugging tools* that need to print or log internal
+   Rust-level details of heap objects.
+
+If your VM
+
+- already boxes every non-scalar value in =Value= variants, and
+- never hands those boxes out as trait objects to arbitrary Rust code,
+
+then you can skip =Any=. The flattened enum + direct =match= is all you
+need.
+
+[[data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld2JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJ0YWJsZXItaWNvbiB0YWJsZXItaWNvbi1jb3B5Ij48cGF0aCBkPSJNNyA3bTAgMi42NjdhMi42NjcgMi42NjcgMCAwIDEgMi42NjcgLTIuNjY3aDguNjY2YTIuNjY3IDIuNjY3IDAgMCAxIDIuNjY3IDIuNjY3djguNjY2YTIuNjY3IDIuNjY3IDAgMCAxIC0yLjY2NyAyLjY2N2gtOC42NjZhMi42NjcgMi42NjcgMCAwIDEgLTIuNjY3IC0yLjY2N3oiIC8+PHBhdGggZD0iTTQuMDEyIDE2LjczN2EyLjAwNSAyLjAwNSAwIDAgMSAtMS4wMTIgLTEuNzM3di0xMGMwIC0xLjEgLjkgLTIgMiAtMmgxMGMuNzUgMCAxLjE1OCAuMzg1IDEuNSAxIiAvPjwvc3ZnPg==]]
+
+[[data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld2JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJ0YWJsZXItaWNvbiB0YWJsZXItaWNvbi1pbmZvLWNpcmNsZSI+PHBhdGggZD0iTTMgMTJhOSA5IDAgMSAwIDE4IDBhOSA5IDAgMCAwIC0xOCAwIiAvPjxwYXRoIGQ9Ik0xMiA5aC4wMSIgLz48cGF0aCBkPSJNMTEgMTJoMXY0aDEiIC8+PC9zdmc+]]
+
+**** Me
+:PROPERTIES:
+:CUSTOM_ID: message
+:END:
+
+Ok and what do you think the limits on performance are for this design?
+In other words, what do i lose just by being stack-based? I was hoping
+at the outset to at least be as fast as python, but so far it's much
+much slower, like 50x in some cases.
+
+**** AI
+:PROPERTIES:
+:CUSTOM_ID: message
+:END:
+
+[[data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld2JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJ0YWJsZXItaWNvbiB0YWJsZXItaWNvbi1jb3B5Ij48cGF0aCBkPSJNNyA3bTAgMi42NjdhMi42NjcgMi42NjcgMCAwIDEgMi42NjcgLTIuNjY3aDguNjY2YTIuNjY3IDIuNjY3IDAgMCAxIDIuNjY3IDIuNjY3djguNjY2YTIuNjY3IDIuNjY3IDAgMCAxIC0yLjY2NyAyLjY2N2gtOC42NjZhMi42NjcgMi42NjcgMCAwIDEgLTIuNjY3IC0yLjY2N3oiIC8+PHBhdGggZD0iTTQuMDEyIDE2LjczN2EyLjAwNSAyLjAwNSAwIDAgMSAtMS4wMTIgLTEuNzM3di0xMGMwIC0xLjEgLjkgLTIgMiAtMmgxMGMuNzUgMCAxLjE1OCAuMzg1IDEuNSAxIiAvPjwvc3ZnPg==]]
+
+[[data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld2JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJ0YWJsZXItaWNvbiB0YWJsZXItaWNvbi1pbmZvLWNpcmNsZSI+PHBhdGggZD0iTTMgMTJhOSA5IDAgMSAwIDE4IDBhOSA5IDAgMCAwIC0xOCAwIiAvPjxwYXRoIGQ9Ik0xMiA5aC4wMSIgLz48cGF0aCBkPSJNMTEgMTJoMXY0aDEiIC8+PC9zdmc+]]
+
+“Stack-based” is *not* inherently 50 × slower than CPython.\\
+Lua 5.4, Wren, Factor, and µPy are all stack or quasi-stack VMs and they
+run at 1--3 × the speed of CPython, sometimes faster.\\
+So the gap you see comes from three other layers:
+
+--------------
+
+***** 1 Instruction-dispatch cost
+:PROPERTIES:
+:CUSTOM_ID: instruction-dispatch-cost
+:END:
+A tight C loop with a =switch= over 100 byte-codes clocks at roughly\\
+20--40 ns / byte-code on a 3 GHz desktop (≈ 25--50 M instr/s) when
+branch-predicted.
+
+• Rust =match= on an =enum= is the same speed if you keep it in one
+function and compile with =-C opt-level=3 -C target-cpu=native=.
+
+• If profiling shows >40 ns / instr, switch to\\
+-- “direct threading” (computed gotos / =&&label= table)\\
+-- or an array of function pointers (=for &f in tape { f(self) }=).\\
+Both cut the dispatch cost by ~30 -- 40 %.
+
+--------------
+
+***** 2 Too many byte-codes per high-level operation
+:PROPERTIES:
+:CUSTOM_ID: too-many-byte-codes-per-high-level-operation
+:END:
+A pure stack VM needs extra =push/pop/swap/rot= that a register VM
+encodes implicitly. That overhead is real but is usually a factor of
+1.5--2, not 50.
+
+Mitigations
+
+- Peephole / super-instructions\\
+  (=LOAD_CONST 0; LOAD_CONST 1; ADD= → one =ADD_KK 0 1=)
+- Specialised variants (=ADD_III= for int + int, =ADD_FFF= for float +
+  float)
+- Hand-written hot path
+  (=if tag_is_int(lhs, rhs) { …fast int add… } else { slow path }=)
+
+--------------
+
+***** 3 Heap traffic and reference counting
+:PROPERTIES:
+:CUSTOM_ID: heap-traffic-and-reference-counting
+:END:
+Every heap allocation or atomic ref-count increment costs 10--200 ns. If
+every =Value= push allocates a =Box= or bumps an =Rc=, the program is
+dead before dispatch even matters.
+
+Make sure
+
+- =Value= is *one word* for scalars, one word + tag for heap things.
+- Lists / dicts kept on the heap use =Rc=/=Arc= /once/; pushing the
+  pointer on the stack is just a copy of 8 bytes.
+- No hidden =clone()= calls in hot loops (look for =#[derive(Clone)]=
+  that the compiler cannot elide).
+
+--------------
+
+***** 4 Bounds checks, dynamic borrow checks, debug build
+:PROPERTIES:
+:CUSTOM_ID: bounds-checks-dynamic-borrow-checks-debug-build
+:END:
+A stack-loop written in safe Rust is still competitive, /if/:
+
+- compile with =--release= (+ =lto = "fat"= and =codegen-units = 1=).\\
+  Debug builds run at 10--40 × slower, which matches the gap you see.
+- =unsafe { *ptr.add(sp) }= is not required; LLVM removes the =Vec=
+  bounds check when it sees the invariant =sp < stack.len()=.
+
+--------------
+
+***** 5 Object system / dictionaries
+:PROPERTIES:
+:CUSTOM_ID: object-system-dictionaries
+:END:
+CPython spends half its time in attribute lookup and hashing strings. If
+your benchmark exercises maps heavily and your implementation uses
+=HashMap<Value, Value>= with per-lookup allocations, the cost explodes.
+
+- Add a symbol table: intern strings once, compare/have hash on the
+  interned =u32 id=.
+- Cache the last lookup (=LOAD_GLOBAL=) next to the byte-code (inline
+  cache) -- that is how PyPy and LuaJIT get their 3--5 × speed-ups.
+
+--------------
+
+***** 6 Garbage collection
+:PROPERTIES:
+:CUSTOM_ID: garbage-collection
+:END:
+Tracing GC pauses do not affect micro-benchmarks, but a naive /“walk
+every =Rc= on every operation”/ will kill you. Use either
+
+- plain =Rc= plus *copy-on-write* (Lua), or
+- a generational tracing GC triggered every N allocations (CPython
+  3.12).
+
+--------------
+
+****** What a realistic Rust interpreter can hit
+:PROPERTIES:
+:CUSTOM_ID: what-a-realistic-rust-interpreter-can-hit
+:END:
+#+begin_example
+Copy code                                                        (desktop Core i7)
+#+end_example
+
+byte-codes / second | 25 M -- 50 M Fibonacci 40 µ-benchmark | 0.8 --
+1.5× CPython Richards / DeltaBlue (object benchmarks)| 0.5 -- 1.2×
+CPython Mandelbrot | 2 -- 4× CPython (tight numeric)
+
+If you are at /50 × slower/ you are almost certainly measuring:
+
+- debug build, or
+- per-value allocation/=Rc::clone=, or
+- front-insertion on the frame =Vec=, or
+- an interpreter loop that calls out to dozens of small Rust functions
+  (no inlining).
+
+Fix those first; the stack vs. register decision at most halves the
+speed once everything else is tight.
+
+--------------
+
+****** Checklist to reach “Python-class” speed
+:PROPERTIES:
+:CUSTOM_ID: checklist-to-reach-python-class-speed
+:END:
+1. =Value= = 8 bytes + tag, stack = =Vec<Value>=.
+2. One tight =loop { match bytecode[ip] { … } }= function, compiled with
+   =-O3=.
+3. All literals and big objects allocated once, referenced by pointer.
+4. No =Vec::insert(0, …)=; push/pop only at the back.
+5. =perf=, =cargo flamegraph=, or =dhatu= to see where time goes.
+6. Only after the profiler is clean: consider direct threading or a
+   register VM to get the last 1.5--2 ×.
+
+A stack machine can absolutely match or beat CPython; the 50 × gap comes
+from avoidable layers above the stack abstraction, not from the stack
+itself.
+
+[[data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld2JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJ0YWJsZXItaWNvbiB0YWJsZXItaWNvbi1jb3B5Ij48cGF0aCBkPSJNNyA3bTAgMi42NjdhMi42NjcgMi42NjcgMCAwIDEgMi42NjcgLTIuNjY3aDguNjY2YTIuNjY3IDIuNjY3IDAgMCAxIDIuNjY3IDIuNjY3djguNjY2YTIuNjY3IDIuNjY3IDAgMCAxIC0yLjY2NyAyLjY2N2gtOC42NjZhMi42NjcgMi42NjcgMCAwIDEgLTIuNjY3IC0yLjY2N3oiIC8+PHBhdGggZD0iTTQuMDEyIDE2LjczN2EyLjAwNSAyLjAwNSAwIDAgMSAtMS4wMTIgLTEuNzM3di0xMGMwIC0xLjEgLjkgLTIgMiAtMmgxMGMuNzUgMCAxLjE1OCAuMzg1IDEuNSAxIiAvPjwvc3ZnPg==]]
+
+[[data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld2JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJ0YWJsZXItaWNvbiB0YWJsZXItaWNvbi1pbmZvLWNpcmNsZSI+PHBhdGggZD0iTTMgMTJhOSA5IDAgMSAwIDE4IDBhOSA5IDAgMCAwIC0xOCAwIiAvPjxwYXRoIGQ9Ik0xMiA5aC4wMSIgLz48cGF0aCBkPSJNMTEgMTJoMXY0aDEiIC8+PC9zdmc+]]
+
+**** Me
+:PROPERTIES:
+:CUSTOM_ID: message
+:END:
+
+ok that's good to know, i may not do all those optimizations because i
+don't *really* need to be as fast as python just yet, it would be nice.
+I think i understand what to do for most of your recommendations. But
+one i'm confused about: right now i look at the next instruction, it's
+an interned string. It's either: an axiom instruction (with a rust
+implementation fn), or derived (it's a program snippet to be appended to
+the front of the program). Either way, i look it up in a hashmap. i
+think i can figure out how to at least turn the axiom words (which are
+all known at compile time) into a match. That should help a lot. but
+what about the user-defined instructions?
+
+**** AI
+:PROPERTIES:
+:CUSTOM_ID: message
+:END:
+
+[[data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld2JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJ0YWJsZXItaWNvbiB0YWJsZXItaWNvbi1jb3B5Ij48cGF0aCBkPSJNNyA3bTAgMi42NjdhMi42NjcgMi42NjcgMCAwIDEgMi42NjcgLTIuNjY3aDguNjY2YTIuNjY3IDIuNjY3IDAgMCAxIDIuNjY3IDIuNjY3djguNjY2YTIuNjY3IDIuNjY3IDAgMCAxIC0yLjY2NyAyLjY2N2gtOC42NjZhMi42NjcgMi42NjcgMCAwIDEgLTIuNjY3IC0yLjY2N3oiIC8+PHBhdGggZD0iTTQuMDEyIDE2LjczN2EyLjAwNSAyLjAwNSAwIDAgMSAtMS4wMTIgLTEuNzM3di0xMGMwIC0xLjEgLjkgLTIgMiAtMmgxMGMuNzUgMCAxLjE1OCAuMzg1IDEuNSAxIiAvPjwvc3ZnPg==]]
+
+[[data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld2JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJ0YWJsZXItaWNvbiB0YWJsZXItaWNvbi1pbmZvLWNpcmNsZSI+PHBhdGggZD0iTTMgMTJhOSA5IDAgMSAwIDE4IDBhOSA5IDAgMCAwIC0xOCAwIiAvPjxwYXRoIGQ9Ik0xMiA5aC4wMSIgLz48cGF0aCBkPSJNMTEgMTJoMXY0aDEiIC8+PC9zdmc+]]
+
+“Look-the-word-up-in-a-hash-map-every-time” is the single largest
+overhead most Joy / Forth interpreters have after they solve the value
+representation.\\
+Fortunately you only need to do that lookup *once per word*, then you
+can patch the byte-code so that subsequent executions jump directly to
+either
+
+• a built-in primitive (Rust function pointer / enum tag), or\\
+• a user quotation (a slice of instructions).
+
+Below are three levels of sophistication; you can start with level-1 and
+already save an order of magnitude.
+
+***** Level 1 Resolve once, patch in place
+:PROPERTIES:
+:CUSTOM_ID: level-1-resolve-once-patch-in-place
+:END:
+Parsing time / first touch:
+
+#+begin_example
+Copy code"dup"   → lookup → Axiom(DUP_IDX)    → overwrite token
+"user+" → lookup → Derived(ptr,len) → overwrite token
+#+end_example
+
+Run time:
+
+#+begin_example rust
+match prog[ip] {
+    Op::Axiom(idx)   => AXIOM_TABLE[idx](vm),        // no HashMap!
+    Op::Derived(p,l) => vm.call(p, l),              // push frame
+    _                => unreachable!(),
+}
+#+end_example
+
+Implementation sketch
+
+#+begin_example rust
+#[derive(Clone, Copy)]
+enum Op {
+    Axiom(u16),            // index into static axiom table
+    Derived { start: u32, len: u16 }, // slice in code space
+    Sym(InternId),         // unresolved (only appears before patching)
+}
+
+fn resolve_op(dict: &HashMap<InternId, Word>, op: &mut Op) {
+    if let Op::Sym(id) = *op {
+        match dict.get(&id).expect("unknown word") {
+            Word::Axiom(ix)     => *op = Op::Axiom(*ix),
+            Word::Derived(sl)   => *op = Op::Derived { start: sl.0, len: sl.1 },
+        }
+    }
+}
+#+end_example
+
+Do =resolve_op= once per token when you load the source, or lazily the
+first time you hit the =Sym=.
+
+Cost per execution: *0 hash-map look-ups* -- just the =match=.
+
+***** Level 2 Inline cache for late binding / redefinition
+:PROPERTIES:
+:CUSTOM_ID: level-2-inline-cache-for-late-binding-redefinition
+:END:
+If the language lets the user do
+
+#+begin_example
+Copy code: dup2 dup dup ;
+
+dup2  ( old definition )
+: dup2 dup dup dup ;
+
+dup2  ( new definition )
+#+end_example
+
+add a /version counter/ to the dictionary:
+
+#+begin_example rust
+struct DictEntry {
+    version: u32,
+    kind:    Word,
+}
+struct OpCache { version: u32, op: Op }   // sits in the byte-code
+#+end_example
+
+Dispatch:
+
+#+begin_example rust
+match prog[ip] {
+    Op::Cached(c) if c.version == dict[c.sym].version => exec(c.op),
+    Op::Sym(sym) | Op::Cached(c) /*stale*/            => {
+        let entry = &dict[sym];
+        let new_op = entry.kind.to_op();
+        prog[ip] = Op::Cached(OpCache{version:entry.version, op:new_op});
+        exec(new_op);
+    }
+}
+#+end_example
+
+A self-modifying inline cache: the extra branch predicts well and the
+cost when the definition is /not/ redefined is still a single
+indirect-call for axioms / direct call for quotations.
+
+***** Level 3 Ahead-of-time “compile” to a register VM
+:PROPERTIES:
+:CUSTOM_ID: level-3-ahead-of-time-compile-to-a-register-vm
+:END:
+Later, when you add peephole optimisations, you can transform the whole
+token stream into a compact numeric byte-code with register operands. At
+that point the string → op translation happens once during “compilation”
+and the runtime never even sees a =HashMap=.
+
+But you can reach CPython-class performance already with level 1.
+
+--------------
+
+****** What about memory?
+:PROPERTIES:
+:CUSTOM_ID: what-about-memory
+:END:
+=Op::Axiom(u16)= = 4 bytes\\
+=Op::Derived(u32,u16)= = 8 bytes\\
+=Op::Sym(u32)= = 4 bytes (until patched)
+
+If you store 100 000 words the opcode tape is < 1 MB.
+
+--------------
+
+****** Putting it in your current code
+:PROPERTIES:
+:CUSTOM_ID: putting-it-in-your-current-code
+:END:
+1. Replace =Item::Symbol(InternId)= in the program list with the =Op=
+   enum above.
+
+2. When the interpreter sees =Op::Sym(id)= call =resolve_op= (or do it
+   in the loader).
+
+3. Built-in words live in a static table:
+
+   #+begin_example rust
+type AxiomFn = fn(&mut VM) -> Result<(), Error>;
+   const AXIOMS: &[AxiomFn] = &[ add, sub, dup, drop, … ];
+   #+end_example
+
+4. User definitions get stored once in =Vec<Op>= and referenced by slice
+   (=start,len=).
+
+You eliminate the per-step =HashMap= cost for both built-ins and user
+words while keeping late binding and redefinition semantics.
+
+[[data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld2JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJ0YWJsZXItaWNvbiB0YWJsZXItaWNvbi1jb3B5Ij48cGF0aCBkPSJNNyA3bTAgMi42NjdhMi42NjcgMi42NjcgMCAwIDEgMi42NjcgLTIuNjY3aDguNjY2YTIuNjY3IDIuNjY3IDAgMCAxIDIuNjY3IDIuNjY3djguNjY2YTIuNjY3IDIuNjY3IDAgMCAxIC0yLjY2NyAyLjY2N2gtOC42NjZhMi42NjcgMi42NjcgMCAwIDEgLTIuNjY3IC0yLjY2N3oiIC8+PHBhdGggZD0iTTQuMDEyIDE2LjczN2EyLjAwNSAyLjAwNSAwIDAgMSAtMS4wMTIgLTEuNzM3di0xMGMwIC0xLjEgLjkgLTIgMiAtMmgxMGMuNzUgMCAxLjE1OCAuMzg1IDEuNSAxIiAvPjwvc3ZnPg==]]
+
+[[data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld2JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9ImN1cnJlbnRDb2xvciIgc3Ryb2tlLXdpZHRoPSIyIiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGNsYXNzPSJ0YWJsZXItaWNvbiB0YWJsZXItaWNvbi1pbmZvLWNpcmNsZSI+PHBhdGggZD0iTTMgMTJhOSA5IDAgMSAwIDE4IDBhOSA5IDAgMCAwIC0xOCAwIiAvPjxwYXRoIGQ9Ik0xMiA5aC4wMSIgLz48cGF0aCBkPSJNMTEgMTJoMXY0aDEiIC8+PC9zdmc+]]
+
+*** TODO Flat enum hierarchy
+
