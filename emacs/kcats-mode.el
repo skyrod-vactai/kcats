@@ -148,6 +148,7 @@
         ("wrap" "🎁")
         ("nothing" "🔳")
         ("yes" "✅")
+        ("reduce" "🪗")
         ("tag" "🏷️")))
 (define-abbrev-table 'kcats-mode-abbrev-table kcats-abbrevs)
 
