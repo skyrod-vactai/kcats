@@ -307,7 +307,6 @@ internally, to keep track of things like the stack, program, lists etc.
   use im;
   use internment::Intern;
   use lazy_static::lazy_static;
-  use number::Number;
   use std::collections::HashMap;
   use std::hash::Hash;
   use std::marker::Sync;
@@ -436,7 +435,10 @@ internally, to keep track of things like the stack, program, lists etc.
   #[derive(Clone)]
   pub enum Item {
       /// A number value
-      Number(number::Number),
+      //Number(number::Number),
+      Int(number::Int),
+      Float(number::Float),
+
       /// A word value. Words are atomic, they can't be broken down into
       /// characters like Strings.
       Word(Word),
@@ -453,12 +455,9 @@ internally, to keep track of things like the stack, program, lists etc.
   impl fmt::Debug for Item {
       fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
           match self {
-              Item::Number(n) => write!(f, "{:?}", n),
-              Item::Word(w) => write!(f, "{:?}", w),
               Item::Char(c) => write!(f, "Char{:?}", c),
               Item::Builtin(b) => write!(f, "Builtin{:?}", b.name),
-              Item::Dispenser(d) => write!(f, "{:?}", d),
-              Item::Receptacle(r) => write!(f, "{:?}", r),
+              i => write!(f, "{:?}", i),
           }
       }
   }
@@ -486,7 +485,11 @@ internally, to keep track of things like the stack, program, lists etc.
       fn eq(&self, other: &Self) -> bool {
           match (self, other) {
               // same types, just use their own eq
-              (Item::Number(a), Item::Number(b)) => a == b,
+              (Item::Int(a), Item::Int(b)) => a == b,
+              (Item::Float(a), Item::Float(b)) => a == b,
+              (Item::Float(a), Item::Int(b)) => *a == *b as number::Float,
+              (Item::Int(a), Item::Float(b)) => *a as number::Float == *b,
+
               (Item::Word(a), Item::Word(b)) => a == b,
               (
                   Item::Dispenser(coll::Dispenser::Sized(a)),
@@ -576,7 +579,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn try_derive(i: Item) -> Result<Self, Self::Error> {
           match i {
               Item::Char(c) => Ok(c),
-              Item::Number(Number::Int(i)) => match char::from_u32(i as u32) {
+              Item::Int(i) => match char::from_u32(i as u32) {
                   Some(c) => Ok(c),
                   None => Err(Error::expected(fit!("character-encoding"), i)),
               },
@@ -718,7 +721,6 @@ internally, to keep track of things like the stack, program, lists etc.
       use crate::traits::*;
       use crate::types::container as coll;
       use crate::types::container::associative as assoc;
-      use crate::types::number;
       use crate::types::Error;
       use serde::de::{self, Deserialize, Deserializer, Visitor};
       use serde::ser::{Serialize, Serializer};
@@ -738,21 +740,21 @@ internally, to keep track of things like the stack, program, lists etc.
           where
               E: de::Error,
           {
-              Ok(Item::Number(number::Number::Int(value)))
+              Ok(Item::Int(value))
           }
 
           fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
           where
               E: de::Error,
           {
-              Ok(Item::Number(number::Number::Int(value as i64)))
+              Ok(Item::Int(value as i64))
           }
 
           fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
           where
               E: de::Error,
           {
-              Ok(Item::Number(number::Number::Float(value)))
+              Ok(Item::Float(value))
           }
 
           fn visit_none<E>(self) -> Result<Self::Value, E>
@@ -833,7 +835,8 @@ internally, to keep track of things like the stack, program, lists etc.
               S: Serializer,
           {
               match self {
-                  Item::Number(num) => num.serialize(serializer),
+                  Item::Int(num) => num.serialize(serializer),
+                  Item::Float(num) => num.serialize(serializer),
                   Item::Char(c) => serializer.serialize_char(*c),
                   Item::Word(w) => serializer.serialize_str(w.fit()),
                   Item::Builtin(b) => {
@@ -1023,13 +1026,13 @@ internally, to keep track of things like the stack, program, lists etc.
 
   impl Derive<Int> for Item {
       fn derive(c: Int) -> Self {
-          Item::Number(Number::Int(c))
+          Item::Int(c)
       }
   }
 
   impl Derive<Float> for Item {
       fn derive(c: Float) -> Self {
-          Item::Number(Number::Float(c))
+          Item::Float(c)
       }
   }
 
@@ -1058,7 +1061,8 @@ internally, to keep track of things like the stack, program, lists etc.
                   .map_err(Error::from)
           };
           match i {
-              Item::Number(i) => Ok(i),
+              Item::Int(i) => Ok(Number::Int(i)),
+              Item::Float(f) => Ok(Number::Float(f)),
               Item::Char(c) => Ok(Number::Int(c as Int)),
               Item::Dispenser(cont::Dispenser::Sized(cont::Sized::String(s))) => fromstr(s),
               Item::Receptacle(cont::Receptacle::Sized(cont::Sized::String(s))) => fromstr(s),
@@ -1089,7 +1093,10 @@ internally, to keep track of things like the stack, program, lists etc.
 
   impl Derive<Number> for Item {
       fn derive(c: Number) -> Self {
-          Item::Number(c)
+          match c {
+              Number::Int(i) => Item::Int(i),
+              Number::Float(f) => Item::Float(f),
+          }
       }
   }
 
@@ -1140,7 +1147,7 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::types::container::error::Nested;
   use crate::types::container::pipe::FutureTake;
   use crate::types::container::program::Program;
-  use crate::types::number::{Int, Number};
+  use crate::types::number::Int;
   use crate::types::*;
 
   use core::fmt;
@@ -1861,7 +1868,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   s.mutate().insert(assoc::KeyItem::try_derive(i)?);
                   Ok(Sized::Set(s))
               }
-              (Sized::Bytes(mut b), Item::Number(Number::Int(i))) => {
+              (Sized::Bytes(mut b), Item::Int(i)) => {
                   b.push(i as u8);
                   Ok(Sized::Bytes(b))
               }
@@ -2549,7 +2556,7 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::traits::*;
   use crate::types::container as coll;
   use crate::types::container::{Count, Join, Mutey};
-  use crate::types::number::{Int, Number};
+  use crate::types::number::Int;
   use crate::types::*;
   use std::collections::HashSet;
   use std::convert::Infallible;
@@ -2619,7 +2626,7 @@ internally, to keep track of things like the stack, program, lists etc.
   impl Derive<KeyItem> for Item {
       fn derive(i: KeyItem) -> Self {
           match i {
-              KeyItem::Int(i) => Item::Number(Number::Int(i)),
+              KeyItem::Int(i) => Item::Int(i),
               KeyItem::String(i) => i.fit(),
               KeyItem::List(l) => coll::List::derive_iter(l.iter().cloned().map(Item::derive)).fit(),
               KeyItem::Word(w) => Item::Word(w),
@@ -2646,7 +2653,7 @@ internally, to keep track of things like the stack, program, lists etc.
       type Error = Error;
       fn try_derive(i: Item) -> Result<Self, Error> {
           match i {
-              Item::Number(Number::Int(i)) => Ok(KeyItem::Int(i)),
+              Item::Int(i) => Ok(KeyItem::Int(i)),
               Item::Word(w) => Ok(KeyItem::Word(w)),
               Item::Char(c) => Ok(KeyItem::Char(c)),
               i => match coll::Sized::try_derive(i)? {
@@ -4397,7 +4404,6 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::types::container::dictionary::Dict;
   use crate::types::container::program::Program;
   use crate::types::container::{self as coll, Mutey};
-  use crate::types::number::Number;
   use crate::types::*;
 
   use once_cell::sync::Lazy;
@@ -4718,8 +4724,8 @@ internally, to keep track of things like the stack, program, lists etc.
           (w, _) if *w == *S_ITEM => true,
           (w, Item::Dispenser(_) | Item::Receptacle(_)) if *w == *S_DISPENSER => true,
           (w, Item::Receptacle(_) | Item::Dispenser(_)) if *w == *S_RECEPTACLE => true,
-          (w, Item::Number(Number::Int(_))) if *w == *S_INTEGER || *w == *S_NUMBER => true,
-          (w, Item::Number(Number::Float(_))) if *w == *S_FLOAT || *w == *S_NUMBER => true,
+          (w, Item::Int(_)) if *w == *S_INTEGER || *w == *S_NUMBER => true,
+          (w, Item::Float(_)) if *w == *S_FLOAT || *w == *S_NUMBER => true,
           (w, Item::Char(_)) if *w == *S_CHAR => true,
           // TODO: also handle cases where bytes/string is a list
           (
@@ -5315,7 +5321,6 @@ example, in order to read/write to/from disk).
   use crate::types::container::{
       self as coll, associative as assoc, environment::Environment, error::Error,
   };
-  use crate::types::number::Number;
   use crate::types::*;
 
   use base64::prelude::BASE64_URL_SAFE_NO_PAD;
@@ -5336,7 +5341,7 @@ example, in order to read/write to/from disk).
   fn to_item(item: &edn_format::Value) -> Result<Item, Error> {
       //println!("to item {:?}", item);
       match item {
-          edn_format::Value::Integer(i) => Ok(Item::Number(Number::Int(*i))),
+          edn_format::Value::Integer(i) => Ok(Item::Int(*i)),
           edn_format::Value::Vector(v) => Ok({
               coll::List::derive_iter(
                   v.iter()
@@ -5359,7 +5364,7 @@ example, in order to read/write to/from disk).
           // language, but might be user-defined later.
           edn_format::Value::Boolean(b) => Ok(if *b { fit!("yes") } else { fit!("false") }),
           edn_format::Value::String(s) => Ok(s.to_string().fit()),
-          edn_format::Value::Float(f) => Ok(Item::Number(Number::Float(f.into_inner()))),
+          edn_format::Value::Float(f) => Ok(Item::Float(f.into_inner())),
           edn_format::Value::TaggedElement(tag, e) => {
               if *tag == edn_format::Symbol::from_name(BYTE_TAG) {
                   if let edn_format::Value::String(s) = &**e {
@@ -5421,8 +5426,8 @@ example, in order to read/write to/from disk).
           match item {
               // dictionaries are big and it's ugly to print them for
               // environments.
-              Item::Number(Number::Int(i)) => edn_format::Value::Integer(*i),
-              Item::Number(Number::Float(f)) => edn_format::Value::from(*f),
+              Item::Int(i) => edn_format::Value::Integer(*i),
+              Item::Float(f) => edn_format::Value::from(*f),
               Item::Char(c) => edn_format::Value::Character(*c),
               Item::Builtin(b) => edn_format::Value::Symbol(edn_format::Symbol::from_name(
                   format!("builtin_{}", b.name).as_str(),
@@ -6519,11 +6524,12 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn is_number(i: Item) -> bool {
-      matches!(i, Item::Number(_))
+      //TODO : this should just do the enum conversion
+      Number::try_derive(i).is_ok()
   }
 
   pub fn is_integer(i: Item) -> bool {
-      matches!(i, Item::Number(number::Number::Int(_)))
+      matches!(i, Item::Int(_))
   }
 
   pub fn is_list(i: Item) -> bool {
@@ -7100,10 +7106,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   /// The default method of encoding items into byte arrays.
   fn encode_item(i: Item) -> Result<Bytes, Infallible> {
       Ok(match i {
-          Item::Number(n) => match n {
-              Number::Int(i) => i.to_be_bytes().to_vec(),
-              Number::Float(f) => f.to_be_bytes().to_vec(),
-          },
+          Item::Int(i) => i.to_be_bytes().to_vec(),
+          Item::Float(f) => f.to_be_bytes().to_vec(),
           Item::Char(c) => vec![c as u8],
           i => {
               let r = coll::Sized::try_derive(i.clone());
@@ -7406,9 +7410,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
   pub fn xor(i: Item, j: Item) -> ItemResult {
       match (i, j) {
-          (Item::Number(Number::Int(i)), Item::Number(Number::Int(j))) => {
-              Ok(Item::Number(Number::Int(i ^ j)))
-          }
+          (Item::Int(i), Item::Int(j)) => Ok(Item::Int(i ^ j)),
           (
               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(i))),
               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(j))),
@@ -7465,15 +7467,15 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           }
       }
       match (i, j) {
-          (Item::Number(Number::Float(fi)), Item::Number(Number::Float(fj))) => {
+          (Item::Float(fi), Item::Float(fj)) => {
               let r = fi.partial_cmp(&fj);
               res(r, fi.fit(), fj.fit())
           }
-          (Item::Number(Number::Int(fi)), Item::Number(Number::Float(fj))) => {
+          (Item::Int(fi), Item::Float(fj)) => {
               let r = (fi as f64).partial_cmp(&fj);
               res(r, fi.fit(), fj.fit())
           }
-          (Item::Number(Number::Float(fi)), Item::Number(Number::Int(fj))) => {
+          (Item::Float(fi), Item::Int(fj)) => {
               let r = fi.partial_cmp(&(fj as f64));
               res(r, fi.fit(), fj.fit())
           }
@@ -9957,7 +9959,6 @@ Implement the =handoff= type
   use crate::config;
   use crate::traits::*;
   use crate::types::container::{self as coll, associative as assoc, error::Error};
-  use crate::types::number::Number;
   use crate::types::{self, Item};
   use crate::{fit, list};
 
@@ -10083,7 +10084,8 @@ Implement the =handoff= type
           i,
           Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(_)))
               | Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(_)))
-              | Item::Number(_)
+              | Item::Int(_)
+              | Item::Float(_)
               | Item::Word(_)
               | Item::Char(_)
       )
@@ -10117,8 +10119,8 @@ Implement the =handoff= type
       type Error = Error;
       fn try_derive(value: ValueRef) -> Result<Self, Self::Error> {
           match value {
-              ValueRef::Integer(i) => Ok(Item::Number(Number::Int(i))),
-              ValueRef::Real(f) => Ok(Item::Number(Number::Float(f))),
+              ValueRef::Integer(i) => Ok(Item::Int(i)),
+              ValueRef::Real(f) => Ok(Item::Float(f)),
               ValueRef::Text(t) => decode_string(String::from_utf8_lossy(t).into_owned()),
 
               ValueRef::Blob(b) => Ok(Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(
@@ -10169,8 +10171,8 @@ Implement the =handoff= type
   impl rusqlite::ToSql for Item {
       fn to_sql(&self) -> Result<ToSqlOutput<'_>, DBError> {
           match self {
-              Item::Number(Number::Int(i)) => i.to_sql(),
-              Item::Number(Number::Float(f)) => f.to_sql(),
+              Item::Int(i) => i.to_sql(),
+              Item::Float(f) => f.to_sql(),
               Item::Char(c) => Ok(EncodeAs::Char(*c).encode()),
               Item::Word(w) => Ok(EncodeAs::Word(w.clone()).encode()),
               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(s))) => {
