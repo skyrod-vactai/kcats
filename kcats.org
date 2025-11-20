@@ -1,4 +1,3 @@
-
 # -*- org-export-babel-evaluate: nil -*-
 #+TITLE: The kcats Programming Language (Production Implementation)
 #+AUTHOR: Skyrod Vactai
@@ -300,6 +299,7 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::types::container::dictionary as dict;
   use crate::types::container::environment as env;
   use crate::types::container::error::Error;
+  use crate::types::container::pipe;
   use crate::{fit, list};
 
   use core::default::Default;
@@ -367,6 +367,38 @@ internally, to keep track of things like the stack, program, lists etc.
 
           // do what `"literal".try_fit().unwrap()` used to do
           ($lit).try_fit().unwrap()
+      }};
+  }
+
+  /// A macro to convert from one enum type to another (assuming variant names match.)
+  /// enum Foo {
+  ///     Var(i32),
+  ///     Other(String),
+  ///     Another(bool),
+  /// }
+  ///
+  /// enum Bar {
+  ///     Var(i32),
+  ///     Other(String),
+  ///     Another(bool),
+  /// }
+  ///
+  /// fn main() {
+  ///     let foo = Foo::Var(42);
+  ///     let bar = convert_enum!(foo, Foo, Bar, [Var, Other, Another]);
+  /// }
+  #[macro_export]
+  macro_rules! convert_enum {
+      ($value:expr, $from:ident, $to:ident, [$($variant:ident),* $(,)?] $(, $pattern:pat => $result:expr)* $(,)?) => {{
+          use $from::*;
+          match $value {
+              $(
+                  $variant(inner) => $to::$variant(inner),
+              )*
+              $(
+                  $pattern => $result,
+              )*
+          }
       }};
   }
 
@@ -447,7 +479,10 @@ internally, to keep track of things like the stack, program, lists etc.
       /// A builtin function
       Builtin(axiom::Builtin),
       /// A container value (that [Item]s can be taken from)
-      Dispenser(coll::Dispenser),
+      // Dispenser(coll::Dispenser),
+      Sized(coll::Sized),
+      Out(pipe::Out),
+      Tunnel(pipe::Tunnel),
       /// A container value (that [Item]s can be put into)
       Receptacle(coll::Receptacle),
   }
@@ -457,7 +492,14 @@ internally, to keep track of things like the stack, program, lists etc.
           match self {
               Item::Char(c) => write!(f, "Char{:?}", c),
               Item::Builtin(b) => write!(f, "Builtin{:?}", b.name),
-              i => write!(f, "{:?}", i),
+              Item::Int(i) => write!(f, "{:?}", i),
+
+              Item::Float(fl) => write!(f, "{:?}", fl),
+              Item::Sized(s) => write!(f, "{:?}", s),
+              Item::Out(o) => write!(f, "{:?}", o),
+              Item::Tunnel(t) => write!(f, "{:?}", t),
+              Item::Word(w) => write!(f, "{:?}", w),
+              Item::Receptacle(r) => write!(f, "{:?}", r),
           }
       }
   }
@@ -466,7 +508,7 @@ internally, to keep track of things like the stack, program, lists etc.
       /// Returns whether the item is empty - only containers can be empty.
       pub fn is_empty(&self) -> bool {
           match self {
-              Item::Dispenser(coll::Dispenser::Sized(s)) => s.is_empty(),
+              Item::Sized(s) => s.is_empty(),
               Item::Receptacle(coll::Receptacle::Sized(s)) => s.is_empty(),
               _ => false,
           }
@@ -491,15 +533,12 @@ internally, to keep track of things like the stack, program, lists etc.
               (Item::Int(a), Item::Float(b)) => *a as number::Float == *b,
 
               (Item::Word(a), Item::Word(b)) => a == b,
-              (
-                  Item::Dispenser(coll::Dispenser::Sized(a)),
-                  Item::Receptacle(coll::Receptacle::Sized(b)),
-              ) => a == b,
-              (
-                  Item::Receptacle(coll::Receptacle::Sized(a)),
-                  Item::Dispenser(coll::Dispenser::Sized(b)),
-              ) => a == b,
-              (Item::Dispenser(a), Item::Dispenser(b)) => a == b,
+              (Item::Sized(a), Item::Sized(b)) => a == b,
+              (Item::Out(a), Item::Out(b)) => a == b,
+              (Item::Tunnel(a), Item::Tunnel(b)) => a == b,
+
+              (Item::Sized(a), Item::Receptacle(coll::Receptacle::Sized(b))) => a == b,
+              (Item::Receptacle(coll::Receptacle::Sized(a)), Item::Sized(b)) => a == b,
               (Item::Receptacle(a), Item::Receptacle(b)) => a == b,
 
               (Item::Char(a), Item::Char(b)) => a == b,
@@ -618,13 +657,13 @@ internally, to keep track of things like the stack, program, lists etc.
 
   impl Derive<String> for Item {
       fn derive(i: String) -> Self {
-          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(i)))
+          Item::Sized(coll::Sized::String(i))
       }
   }
 
   impl Derive<Bytes> for Item {
       fn derive(b: Bytes) -> Self {
-          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(b)))
+          Item::Sized(coll::Sized::Bytes(b))
       }
   }
 
@@ -718,6 +757,7 @@ internally, to keep track of things like the stack, program, lists etc.
   mod serde {
       //! Support for json serialization of kcats objects
       use super::Item;
+      use crate::serialize::Display;
       use crate::traits::*;
       use crate::types::container as coll;
       use crate::types::container::associative as assoc;
@@ -775,18 +815,14 @@ internally, to keep track of things like the stack, program, lists etc.
           where
               E: de::Error,
           {
-              Ok(Item::Dispenser(coll::Dispenser::Sized(
-                  coll::Sized::String(v.to_string()),
-              )))
+              Ok(Item::Sized(coll::Sized::String(v.to_string())))
           }
 
           fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E>
           where
               E: de::Error,
           {
-              Ok(Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(
-                  v,
-              ))))
+              Ok(Item::Sized(coll::Sized::Bytes(v)))
           }
 
           fn visit_map<A>(self, mut ma: A) -> Result<Self::Value, A::Error>
@@ -797,8 +833,8 @@ internally, to keep track of things like the stack, program, lists etc.
               while let Some((key, value)) = ma.next_entry::<assoc::KeyItem, Item>()? {
                   map.insert(key, value);
               }
-              Ok(Item::Dispenser(coll::Dispenser::Sized(
-                  coll::Sized::Associative(assoc::Associative::Assoc(map.fit())),
+              Ok(Item::Sized(coll::Sized::Associative(
+                  assoc::Associative::Assoc(map.fit()),
               )))
           }
 
@@ -843,7 +879,9 @@ internally, to keep track of things like the stack, program, lists etc.
                       serializer.serialize_str(format!("builtin_{}", b.name).as_str())
                   }
                   // Handle other variants
-                  Item::Dispenser(ref dispenser) => dispenser.serialize(serializer),
+                  Item::Sized(ref sized) => sized.serialize(serializer),
+                  Item::Out(ref out) => (*out).representation().serialize(serializer),
+                  Item::Tunnel(ref t) => t.representation().serialize(serializer),
                   Item::Receptacle(ref receptacle) => receptacle.serialize(serializer),
               }
           }
@@ -1064,8 +1102,7 @@ internally, to keep track of things like the stack, program, lists etc.
               Item::Int(i) => Ok(Number::Int(i)),
               Item::Float(f) => Ok(Number::Float(f)),
               Item::Char(c) => Ok(Number::Int(c as Int)),
-              Item::Dispenser(cont::Dispenser::Sized(cont::Sized::String(s))) => fromstr(s),
-              Item::Receptacle(cont::Receptacle::Sized(cont::Sized::String(s))) => fromstr(s),
+              Item::Sized(cont::Sized::String(s)) => fromstr(s),
               i => Err(Error::expected(fit!("number"), i)),
           }
       }
@@ -1143,8 +1180,8 @@ internally, to keep track of things like the stack, program, lists etc.
   use futures::FutureExt;
 
   use self::associative as assoc;
+  use crate::convert_enum;
   use crate::traits::*;
-  use crate::types::container::error::Nested;
   use crate::types::container::pipe::FutureTake;
   use crate::types::container::program::Program;
   use crate::types::number::Int;
@@ -1175,7 +1212,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
   impl Derive<List> for Item {
       fn derive(l: List) -> Item {
-          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(Box::new(l))))
+          Item::Sized(coll::Sized::List(Box::new(l)))
       }
   }
 
@@ -1473,9 +1510,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   assoc::KeyItem::try_derive(other.clone()).is_ok_and(|k| a.contains_key(&k))
               }
               (Sized::List(l), other) => l.contains(other),
-              (Sized::Set(s), Item::Dispenser(Dispenser::Sized(Sized::Set(other)))) => {
-                  other.is_subset(s)
-              }
+              (Sized::Set(s), Item::Sized(Sized::Set(other))) => other.is_subset(s),
               (Sized::Set(s), Item::Receptacle(Receptacle::Sized(Sized::Set(other)))) => {
                   other.is_subset(s)
               }
@@ -1612,7 +1647,7 @@ internally, to keep track of things like the stack, program, lists etc.
   impl fmt::Debug for Dispenser {
       fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
           match self {
-              Dispenser::Sized(sized) => write!(f, "{:?}", sized),
+              Dispenser::Sized(sized) => write!(f, "Sized{:?}", sized),
               Dispenser::Out(out) => write!(f, "{:?}", out),
               Dispenser::Tunnel(tunnel) => write!(f, "{:?}", tunnel),
           }
@@ -1669,7 +1704,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
           match self {
               Sized::Associative(a) => write!(f, "{:?}", a),
-              Sized::List(l) => write!(f, "{:?}", l),
+              Sized::List(l) => write!(f, "List{:?}", l),
               Sized::Set(s) => write!(f, "{:?}", s),
               Sized::String(s) => write!(f, "{:?}", s),
               Sized::Bytes(b) => write!(f, "{:?}", b),
@@ -2050,9 +2085,7 @@ internally, to keep track of things like the stack, program, lists etc.
       type Error = Error;
       fn try_derive(i: Item) -> Result<Self, Self::Error> {
           match i {
-              Item::Dispenser(l) => Sized::try_derive(l.clone())
-                  .caused(|| Error::expected(fit!("list"), l))
-                  .and_then(List::try_derive),
+              Item::Sized(s) => List::try_derive(s),
               Item::Receptacle(l) => Sized::try_derive(l).and_then(List::try_derive),
               i => Err(Error::expected(fit!("list"), i)),
           }
@@ -2064,10 +2097,8 @@ internally, to keep track of things like the stack, program, lists etc.
 
       fn try_derive(item: Item) -> Result<Self, Self::Error> {
           match item {
-              Item::Dispenser(c) => c.try_fit(),
-              Item::Receptacle(p) => Dispenser::try_derive(p.clone())
-                  .caused(|| Error::expected(fit!("sized"), p))?
-                  .try_fit(),
+              Item::Sized(s) => Ok(s),
+              Item::Receptacle(Receptacle::Sized(s)) => Ok(s),
               i => {
                   // let bt = backtrace::Backtrace::new();
                   // println!("try from item {:?},\n {:?}", i, bt);
@@ -2083,7 +2114,8 @@ internally, to keep track of things like the stack, program, lists etc.
       fn try_derive(item: Item) -> Result<Self, Self::Error> {
           match item {
               Item::Receptacle(p) => Ok(p),
-              Item::Dispenser(c) => c.try_fit(),
+              Item::Sized(s) => Ok(Receptacle::Sized(s)),
+              Item::Tunnel(t) => Ok(Receptacle::Tunnel(t)),
               i => Err(Error::expected(fit!("receptacle"), i)),
           }
       }
@@ -2153,13 +2185,13 @@ internally, to keep track of things like the stack, program, lists etc.
 
   impl Derive<Set> for Item {
       fn derive(l: Set) -> Self {
-          Item::Dispenser(Dispenser::Sized(Sized::Set(l)))
+          Item::Sized(Sized::Set(l))
       }
   }
 
   impl Derive<Dispenser> for Item {
       fn derive(c: Dispenser) -> Self {
-          Item::Dispenser(c)
+          convert_enum!(c, Dispenser, Item, [Sized, Out, Tunnel])
       }
   }
 
@@ -2180,8 +2212,12 @@ internally, to keep track of things like the stack, program, lists etc.
 
       fn try_derive(item: Item) -> Result<Self, Self::Error> {
           match item {
-              Item::Dispenser(c) => Ok(c),
-              Item::Receptacle(p) => Ok(Dispenser::try_derive(p)?),
+              Item::Sized(s) => Ok(Dispenser::Sized(s)),
+              Item::Out(s) => Ok(Dispenser::Out(s)),
+              Item::Tunnel(s) => Ok(Dispenser::Tunnel(s)),
+              Item::Receptacle(Receptacle::Sized(s)) => Ok(Dispenser::Sized(s)),
+              Item::Receptacle(Receptacle::Tunnel(t)) => Ok(Dispenser::Tunnel(t)),
+
               i => Err(Error::expected(fit!("iterable"), i)),
           }
       }
@@ -3506,16 +3542,14 @@ internally, to keep track of things like the stack, program, lists etc.
       type Error = Error;
       fn try_derive(i: Item) -> Result<Self, Self::Error> {
           match i {
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
-                  assoc::Associative::Error(e),
-              ))) => Ok(e),
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(_)))
-              | Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(_)))
+              Item::Sized(coll::Sized::Associative(assoc::Associative::Error(e))) => Ok(e),
+              Item::Sized(coll::Sized::String(_))
+              | Item::Sized(coll::Sized::Bytes(_))
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::String(_)))
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(_))) => {
                   Err(Error::expected(fit!("error"), Item::default()))
               }
-              Item::Dispenser(coll::Dispenser::Sized(c)) => c.into_iter().try_fit(),
+              Item::Sized(c) => c.into_iter().try_fit(),
               i => Err(Error::expected(fit!("error"), i)),
           }
       }
@@ -3773,9 +3807,7 @@ internally, to keep track of things like the stack, program, lists etc.
       type Error = Error;
       fn try_derive(i: Item) -> Result<Namespace, Error> {
           match i {
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(b))) => Ok(bytes_to_ns(b)),
-              Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(b))) => Ok(bytes_to_ns(b)),
-
+              Item::Sized(coll::Sized::Bytes(b)) => Ok(bytes_to_ns(b)),
               i => {
                   let s = coll::Sized::try_derive(i)?;
                   if s.is_empty() {
@@ -4349,24 +4381,22 @@ internally, to keep track of things like the stack, program, lists etc.
 
   impl Derive<Entry> for Item {
       fn derive(e: Entry) -> Self {
-          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
-              assoc::Associative::DictEntry(Box::new(e)),
+          Item::Sized(coll::Sized::Associative(assoc::Associative::DictEntry(
+              Box::new(e),
           )))
       }
   }
 
   impl Derive<Words> for Item {
       fn derive(e: Words) -> Self {
-          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
-              assoc::Associative::Words(e),
-          )))
+          Item::Sized(coll::Sized::Associative(assoc::Associative::Words(e)))
       }
   }
 
   impl Derive<Dictionary> for Item {
       fn derive(d: Dictionary) -> Self {
-          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
-              assoc::Associative::Dictionary(Box::new(d)),
+          Item::Sized(coll::Sized::Associative(assoc::Associative::Dictionary(
+              Box::new(d),
           )))
       }
   }
@@ -4720,54 +4750,59 @@ internally, to keep track of things like the stack, program, lists etc.
   /// hierarchy, eg, `integer` is a `number`, `list` is a `sized` etc.
   fn check_type(i: &Item, w: &Word) -> bool {
       //println!("Check {:?} is {:?}", w, i);
+      //if *w == *S_DISPENSER {
+      //   println!("Dispenser? {:?}", i);
+      //}
       match (w, i) {
           (w, _) if *w == *S_ITEM => true,
-          (w, Item::Dispenser(_) | Item::Receptacle(_)) if *w == *S_DISPENSER => true,
-          (w, Item::Receptacle(_) | Item::Dispenser(_)) if *w == *S_RECEPTACLE => true,
+          (w, Item::Out(_) | Item::Tunnel(_) | Item::Sized(_) | Item::Receptacle(_))
+              if *w == *S_DISPENSER =>
+          {
+              true
+          }
+          (w, Item::Receptacle(_) | Item::Tunnel(_) | Item::Sized(_)) if *w == *S_RECEPTACLE => true,
           (w, Item::Int(_)) if *w == *S_INTEGER || *w == *S_NUMBER => true,
           (w, Item::Float(_)) if *w == *S_FLOAT || *w == *S_NUMBER => true,
           (w, Item::Char(_)) if *w == *S_CHAR => true,
           // TODO: also handle cases where bytes/string is a list
           (
               w,
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(_)))
+              Item::Sized(coll::Sized::Bytes(_))
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(_))),
           ) if *w == *S_BYTES || *w == *S_ORDERED => true,
 
           (
               w,
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(_)))
+              Item::Sized(coll::Sized::String(_))
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::String(_))),
           ) if *w == *S_STRING => true,
           (w, Item::Word(_)) if *w == *S_WORD => true,
 
           (
               w,
-              Item::Dispenser(coll::Dispenser::Out(_))
-              | Item::Dispenser(coll::Dispenser::Tunnel(_))
+              Item::Out(_)
+              | Item::Tunnel(_)
               | Item::Receptacle(coll::Receptacle::Tunnel(_))
               | Item::Receptacle(coll::Receptacle::In(_)),
           ) if *w == *S_PIPE => true,
 
           (
               w,
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(_)))
+              Item::Sized(coll::Sized::List(_))
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::List(_)))
-              | Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Program(_)))
+              | Item::Sized(coll::Sized::Program(_))
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Program(_))),
           ) if *w == *S_LIST || *w == *S_PROGRAM => true,
 
           (
               w,
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(_)))
+              Item::Sized(coll::Sized::Associative(_))
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(_))),
           ) if *w == *S_ASSOC => true,
 
           (
               w,
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
-                  assoc::Associative::Error(_),
-              )))
+              Item::Sized(coll::Sized::Associative(assoc::Associative::Error(_)))
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(
                   assoc::Associative::Error(_),
               ))),
@@ -4775,25 +4810,21 @@ internally, to keep track of things like the stack, program, lists etc.
 
           (
               w,
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
-                  assoc::Associative::Dictionary(_),
-              )))
+              Item::Sized(coll::Sized::Associative(assoc::Associative::Dictionary(_)))
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(
                   assoc::Associative::Dictionary(_),
               ))),
           ) if *w == *S_DICTIONARY => true,
 
-          (
-              w,
-              Item::Dispenser(coll::Dispenser::Sized(_))
-              | Item::Receptacle(coll::Receptacle::Sized(_)),
-          ) if *w == *S_SIZED || *w == *S_ORDERED => true,
+          (w, Item::Sized(_) | Item::Receptacle(coll::Receptacle::Sized(_)))
+              if *w == *S_SIZED || *w == *S_ORDERED =>
+          {
+              true
+          }
 
           (
               w,
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
-                  assoc::Associative::Env(_),
-              )))
+              Item::Sized(coll::Sized::Associative(assoc::Associative::Env(_)))
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(
                   assoc::Associative::Env(_),
               ))),
@@ -5443,11 +5474,11 @@ example, in order to read/write to/from disk).
                   }
               }),
               //Item::Entry(w) => edn_format::Value::Symbol(edn_format::Symbol::from_name(&w.word)),
-              Item::Dispenser(coll::Dispenser::Out(o)) => (&o.representation()).into(),
-              Item::Dispenser(coll::Dispenser::Tunnel(t)) => (&t.representation()).into(),
+              Item::Out(o) => (&o.representation()).into(),
+              Item::Tunnel(t) => (&t.representation()).into(),
               Item::Receptacle(coll::Receptacle::In(i)) => (&i.representation()).into(),
               Item::Receptacle(coll::Receptacle::Tunnel(t)) => (&t.representation()).into(),
-              Item::Dispenser(coll::Dispenser::Sized(s)) => from_sized(s),
+              Item::Sized(s) => from_sized(s),
               Item::Receptacle(coll::Receptacle::Sized(s)) => from_sized(s),
           }
       }
@@ -6476,7 +6507,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   pub fn is_string(i: Item) -> bool {
       matches!(
           i,
-          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(_)))
+          Item::Sized(coll::Sized::String(_))
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::String(_)))
       )
   }
@@ -6484,7 +6515,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   pub fn is_bytes(i: Item) -> bool {
       matches!(
           i,
-          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(_)))
+          Item::Sized(coll::Sized::Bytes(_))
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(_)))
       )
   }
@@ -6492,9 +6523,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   pub fn is_error(i: Item) -> bool {
       matches!(
           i,
-          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
-              assoc::Associative::Error(_),
-          )))
+          Item::Sized(coll::Sized::Associative(assoc::Associative::Error(_),))
       )
   }
 
@@ -6505,26 +6534,24 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   pub fn is_environment(i: Item) -> bool {
       matches!(
           i,
-          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
-              assoc::Associative::Env(_)
-          ))) | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(
-              assoc::Associative::Env(_)
-          )))
+          Item::Sized(coll::Sized::Associative(assoc::Associative::Env(_)))
+              | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(
+                  assoc::Associative::Env(_)
+              )))
       )
   }
 
   pub fn is_pipe(i: Item) -> bool {
       matches!(
           i,
-          Item::Dispenser(coll::Dispenser::Out(_))
-              | Item::Dispenser(coll::Dispenser::Tunnel(_))
+          Item::Out(_)
+              | Item::Tunnel(_)
               | Item::Receptacle(coll::Receptacle::In(_))
               | Item::Receptacle(coll::Receptacle::Tunnel(_))
       )
   }
 
   pub fn is_number(i: Item) -> bool {
-      //TODO : this should just do the enum conversion
       Number::try_derive(i).is_ok()
   }
 
@@ -6648,6 +6675,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               env
           }),
           Err(e) => {
+              println!("Not a dispenser! {:?}", env.tos().unwrap());
               env.push(e);
               env.fit()
           }
@@ -6672,7 +6700,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn is_truthy(i: &Item) -> bool {
       match i {
-          Item::Dispenser(coll::Dispenser::Sized(d)) => !d.is_empty(),
+          Item::Sized(d) => !d.is_empty(),
           Item::Receptacle(coll::Receptacle::Sized(r)) => !r.is_empty(),
           _ => true,
       }
@@ -6803,10 +6831,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       if let [k, ks @ ..] = ks {
           match (i, k) {
               // An int key for a list means update that index
-              (
-                  Some(Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(l)))),
-                  assoc::KeyItem::Int(k),
-              ) => assoc_vec(*l, ks, *k, v),
+              (Some(Item::Sized(coll::Sized::List(l))), assoc::KeyItem::Int(k)) => {
+                  assoc_vec(*l, ks, *k, v)
+              }
 
               (
                   Some(Item::Receptacle(coll::Receptacle::Sized(coll::Sized::List(l)))),
@@ -6815,10 +6842,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
               // An int key for an associative means an integer key, which is uncommon
               // but we'll support it
-              (
-                  Some(Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(a)))),
-                  assoc::KeyItem::Int(k),
-              ) => assoc_map(a, ks, &assoc::KeyItem::Int(*k), v),
+              (Some(Item::Sized(coll::Sized::Associative(a))), assoc::KeyItem::Int(k)) => {
+                  assoc_map(a, ks, &assoc::KeyItem::Int(*k), v)
+              }
               (
                   Some(Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(a)))),
                   assoc::KeyItem::Int(k),
@@ -6876,10 +6902,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               Ok(a.remove(k).0.fit())
           } else {
               match (i, k) {
-                  (
-                      Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(mut l))),
-                      assoc::KeyItem::Int(k),
-                  ) => {
+                  (Item::Sized(coll::Sized::List(mut l)), assoc::KeyItem::Int(k)) => {
                       let old_value = if let Some(item) = l.get_mut(*k as usize) {
                           mem::take(item)
                       } else {
@@ -7116,15 +7139,12 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       coll::Sized::String(s) => s.as_bytes().to_vec(),
                       coll::Sized::Bytes(b) => b,
                       coll::Sized::List(l) => Bytes::try_derive((*l).clone()).unwrap_or_else(|_| {
-                          (&Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(l))))
+                          (&Item::Sized(coll::Sized::List(l)))
                               .emit()
                               .as_bytes()
                               .to_vec()
                       }),
-                      s => (&Item::Dispenser(coll::Dispenser::Sized(s)))
-                          .emit()
-                          .as_bytes()
-                          .to_vec(),
+                      s => (&Item::Sized(s)).emit().as_bytes().to_vec(),
                   },
                   Err(_) => (&i).emit().as_bytes().to_vec(),
               }
@@ -7153,12 +7173,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   fn get_error(env: &Environment) -> Option<Error> {
       env.tos().and_then(|i| match i {
-          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
-              assoc::Associative::Error(e),
-          ))) => Some(e.clone()),
-          Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(
-              assoc::Associative::Error(e),
-          ))) => Some(e.clone()),
+          Item::Sized(coll::Sized::Associative(assoc::Associative::Error(e))) => Some(e.clone()),
           _ => None,
       })
   }
@@ -7168,9 +7183,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let handle: &Item = &fit!("handle");
 
       let err = match err {
-          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
-              assoc::Associative::Error(mut e),
-          ))) => {
+          Item::Sized(coll::Sized::Associative(assoc::Associative::Error(mut e))) => {
               let mut next = env.program.peek();
               let data = e.data.mutate();
               let mut unwound: coll::List = data
@@ -7284,14 +7297,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       match env.stack.front_mut() {
           None => {}
           Some(i) => match i {
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(
-                  assoc::Associative::Error(ref mut e),
-              ))) => {
-                  e.is_handled = true;
-              }
-              Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Associative(
-                  assoc::Associative::Error(ref mut e),
-              ))) => {
+              Item::Sized(coll::Sized::Associative(assoc::Associative::Error(ref mut e))) => {
                   e.is_handled = true;
               }
               _ => {}
@@ -7368,7 +7374,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           _ => None,
       };
       match env.pop() {
-          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(b))) => {
+          Item::Sized(coll::Sized::Bytes(b)) => {
               let cache = config::PlatformConfig::get()?.cache;
               let hash = cache.put(&b, alias)?;
               env.push(hash);
@@ -7411,10 +7417,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   pub fn xor(i: Item, j: Item) -> ItemResult {
       match (i, j) {
           (Item::Int(i), Item::Int(j)) => Ok(Item::Int(i ^ j)),
-          (
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(i))),
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(j))),
-          ) => Ok(xor_(i, j).fit()),
+          (Item::Sized(coll::Sized::Bytes(i)), Item::Sized(coll::Sized::Bytes(j))) => {
+              Ok(xor_(i, j).fit())
+          }
           (
               Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(i))),
               Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(j))),
@@ -7429,15 +7434,13 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn timestamps(mut env: Environment) -> Future<Environment> {
       env.pop_prog();
-      env.push(Item::Dispenser(coll::Dispenser::Out(pipe::Out::Time)));
+      env.push(Item::Out(pipe::Out::Time));
       env.fit()
   }
 
   pub fn standard(mut env: Environment) -> Future<Environment> {
       env.pop_prog();
-      env.push(Item::Dispenser(coll::Dispenser::Tunnel(
-          pipe::Tunnel::Standard,
-      )));
+      env.push(Item::Tunnel(pipe::Tunnel::Standard));
       env.fit()
   }
 
@@ -7700,7 +7703,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                           Ok((stack, last_stack_item_used, list))
                       }
                   }
-                  Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(l))) => {
+                  Item::Sized(coll::Sized::List(l)) => {
                       // recurse
                       let (stack, last_stack_item_used, filled) = l.iter().cloned().fold(
                           Ok((stack.clone(), last_stack_item_used, Vec::new())),
@@ -8270,6 +8273,7 @@ rust project or some other language through FFI.
 
   #[cfg(test)]
   mod tests {
+
       //! Unit tests, in the form of all the examples of usage of the
       //! different lexicon words. Examples are all in the form of two
       //! programs that should be equivalent, something like `2 3 +` and
@@ -8288,6 +8292,20 @@ rust project or some other language through FFI.
 
       use test_case::test_case;
 
+      //use std::{panic, sync::Once};
+
+      // static INIT: Once = Once::new();
+
+      // fn init_panic_hook() {
+      //     //println!("Installing panic hook");
+      //     INIT.call_once(|| {
+      //         panic::set_hook(Box::new(|info| {
+      //             eprintln!("panic in test: {info}");
+      //             eprintln!("{}", std::backtrace::Backtrace::capture());
+      //         }));
+      //     });
+      // }
+
       pub fn get_item(i: &coll::List, index: usize) -> Option<Item> {
           i.get(index).cloned()
       }
@@ -8302,10 +8320,16 @@ rust project or some other language through FFI.
           let mut exp_env = prog_env.clone();
           prog_env.program.prepend(program.clone());
           exp_env.program.prepend(expected_prog.clone());
+          //init_panic_hook();
+          let p_fut = tokio::spawn(async move {
+              //init_panic_hook();
+              axiom::eval(prog_env).await
+          });
 
-          let p_fut = tokio::spawn(async move { axiom::eval(prog_env).await });
-
-          let exp_fut = tokio::spawn(async move { axiom::eval(exp_env).await });
+          let exp_fut = tokio::spawn(async move {
+              //init_panic_hook();
+              axiom::eval(exp_env).await
+          });
           let (prog_env, exp_env) = tokio::join!(p_fut, exp_fut);
           let prog_env = prog_env.unwrap();
           let exp_env = exp_env.unwrap();
@@ -9119,13 +9143,13 @@ The basic pipe contracts.
 
   impl Derive<Tunnel> for Item {
       fn derive(t: Tunnel) -> Self {
-          Item::Dispenser(coll::Dispenser::Tunnel(t))
+          Item::Tunnel(t)
       }
   }
 
   impl Derive<Out> for Item {
       fn derive(t: Out) -> Self {
-          Item::Dispenser(coll::Dispenser::Out(t))
+          Item::Out(t)
       }
   }
 
@@ -9141,7 +9165,7 @@ The basic pipe contracts.
           match i {
               Item::Receptacle(coll::Receptacle::In(i)) => Ok(i),
               Item::Receptacle(coll::Receptacle::Tunnel(t)) => Ok(t.fit()),
-              Item::Dispenser(coll::Dispenser::Tunnel(t)) => Ok(t.fit()),
+              Item::Tunnel(t) => Ok(t.fit()),
               i => Err(Error::expected(fit!("pipe"), i)),
           }
       }
@@ -9151,8 +9175,8 @@ The basic pipe contracts.
       type Error = Error;
       fn try_derive(i: Item) -> Result<Self, Self::Error> {
           match i {
-              Item::Dispenser(coll::Dispenser::Out(o)) => Ok(o),
-              Item::Dispenser(coll::Dispenser::Tunnel(t)) => Ok(t.fit()),
+              Item::Out(o) => Ok(o),
+              Item::Tunnel(t) => Ok(t.fit()),
               Item::Receptacle(coll::Receptacle::Tunnel(t)) => Ok(t.fit()),
               i => Err(Error::expected(fit!("pipe"), i)),
           }
@@ -9284,7 +9308,6 @@ How to interact with the network (TCP/IP sockets)
 #+begin_src rust :tangle src/types/container/pipe/net.rs :mkdirp yes
   use crate::axiom::ItemResult;
   use crate::traits::*;
-  use crate::types::container as cont;
   use crate::types::container::associative as assoc;
   use crate::types::container::error::Error;
   use crate::types::container::pipe::{self, FutureTake};
@@ -9475,9 +9498,7 @@ How to interact with the network (TCP/IP sockets)
 
   impl Derive<Socket> for Item {
       fn derive(ss: Socket) -> Item {
-          Item::Dispenser(cont::Dispenser::Tunnel(pipe::Tunnel::Socket(Arc::new(
-              RwLock::new(ss),
-          ))))
+          Item::Tunnel(pipe::Tunnel::Socket(Arc::new(RwLock::new(ss))))
       }
   }
 #+end_src
@@ -9777,14 +9798,14 @@ Implement the =handoff= type
           .iter()
           .cloned()
           .map(move |i| match i {
-              Item::Dispenser(coll::Dispenser::Out(pipe::Out::Handoff(p))) => {
+              Item::Out(pipe::Out::Handoff(p)) => {
                   Ok(ChannelOp::Receive(Arc::new(p.receiver.unwrap())))
               }
-              Item::Dispenser(coll::Dispenser::Tunnel(pipe::Tunnel::Handoff(p))) => {
+              Item::Tunnel(pipe::Tunnel::Handoff(p)) => {
                   Ok(ChannelOp::Receive(Arc::new(p.receiver.unwrap())))
               }
               // Handle timeout channels - start the timer and add receive op
-              Item::Dispenser(coll::Dispenser::Out(pipe::Out::Timer(t))) => {
+              Item::Out(pipe::Out::Timer(t)) => {
                   let mut t = t.clone();
                   t.start();
                   Ok(ChannelOp::Receive(Arc::new(t.receiver.unwrap())))
@@ -9853,10 +9874,10 @@ Implement the =handoff= type
 
       fn try_derive(i: Item) -> Result<Self, Self::Error> {
           match i {
-              Item::Dispenser(coll::Dispenser::Out(pipe::Out::Handoff(p))) => Ok(p),
+              Item::Out(pipe::Out::Handoff(p)) => Ok(p),
               Item::Receptacle(coll::Receptacle::In(pipe::In::Handoff(p))) => Ok(p),
               Item::Receptacle(coll::Receptacle::Tunnel(pipe::Tunnel::Handoff(p))) => Ok(p),
-              Item::Dispenser(coll::Dispenser::Tunnel(pipe::Tunnel::Handoff(p))) => Ok(p),
+              Item::Tunnel(pipe::Tunnel::Handoff(p)) => Ok(p),
               i => Err(error::Error::expected(fit!("handoff"), i)),
           }
       }
@@ -9873,7 +9894,7 @@ Implement the =handoff= type
   pub fn receiver(i: Item) -> axiom::ItemResult {
       let mut h = Handoff::try_derive(i)?;
       h.close_put();
-      Ok(Item::Dispenser(coll::Dispenser::Out(pipe::Out::Handoff(h))))
+      Ok(Item::Out(pipe::Out::Handoff(h)))
   }
 
   #[derive(Debug)]
@@ -9933,7 +9954,7 @@ Implement the =handoff= type
 
   impl Derive<Timer> for Item {
       fn derive(t: Timer) -> Self {
-          Item::Dispenser(coll::Dispenser::Out(pipe::Out::Timer(t)))
+          Item::Out(pipe::Out::Timer(t))
       }
   }
 
@@ -10011,18 +10032,16 @@ Implement the =handoff= type
           let q = "INSERT INTO EAV (entity, attribute, value) VALUES (?, ?, ?)";
 
           match value {
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Associative(a))) => {
+              Item::Sized(coll::Sized::Associative(a)) => {
                   let sub_id = uuid::Uuid::new_v4();
                   self.insert_item(a.fit(), sub_id)?;
                   self.conn.execute(q, params![id, attribute, sub_id])?;
               }
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Set(s))) => self.insert_iter(
+              Item::Sized(coll::Sized::Set(s)) => self.insert_iter(
                   Some((id, attribute)),
                   s.iter().map(|i| Item::derive(i.clone())),
               )?,
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::List(l))) => {
-                  self.insert_iter(Some((id, attribute)), *l)?
-              }
+              Item::Sized(coll::Sized::List(l)) => self.insert_iter(Some((id, attribute)), *l)?,
               i => {
                   self.conn.execute(q, params![id, attribute, i])?;
               }
@@ -10082,8 +10101,8 @@ Implement the =handoff= type
   pub fn is_value(i: &Item) -> bool {
       matches!(
           i,
-          Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(_)))
-              | Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(_)))
+          Item::Sized(coll::Sized::String(_))
+              | Item::Sized(coll::Sized::Bytes(_))
               | Item::Int(_)
               | Item::Float(_)
               | Item::Word(_)
@@ -10123,9 +10142,7 @@ Implement the =handoff= type
               ValueRef::Real(f) => Ok(Item::Float(f)),
               ValueRef::Text(t) => decode_string(String::from_utf8_lossy(t).into_owned()),
 
-              ValueRef::Blob(b) => Ok(Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(
-                  b.to_vec(),
-              )))),
+              ValueRef::Blob(b) => Ok(Item::Sized(coll::Sized::Bytes(b.to_vec()))),
               ValueRef::Null => Ok(Item::default()),
           }
       }
@@ -10137,9 +10154,7 @@ Implement the =handoff= type
       if let Some(w) = s.strip_prefix("w|") {
           w.try_fit()
       } else if let Some(s) = s.strip_prefix("s|") {
-          Ok(Item::Dispenser(coll::Dispenser::Sized(
-              coll::Sized::String(s.to_string()),
-          )))
+          Ok(Item::Sized(coll::Sized::String(s.to_string())))
       } else if let Some(c) = s.strip_prefix("c|") {
           let char_seq = c;
           if char_seq.chars().count() == 1 {
@@ -10175,13 +10190,11 @@ Implement the =handoff= type
               Item::Float(f) => f.to_sql(),
               Item::Char(c) => Ok(EncodeAs::Char(*c).encode()),
               Item::Word(w) => Ok(EncodeAs::Word(w.clone()).encode()),
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(s))) => {
-                  Ok(EncodeAs::String(s.clone()).encode())
-              }
+              Item::Sized(coll::Sized::String(s)) => Ok(EncodeAs::String(s.clone()).encode()),
               Item::Receptacle(coll::Receptacle::Sized(coll::Sized::String(s))) => {
                   Ok(EncodeAs::String(s.clone()).encode())
               }
-              Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Bytes(b))) => b.to_sql(),
+              Item::Sized(coll::Sized::Bytes(b)) => b.to_sql(),
               Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Bytes(b))) => b.to_sql(),
 
               _ => todo!("convert item variants to sql values"),
