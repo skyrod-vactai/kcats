@@ -245,6 +245,12 @@ types to wrap stdlib types.
       }
   }
 
+  /// A trait that gives the name of the type - used in kcats specs for
+  /// example
+  pub trait TypeName {
+      fn type_name(&self) -> &str;
+  }
+
   impl<I: Iterator> MyCollect for I {}
 
   //blanket impl
@@ -797,6 +803,11 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  impl TypeName for Bytes {
+      fn type_name(&self) -> &str {
+          "bytes"
+      }
+  }
   /// A macro to build a kcats List, accepts any values that are
   /// convertible to [Item].
   #[macro_export]
@@ -1994,41 +2005,6 @@ internally, to keep track of things like the stack, program, lists etc.
       /// Takes an item from the back (end) of the container.
       pub fn pop(self) -> (Self, Option<Item>) {
           match self {
-              Sized::Assoc(mut a) => {
-                  let v = a.take_simple();
-                  (Sized::Assoc(a), v.map(Item::derive))
-              }
-              Sized::Words(mut a) => {
-                  let v = a.take_simple();
-                  (Sized::Words(a), v.map(Item::derive))
-              }
-
-              // The remaining Associative impls may require auto-demotion (eg,
-              // removing a required field from say, Error). We'll just
-              // demote all of them whether the field that is removed is
-              // required or not, since the caller cannot know in
-              // advance which it will be.
-              Sized::Dictionary(mut a) => {
-                  let mut assoc: assoc::Association = assoc::Associative::Dictionary(a).fit();
-                  let v = assoc.take_simple().map(Item::derive);
-                  (assoc::Associative::Assoc(assoc), v);
-              }
-              Sized::Error(mut a) => {
-                  let mut assoc: assoc::Association = assoc::Associative::Error(a).fit();
-                  let v = assoc.take_simple().map(Item::derive);
-                  (assoc::Associative::Assoc(assoc), v);
-              }
-              Sized::DictEntry(mut a) => {
-                  let mut assoc: assoc::Association = assoc::Associative::DictEntry(a).fit();
-                  let v = assoc.take_simple().map(Item::derive);
-                  (assoc::Associative::Assoc(assoc), v);
-              }
-              Sized::Env(mut a) => {
-                  let mut assoc: assoc::Association = assoc::Associative::Env(a).fit();
-                  let v = assoc.take_simple().map(Item::derive);
-                  (assoc::Associative::Assoc(assoc), v);
-              }
-
               Sized::List(mut l) => {
                   let i = l.pop_back();
                   (Sized::List(l), i)
@@ -2053,8 +2029,10 @@ internally, to keep track of things like the stack, program, lists etc.
                   let i = p.pop().cloned();
                   (Sized::Program(p), i)
               }
-
-              Sized::Nothing => (Sized::Nothing, None),
+              _ => {
+                  let a = assoc::Associative::try_derive(&self).unwrap().take_simple();
+                  (self, a)
+              }
           }
       }
 
@@ -2065,7 +2043,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   c.push_back(i);
                   Ok(Sized::List(c))
               }
-              (Sized::Associative(a), l) => Ok(Sized::Associative(a.put(l)?)),
+
               (Sized::Set(mut s), i) => {
                   s.mutate().insert(assoc::KeyItem::try_derive(i)?);
                   Ok(Sized::Set(s))
@@ -2084,6 +2062,10 @@ internally, to keep track of things like the stack, program, lists etc.
                   p.extend(list![i]);
                   Ok(Sized::Program(p))
               }
+              (a, i) => assoc::Associative::try_derive(&self)
+                  .unwrap()
+                  .put(i)
+                  .map(Sized::derive),
           }
       }
 
@@ -2846,6 +2828,7 @@ internally, to keep track of things like the stack, program, lists etc.
   //! Dictionaries, Environments, as well as generic maps (which are
   //! called "associations" in kcats)
   use super::{dictionary as dict, environment as env};
+  use crate::convert_enum;
   use crate::traits::*;
   use crate::types::container as coll;
   use crate::types::container::{Count, Join, Mutey};
@@ -3445,6 +3428,17 @@ internally, to keep track of things like the stack, program, lists etc.
   impl Derive<Association> for Item {
       fn derive(a: Association) -> Item {
           Associative::Assoc(a).fit()
+      }
+  }
+
+  impl Derive<Associative> for coll::Sized {
+      fn derive(a: Associative) -> coll::Sized {
+          convert_enum!(
+              a,
+              Associative,
+              coll::Sized,
+              [Assoc, Dictionary, DictEntry, Error, Env, Nothing, Words]
+          )
       }
   }
 
@@ -5620,6 +5614,7 @@ example, in order to read/write to/from disk).
   //! subject to change.
   use crate::fit;
   use crate::traits::*;
+  use crate::types::container::dictionary as dict;
   use crate::types::container::{
       self as coll, associative as assoc, environment::Environment, error::Error,
   };
@@ -6078,6 +6073,30 @@ example, in order to read/write to/from disk).
       Ok(())
   }
 
+  use std::any::TypeId;
+
+  /// A function to give the name of a type, useful for specs and errors
+  fn get_name<T: 'static>(_val: &T) -> &'static str {
+      match TypeId::of::<T>() {
+          t if t == TypeId::of::<Vec<u8>>() => "bytes",
+          t if t == TypeId::of::<String>() => "string",
+          t if t == TypeId::of::<&str>() => "string",
+          t if t == TypeId::of::<Word>() => "word",
+          t if t == TypeId::of::<coll::List>() => "list",
+          t if t == TypeId::of::<Item>() => "item",
+          t if t == TypeId::of::<coll::Set>() => "set",
+          t if t == TypeId::of::<coll::Dispenser>() => "dispenser",
+          t if t == TypeId::of::<coll::Receptacle>() => "receptacle",
+          t if t == TypeId::of::<coll::Sized>() => "sized",
+          t if t == TypeId::of::<assoc::Associative>() => "associative",
+          t if t == TypeId::of::<assoc::Association>() => "association",
+          t if t == TypeId::of::<Error>() => "error",
+          t if t == TypeId::of::<Environment>() => "environment",
+          t if t == TypeId::of::<dict::Dictionary>() => "dictionary",
+          t if t == TypeId::of::<number::Number>() => "number",
+          _ => std::any::type_name::<T>(),
+      }
+  }
   #[cfg(test)]
   mod tests {
       use super::*;
