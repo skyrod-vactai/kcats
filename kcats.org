@@ -177,7 +177,9 @@ unless you own either the trait or the type), we'll opt for making our
 own traits rather than using the "newtype" pattern of making our own
 types to wrap stdlib types.
 #+begin_src rust :tangle src/traits.rs :mkdirp yes
+  use crate::types;
   use crate::types::container::error::Error;
+  use core::fmt::{self, Debug};
 
   // Define custom traits that mimic std ones
   /// a trait similar to [std::convert::From]
@@ -185,12 +187,42 @@ types to wrap stdlib types.
       fn derive(value: T) -> Self;
   }
 
+  pub struct DeriveError<T> {
+      pub src: T,
+      pub expected: types::Word,
+  }
+
+  impl<T> Debug for DeriveError<T>
+  where
+      T: Debug,
+  {
+      fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+          write!(
+              f,
+              "DeriveError[src: {:?}, expected: {:?}]",
+              self.src, self.expected
+          )
+      }
+  }
+  impl<T> DeriveError<T> {
+      pub fn expected(expected: types::Word, src: T) -> DeriveError<T> {
+          DeriveError { src, expected }
+      }
+
+      pub fn swap<U>(self, updated: U) -> DeriveError<U> {
+          DeriveError {
+              src: updated,
+              expected: self.expected,
+          }
+      }
+  }
   /// a trait similar to [std::convert::TryFrom]
   pub trait TryDerive<T>: Sized {
-      type Error;
-
-      fn try_derive(value: T) -> Result<Self, Self::Error>;
+      fn try_derive(value: T) -> Result<Self, DeriveError<T>>;
+      //fn try_derive(value: T) -> Result<Self, Self::Error>;
   }
+
+  //impl TryDeriveSoft<F, F> for T
 
   /// a trait similar to [std::convert::Into]
   pub trait Fit<T>: Sized {
@@ -199,9 +231,26 @@ types to wrap stdlib types.
 
   /// a trait similar to [std::convert::TryInto]
   pub trait TryFit<T>: Sized {
-      type Error;
+      fn try_fit(self) -> Result<T, DeriveError<Self>>;
+  }
 
-      fn try_fit(self) -> Result<T, Self::Error>;
+  /// Convert DeriveError to Error
+  impl<I> Derive<DeriveError<I>> for Error
+  where
+      I: Fit<types::Item>,
+  {
+      fn derive(de: DeriveError<I>) -> Error {
+          Error::expected(de.expected, Some(de.src.fit()))
+      }
+  }
+
+  impl<T, I> Derive<Result<T, DeriveError<I>>> for Result<T, Error>
+  where
+      I: Fit<types::Item>,
+  {
+      fn derive(r: Result<T, DeriveError<I>>) -> Self {
+          r.map_err(Error::derive)
+      }
   }
 
   /// a trait that marks iterable types that can return arbitrary
@@ -245,12 +294,6 @@ types to wrap stdlib types.
       }
   }
 
-  /// A trait that gives the name of the type - used in kcats specs for
-  /// example
-  pub trait TypeName {
-      fn type_name(&self) -> &str;
-  }
-
   impl<I: Iterator> MyCollect for I {}
 
   //blanket impl
@@ -263,13 +306,20 @@ types to wrap stdlib types.
       }
   }
 
+  // impl<T, U> TryFit<U> for T
+  // where
+  //     U: TryDerive<T>,
+  // {
+  //     fn try_fit<E>(self) -> Result<U, E> {
+  //         U::try_derive::<E>(self)
+  //     }
+  // }
+
   impl<T, U> TryFit<U> for T
   where
       U: TryDerive<T>,
   {
-      type Error = U::Error;
-
-      fn try_fit(self) -> Result<U, U::Error> {
+      fn try_fit(self) -> Result<U, DeriveError<T>> {
           U::try_derive(self)
       }
   }
@@ -281,9 +331,7 @@ types to wrap stdlib types.
   }
 
   impl<T> TryDerive<T> for T {
-      type Error = std::convert::Infallible;
-
-      fn try_derive(value: T) -> Result<Self, Self::Error> {
+      fn try_derive(value: T) -> Result<Self, DeriveError<T>> {
           Ok(value)
       }
   }
@@ -347,8 +395,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
   // these are wrong, not every string is a valid word
   impl TryDerive<String> for Word {
-      type Error = Error;
-      fn try_derive(s: String) -> Result<Self, Self::Error> {
+      fn try_derive(s: String) -> Result<Self, DeriveError<String>> {
           serialize::parse(s).and_then(|mut l| {
               if l.len() == 1 {
                   match l.pop_front().unwrap() {
@@ -426,9 +473,8 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<&str> for Word {
-      type Error = Error;
-      fn try_derive(s: &str) -> Result<Self, Self::Error> {
-          Word::try_derive(s.to_string())
+      fn try_derive(s: &str) -> Result<Self, DeriveError<&str>> {
+          Word::try_derive(s.to_string()).map_err(|e| e.swap(s))
       }
   }
 
@@ -484,6 +530,33 @@ internally, to keep track of things like the stack, program, lists etc.
       pub static ref S_SIZED: Word = fit!("sized");
       pub static ref S_STRING: Word = fit!("string");
       pub static ref S_WORD: Word = fit!("word");
+      pub static ref S_SET: Word = fit!("set");
+  }
+
+  use std::any::TypeId;
+
+  /// A function to give the name of a type, useful for specs and errors
+  pub fn get_name<T: 'static>() -> &'static Word {
+      match TypeId::of::<T>() {
+          t if t == TypeId::of::<Vec<u8>>() => &S_BYTES,
+          t if t == TypeId::of::<String>() || t == TypeId::of::<&str>() => &S_STRING,
+          t if t == TypeId::of::<Word>() => &S_WORD,
+          t if t == TypeId::of::<coll::List>() => &S_LIST,
+          t if t == TypeId::of::<Item>() => &S_ITEM,
+          t if t == TypeId::of::<coll::Set>() => &S_SET,
+          t if t == TypeId::of::<coll::Dispenser>() => &S_DISPENSER,
+          t if t == TypeId::of::<coll::Receptacle>() => &S_RECEPTACLE,
+          t if t == TypeId::of::<coll::Sized>() => &S_SIZED,
+          t if t == TypeId::of::<assoc::Associative>() || t == TypeId::of::<assoc::Association>() => {
+              &S_ASSOC
+          }
+          t if t == TypeId::of::<Error>() => &S_ERROR,
+          t if t == TypeId::of::<env::Environment>() => &S_ENVIRONMENT,
+          t if t == TypeId::of::<dict::Dictionary>() => &S_DICTIONARY,
+          t if t == TypeId::of::<number::Number>() => &S_NUMBER,
+          t if t == TypeId::of::<Char>() => &S_CHAR,
+          _ => &S_ITEM,
+      }
   }
 
   /// A kcats data value.
@@ -634,15 +707,14 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<Item> for String {
-      type Error = Error;
-      fn try_derive(i: Item) -> Result<Self, Self::Error> {
+      fn try_derive(i: Item) -> Result<Self, DeriveError<Item>> {
           match i {
               Item::Word(w) => Ok(w.data.as_str().to_string().fit()),
               i => {
                   let s = coll::Sized::try_derive(i)?;
                   match s {
                       coll::Sized::String(i) => Ok(i),
-                      i => Err(Error::expected(fit!("string"), i)),
+                      i => Err(DeriveError::expected(fit!("string"), i)),
                   }
               }
           }
@@ -652,27 +724,27 @@ internally, to keep track of things like the stack, program, lists etc.
   /// Converts Item to Word but also considers a quoted word as a word,
   /// eg \[foo\] -> foo.
   impl TryDerive<Item> for Word {
-      type Error = Error;
-      fn try_derive(i: Item) -> Result<Self, Self::Error> {
+      fn try_derive(i: Item) -> Result<Self, DeriveError<Item>> {
           match i {
               Item::Word(i) => Ok(i),
               i => {
-                  let s = coll::Sized::try_derive(i)?;
+                  let s = coll::Sized::try_derive(i.clone())?;
                   match s {
-                      coll::Sized::String(s) => s.try_fit(),
+                      coll::Sized::String(s) => s.try_fit().map_err(|e| e.swap(i)),
                       s => {
-                          let i2 = s.clone();
                           let l = coll::List::try_derive(s);
                           match l {
+                              //TODO i think this was meant to support
+                              // quoted words or strings as words?
                               Ok(mut l) => {
                                   if l.len() == 1 {
                                       let i = l.pop_front().unwrap();
                                       i.try_fit()
                                   } else {
-                                      Err(Error::expected(fit!("word"), l))
+                                      Err(DeriveError::expected(fit!("word"), i))
                                   }
                               }
-                              Err(_) => Err(Error::expected(fit!("word"), i2)),
+                              Err(_) => Err(DeriveError::expected(fit!("word"), i)),
                           }
                       }
                   }
@@ -682,26 +754,24 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<Item> for Bytes {
-      type Error = Error;
-      fn try_derive(i: Item) -> Result<Self, Self::Error> {
+      fn try_derive(i: Item) -> Result<Self, DeriveError<Item>> {
           let s = coll::Sized::try_derive(i)?;
           match s {
               coll::Sized::Bytes(b) => Ok(b),
-              b => Err(Error::expected(fit!("bytes"), b)),
+              b => Err(DeriveError::expected(fit!("bytes"), b)),
           }
       }
   }
 
   impl TryDerive<Item> for char {
-      type Error = Error;
-      fn try_derive(i: Item) -> Result<Self, Self::Error> {
+      fn try_derive(i: Item) -> Result<Self, DeriveError<Item>> {
           match i {
               Item::Char(c) => Ok(c),
               Item::Int(i) => match char::from_u32(i as u32) {
                   Some(c) => Ok(c),
-                  None => Err(Error::expected(fit!("character-encoding"), i)),
+                  None => Err(DeriveError::expected(fit!("character-encoding"), i)),
               },
-              b => Err(Error::expected(fit!("character"), b)),
+              b => Err(DeriveError::expected(fit!("character"), b)),
           }
       }
   }
@@ -727,10 +797,10 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  /// This impl is specifically for Word items, so it can fail
   impl TryDerive<&str> for Item {
-      type Error = Error;
-      fn try_derive(i: &str) -> Result<Self, Error> {
-          Ok(Item::Word(Word::try_derive(i)?))
+      fn try_derive(i: &str) -> Result<Self, DeriveError<&str>> {
+          Ok(Item::Word(Word::try_derive(i).map_err(|e| e.swap(i))?))
       }
   }
 
@@ -776,38 +846,37 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  /// Convert reference to Item to Item, by cloning, useful when the
+  /// reference is buried in other structures that can handle Fit<Item>s.
+  impl Derive<&Item> for Item {
+      fn derive(i: &Item) -> Item {
+          i.clone()
+      }
+  }
+
   /// Try to convert any reference to Item to T, and don't destroy the
   /// original in case it fails (so the caller could try again if
   /// needed.)
-  impl<T: TryDerive<Item, Error = E>, E> TryDerive<&Item> for T
+  impl<T: TryDerive<Item>> TryDerive<&Item> for T
   where
       T: TryDerive<Item>,
-      E: Fit<Error>,
   {
-      type Error = Error;
-      fn try_derive(value: &Item) -> Result<Self, Self::Error> {
-          T::try_derive(value.clone()).map_err(Fit::fit)
+      fn try_derive(value: &Item) -> Result<Self, DeriveError<&Item>> {
+          T::try_derive(value.clone()).map_err(|e| e.swap(value))
       }
   }
 
   /// A generic impl to convert an Item to a vec of the given
   /// type. Assumes the Item is some sort of container and converts each
   /// item in the container.
-  impl<T: TryDerive<Item, Error = Error>> TryDerive<Item> for Vec<T> {
-      type Error = Error;
-
-      fn try_derive(i: Item) -> Result<Self, Self::Error> {
+  impl<T: TryDerive<Item>> TryDerive<Item> for Vec<T> {
+      fn try_derive(i: Item) -> Result<Self, DeriveError<Item>> {
           // First try to convert the Item to an IntoIterator<Item>
           let it: Box<dyn Iterator<Item = Item>> = i.try_fit()?;
           it.map(T::try_derive).collect()
       }
   }
 
-  impl TypeName for Bytes {
-      fn type_name(&self) -> &str {
-          "bytes"
-      }
-  }
   /// A macro to build a kcats List, accepts any values that are
   /// convertible to [Item].
   #[macro_export]
@@ -1175,21 +1244,19 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<Number> for Float {
-      type Error = Error;
-      fn try_derive(i: Number) -> Result<Self, Self::Error> {
+      fn try_derive(i: Number) -> Result<Self, DeriveError<Number>> {
           match i {
               Number::Float(i) => Ok(i),
-              i => Err(Error::expected(fit!("float"), i)),
+              i => Err(DeriveError::expected(fit!("float"), i)),
           }
       }
   }
 
   impl TryDerive<Number> for Int {
-      type Error = Error;
-      fn try_derive(i: Number) -> Result<Self, Self::Error> {
+      fn try_derive(i: Number) -> Result<Self, DeriveError<Number>> {
           match i {
               Number::Int(i) => Ok(i),
-              i => Err(Error::expected(fit!("integer"), i)),
+              i => Err(DeriveError::expected(fit!("integer"), i)),
           }
       }
   }
@@ -1218,44 +1285,41 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<Item> for Number {
-      type Error = Error;
-      fn try_derive(i: Item) -> Result<Self, Self::Error> {
+      fn try_derive(i: Item) -> Result<Self, DeriveError<Item>> {
           let fromstr = |s: String| {
               let r = s
                   .as_str()
                   .parse::<i64>()
                   .map(Number::Int)
-                  .map_err(Error::from);
+                  .map_err(|e| DeriveError::expected(fit!("integer"), s));
 
               r.or_else(|_| s.as_str().parse::<Float>().map(Number::Float))
-                  .map_err(Error::from)
+                  .map_err(|e| DeriveError::expected(fit!("float"), s))
           };
           match i {
               Item::Int(i) => Ok(Number::Int(i)),
               Item::Float(f) => Ok(Number::Float(f)),
               Item::Char(c) => Ok(Number::Int(c as Int)),
               Item::String(s) => fromstr(s),
-              i => Err(Error::expected(fit!("number"), i)),
+              i => Err(DeriveError::expected(fit!("number"), i)),
           }
       }
   }
 
   impl TryDerive<Item> for Int {
-      type Error = Error;
-      fn try_derive(i: Item) -> Result<Self, Self::Error> {
+      fn try_derive(i: Item) -> Result<Self, DeriveError<Item>> {
           match Number::try_derive(i)? {
               Number::Int(i) => Ok(i),
-              i => Err(Error::expected(fit!("integer"), i)),
+              n => Err(DeriveError::expected(fit!("integer"), i.fit())),
           }
       }
   }
 
   impl TryDerive<Item> for Float {
-      type Error = Error;
-      fn try_derive(i: Item) -> Result<Self, Self::Error> {
+      fn try_derive(i: Item) -> Result<Self, DeriveError<Item>> {
           match Number::try_derive(i)? {
               Number::Float(i) => Ok(i),
-              i => Err(Error::expected(fit!("float"), i)),
+              i => Err(DeriveError::expected(fit!("float"), i.fit())),
           }
       }
   }
@@ -1517,7 +1581,8 @@ internally, to keep track of things like the stack, program, lists etc.
               self.iter()
                   .cloned()
                   .map(assoc::KeyItem::try_derive)
-                  .collect::<Result<Vec<assoc::KeyItem>, Error>>()?,
+                  .collect::<Result<Vec<assoc::KeyItem>, DeriveError<dict::Entry>>>()
+                  .map_err(|e| Error::derive)?,
           );
           Ok(other)
       }
@@ -1537,7 +1602,7 @@ internally, to keep track of things like the stack, program, lists etc.
       type Output = Sized;
       type Error = Error;
 
-      fn join(self, other: Sized) -> Result<Self::Output, Error> {
+      fn join(self, other: Sized) -> Result<Self::Output, Self::Error> {
           //println!("Joining sized {:?} to sized {:?}", self, other);
           if self.is_empty() {
               return Ok(other);
@@ -1811,24 +1876,7 @@ internally, to keep track of things like the stack, program, lists etc.
   pub enum Sized {
       /// Associative containers associate Items in pairs, like Map or
       /// Dict in other languages.
-
-      /// A generic associative structure where you can associate any
-      /// [KeyItem] with any [Item].
-      Assoc(assoc::Association),
-      /// Represents an [dict::Dictionary] entry structure with
-      /// specific keys.
-      DictEntry(Box<dict::Entry>),
-      /// Represents an execution environment, with specific keys
-      Env(Box<env::Environment>),
-      /// Represents a runtime Error value, with specific keys
-      Error(Error),
-      /// Represents the words available in to use
-      Words(dict::Words),
-      /// Represents a dictionary, including which modules have priority
-      Dictionary(Box<dict::Dictionary>),
-      /// A memory efficient representation of empty container
-      Nothing,
-
+      Associative(assoc::Associative),
       /// List containers have multiple Items in a specific order.
       List(Box<List>),
       /// Program containers are optimized for execution of programs, but
@@ -1846,29 +1894,30 @@ internally, to keep track of things like the stack, program, lists etc.
       Bytes(Bytes),
   }
 
-  // impl fmt::Debug for Sized {
-  //     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-  //         match self {
-  //             Sized::Assoc(a) => write!(f, "{:?}", a),
-  //             Sized::Error(a) => write!(f, "{:?}", a),
-  //             Sized::Dictionary(a) => write!(f, "{:?}", a),
-  //             Sized::Words(a) => write!(f, "{:?}", a),
-  //             Sized::DictEntry(a) => write!(f, "{:?}", a),
-  //             Sized::Nothing => write!(f, "{:?}", a),
-
-  //             Sized::List(l) => write!(f, "List{:?}", l),
-  //             Sized::Set(s) => write!(f, "{:?}", s),
-  //             Sized::String(s) => write!(f, "{:?}", s),
-  //             Sized::Bytes(b) => write!(f, "{:?}", b),
-  //             Sized::Program(p) => write!(f, "{:?}", p),
-  //         }
-  //     }
-  // }
+  impl fmt::Debug for Sized {
+      fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+          match self {
+              Sized::Associative(a) => write!(f, "{:?}", a),
+              Sized::List(l) => write!(f, "List{:?}", l),
+              Sized::Set(s) => write!(f, "{:?}", s),
+              Sized::String(s) => write!(f, "{:?}", s),
+              Sized::Bytes(b) => write!(f, "{:?}", b),
+              Sized::Program(p) => write!(f, "{:?}", p),
+          }
+      }
+  }
 
   /// Empty Sized containers are equal to each other.
   impl PartialEq for Sized {
       fn eq(&self, other: &Self) -> bool {
-          Item::derive(self.clone()) == Item::derive(other.clone())
+          match (self, other) {
+              (Sized::Associative(a), Sized::Associative(b)) => a == b,
+              (Sized::List(a), Sized::List(b)) => a == b,
+              (Sized::String(a), Sized::String(b)) => a == b,
+              (Sized::Bytes(a), Sized::Bytes(b)) => a == b,
+              (Sized::Set(a), Sized::Set(b)) => a == b,
+              _ => self.is_empty() && other.is_empty(),
+          }
       }
   }
 
@@ -2005,6 +2054,10 @@ internally, to keep track of things like the stack, program, lists etc.
       /// Takes an item from the back (end) of the container.
       pub fn pop(self) -> (Self, Option<Item>) {
           match self {
+              Sized::Associative(mut a) => {
+                  let v = a.take_simple();
+                  (Sized::Associative(a), v)
+              }
               Sized::List(mut l) => {
                   let i = l.pop_back();
                   (Sized::List(l), i)
@@ -2029,10 +2082,6 @@ internally, to keep track of things like the stack, program, lists etc.
                   let i = p.pop().cloned();
                   (Sized::Program(p), i)
               }
-              _ => {
-                  let a = assoc::Associative::try_derive(&self).unwrap().take_simple();
-                  (self, a)
-              }
           }
       }
 
@@ -2043,7 +2092,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   c.push_back(i);
                   Ok(Sized::List(c))
               }
-
+              (Sized::Associative(a), l) => Ok(Sized::Associative(a.put(l)?)),
               (Sized::Set(mut s), i) => {
                   s.mutate().insert(assoc::KeyItem::try_derive(i)?);
                   Ok(Sized::Set(s))
@@ -2062,10 +2111,6 @@ internally, to keep track of things like the stack, program, lists etc.
                   p.extend(list![i]);
                   Ok(Sized::Program(p))
               }
-              (a, i) => assoc::Associative::try_derive(&self)
-                  .unwrap()
-                  .put(i)
-                  .map(Sized::derive),
           }
       }
 
@@ -2134,38 +2179,30 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<Dispenser> for Sized {
-      type Error = Error;
-
-      fn try_derive(c: Dispenser) -> Result<Self, Error> {
+      fn try_derive(c: Dispenser) -> Result<Self, DeriveError<Dispenser>> {
           //println!("from iterable {:?}", c);
           match c {
               Dispenser::Sized(s) => Ok(s),
-              i => Err(Error::expected(fit!("sized"), i)),
+              i => Err(DeriveError::expected(fit!("sized"), i)),
           }
       }
   }
 
   impl TryDerive<Receptacle> for Sized {
-      type Error = Error;
-
-      fn try_derive(c: Receptacle) -> Result<Self, Error> {
+      fn try_derive(c: Receptacle) -> Result<Self, DeriveError<Receptacle>> {
           match c {
               Receptacle::Sized(s) => Ok(s),
-              i => Err(Error::expected(fit!("sized"), i)),
+              i => Err(DeriveError::expected(fit!("sized"), i)),
           }
       }
   }
 
   impl TryDerive<Sized> for List {
-      type Error = Error;
-
-      fn try_derive(s: Sized) -> Result<Self, Self::Error> {
+      fn try_derive(s: Sized) -> Result<Self, DeriveError<Sized>> {
           match s {
               Sized::List(l) => Ok(*l),
-              i => match assoc::Associative::try_derive(&i) {
-                  Ok(a) => Ok(List::derive_iter(a.to_iter().map(Item::derive))),
-                  Err(i) => Err(Error::expected(fit!("list"), i)),
-              },
+              Sized::Associative(a) => Ok(List::derive_iter(a.to_iter().map(Item::derive))),
+              i => Err(DeriveError::expected(fit!("list"), i)),
           }
       }
   }
@@ -2183,9 +2220,7 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<List> for Vec<dict::Namespace> {
-      type Error = Error;
-
-      fn try_derive(l: List) -> Result<Self, Self::Error> {
+      fn try_derive(l: List) -> Result<Self, DeriveError<List>> {
           l.iter().cloned().map(dict::Namespace::try_derive).collect()
       }
   }
@@ -2209,8 +2244,7 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<List> for String {
-      type Error = Error;
-      fn try_derive(l: List) -> Result<Self, Error> {
+      fn try_derive(l: List) -> Result<Self, DeriveError<List>> {
           let v = l
               .iter()
               .cloned()
@@ -2221,8 +2255,7 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<List> for Bytes {
-      type Error = Error;
-      fn try_derive(l: List) -> Result<Self, Error> {
+      fn try_derive(l: List) -> Result<Self, DeriveError<List>> {
           let v = l
               .iter()
               .cloned()
@@ -2233,87 +2266,93 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<Item> for List {
-      type Error = Error;
-      fn try_derive(i: Item) -> Result<Self, Self::Error> {
-          Sized::try_derive(i).and_then(List::try_derive)
+      fn try_derive(i: Item) -> Result<Self, DeriveError<Item>> {
+          let i2 = i.clone();
+          Sized::try_derive(i)
+              .and_then(List::try_derive)
+              .map_err(|e| e.swap(i2))
       }
   }
 
   impl TryDerive<Item> for Sized {
-      type Error = Error;
-
-      fn try_derive(item: Item) -> Result<Self, Error> {
+      fn try_derive(item: Item) -> Result<Self, DeriveError<Item>> {
           match item {
               Item::Bytes(b) => Ok(Sized::Bytes(b)),
               Item::String(s) => Ok(Sized::String(s)),
               Item::List(l) => Ok(Sized::List(l)),
-              Item::Assoc(a) => Ok(Sized::Assoc(a)),
-              Item::Error(a) => Ok(Sized::Error(a)),
-              Item::Dictionary(a) => Ok(Sized::Dictionary(a)),
-              Item::DictEntry(a) => Ok(Sized::DictEntry(a)),
-              Item::Words(a) => Ok(Sized::Words(a)),
-              Item::Env(a) => Ok(Sized::Env(a)),
-              Item::Nothing => Ok(Sized::Nothing),
+              Item::Assoc(a) => Ok(Sized::Associative(assoc::Associative::Assoc(a))),
+              Item::Error(a) => Ok(Sized::Associative(assoc::Associative::Error(a))),
+              Item::Dictionary(a) => Ok(Sized::Associative(assoc::Associative::Dictionary(a))),
+              Item::DictEntry(a) => Ok(Sized::Associative(assoc::Associative::DictEntry(a))),
+              Item::Words(a) => Ok(Sized::Associative(assoc::Associative::Words(a))),
+              Item::Env(a) => Ok(Sized::Associative(assoc::Associative::Env(a))),
+              Item::Nothing => Ok(Sized::Associative(assoc::Associative::Nothing)),
               Item::Set(s) => Ok(Sized::Set(s)),
               Item::Program(p) => Ok(Sized::Program(p)),
-              i => Err(Error::expected(fit!("sized"), i)),
-              //try_convert_enum!(item, Item => Sized, [Bytes, String, List, Associative, Set, Program], |i| Self::Error::expected(fit!("sized"), i) )
+              i => Err(DeriveError::expected(fit!("sized"), i)),
+              //try_convert_enum!(item, Item => Sized, [Bytes, String, List, Associative, Set, Program], |i| Self::DeriveError::expected(fit!("sized"), i) )
           }
       }
   }
 
   impl TryDerive<Item> for Receptacle {
-      type Error = Error;
-
-      fn try_derive(item: Item) -> Result<Self, Self::Error> {
+      fn try_derive(item: Item) -> Result<Self, DeriveError<Item>> {
           match item {
               Item::In(i) => Ok(Receptacle::In(i)),
               Item::Tunnel(t) => Ok(Receptacle::Tunnel(t)),
               Item::Bytes(b) => Ok(Receptacle::Sized(Sized::Bytes(b))),
               Item::String(s) => Ok(Receptacle::Sized(Sized::String(s))),
               Item::List(l) => Ok(Receptacle::Sized(Sized::List(l))),
-              Item::Assoc(a) => Ok(Receptacle::Sized(Sized::Assoc(a))),
-              Item::Error(a) => Ok(Receptacle::Sized(Sized::Error(a))),
-              Item::Dictionary(a) => Ok(Receptacle::Sized(Sized::Dictionary(a))),
-              Item::DictEntry(a) => Ok(Receptacle::Sized(Sized::DictEntry(a))),
-              Item::Words(a) => Ok(Receptacle::Sized(Sized::Words(a))),
-              Item::Env(a) => Ok(Receptacle::Sized(Sized::Env(a))),
-              Item::Nothing => Ok(Receptacle::Sized(Sized::Nothing)),
+              Item::Assoc(a) => Ok(Receptacle::Sized(Sized::Associative(
+                  assoc::Associative::Assoc(a),
+              ))),
+              Item::Error(a) => Ok(Receptacle::Sized(Sized::Associative(
+                  assoc::Associative::Error(a),
+              ))),
+              Item::Dictionary(a) => Ok(Receptacle::Sized(Sized::Associative(
+                  assoc::Associative::Dictionary(a),
+              ))),
+              Item::DictEntry(a) => Ok(Receptacle::Sized(Sized::Associative(
+                  assoc::Associative::DictEntry(a),
+              ))),
+              Item::Words(a) => Ok(Receptacle::Sized(Sized::Associative(
+                  assoc::Associative::Words(a),
+              ))),
+              Item::Env(a) => Ok(Receptacle::Sized(Sized::Associative(
+                  assoc::Associative::Env(a),
+              ))),
+              Item::Nothing => Ok(Receptacle::Sized(Sized::Associative(
+                  assoc::Associative::Nothing,
+              ))),
               Item::Set(s) => Ok(Receptacle::Sized(Sized::Set(s))),
               Item::Program(p) => Ok(Receptacle::Sized(Sized::Program(p))),
-              i => Err(Error::expected(fit!("receptacle"), i)),
+              i => Err(DeriveError::expected(fit!("receptacle"), i)),
           }
       }
   }
 
   impl TryDerive<Dispenser> for Receptacle {
-      type Error = Error;
-
-      fn try_derive(c: Dispenser) -> Result<Self, Self::Error> {
+      fn try_derive(c: Dispenser) -> Result<Self, DeriveError<Dispenser>> {
           match c {
               Dispenser::Sized(s) => Ok(Receptacle::Sized(s)),
               Dispenser::Tunnel(t) => Ok(Receptacle::Tunnel(t)),
-              i => Err(Error::expected(fit!("receptacle"), i)),
+              i => Err(DeriveError::expected(fit!("receptacle"), i)),
           }
       }
   }
 
   impl TryDerive<Receptacle> for Dispenser {
-      type Error = Error;
-
-      fn try_derive(c: Receptacle) -> Result<Self, Self::Error> {
+      fn try_derive(c: Receptacle) -> Result<Self, DeriveError<Receptacle>> {
           match c {
               Receptacle::Sized(s) => Ok(Dispenser::Sized(s)),
               Receptacle::Tunnel(t) => Ok(Dispenser::Tunnel(t)),
-              i => Err(Error::expected(fit!("iterable"), i)),
+              i => Err(DeriveError::expected(fit!("iterable"), i)),
           }
       }
   }
 
   impl TryDerive<Item> for Box<dyn Iterator<Item = Item>> {
-      type Error = Error;
-
-      fn try_derive(item: Item) -> Result<Self, Self::Error> {
+      fn try_derive(item: Item) -> Result<Self, DeriveError<Item>> {
           Ok(Sized::try_derive(item)?.into_iter())
       }
   }
@@ -2361,13 +2400,17 @@ internally, to keep track of things like the stack, program, lists etc.
               Dispenser::Sized(Sized::String(s)) => Item::String(s),
               Dispenser::Sized(Sized::List(l)) => Item::List(l),
               Dispenser::Sized(Sized::Set(s)) => Item::Set(s),
-              Dispenser::Sized(Sized::Assoc(a)) => Item::Assoc(a),
-              Dispenser::Sized(Sized::Dictionary(a)) => Item::Dictionary(a),
-              Dispenser::Sized(Sized::DictEntry(a)) => Item::DictEntry(a),
-              Dispenser::Sized(Sized::Words(a)) => Item::Words(a),
-              Dispenser::Sized(Sized::Env(a)) => Item::Env(a),
-              Dispenser::Sized(Sized::Error(a)) => Item::Error(a),
-              Dispenser::Sized(Sized::Nothing) => Item::Nothing,
+              Dispenser::Sized(Sized::Associative(assoc::Associative::Assoc(a))) => Item::Assoc(a),
+              Dispenser::Sized(Sized::Associative(assoc::Associative::Dictionary(a))) => {
+                  Item::Dictionary(a)
+              }
+              Dispenser::Sized(Sized::Associative(assoc::Associative::DictEntry(a))) => {
+                  Item::DictEntry(a)
+              }
+              Dispenser::Sized(Sized::Associative(assoc::Associative::Words(a))) => Item::Words(a),
+              Dispenser::Sized(Sized::Associative(assoc::Associative::Env(a))) => Item::Env(a),
+              Dispenser::Sized(Sized::Associative(assoc::Associative::Error(a))) => Item::Error(a),
+              Dispenser::Sized(Sized::Associative(assoc::Associative::Nothing)) => Item::Nothing,
               Dispenser::Sized(Sized::Program(p)) => Item::Program(p),
               Dispenser::Out(o) => Item::Out(o),
               Dispenser::Tunnel(t) => Item::Tunnel(t),
@@ -2383,13 +2426,17 @@ internally, to keep track of things like the stack, program, lists etc.
               Receptacle::Sized(Sized::List(l)) => Item::List(l),
               Receptacle::Sized(Sized::Set(s)) => Item::Set(s),
               Receptacle::Sized(Sized::Program(p)) => Item::Program(p),
-              Receptacle::Sized(Sized::Assoc(a)) => Item::Assoc(a),
-              Receptacle::Sized(Sized::Dictionary(a)) => Item::Dictionary(a),
-              Receptacle::Sized(Sized::DictEntry(a)) => Item::DictEntry(a),
-              Receptacle::Sized(Sized::Nothing) => Item::Nothing,
-              Receptacle::Sized(Sized::Words(a)) => Item::Words(a),
-              Receptacle::Sized(Sized::Env(a)) => Item::Env(a),
-              Receptacle::Sized(Sized::Error(a)) => Item::Error(a),
+              Receptacle::Sized(Sized::Associative(assoc::Associative::Assoc(a))) => Item::Assoc(a),
+              Receptacle::Sized(Sized::Associative(assoc::Associative::Dictionary(a))) => {
+                  Item::Dictionary(a)
+              }
+              Receptacle::Sized(Sized::Associative(assoc::Associative::DictEntry(a))) => {
+                  Item::DictEntry(a)
+              }
+              Receptacle::Sized(Sized::Associative(assoc::Associative::Nothing)) => Item::Nothing,
+              Receptacle::Sized(Sized::Associative(assoc::Associative::Words(a))) => Item::Words(a),
+              Receptacle::Sized(Sized::Associative(assoc::Associative::Env(a))) => Item::Env(a),
+              Receptacle::Sized(Sized::Associative(assoc::Associative::Error(a))) => Item::Error(a),
               Receptacle::In(o) => Item::In(o),
               Receptacle::Tunnel(t) => Item::Tunnel(t),
           }
@@ -2403,75 +2450,49 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<Item> for Dispenser {
-      type Error = Error;
-
-      fn try_derive(item: Item) -> Result<Self, Self::Error> {
+      fn try_derive(item: Item) -> Result<Self, DeriveError<Item>> {
           match item {
               Item::Bytes(b) => Ok(Dispenser::Sized(Sized::Bytes(b))),
               Item::String(s) => Ok(Dispenser::Sized(Sized::String(s))),
               Item::List(l) => Ok(Dispenser::Sized(Sized::List(l))),
               Item::Set(s) => Ok(Dispenser::Sized(Sized::Set(s))),
-              Item::Assoc(a) => Ok(Dispenser::Sized(Sized::Assoc(a))),
-              Item::Error(a) => Ok(Dispenser::Sized(Sized::Error(a))),
-              Item::Dictionary(a) => Ok(Dispenser::Sized(Sized::Dictionary(a))),
-              Item::DictEntry(a) => Ok(Dispenser::Sized(Sized::DictEntry(a))),
-              Item::Words(a) => Ok(Dispenser::Sized(Sized::Words(a))),
-              Item::Env(a) => Ok(Dispenser::Sized(Sized::Env(a))),
-              Item::Nothing => Ok(Dispenser::Sized(Sized::Nothing)),
+              Item::Assoc(a) => Ok(Dispenser::Sized(Sized::Associative(
+                  assoc::Associative::Assoc(a),
+              ))),
+              Item::Error(a) => Ok(Dispenser::Sized(Sized::Associative(
+                  assoc::Associative::Error(a),
+              ))),
+              Item::Dictionary(a) => Ok(Dispenser::Sized(Sized::Associative(
+                  assoc::Associative::Dictionary(a),
+              ))),
+              Item::DictEntry(a) => Ok(Dispenser::Sized(Sized::Associative(
+                  assoc::Associative::DictEntry(a),
+              ))),
+              Item::Words(a) => Ok(Dispenser::Sized(Sized::Associative(
+                  assoc::Associative::Words(a),
+              ))),
+              Item::Env(a) => Ok(Dispenser::Sized(Sized::Associative(
+                  assoc::Associative::Env(a),
+              ))),
+              Item::Nothing => Ok(Dispenser::Sized(Sized::Associative(
+                  assoc::Associative::Nothing,
+              ))),
               Item::Program(p) => Ok(Dispenser::Sized(Sized::Program(p))),
               Item::Out(s) => Ok(Dispenser::Out(s)),
               Item::Tunnel(s) => Ok(Dispenser::Tunnel(s)),
-              i => Err(Error::expected(fit!("iterable"), i)),
+              i => Err(DeriveError::expected(fit!("iterable"), i)),
           }
       }
   }
 
   impl TryDerive<Item> for Set {
-      type Error = Error;
-
-      fn try_derive(item: Item) -> Result<Self, Self::Error> {
+      fn try_derive(item: Item) -> Result<Self, DeriveError<Item>> {
           let s = Sized::try_derive(item)?;
           let hs: HashSet<assoc::KeyItem> = s
               .into_iter()
               .map(|i| i.try_fit())
               .collect::<Result<_, Error>>()?;
           Ok(Set::derive(hs))
-      }
-  }
-
-  /// Try to convert any reference to our types to T, and don't destroy the
-  /// original in case it fails (so the caller could try again if
-  /// needed.)
-  impl<T: TryDerive<Dispenser, Error = E>, E> TryDerive<&Dispenser> for T
-  where
-      T: TryDerive<Dispenser>,
-      E: Fit<Error>,
-  {
-      type Error = Error;
-      fn try_derive(value: &Dispenser) -> Result<Self, Self::Error> {
-          T::try_derive(value.clone()).map_err(Fit::fit)
-      }
-  }
-
-  impl<T: TryDerive<Receptacle, Error = E>, E> TryDerive<&Receptacle> for T
-  where
-      T: TryDerive<Receptacle>,
-      E: Fit<Error>,
-  {
-      type Error = Error;
-      fn try_derive(value: &Receptacle) -> Result<Self, Self::Error> {
-          T::try_derive(value.clone()).map_err(Fit::fit)
-      }
-  }
-
-  impl<T: TryDerive<Sized, Error = E>, E> TryDerive<&Sized> for T
-  where
-      T: TryDerive<Sized>,
-      E: Fit<Error>,
-  {
-      type Error = Error;
-      fn try_derive(value: &Sized) -> Result<Self, Self::Error> {
-          T::try_derive(value.clone()).map_err(Fit::fit)
       }
   }
 
@@ -2592,7 +2613,6 @@ internally, to keep track of things like the stack, program, lists etc.
 #+begin_src rust :tangle src/types/container/program.rs :mkdirp yes
   use crate::traits::*;
   use crate::types::container as cont;
-  use crate::types::container::error::Error;
   use crate::types::container::SimpleTake;
   use crate::types::Item;
 
@@ -2762,12 +2782,16 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<Item> for Program {
-      type Error = Error;
-      fn try_derive(i: Item) -> Result<Program, Self::Error> {
+      fn try_derive(i: Item) -> Result<Program, DeriveError<Item>> {
           let s: cont::Sized = i.try_fit()?;
           match s {
               cont::Sized::Program(p) => Ok(p),
-              s => Ok(Program::derive(cont::List::try_derive(s)?)),
+              s => Ok(Program::derive(cont::List::try_derive(s).map_err(|e| {
+                  DeriveError {
+                      src: e.src.fit(),
+                      expected: e.expected,
+                  }
+              })?)),
           }
       }
   }
@@ -2828,7 +2852,6 @@ internally, to keep track of things like the stack, program, lists etc.
   //! Dictionaries, Environments, as well as generic maps (which are
   //! called "associations" in kcats)
   use super::{dictionary as dict, environment as env};
-  use crate::convert_enum;
   use crate::traits::*;
   use crate::types::container as coll;
   use crate::types::container::{Count, Join, Mutey};
@@ -2913,8 +2936,7 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<&str> for KeyItem {
-      type Error = Error;
-      fn try_derive(i: &str) -> Result<Self, Self::Error> {
+      fn try_derive(i: &str) -> Result<Self, DeriveError<&str>> {
           Word::try_derive(i).map(KeyItem::Word)
       }
   }
@@ -2926,8 +2948,7 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<Item> for KeyItem {
-      type Error = Error;
-      fn try_derive(i: Item) -> Result<Self, Error> {
+      fn try_derive(i: Item) -> Result<Self, DeriveError<Item>> {
           match i {
               Item::Int(i) => Ok(KeyItem::Int(i)),
               Item::Word(w) => Ok(KeyItem::Word(w)),
@@ -2942,7 +2963,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   }
                   s => {
                       println!("Bad keyitem {:?}", s);
-                      Err(Error::expected(fit!("KeyItem"), s))
+                      Err(DeriveError::expected(fit!("KeyItem"), s))
                   }
               },
           }
@@ -2950,12 +2971,11 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<KeyItem> for Word {
-      type Error = Error;
-      fn try_derive(k: KeyItem) -> Result<Self, Self::Error> {
+      fn try_derive(k: KeyItem) -> Result<Self, DeriveError<KeyItem>> {
           match k {
               KeyItem::Word(w) => Ok(w),
               KeyItem::String(s) => s.try_fit(),
-              i => Err(Error::expected(fit!("word"), i)),
+              i => Err(DeriveError::expected(fit!("word"), i)),
           }
       }
   }
@@ -3320,20 +3340,18 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<coll::Sized> for Associative {
-      type Error = Error;
-      fn try_derive(s: coll::Sized) -> Result<Self, Error> {
+      fn try_derive(s: coll::Sized) -> Result<Self, DeriveError<coll::Sized>> {
           match s {
               coll::Sized::Associative(a) => Ok(a),
-              coll::Sized::String(i) => Err(Error::expected(fit!("associative"), i)),
-              coll::Sized::Bytes(i) => Err(Error::expected(fit!("associative"), i)),
+              coll::Sized::String(i) => Err(DeriveError::expected(fit!("associative"), i)),
+              coll::Sized::Bytes(i) => Err(DeriveError::expected(fit!("associative"), i)),
               s => Ok(Associative::Assoc(Association::try_from_iter(s)?)),
           }
       }
   }
 
   impl TryDerive<Item> for Associative {
-      type Error = Error;
-      fn try_derive(i: Item) -> Result<Self, Error> {
+      fn try_derive(i: Item) -> Result<Self, DeriveError<Item>> {
           let s = coll::Sized::try_derive(i)?;
           Associative::try_derive(s)
       }
@@ -3395,12 +3413,10 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<Item> for Entry {
-      type Error = Error;
-
-      fn try_derive(i: Item) -> Result<Self, Error> {
+      fn try_derive(i: Item) -> Result<Self, DeriveError<Item>> {
           let s = coll::Sized::try_derive(i)?;
           if s.count() != 2 {
-              Err(Error::expected(fit!("pair"), s))
+              Err(DeriveError::expected(fit!("pair"), s))
           } else {
               let mut iter = s.into_iter();
               let key: KeyItem = iter.next().unwrap().try_fit()?;
@@ -3428,17 +3444,6 @@ internally, to keep track of things like the stack, program, lists etc.
   impl Derive<Association> for Item {
       fn derive(a: Association) -> Item {
           Associative::Assoc(a).fit()
-      }
-  }
-
-  impl Derive<Associative> for coll::Sized {
-      fn derive(a: Associative) -> coll::Sized {
-          convert_enum!(
-              a,
-              Associative,
-              coll::Sized,
-              [Assoc, Dictionary, DictEntry, Error, Env, Nothing, Words]
-          )
       }
   }
 
@@ -3484,8 +3489,8 @@ internally, to keep track of things like the stack, program, lists etc.
       /// and values convert
       fn convert<KB, VB>(&self) -> Result<HashMap<KB, VB>, Error>
       where
-          KB: Clone + Eq + Hash + TryDerive<KA, Error = Error>,
-          VB: Clone + TryDerive<VA, Error = Error>,
+          KB: Clone + Eq + Hash + TryDerive<KA>,
+          VB: Clone + TryDerive<VA>,
           KA: Clone + Eq + Hash, // Assuming Clone is needed for TryFrom
           VA: Clone;
   }
@@ -3497,8 +3502,8 @@ internally, to keep track of things like the stack, program, lists etc.
   {
       fn convert<KB, VB>(&self) -> Result<HashMap<KB, VB>, Error>
       where
-          KB: Clone + Eq + Hash + TryDerive<KA, Error = Error>,
-          VB: Clone + TryDerive<VA, Error = Error>,
+          KB: Clone + Eq + Hash + TryDerive<KA>,
+          VB: Clone + TryDerive<VA>,
           KA: Clone + Eq + Hash, // Assuming Clone is needed for TryFrom
           VA: Clone,
       {
@@ -3772,6 +3777,16 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  impl<T> Derive<DeriveError<T>> for Item
+  where
+      T: Fit<Item>,
+  {
+      fn derive(e: DeriveError<T>) -> Item {
+          //return an Error
+          Item::Error(e.fit())
+      }
+  }
+
   impl Derive<Infallible> for Error {
       fn derive(_x: Infallible) -> Self {
           match _x {} // Since Infallible can never be instantiated, this will never run
@@ -3791,8 +3806,7 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<Item> for Error {
-      type Error = Error;
-      fn try_derive(i: Item) -> Result<Self, Self::Error> {
+      fn try_derive(i: Item) -> Result<Self, DeriveError<Item>> {
           match i {
               Item::Error(e) => Ok(e),
               i => Error::try_derive(assoc::Associative::try_derive(i)?),
@@ -3802,8 +3816,9 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<Box<dyn Iterator<Item = Item>>> for Error {
-      type Error = Error;
-      fn try_derive(i: Box<dyn Iterator<Item = Item>>) -> Result<Self, Self::Error> {
+      fn try_derive(
+          i: Box<dyn Iterator<Item = Item>>,
+      ) -> Result<Self, DeriveError<Box<dyn Iterator<Item = Item>>>> {
           //TODO: this can't fail, can just be a From.
           // Really though, Error should have predefined fields like Environment.
           let data = assoc::Association::try_from_iter(i)?;
@@ -3815,8 +3830,7 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<assoc::Associative> for Error {
-      type Error = Error;
-      fn try_derive(a: assoc::Associative) -> Result<Self, Self::Error> {
+      fn try_derive(a: assoc::Associative) -> Result<Self, DeriveError<assoc::Associative>> {
           match a {
               assoc::Associative::Error(e) => Ok(e),
               assoc::Associative::Assoc(a) => {
@@ -3906,8 +3920,7 @@ internally, to keep track of things like the stack, program, lists etc.
   pub type Spec = (StackSpec, StackSpec);
 
   impl TryDerive<Item> for SpecElement {
-      type Error = Error;
-      fn try_derive(i: Item) -> Result<SpecElement, Error> {
+      fn try_derive(i: Item) -> Result<SpecElement, DeriveError<Item>> {
           match i {
               Item::Word(w) => Ok(SpecElement {
                   elemtype: w,
@@ -3931,8 +3944,7 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<coll::List> for StackSpec {
-      type Error = Error;
-      fn try_derive(s: coll::List) -> Result<StackSpec, Error> {
+      fn try_derive(s: coll::List) -> Result<StackSpec, DeriveError<coll::List>> {
           s.iter()
               .cloned()
               .map(SpecElement::try_derive)
@@ -3942,8 +3954,7 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<coll::List> for Spec {
-      type Error = Error;
-      fn try_derive(s: coll::List) -> Result<Spec, Error> {
+      fn try_derive(s: coll::List) -> Result<Spec, DeriveError<coll::List>> {
           if s.len() != 2 {
               Err(Error::list_count(2))
           } else {
@@ -3956,8 +3967,7 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<Item> for Spec {
-      type Error = Error;
-      fn try_derive(i: Item) -> Result<Spec, Error> {
+      fn try_derive(i: Item) -> Result<Spec, DeriveError<Item>> {
           Spec::try_derive(coll::List::try_derive(i)?)
       }
   }
@@ -4050,8 +4060,7 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<Item> for Namespace {
-      type Error = Error;
-      fn try_derive(i: Item) -> Result<Namespace, Error> {
+      fn try_derive(i: Item) -> Result<Namespace, DeriveError<Item>> {
           match i {
               Item::Bytes(b) => Ok(bytes_to_ns(b)),
               i => {
@@ -4059,7 +4068,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   if s.is_empty() {
                       Ok(Default::default())
                   } else {
-                      Err(Error::expected(fit!("namespace"), s))
+                      Err(DeriveError::expected(fit!("namespace"), s))
                   }
               }
           }
@@ -4495,8 +4504,9 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<Box<dyn Iterator<Item = Item>>> for Entry {
-      type Error = Error;
-      fn try_derive(iter: Box<dyn Iterator<Item = Item>>) -> Result<Self, Error> {
+      fn try_derive(
+          iter: Box<dyn Iterator<Item = Item>>,
+      ) -> Result<Self, DeriveError<Box<dyn Iterator<Item = Item>>>> {
           let mut examples: Option<coll::List> = None;
           let mut definition: Option<Executable> = None;
           let mut spec: Option<Spec> = None;
@@ -4530,9 +4540,9 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<Box<dyn Iterator<Item = Item>>> for Words {
-      type Error = Error;
-
-      fn try_derive(iter: Box<dyn Iterator<Item = Item>>) -> Result<Self, Error> {
+      fn try_derive(
+          iter: Box<dyn Iterator<Item = Item>>,
+      ) -> Result<Self, DeriveError<Box<dyn Iterator<Item = Item>>>> {
           iter.map(<(Word, Entry)>::try_derive)
               .collect::<Result<HashMap<Word, Entry>, Error>>()
               .map(Arc::new)
@@ -4540,8 +4550,9 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<Box<dyn Iterator<Item = Item>>> for Dictionary {
-      type Error = Error;
-      fn try_derive(iter: Box<dyn Iterator<Item = Item>>) -> Result<Self, Error> {
+      fn try_derive(
+          iter: Box<dyn Iterator<Item = Item>>,
+      ) -> Result<Self, DeriveError<Box<dyn Iterator<Item = Item>>>> {
           let mut words = Words::default();
           let mut modules = Vec::<Namespace>::default();
 
@@ -4568,15 +4579,13 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<Item> for Executable {
-      type Error = Error;
-      fn try_derive(i: Item) -> Result<Self, Self::Error> {
+      fn try_derive(i: Item) -> Result<Self, DeriveError<Item>> {
           coll::List::try_derive(i).map(Executable::Derived)
       }
   }
 
   impl TryDerive<Item> for Entry {
-      type Error = Error;
-      fn try_derive(i: Item) -> Result<Self, Self::Error> {
+      fn try_derive(i: Item) -> Result<Self, DeriveError<Item>> {
           let s = coll::Sized::try_derive(i)?;
           match s {
               coll::Sized::Associative(assoc::Associative::DictEntry(d)) => Ok(*d),
@@ -4603,8 +4612,7 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<Item> for Words {
-      type Error = Error;
-      fn try_derive(i: Item) -> Result<Self, Self::Error> {
+      fn try_derive(i: Item) -> Result<Self, DeriveError<Item>> {
           let s = coll::Sized::try_derive(i)?;
           match s {
               coll::Sized::Associative(assoc::Associative::Words(d)) => Ok(d),
@@ -4614,13 +4622,12 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<Item> for Dictionary {
-      type Error = Error;
-      fn try_derive(i: Item) -> Result<Self, Self::Error> {
+      fn try_derive(i: Item) -> Result<Self, DeriveError<Item>> {
           let s = assoc::Associative::try_derive(i)?;
           match s {
               assoc::Associative::Dictionary(d) => Ok(*d),
               //assoc::Associative::Assoc(a) => a.into_iter().try_fit(),
-              a => Err(Error::expected(fit!("dictionary"), a)),
+              a => Err(DeriveError::expected(fit!("dictionary"), a)),
           }
       }
   }
@@ -4650,12 +4657,10 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<Item> for (Word, Entry) {
-      type Error = Error;
-
-      fn try_derive(i: Item) -> Result<Self, Self::Error> {
+      fn try_derive(i: Item) -> Result<Self, DeriveError<Item>> {
           let s = coll::Sized::try_derive(i)?;
           if s.count() != 2 {
-              Err(Error::expected(fit!("pair"), s))
+              Err(DeriveError::expected(fit!("pair"), s))
           } else {
               let mut iter = s.into_iter();
               let key: types::Word = iter.next().unwrap().try_fit()?;
@@ -4715,6 +4720,16 @@ internally, to keep track of things like the stack, program, lists etc.
           let trace = self.program.stacktrace();
           err.add_trace(trace);
           self.stack.push_front(err.fit());
+      }
+
+      /// Use when a stack item fails the type check, pushes the item
+      /// (which is stored in the error)
+      pub fn push_err_with_src<T>(&mut self, err: DeriveError<T>)
+      where
+          T: Clone + Fit<Item>,
+      {
+          self.push(err.src.clone());
+          self.push(err);
       }
 
       /// Pop the top [Item] from the stack, panicking if the stack is
@@ -5099,8 +5114,9 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<Box<dyn Iterator<Item = Item>>> for Environment {
-      type Error = Error;
-      fn try_derive(iter: Box<dyn Iterator<Item = Item>>) -> Result<Self, Error> {
+      fn try_derive(
+          iter: Box<dyn Iterator<Item = Item>>,
+      ) -> Result<Self, DeriveError<Box<dyn Iterator<Item = Item>>>> {
           let mut stack: Option<coll::List> = None;
           let mut program: Option<Program> = None;
           let mut dictionary: Option<dict::Dictionary> = None;
@@ -5128,8 +5144,7 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
   impl TryDerive<Item> for Environment {
-      type Error = Error;
-      fn try_derive(i: Item) -> Result<Self, Self::Error> {
+      fn try_derive(i: Item) -> Result<Self, DeriveError<Item>> {
           //println!("Convert to env: {:?}", i);
           let s = coll::Sized::try_derive(i)?;
 
@@ -5525,8 +5540,7 @@ words for them (hashing, encryption, signing)
   }
 
   impl TryDerive<Item> for signing::Keypair {
-      type Error = Error;
-      fn try_derive(i: Item) -> Result<Self, Self::Error> {
+      fn try_derive(i: Item) -> Result<Self, DeriveError<Item>> {
           let sk: signing::SecretKey = i.try_fit()?;
           let pk: signing::PublicKey = (&sk).into();
           Ok(signing::Keypair {
@@ -5537,36 +5551,33 @@ words for them (hashing, encryption, signing)
   }
 
   impl TryDerive<Item> for signing::SecretKey {
-      type Error = Error;
-      fn try_derive(i: Item) -> Result<Self, Self::Error> {
+      fn try_derive(i: Item) -> Result<Self, DeriveError<Item>> {
           let a = assoc::Associative::try_derive(i)?;
           if a.get(&fit!("type")) == Some(fit!("elliptic-curve-key")) {
               let sk = signing::SecretKey::from_bytes(
-                  &Bytes::try_derive(
-                      a.get(&fit!("secret"))
-                          .ok_or_else(|| Error::expected(fit!("secret"), None::<Item>))?,
-                  )?[..],
+                  &Bytes::try_derive(a.get(&fit!("secret")).map_err(
+                      |_e| DeriveError::expected(i, fit!("secret")), //Error::expected(fit!("secret"), None::<Item>)
+                  )?)?[..],
               )
-              .map_err(|_e| Error::expected(fit!("valid-secret-key"), None::<Item>))?;
+              .map_err(|_e| DeriveError::expected(i, fit!("valid-secret-key")))?;
               Ok(sk)
           } else {
-              Err(Error::expected(fit!("keypair"), a))
+              Err(DeriveError::expected(i, fit!("elliptic-curve-key")))
           }
       }
   }
 
   impl TryDerive<Item> for signing::PublicKey {
-      type Error = Error;
-      fn try_derive(i: Item) -> Result<Self, Self::Error> {
-          let a = assoc::Associative::try_derive(i)?;
+      fn try_derive(i: Item) -> Result<Self, DeriveError<Item>> {
+          let a = assoc::Associative::try_derive_impl(i)?;
           if a.get(&fit!("type")) == Some(fit!("elliptic-curve-key")) {
               let pk = signing::PublicKey::from_bytes(
                   &Bytes::try_derive(
                       a.get(&fit!("public"))
-                          .ok_or_else(|| Error::expected(fit!("public"), None::<Item>))?,
+                          .ok_or_else(|| DeriveError::expected(fit!("public"), None::<Item>))?,
                   )?[..],
               )
-              .map_err(|_e| Error::expected(fit!("valid-public-key"), None::<Item>))?;
+              .map_err(|_e| DeriveError::expected(fit!("valid-public-key"), None::<Item>))?;
               Ok(pk)
           } else {
               Err(Error::expected(fit!("public-key"), a))
@@ -5614,7 +5625,6 @@ example, in order to read/write to/from disk).
   //! subject to change.
   use crate::fit;
   use crate::traits::*;
-  use crate::types::container::dictionary as dict;
   use crate::types::container::{
       self as coll, associative as assoc, environment::Environment, error::Error,
   };
@@ -6073,30 +6083,6 @@ example, in order to read/write to/from disk).
       Ok(())
   }
 
-  use std::any::TypeId;
-
-  /// A function to give the name of a type, useful for specs and errors
-  fn get_name<T: 'static>(_val: &T) -> &'static str {
-      match TypeId::of::<T>() {
-          t if t == TypeId::of::<Vec<u8>>() => "bytes",
-          t if t == TypeId::of::<String>() => "string",
-          t if t == TypeId::of::<&str>() => "string",
-          t if t == TypeId::of::<Word>() => "word",
-          t if t == TypeId::of::<coll::List>() => "list",
-          t if t == TypeId::of::<Item>() => "item",
-          t if t == TypeId::of::<coll::Set>() => "set",
-          t if t == TypeId::of::<coll::Dispenser>() => "dispenser",
-          t if t == TypeId::of::<coll::Receptacle>() => "receptacle",
-          t if t == TypeId::of::<coll::Sized>() => "sized",
-          t if t == TypeId::of::<assoc::Associative>() => "associative",
-          t if t == TypeId::of::<assoc::Association>() => "association",
-          t if t == TypeId::of::<Error>() => "error",
-          t if t == TypeId::of::<Environment>() => "environment",
-          t if t == TypeId::of::<dict::Dictionary>() => "dictionary",
-          t if t == TypeId::of::<number::Number>() => "number",
-          _ => std::any::type_name::<T>(),
-      }
-  }
   #[cfg(test)]
   mod tests {
       use super::*;
@@ -6192,31 +6178,32 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   fn f_stack1<F, Output, SpecInput, E>(f: F) -> impl Fn(Environment) -> Future<Environment>
   where
       F: Fn(SpecInput) -> Result<Output, E> + 'static,
-      SpecInput: for<'a> TryDerive<&'a Item> + Fit<Item> + Clone,
-      for<'a> <SpecInput as TryDerive<&'a Item>>::Error: Fit<Error>,
+      SpecInput: TryDerive<Item> + Fit<Item> + Clone,
+      //for<'a> <SpecInput as TryDerive<&'a Item>>::Error: Fit<Error>,
       E: Fit<Error>,
       Output: Fit<Item>,
   {
       move |mut env: Environment| {
-          let x = env
-              .tos()
-              .ok_or_else(Error::stack_underflow)
-              .and_then(|x| SpecInput::try_derive(x).map_err(Fit::fit));
+          let x = env.stack.pop_front().ok_or_else(Error::stack_underflow);
           match x {
-              Ok(i) => {
-                  let res = f(i);
-                  match res {
-                      Ok(r) => {
-                          env.pop_prog();
-                          env.pop();
-                          env.push(r);
-                      }
-                      Err(e) => {
-                          let err: Error = e.fit();
-                          env.push_err(err);
+              Ok(i) => match SpecInput::try_derive(i) {
+                  Ok(i) => {
+                      let res = f(i);
+                      match res {
+                          Ok(r) => {
+                              env.pop_prog();
+                              //env.pop();
+                              env.push(r);
+                          }
+                          Err(e) => {
+                              env.push_err(e.fit());
+                          }
                       }
                   }
-              }
+                  Err(e) => {
+                      env.push_err_with_src(e);
+                  }
+              },
               Err(e) => {
                   env.push_err(e);
               }
@@ -6234,9 +6221,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   where
       F: Fn(SpecInputY, SpecInputX) -> Result<Output, E> + 'static,
       SpecInputX: for<'a> TryDerive<&'a Item> + Fit<Item> + Clone,
-      for<'a> <SpecInputX as TryDerive<&'a Item>>::Error: Fit<Error>,
+      //for<'a> <SpecInputX as TryDerive<&'a Item>>::Error: Fit<Error>,
       SpecInputY: for<'b> TryDerive<&'b Item> + Fit<Item> + Clone,
-      for<'b> <SpecInputY as TryDerive<&'b Item>>::Error: Fit<Error>,
+      //for<'b> <SpecInputY as TryDerive<&'b Item>>::Error: Fit<Error>,
       E: Fit<Error>,
       Output: Fit<Item>,
   {
@@ -6286,11 +6273,11 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   where
       F: Fn(SpecInputZ, SpecInputY, SpecInputX) -> Result<Output, E> + 'static,
       SpecInputX: for<'a> TryDerive<&'a Item> + Fit<Item> + Clone,
-      for<'a> <SpecInputX as TryDerive<&'a Item>>::Error: Fit<Error>,
+      //for<'a> <SpecInputX as TryDerive<&'a Item>>::Error: Fit<Error>,
       SpecInputY: for<'b> TryDerive<&'b Item> + Fit<Item> + Clone,
-      for<'b> <SpecInputY as TryDerive<&'b Item>>::Error: Fit<Error>,
+      //for<'b> <SpecInputY as TryDerive<&'b Item>>::Error: Fit<Error>,
       SpecInputZ: for<'c> TryDerive<&'c Item> + Fit<Item> + Clone,
-      for<'c> <SpecInputZ as TryDerive<&'c Item>>::Error: Fit<Error>,
+      //for<'c> <SpecInputZ as TryDerive<&'c Item>>::Error: Fit<Error>,
       E: Fit<Error>,
       Output: Fit<Item>,
   {
@@ -6721,7 +6708,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn put(mut env: Environment) -> Future<Environment> {
-      match coll::Receptacle::try_derive(env.stack.get(1).unwrap()) {
+      match coll::Receptacle::try_derive(env.pop()) {
           Ok(p) => {
               let i = env.tos().cloned().unwrap();
               Box::pin(p.put(i).map(|f| {
@@ -6729,7 +6716,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       Ok(p) => {
                           env.pop_prog();
                           env.pop(); // i
-                          env.pop(); // old receptacle
                           env.push(Item::derive(p))
                       }
                       Err(e) => env.push(e),
@@ -6738,7 +6724,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               }))
           }
           Err(e) => {
-              env.push(e);
+              env.push(Error::derive(e));
               env.fit()
           }
       }
@@ -6881,10 +6867,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn unwrap(mut env: Environment) -> Future<Environment> {
       //println!("Unwrap: {:?} {:?}", env.stack, env.program.stacktrace());
-      match coll::List::try_derive(env.tos().unwrap()) {
+      match coll::List::try_derive(env.pop()) {
           Ok(l) => {
               env.pop_prog();
-              env.pop();
               for item in l.iter().cloned() {
                   env.push(item);
               }
@@ -6906,9 +6891,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn dip(mut env: Environment) -> Future<Environment> {
-      match coll::List::try_derive(env.tos().unwrap()) {
+      match coll::List::try_derive(env.pop()) {
           Ok(program) => {
-              env.pop();
               let mut item = env.pop();
               env.pop_prog();
               dip_quote(&mut item);
@@ -6917,15 +6901,14 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               env.program.prepend(program);
               //println!("Dip: {:?}", env.program);
           }
-          Err(e) => env.push(e),
+          Err(e) => env.push_err_with_src(e),
       }
       env.fit()
   }
 
   pub fn dipdown(mut env: Environment) -> Future<Environment> {
-      match coll::List::try_derive(env.tos().unwrap()) {
+      match coll::List::try_derive(env.pop()) {
           Ok(program) => {
-              env.pop();
               let mut item1 = env.pop();
               let mut item2 = env.pop();
               env.program.pop();
@@ -6934,32 +6917,31 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               env.program.prepend(vector![item2, item1]);
               env.program.prepend(program)
           }
-          Err(e) => env.push(e),
+          Err(e) => env.push_err_with_src(e),
       }
       env.fit()
   }
 
   pub fn take(mut env: Environment) -> Future<Environment> {
       // TODO: handle Nothing case
-      match coll::Dispenser::try_derive(env.tos().unwrap()) {
+      match coll::Dispenser::try_derive(env.pop()) {
           Ok(d) => Box::pin(async move {
               let (i, c) = d.take().await;
               env.pop_prog();
-              env.pop();
               env.push(c);
               env.push(coll::result_to_option(i).unwrap_or_default());
               env
           }),
           Err(e) => {
-              println!("Not a dispenser! {:?}", env.tos().unwrap());
-              env.push(e);
+              //println!("Not a dispenser! {:?}", env.tos().unwrap());
+              env.push_err_with_src(e);
               env.fit()
           }
       }
   }
 
   pub fn pop(mut env: Environment) -> Future<Environment> {
-      match coll::Sized::try_derive(env.tos().unwrap()) {
+      match coll::Sized::try_derive(env.pop()) {
           Ok(it) => {
               let (c, i) = it.pop();
               env.pop_prog();
@@ -6968,7 +6950,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               env.push(i.unwrap_or_default());
           }
           Err(e) => {
-              env.push(e);
+              env.push_err_with_src(e);
           }
       }
       env.fit()
@@ -6980,8 +6962,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn branch(mut env: Environment) -> Future<Environment> {
       match (
-          coll::List::try_derive(env.tos().unwrap()),
-          coll::List::try_derive(env.stack.get(1).unwrap()),
+          coll::List::try_derive(env.pop()),
+          coll::List::try_derive(env.pop()),
       ) {
           (Ok(false_branch), Ok(true_branch)) => {
               env.pop_prog();
@@ -6998,8 +6980,15 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               };
               env.program.prepend(selected_branch)
           }
-          (Err(e), _) => env.push(e),
-          (_, Err(e)) => env.push(e),
+          (Err(e), i) => {
+              env.push(i);
+              env.push_err_with_src(e)
+          }
+          (i, Err(e)) => {
+              env.push(e.src.clone());
+              env.push(i);
+              env.push(e)
+          }
       }
       env.fit()
   }
@@ -7129,7 +7118,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
               // Whatever it is, treat it as a map if possible
               (Some(i), k) => {
-                  let a = assoc::Associative::try_derive(i)?;
+                  let a = assoc::Associative::try_derive(i).map_err(Error::derive)?;
                   assoc_map(a, ks, k, v)
               }
           }
@@ -7148,21 +7137,22 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               Ok((*l).fit())
           }
           coll::Sized::Set(mut s) => {
-              s.mutate().remove(&assoc::KeyItem::try_derive(k)?);
+              s.mutate()
+                  .remove(&assoc::KeyItem::try_derive(k).map_err(Error::derive)?);
               Ok(s.fit())
           }
           coll::Sized::Associative(a) => {
-              let (a, _) = a.remove(&assoc::KeyItem::try_derive(k)?);
+              let (a, _) = a.remove(&assoc::KeyItem::try_derive(k).map_err(Error::derive)?);
               Ok(a.fit())
           }
           i => Err(Error::expected(fit!("simple-container"), i)),
       }
   }
 
-  fn unassoc_in(i: Item, ks: &[assoc::KeyItem]) -> Result<Item, Error> {
+  fn unassoc_in(i: Item, ks: &[assoc::KeyItem]) -> Result<Item, Fit<Error>> {
       if let [k, ks @ ..] = ks {
           if ks.is_empty() {
-              let a = assoc::Associative::try_derive(i)?;
+              let a = assoc::Associative::try_derive(i).map_err(DeriveError::derive)?;
               Ok(a.remove(k).0.fit())
           } else {
               match (i, k) {
@@ -9414,23 +9404,21 @@ The basic pipe contracts.
   }
 
   impl TryDerive<Item> for In {
-      type Error = Error;
-      fn try_derive(i: Item) -> Result<Self, Self::Error> {
+      fn try_derive(i: Item) -> Result<Self, DeriveError<Item>> {
           match i {
               Item::In(i) => Ok(i),
               Item::Tunnel(t) => Ok(t.fit()),
-              i => Err(Error::expected(fit!("pipe"), i)),
+              i => Err(DeriveError::expected(fit!("pipe"), i)),
           }
       }
   }
 
   impl TryDerive<Item> for Out {
-      type Error = Error;
-      fn try_derive(i: Item) -> Result<Self, Self::Error> {
+      fn try_derive(i: Item) -> Result<Self, DeriveError<Item>> {
           match i {
               Item::Out(o) => Ok(o),
               Item::Tunnel(t) => Ok(t.fit()),
-              i => Err(Error::expected(fit!("pipe"), i)),
+              i => Err(DeriveError::expected(fit!("pipe"), i)),
           }
       }
   }
@@ -10120,28 +10108,26 @@ Implement the =handoff= type
   }
 
   impl TryDerive<Item> for Handoff<Item> {
-      type Error = error::Error;
-
-      fn try_derive(i: Item) -> Result<Self, Self::Error> {
+      fn try_derive(i: Item) -> Result<Self, DeriveError<Item>> {
           match i {
               Item::Out(pipe::Out::Handoff(p)) => Ok(p),
               Item::In(pipe::In::Handoff(p)) => Ok(p),
               Item::Tunnel(pipe::Tunnel::Handoff(p)) => Ok(p),
-              i => Err(error::Error::expected(fit!("handoff"), i)),
+              i => Err(DeriveError::expected(fit!("handoff"), i)),
           }
       }
   }
 
   // drop the receiver side of the handoff and return the handoff item
   pub fn sender(i: Item) -> axiom::ItemResult {
-      let mut h = Handoff::try_derive(i)?;
+      let mut h = Handoff::try_derive(i).map_err(Error::derive)?;
       h.close_take();
       Ok(Item::In(pipe::In::Handoff(h)))
   }
 
   // drop the sender side of the handoff and return the handoff item
   pub fn receiver(i: Item) -> axiom::ItemResult {
-      let mut h = Handoff::try_derive(i)?;
+      let mut h = Handoff::try_derive(i).map_err(Error::derive)?;
       h.close_put();
       Ok(Item::Out(pipe::Out::Handoff(h)))
   }
@@ -10218,9 +10204,9 @@ Implement the =handoff= type
   }
 
   pub fn timer(i: Item) -> axiom::ItemResult {
-      let ms = Int::try_derive(i)?;
+      let ms = Int::try_derive(i).map_err(Error::derive)?;
       //TODO: check for negative values
-      Ok(Timer::new(Duration::from_millis(ms as u64)).fit())
+      Ok(Timer::new(Duration::from_millis(ms)).fit())
   }
 #+end_src
 ***** Database
@@ -10361,7 +10347,7 @@ Implement the =handoff= type
   }
 
   pub fn query(q: Item, params: Item) -> axiom::ItemResult {
-      let query: String = q.try_fit()?;
+      let query: String = q.try_fit().map?;
       // Needs to be association, and instead of a slice of ToSql,
       // we need &[(&str, &dyn ToSql)] (slice of pairs of strings and ToSql)
       let params: assoc::Associative = params.try_fit()?;
@@ -10385,8 +10371,7 @@ Implement the =handoff= type
   }
 
   impl TryDerive<ValueRef<'_>> for Item {
-      type Error = Error;
-      fn try_derive(value: ValueRef) -> Result<Self, Error> {
+      fn try_derive(value: ValueRef) -> Result<Self, DeriveError<ValueRef>> {
           match value {
               ValueRef::Integer(i) => Ok(Item::Int(i)),
               ValueRef::Real(f) => Ok(Item::Float(f)),
@@ -10400,7 +10385,7 @@ Implement the =handoff= type
   /// Since sqlite doesn't have separate string/word/char types, we
   /// store them all as String, and encode a prefix to note which type
   /// it should be when decoded.
-  fn decode_string(s: String) -> axiom::ItemResult {
+  fn decode_string(s: String) -> Result<Item, DeriveError<String>> {
       if let Some(w) = s.strip_prefix("w|") {
           w.try_fit()
       } else if let Some(s) = s.strip_prefix("s|") {
