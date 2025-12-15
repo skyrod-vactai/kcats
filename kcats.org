@@ -323,7 +323,7 @@ internally, to keep track of things like the stack, program, lists etc.
   pub struct Word {
       pub data: Intern<String>,
       pub quoted: bool,
-      pub namespace: dict::Namespace,
+      pub namespace: Option<dict::Namespace>,
   }
 
   impl fmt::Debug for Word {
@@ -3573,6 +3573,7 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::axiom;
   use crate::axiom::BUILTIN_FUNCTIONS;
   use crate::serialize;
+  use crate::stdlib_hashes;
   use crate::traits::*;
   use crate::types::container::associative::Convert;
   use crate::types::container::{self as coll, Count, Mutey};
@@ -3710,10 +3711,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
   impl Derive<Namespace> for Item {
       fn derive(ns: Namespace) -> Item {
-          match ns {
-              Some(ns) => (*ns).clone().fit(),
-              None => Item::default(),
-          }
+          (*ns).clone().fit()
       }
   }
 
@@ -3736,7 +3734,7 @@ internally, to keep track of things like the stack, program, lists etc.
                       Executable::Axiom(a) => a.clone().fit(),
                       Executable::Derived(d) => d.fit(),
                   }),
-                  "namespace" => self.namespace.map(|x| x.as_ref().clone().fit()),
+                  "namespace" => Some(self.namespace.fit()),
                   "doc" => self.doc.clone().map(|x| x.fit()),
                   _ => None,
               },
@@ -3751,13 +3749,13 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   // TODO: Use the builtin Bytes type
-  pub type Namespace = Option<Intern<Vec<u8>>>;
+  pub type Namespace = Intern<Vec<u8>>;
 
   pub fn bytes_to_ns(b: Bytes) -> Namespace {
       if b.is_empty() {
           Default::default()
       } else {
-          Some(Intern::new(b))
+          Intern::new(b)
       }
   }
 
@@ -3793,11 +3791,11 @@ internally, to keep track of things like the stack, program, lists etc.
       pub words: Words,
       pub lingo: Words,
       pub modules: Vec<Namespace>,
-      pub loaded_modules: HashSet<Namespace>,
   }
 
   /// A namespace for the core functions
   pub static CORE: OnceLock<Namespace> = OnceLock::new();
+  pub static CORE_NAMESPACES: OnceLock<HashMap<&'static str, Namespace>> = OnceLock::new();
 
   /// A custom impl for Dictionary that doesn't dump a massive data
   /// structure. comment this out to get access to the full debug output.
@@ -3837,7 +3835,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
       pub fn merge(&mut self, new: Self, namespace: &Namespace) {
           self.words.merge(new.words, namespace);
-          //self.resolve();
+          self.resolve();
       }
 
       pub fn contains_key(&self, key: &assoc::KeyItem) -> bool {
@@ -3853,16 +3851,19 @@ internally, to keep track of things like the stack, program, lists etc.
               let mut grouped: HashMap<Namespace, Vec<(types::Word, Entry)>> = HashMap::new();
 
               for (k, v) in words.iter() {
-                  grouped.entry(k.namespace).or_default().push((
-                      {
-                          // Block out the namespace, since we want to
-                          // find the word using no namespace
-                          let mut kk = k.clone();
-                          kk.namespace = None;
-                          kk
-                      },
-                      v.clone(),
-                  ));
+                  grouped
+                      .entry(k.namespace.unwrap_or_default())
+                      .or_default()
+                      .push((
+                          {
+                              // Block out the namespace, since we want to
+                              // find the word using no namespace
+                              let mut kk = k.clone();
+                              kk.namespace = None;
+                              kk
+                          },
+                          v.clone(),
+                      ));
               }
               grouped
           }
@@ -3870,14 +3871,12 @@ internally, to keep track of things like the stack, program, lists etc.
           //println!("by namespace: {:?}", by_ns);
           let mut cache = Words::fresh();
           let mcache = cache.mutate();
-          // first all the non-namespaced core words that can be overridden
-          mcache.extend(by_ns.get(&None).cloned().unwrap_or_default());
+
           for module in self.modules.iter() {
               //println!("Adding {:?} to cache", module);
               mcache.extend(by_ns.get(module).cloned().unwrap_or_default())
           }
 
-          self.loaded_modules = by_ns.keys().cloned().collect();
           // println!(
           //     "Cache now selected {} words. modules: {:?}",
           //     cache.len(),
@@ -3910,7 +3909,7 @@ internally, to keep track of things like the stack, program, lists etc.
       /// of word definitions, not wrapped in a single list), and
       /// inserts all the definitions into the dictionary, with an
       /// optional namespace.
-      fn insert_core_module(&mut self, lexicon: String) -> Result<(), Error>;
+      fn insert_core_module(&mut self, lexicon: String, ns: &[u8]) -> Result<(), Error>;
 
       /// For stdlib words that are both built-in and part of a module
       /// that isn't necessarily loaded as part of the standard
@@ -3936,6 +3935,32 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  /// Instead of blindly extending dictionaries, we don't overwrite
+  /// entries that are axiom word defs. The idea is that when there is
+  /// an existing key that is an axiom word, and then we get a new value
+  /// that's also an axiom (no definition) - we don't overwrite the
+  /// existing definition, we pull it in. The tricky part is
+  fn merge_smart<K, V, F>(base: &mut HashMap<K, V>, incoming: HashMap<K, V>, merger: F)
+  where
+      K: Eq + Hash,
+      F: Fn(&mut V, V), // Takes mutable reference to old, owned new
+  {
+      for (key, new_val) in incoming {
+          match base.entry(key) {
+              // Case 1: Key exists. We have mutable access to old value.
+              // We pass ownership of `new_val` to the merger.
+              std::collections::hash_map::Entry::Occupied(mut entry) => {
+                  merger(entry.get_mut(), new_val);
+              }
+              // Case 2: Key does not exist.
+              // We insert `new_val` directly.
+              std::collections::hash_map::Entry::Vacant(entry) => {
+                  entry.insert(new_val);
+              }
+          }
+      }
+  }
+
   impl Dict for Words {
       fn diff(&self, newer: Words) -> (Vec<(Word, Entry)>, Vec<Word>) {
           diff_hashmaps(self, &newer)
@@ -3949,7 +3974,7 @@ internally, to keep track of things like the stack, program, lists etc.
           let adds: Vec<_> = adds
               .into_iter()
               .map(|(mut w, mut e)| {
-                  w.namespace = *namespace;
+                  w.namespace = Some(*namespace);
                   e.namespace = *namespace;
                   //println!("Adding {:?}", w);
                   (w, e)
@@ -3958,7 +3983,7 @@ internally, to keep track of things like the stack, program, lists etc.
           let deletes: Vec<_> = deletes
               .into_iter()
               .map(|mut w| {
-                  w.namespace = *namespace;
+                  w.namespace = Some(*namespace);
                   w
               })
               .collect();
@@ -3970,14 +3995,14 @@ internally, to keep track of things like the stack, program, lists etc.
           //println!("Contains: {:?}", d.get(&"contains?".fit()))
       }
 
-      fn insert_core_module(&mut self, lexicon: String) -> Result<(), Error> {
+      fn insert_core_module(&mut self, lexicon: String, ns_alias: &[u8]) -> Result<(), Error> {
           //println!("Parsing: {}", lexicon);
           let core = CORE.get().unwrap();
           let items = serialize::parse(lexicon)?;
           for r in Box::new(items.iter().cloned()) {
               let (k, def): (assoc::KeyItem, Item) = r.try_fit().unwrap();
               let mut word: Word = k.try_fit().unwrap();
-              word.namespace = *core;
+              word.namespace = Some(Intern::new(ns_alias.to_vec()));
               let iter: Box<dyn Iterator<Item = Item>> = def.try_fit().unwrap();
               let new_entry: Entry = iter.try_fit().unwrap();
               let new_entry2 = new_entry.clone();
@@ -4002,18 +4027,29 @@ internally, to keep track of things like the stack, program, lists etc.
       }
 
       fn builtins() -> Self {
-          let core = CORE.get_or_init(|| Some(Intern::new(vec![114, 138, 222]))); // base64 encodes to "core"
+          // base64 encodes to "core"
+          let core_nss = CORE_NAMESPACES.get_or_init(|| {
+              stdlib_hashes::get()
+                  .into_iter()
+                  .map(|(k, v)| {
+                      // Convert &'static [u8] -> Vec<u8> -> Intern<Vec<u8>>
+                      (k, Intern::new(v.to_vec()))
+                  })
+                  .collect()
+          });
           let mut dict = HashMap::new();
-          for (bw, bd) in BUILTIN_FUNCTIONS.iter() {
+          for (bw, bns, bd) in BUILTIN_FUNCTIONS.iter() {
+              let ns = core_nss.get(bns);
               let entry = Entry {
                   definition: bd.clone(),
                   examples: None,
                   spec: None,
-                  namespace: None,
+
+                  namespace: Default::default(),
                   doc: None,
               };
               let mut bw = bw.clone();
-              bw.namespace = *core;
+              bw.namespace = Default::default();
               dict.insert(Word::derive(bw.clone()), entry);
           }
           Arc::new(dict)
@@ -4274,7 +4310,6 @@ internally, to keep track of things like the stack, program, lists etc.
               words,
               modules,
               lingo: Default::default(),
-              loaded_modules: Default::default(),
           };
           dict.resolve();
           Ok(dict)
@@ -4627,33 +4662,28 @@ internally, to keep track of things like the stack, program, lists etc.
       pub fn is_finished(&self) -> bool {
           self.program.is_empty()
       }
-  }
 
-  /// A reducing function that loads modules one at a time. Takes an
-  /// existing env, loads the given module and returns the new env with
-  /// the dictionary that the module built on the stack.
-  fn load_module(mut env: Environment, module: &Word) -> Environment {
-      //println!("Loading module {:?}", module);
-      //println!("Cache: {:?}", env.dictionary.lingo);
-      env.push(module.clone());
-      //println!("Loading module (should be empty?): {:?}", env.program);
-      env.program.prepend(list!(
-          "dictionary",
-          "🔀",
-          list!("module", list!("words"), "🔀", "update"),
-          "•🛡️",
-          "▶️",
-          "•🗑️"
-      ));
-      //println!("Env: {:?}", env);
-      //println!("Dictionary: {:?}", env.dictionary);
-      let mut new_env = futures::executor::block_on(async move { axiom::eval(env).await });
-      //println!("Env: {:?}", new_env);
-      let mut dict: dict::Dictionary = new_env.pop().try_fit().unwrap();
-      dict.resolve();
-      new_env.dictionary = dict;
-      //println!("loaded module {}: {:?}", module, new_env.dictionary);
-      new_env
+      /// A reducing function that loads modules one at a time. Takes an
+      /// existing env, loads the given module and returns the new env with
+      /// the modified dictionary that the module built.
+      pub fn load_module(mut self, module: Item, is_using: bool) -> Environment {
+          //println!("Loading module {:?}", module);
+          //println!("Cache: {:?}", env.dictionary.lingo);
+          self.push(module.clone());
+          self.push(is_using);
+          //println!("Loading module (should be empty?): {:?}", env.program);
+          self.program
+              .prepend(list!("dictionary", "⚓", "pair", "🎁", "using"));
+          //println!("Env: {:?}", self);
+          //println!("Dictionary: {:?}", self.dictionary);
+          self = futures::executor::block_on(async move { axiom::eval(self).await });
+          //println!("Env: {:?}", new_env);
+          let mut dict: dict::Dictionary = self.pop().try_fit().unwrap();
+          dict.resolve();
+          self.dictionary = dict;
+          //println!("loaded module {:?}: {:?}", module, self.dictionary);
+          self
+      }
   }
 
   impl Default for Environment {
@@ -4668,7 +4698,6 @@ internally, to keep track of things like the stack, program, lists etc.
                       words: dict::Words::builtins(),
                       modules: Default::default(),
                       lingo: dict::Words::fresh(),
-                      loaded_modules: Default::default(),
                   },
                   stack: Default::default(),
                   program: Default::default(),
@@ -4688,11 +4717,12 @@ internally, to keep track of things like the stack, program, lists etc.
                   fit!("methods"),
                   fit!("generators"),
                   fit!("debug"),
+                  fit!("crypto-builtins"),
                   //"more-generators",
                   //"database",
               ]
-              .iter()
-              .fold(env, load_module);
+              .into_iter()
+              .fold(env, |env, module| env.load_module(module, true));
               // println!(
               //     "After loading modules Dict has {} words",
               //     env.dictionary.entries.len()
@@ -4715,8 +4745,11 @@ internally, to keep track of things like the stack, program, lists etc.
       //println!("Check {:?} is {:?}", w, i);
       match (w, i) {
           (w, _) if *w == *S_ITEM => true,
-          (w, Item::Dispenser(_) | Item::Receptacle(_)) if *w == *S_DISPENSER => true,
-          (w, Item::Receptacle(_) | Item::Dispenser(_)) if *w == *S_RECEPTACLE => true,
+          (w, Item::Receptacle(_) | Item::Dispenser(_))
+              if *w == *S_RECEPTACLE || *w == *S_DISPENSER =>
+          {
+              true
+          }
           (w, Item::Number(Number::Int(_))) if *w == *S_INTEGER || *w == *S_NUMBER => true,
           (w, Item::Number(Number::Float(_))) if *w == *S_FLOAT || *w == *S_NUMBER => true,
           (w, Item::Char(_)) if *w == *S_CHAR => true,
@@ -4731,7 +4764,7 @@ internally, to keep track of things like the stack, program, lists etc.
               w,
               Item::Dispenser(coll::Dispenser::Sized(coll::Sized::String(_)))
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::String(_))),
-          ) if *w == *S_STRING => true,
+          ) if *w == *S_STRING || *w == *S_ORDERED => true,
           (w, Item::Word(_)) if *w == *S_WORD => true,
 
           (
@@ -4748,7 +4781,7 @@ internally, to keep track of things like the stack, program, lists etc.
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::List(_)))
               | Item::Dispenser(coll::Dispenser::Sized(coll::Sized::Program(_)))
               | Item::Receptacle(coll::Receptacle::Sized(coll::Sized::Program(_))),
-          ) if *w == *S_LIST || *w == *S_PROGRAM => true,
+          ) if *w == *S_LIST || *w == *S_PROGRAM || *w == *S_ORDERED => true,
 
           (
               w,
@@ -4780,7 +4813,7 @@ internally, to keep track of things like the stack, program, lists etc.
               w,
               Item::Dispenser(coll::Dispenser::Sized(_))
               | Item::Receptacle(coll::Receptacle::Sized(_)),
-          ) if *w == *S_SIZED || *w == *S_ORDERED => true,
+          ) if *w == *S_SIZED => true,
 
           (
               w,
@@ -4824,6 +4857,7 @@ internally, to keep track of things like the stack, program, lists etc.
           Ok(env)
       }
   }
+
   impl TryDerive<Item> for Environment {
       type Error = Error;
       fn try_derive(i: Item) -> Result<Self, Self::Error> {
@@ -7612,7 +7646,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   env.pop_prog();
                   env.pop();
                   if let Some(e) = env.dictionary.lingo.get(&w) {
-                      w.namespace = e.namespace;
+                      w.namespace = Some(e.namespace);
                   }
                   env.push(w);
               }
@@ -8049,6 +8083,7 @@ rust project or some other language through FFI.
   mod crypto;
   //mod enumtest;
   pub mod serialize;
+  pub mod stdlib_hashes;
   pub mod traits;
   pub mod types;
 
@@ -8267,6 +8302,7 @@ rust project or some other language through FFI.
 
   #[cfg(test)]
   mod tests {
+
       //! Unit tests, in the form of all the examples of usage of the
       //! different lexicon words. Examples are all in the form of two
       //! programs that should be equivalent, something like `2 3 +` and
@@ -8276,14 +8312,28 @@ rust project or some other language through FFI.
       //use super::error::Error;
       //use super::*;
       use crate::axiom;
-      use crate::list;
       use crate::serialize::Emit;
       use crate::traits::*;
       use crate::types::container as coll;
       use crate::types::container::{environment::Environment, error::Error};
       use crate::types::{Item, Word};
+      use crate::{fit, list};
 
       use test_case::test_case;
+
+      //use std::{panic, sync::Once};
+
+      // static INIT: Once = Once::new();
+
+      // fn init_panic_hook() {
+      //     //println!("Installing panic hook");
+      //     INIT.call_once(|| {
+      //         panic::set_hook(Box::new(|info| {
+      //             eprintln!("panic in test: {info}");
+      //             eprintln!("{}", std::backtrace::Backtrace::capture());
+      //         }));
+      //     });
+      // }
 
       pub fn get_item(i: &coll::List, index: usize) -> Option<Item> {
           i.get(index).cloned()
@@ -8299,10 +8349,16 @@ rust project or some other language through FFI.
           let mut exp_env = prog_env.clone();
           prog_env.program.prepend(program.clone());
           exp_env.program.prepend(expected_prog.clone());
+          //init_panic_hook();
+          let p_fut = tokio::spawn(async move {
+              //init_panic_hook();
+              axiom::eval(prog_env).await
+          });
 
-          let p_fut = tokio::spawn(async move { axiom::eval(prog_env).await });
-
-          let exp_fut = tokio::spawn(async move { axiom::eval(exp_env).await });
+          let exp_fut = tokio::spawn(async move {
+              //init_panic_hook();
+              axiom::eval(exp_env).await
+          });
           let (prog_env, exp_env) = tokio::join!(p_fut, exp_fut);
           let prog_env = prog_env.unwrap();
           let exp_env = exp_env.unwrap();
@@ -8392,10 +8448,18 @@ rust project or some other language through FFI.
           }
       }
 
-      fn test_lexicon(word: &str) {
-          crate::config::configure_platform();
-          let e = Environment::default();
+      use base64::prelude::BASE64_URL_SAFE_NO_PAD;
+      use base64::Engine;
+      fn b64decode(s: &str) -> Item {
+          BASE64_URL_SAFE_NO_PAD.decode(s).unwrap().fit()
+      }
 
+      fn test_lexicon(word: &str, modules: Vec<Item>) {
+          crate::config::configure_platform();
+          let mut e = Environment::default();
+          e = modules
+              .iter()
+              .fold(e, |env, module| env.load_module(module.clone(), true));
           let r = test_word(e.clone(), word.try_fit().unwrap());
           assert!(r.is_empty(), "{:?}", r);
       }
@@ -8438,7 +8502,6 @@ rust project or some other language through FFI.
       #[test_case("inc")]
       #[test_case("integer?" ; "is_integer")]
       #[test_case("intersection")]
-      #[test_case("key")]
       #[test_case("log")]
       #[test_case("mod")]
       #[test_case("namespace")]
@@ -8465,7 +8528,6 @@ rust project or some other language through FFI.
       #[test_case("string")]
       #[test_case("string?" ; "is_string")]
       #[test_case("unnamespace")]
-      #[test_case("verify")]
       #[test_case("word")]
       #[test_case("word?" ; "is_word")]
       #[test_case("zero?" ; "is_zero")]
@@ -8491,7 +8553,7 @@ rust project or some other language through FFI.
       #[test_case("🪄" ; "dip")]
       #[test_case["last"]]
       fn test_axiom(word: &str) {
-          test_lexicon(word)
+          test_lexicon(word, vec![])
       }
 
       #[test_case("<" ; "lt")]
@@ -8610,7 +8672,13 @@ rust project or some other language through FFI.
       #[test_case("🪗" ; "reduce")]
       #[test_case("🪜" ; "step")]
       fn test_derived(word: &str) {
-          test_lexicon(word)
+          test_lexicon(word, vec![])
+      }
+
+      #[test_case("key")]
+      #[test_case("verify")]
+      fn test_crypto(word: &str) {
+          test_lexicon(word, vec![fit!("crypto-builtins")])
       }
   }
 #+end_src
@@ -18234,7 +18302,8 @@ it's always [] due to the negation logic, so we don't need to pass it to the bod
 #+end_src
 ** INPROGRESS parse-edn should deliver chunks too
 - State "INPROGRESS" from "TODO"       [2025-10-23 Thu 07:49]
-** TODO Make axiom words testable separately
+** INPROGRESS Make axiom words testable separately
+- State "INPROGRESS" from "TODO"       [2025-12-12 Fri 19:17]
 When these are broken, we shouldn't bother with the rest
 
 
