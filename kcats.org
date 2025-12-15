@@ -18343,6 +18343,158 @@ When these are broken, we shouldn't bother with the rest
  [words 286_entries]]
 #+end_src
 
+Gemini suggest fix
+#+begin_src markdown
+Yes, this approach works perfectly and satisfies all your constraints:
+
+1.  **Security:** The specific (Name, Hash) pairing is enforced.
+2.  **No Manual Sync:** `build.rs` does the dirty work.
+3.  **Brittleness Fix:** The Runtime Merge step acts as a "Linker". If Rust has a function that defines `+`, but `build.rs` didn't find `+` in any EDN file, the linker panics at startup.
+
+Here is the implementation strategy.
+
+### 1. `build.rs` (The Mapper)
+
+We need `build.rs` to scan your EDN files, parse out the function names, calculate the file hash, and generate a static map of `Function Name -> File Hash`.
+
+*Assumption: Your function names are globally unique across the stdlib. If `+` appears in two different files, your current `BUILTIN_FUNCTIONS` flat map wouldn't work anyway.*
+
+```rust
+// build.rs
+use std::env;
+use std::fs;
+use std::path::Path;
+use std::io::Write;
+// use your_edn_parser; 
+
+fn main() {
+    let out_dir = env::var("OUT_DIR").unwrap();
+    let dest_path = Path::new(&out_dir).join("stdlib_manifest.rs");
+    let mut f = fs::File::create(&dest_path).unwrap();
+
+    let src_dir = Path::new("src/kcats/stdlib"); // Your path
+    
+    // We will generate a map: "function_name" -> "file_hash"
+    writeln!(f, "pub fn get_manifest() -> std::collections::HashMap<&'static str, &'static str> {{").unwrap();
+    writeln!(f, "    let mut m = std::collections::HashMap::new();").unwrap();
+
+    for entry in fs::read_dir(src_dir).unwrap().flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("joy") { // or .edn
+            
+            let content = fs::read_to_string(&path).unwrap();
+            
+            // 1. Calculate Hash of the file content
+            // (Using whatever caching logic you have)
+            let file_hash = calculate_hash(&content); 
+
+            // 2. Parse EDN to find defined names
+            // This is the only logic specific to your format.
+            // You need to extract ["postbox", "put"] from the file content.
+            let names_found: Vec<String> = parse_names_from_edn(&content);
+
+            for name in names_found {
+                writeln!(f, "    m.insert(\"{}\", \"{}\");", name, file_hash).unwrap();
+            }
+        }
+    }
+
+    writeln!(f, "    m").unwrap();
+    writeln!(f, "}}").unwrap();
+}
+```
+
+This generates:
+```rust
+// stdlib_manifest.rs
+pub fn get_manifest() -> HashMap<&'static str, &'static str> {
+    let mut m = HashMap::new();
+    m.insert("postbox", "QmHashA...");
+    m.insert("put", "QmHashA...");
+    m.insert("+", "QmHashB...");
+    m
+}
+```
+
+### 2. Runtime (The Linker)
+
+Now, inside your interpreter initialization, you merge your existing `BUILTIN_FUNCTIONS` (which has the logic) with the `manifest` (which has the security context).
+
+```rust
+// src/stdlib.rs or main.rs
+
+// Import the generated manifest
+include!(concat!(env!("OUT_DIR"), "/stdlib_manifest.rs"));
+
+pub struct NativeRegistry {
+    // Key: (FileHash, FunctionName) -> FunctionPointer
+    // This is the secure table.
+    registry: HashMap<(String, String), dict::Executable>,
+}
+
+impl NativeRegistry {
+    pub fn build(builtins: &HashMap<Word, dict::Executable>) -> Self {
+        let manifest = get_manifest(); // From generated code
+        let mut registry = HashMap::new();
+
+        for (word, exec) in builtins {
+            let func_name = word.as_str(); // Assuming Word can give us &str
+
+            // THE LINKER CHECK
+            // We look up where this function *should* live according to the source files.
+            match manifest.get(func_name) {
+                Some(file_hash) => {
+                    // Success! We found the file that claims this function.
+                    // We lock this function pointer to THAT hash only.
+                    registry.insert(
+                        (file_hash.to_string(), func_name.to_string()), 
+                        exec.clone() // or copy/reference
+                    );
+                },
+                None => {
+                    // BRITTLENESS CHECK:
+                    // Rust defines a function, but no EDN file claims it.
+                    // This panics at startup so you know you broke the build.
+                    panic!("Orphaned Native Function: '{}' is defined in Rust BUILTIN_FUNCTIONS but not found in any stdlib file.", func_name);
+                }
+            }
+        }
+        
+        // REVERSE CHECK (Optional):
+        // Did we miss implementing something in Rust that the EDN expects?
+        for (name, _) in manifest {
+            // Logic depends on your Word type, simplified here:
+            if !builtins.keys().any(|w| w.as_str() == *name) {
+                println!("WARNING: stdlib defines '{}' but Rust has no implementation.", name);
+            }
+        }
+
+        Self { registry }
+    }
+
+    // This is called when the Interpreter is running a specific module
+    pub fn resolve(&self, callers_file_hash: &str, func_name: &str) -> Option<&dict::Executable> {
+        self.registry.get(&(callers_file_hash.to_string(), func_name.to_string()))
+    }
+}
+```
+
+### Analysis of constraints
+
+1.  **Dangling Pointers (Brittleness):**
+    If you rename `postbox` to `mailbox` in the text file, `manifest.get("postbox")` returns None. The `panic!("Orphaned Native Function...")` fires immediately when you run the project. You are forced to update the Rust string to match.
+
+2.  **Security/Sandboxing:**
+    If a user loads a script `malicious.joy` (Hash: `QmEvil`), and tries to call `postbox`:
+    *   Interpreter asks: `registry.resolve("QmEvil", "postbox")`.
+    *   Registry looks for key key `("QmEvil", "postbox")`.
+    *   It only has `("QmHashA", "postbox")`.
+    *   Returns `None`.
+    *   The malicious script cannot access the raw memory pointer, even though it used the correct name.
+
+3.  **Manual Work:**
+    You only maintain `BUILTIN_FUNCTIONS` (which you have to do anyway to write the code) and the EDN files. The mapping of "Which file owns what" is automated.
+#+end_src
 *** TODO Inscribe should return module hash
 Just in case the caller wants to add it to the resolution list
 #+begin_src kcats
