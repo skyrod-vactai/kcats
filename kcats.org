@@ -3903,13 +3903,13 @@ internally, to keep track of things like the stack, program, lists etc.
   pub trait Dict {
       /// Returns the difference between this dictionary and a "newer"
       /// one: The additions/updates, and the deletions.
-      fn diff(&self, newer: Words) -> (Vec<(Word, Entry)>, Vec<Word>);
+      fn diff(&self, newer: &Words) -> (Vec<(Word, Entry)>, Vec<Word>);
 
       /// Takes a core module (in string form - should contain a series
       /// of word definitions, not wrapped in a single list), and
       /// inserts all the definitions into the dictionary, with an
       /// optional namespace.
-      fn insert_core_module(&mut self, lexicon: String, ns: &[u8]) -> Result<(), Error>;
+      fn insert_core_module(&mut self, lexicon: String) -> Result<(), Error>;
 
       /// For stdlib words that are both built-in and part of a module
       /// that isn't necessarily loaded as part of the standard
@@ -3961,13 +3961,19 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  use sha2::{self, Digest}; // Import RngCore for the fill_bytes method
+
+  fn hash(s: String) -> Vec<u8> {
+      sha2::Sha256::digest(s.as_bytes()).to_vec()
+  }
+
   impl Dict for Words {
-      fn diff(&self, newer: Words) -> (Vec<(Word, Entry)>, Vec<Word>) {
+      fn diff(&self, newer: &Words) -> (Vec<(Word, Entry)>, Vec<Word>) {
           diff_hashmaps(self, &newer)
       }
 
-      fn merge(&mut self, new: Words, namespace: &Namespace) {
-          let (adds, deletes) = self.diff(new);
+      fn merge(&mut self, mut new: Words, namespace: &Namespace) {
+          let (adds, _) = self.diff(&new);
           // add namepaces to the adds and deletes
           //println!("Merge {} adds, {} deletes", adds.len(), deletes.len());
 
@@ -3980,29 +3986,28 @@ internally, to keep track of things like the stack, program, lists etc.
                   (w, e)
               })
               .collect();
-          let deletes: Vec<_> = deletes
-              .into_iter()
-              .map(|mut w| {
-                  w.namespace = Some(*namespace);
-                  w
-              })
-              .collect();
-          let d = self.mutate();
 
-          d.extend(adds);
-          d.extend(make_deletes(deletes));
-
-          //println!("Contains: {:?}", d.get(&"contains?".fit()))
+          let n = new.mutate();
+          n.extend(adds);
+          ,*self = new;
       }
 
-      fn insert_core_module(&mut self, lexicon: String, ns_alias: &[u8]) -> Result<(), Error> {
+      /// Load core modules. For now, we cheat and assume it's in the
+      /// format of `[list-of-definitions] join`, and we don't actually
+      /// evaluate the join like we will do later in bootstrapping.
+      fn insert_core_module(&mut self, lexicon: String) -> Result<(), Error> {
           //println!("Parsing: {}", lexicon);
-          let core = CORE.get().unwrap();
-          let items = serialize::parse(lexicon)?;
+
+          let hash = hash(lexicon.clone());
+          let namespace = Intern::new(hash);
+          let items = serialize::parse(lexicon)?
+              .pop_front()
+              .ok_or_else(|| Error::short_list(1))
+              .and_then(|i| coll::List::try_derive(i))?;
           for r in Box::new(items.iter().cloned()) {
               let (k, def): (assoc::KeyItem, Item) = r.try_fit().unwrap();
               let mut word: Word = k.try_fit().unwrap();
-              word.namespace = Some(Intern::new(ns_alias.to_vec()));
+              word.namespace = Some(namespace);
               let iter: Box<dyn Iterator<Item = Item>> = def.try_fit().unwrap();
               let new_entry: Entry = iter.try_fit().unwrap();
               let new_entry2 = new_entry.clone();
@@ -4012,7 +4017,7 @@ internally, to keep track of things like the stack, program, lists etc.
                       e.examples = new_entry.examples;
                       e.spec = new_entry.spec;
                       e.doc = new_entry.doc;
-                      e.namespace = *core;
+                      e.namespace = namespace;
                       // Don't overwrite the definition, this should be
                       // an axiom word where we've left the
                       // spec/examples temporarily blank and we're
@@ -4029,7 +4034,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn builtins() -> Self {
           // base64 encodes to "core"
           let core_nss = CORE_NAMESPACES.get_or_init(|| {
-              stdlib_hashes::get()
+              stdlib_hashes::get_manifest()
                   .into_iter()
                   .map(|(k, v)| {
                       // Convert &'static [u8] -> Vec<u8> -> Intern<Vec<u8>>
@@ -4038,47 +4043,22 @@ internally, to keep track of things like the stack, program, lists etc.
                   .collect()
           });
           let mut dict = HashMap::new();
-          for (bw, bns, bd) in BUILTIN_FUNCTIONS.iter() {
-              let ns = core_nss.get(bns);
+          for (bw, bd) in BUILTIN_FUNCTIONS.iter() {
+              let ns = core_nss.get(bw.data.as_str()).unwrap();
               let entry = Entry {
                   definition: bd.clone(),
                   examples: None,
                   spec: None,
 
-                  namespace: Default::default(),
+                  namespace: ns.clone(),
                   doc: None,
               };
               let mut bw = bw.clone();
-              bw.namespace = Default::default();
-              dict.insert(Word::derive(bw.clone()), entry);
+              bw.namespace = Some(*ns);
+              dict.insert(bw.clone(), entry);
           }
           Arc::new(dict)
       }
-  }
-
-  /// Each word should run a program that calls fail (already namespaced
-  /// to the stdlib so that the word acts like it isn't in the dictionary
-  /// even though it is.)
-  fn make_deletes(words: Vec<Word>) -> Vec<(Word, Entry)> {
-      words
-          .into_iter()
-          .map(|word| {
-              //println!("Shadowing word: {:?}", word);
-              let err = Error::create(
-                  list!(types::Word::derive(word.clone())),
-                  "word removed by module",
-                  Some::<Item>(fit!("access-denied")),
-              );
-              let entry = Entry {
-                  examples: None,
-                  spec: None,
-                  definition: Executable::Derived(list!(err, "fail")),
-                  namespace: word.namespace,
-                  doc: None,
-              };
-              (word, entry)
-          })
-          .collect()
   }
 
   /// Returns an owned pair given a pair of references
@@ -4125,6 +4105,7 @@ internally, to keep track of things like the stack, program, lists etc.
       type Error = Infallible;
       fn join(mut self, other: Self) -> Result<Self::Output, Self::Error> {
           self.words = self.words.join(other.words)?;
+          self.resolve();
           Ok(self)
       }
   }
@@ -4223,9 +4204,7 @@ internally, to keep track of things like the stack, program, lists etc.
           if let Some(d) = self.doc {
               v.push((fit!("doc"), d.fit()))
           }
-          if let Some(n) = self.namespace {
-              v.push((fit!("namespace"), n.as_ref().clone().fit()))
-          }
+          v.push((fit!("namespace"), self.namespace.as_ref().clone().fit()));
           Box::new(v.into_iter())
       }
   }
@@ -4250,7 +4229,7 @@ internally, to keep track of things like the stack, program, lists etc.
           let mut examples: Option<coll::List> = None;
           let mut definition: Option<Executable> = None;
           let mut spec: Option<Spec> = None;
-          let mut namespace: Namespace = None;
+          let mut namespace: Namespace = Default::default();
           let mut doc: Option<String> = None;
           for i in iter {
               let (k, v): (assoc::KeyItem, Item) = i.try_fit()?;
@@ -4341,8 +4320,8 @@ internally, to keep track of things like the stack, program, lists etc.
           d.examples.and_then(|l| a.insert(fit!("examples"), l.fit()));
           d.spec.and_then(|l| a.insert(fit!("spec"), l.fit()));
           d.doc.and_then(|l| a.insert(fit!("doc"), l.fit()));
-          d.namespace
-              .and_then(|l| a.insert(fit!("namespace"), l.as_ref().clone().fit()));
+          a.insert(fit!("namespace"), d.namespace.as_ref().clone().fit());
+
           if let Executable::Derived(d) = d.definition {
               a.insert(fit!("definition"), d.fit());
           }
@@ -4584,25 +4563,26 @@ internally, to keep track of things like the stack, program, lists etc.
               include_bytes!("../../kcats/core/strings-builtins.kcats"),
               include_bytes!("../../kcats/core/errors-builtins.kcats"),
               include_bytes!("../../kcats/core/pipes-builtins.kcats"),
-              include_bytes!("../../kcats/core/stack.kcats"),
-              include_bytes!("../../kcats/core/motion.kcats"),
               include_bytes!("../../kcats/core/collections-builtins.kcats"),
               include_bytes!("../../kcats/core/execute-builtins.kcats"),
-              include_bytes!("../../kcats/core/execute.kcats"),
               include_bytes!("../../kcats/core/dictionary-builtins.kcats"),
-              include_bytes!("../../kcats/core/math.kcats"),
-              include_bytes!("../../kcats/core/compare.kcats"),
-              include_bytes!("../../kcats/core/collections.kcats"),
               include_bytes!("../../kcats/core/associations-builtins.kcats"),
-              include_bytes!("../../kcats/core/associations.kcats"),
-              include_bytes!("../../kcats/core/dictionary.kcats"),
               include_bytes!("../../kcats/core/environment-builtins.kcats"),
-              include_bytes!("../../kcats/core/environment.kcats"),
               include_bytes!("../../kcats/core/sets-builtins.kcats"),
+              include_bytes!("../../kcats/stdlib/stack.kcats"),
+              include_bytes!("../../kcats/stdlib/motion.kcats"),
+              include_bytes!("../../kcats/stdlib/execute.kcats"),
+              include_bytes!("../../kcats/stdlib/math.kcats"),
+              include_bytes!("../../kcats/stdlib/compare.kcats"),
+              include_bytes!("../../kcats/stdlib/collections.kcats"),
+              include_bytes!("../../kcats/stdlib/associations.kcats"),
+              include_bytes!("../../kcats/stdlib/dictionary.kcats"),
+              include_bytes!("../../kcats/stdlib/environment.kcats"),
           ];
 
           for &file_contents in &files {
-              let lexicon = String::from_utf8_lossy(file_contents).into_owned();
+              let lexicon =
+                  edn_format::canonicalize(String::from_utf8_lossy(file_contents).into_owned())?;
               match self.dictionary.words.insert_core_module(lexicon.clone()) {
                   Ok(_) => {}
                   Err(mut e) => {
@@ -4706,8 +4686,15 @@ internally, to keep track of things like the stack, program, lists etc.
               env.load_core_modules()
                   .expect("failed to load core modules");
               // add core module as default module
-              env.dictionary.modules.push(*dict::CORE.get().unwrap());
+              let modules = dict::CORE_NAMESPACES
+                  .get()
+                  .unwrap()
+                  .iter()
+                  .map(|(_, ns)| ns.clone())
+                  .collect::<Vec<_>>();
+              env.dictionary.modules = modules;
               env.dictionary.resolve();
+              println!("starting dictionary: {:?}", env.dictionary.lingo);
               //println!("Dict has {} words", env.dictionary.entries.len());
               let mut env = [
                   fit!("errors"),

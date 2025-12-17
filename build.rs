@@ -151,7 +151,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Generate some consts
     for (module_name, (hash, _)) in r.iter() {
         let sanitized_name = module_name.replace("-", "_").to_uppercase();
-        writeln!(f, "const {}: &[u8] = {:?};", sanitized_name, hash).unwrap();
+        writeln!(f, "const {}: &[u8] = &{:?};", sanitized_name, hash).unwrap();
     }
     writeln!(
         f,
