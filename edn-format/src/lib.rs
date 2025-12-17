@@ -1419,7 +1419,7 @@ impl Display for Value {
                 write!(f, "{}", i)?;
             }
             Value::Float(fl) => {
-                write!(f, "{}", fl)?;
+                write!(f, "{:?}", fl.into_inner())?; // use Debug, or else 10.0 prints as 10
             }
             Value::BigInt(bi) => {
                 write!(f, "{}N", bi)?;

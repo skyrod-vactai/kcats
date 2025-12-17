@@ -380,7 +380,7 @@ internally, to keep track of things like the stack, program, lists etc.
   pub struct Word {
       pub data: Intern<String>,
       pub quoted: bool,
-      pub namespace: dict::Namespace,
+      pub namespace: Option<dict::Namespace>,
   }
 
   impl fmt::Debug for Word {
@@ -3875,6 +3875,7 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::axiom;
   use crate::axiom::BUILTIN_FUNCTIONS;
   use crate::serialize;
+  use crate::stdlib_hashes;
   use crate::traits::*;
   use crate::types::container::associative::Convert;
   use crate::types::container::{self as coll, Count, Mutey};
@@ -4008,10 +4009,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
   impl Derive<Namespace> for Item {
       fn derive(ns: Namespace) -> Item {
-          match ns {
-              Some(ns) => (*ns).clone().fit(),
-              None => Item::default(),
-          }
+          (*ns).clone().fit()
       }
   }
 
@@ -4034,7 +4032,7 @@ internally, to keep track of things like the stack, program, lists etc.
                       Executable::Axiom(a) => a.clone().fit(),
                       Executable::Derived(d) => d.fit(),
                   }),
-                  "namespace" => self.namespace.map(|x| x.as_ref().clone().fit()),
+                  "namespace" => Some(self.namespace.fit()),
                   "doc" => self.doc.clone().map(|x| x.fit()),
                   _ => None,
               },
@@ -4049,13 +4047,13 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   // TODO: Use the builtin Bytes type
-  pub type Namespace = Option<Intern<Vec<u8>>>;
+  pub type Namespace = Intern<Vec<u8>>;
 
   pub fn bytes_to_ns(b: Bytes) -> Namespace {
       if b.is_empty() {
           Default::default()
       } else {
-          Some(Intern::new(b))
+          Intern::new(b)
       }
   }
 
@@ -4088,11 +4086,11 @@ internally, to keep track of things like the stack, program, lists etc.
       pub words: Words,
       pub lingo: Words,
       pub modules: Vec<Namespace>,
-      pub loaded_modules: HashSet<Namespace>,
   }
 
   /// A namespace for the core functions
   pub static CORE: OnceLock<Namespace> = OnceLock::new();
+  pub static CORE_NAMESPACES: OnceLock<HashMap<&'static str, Namespace>> = OnceLock::new();
 
   /// A custom impl for Dictionary that doesn't dump a massive data
   /// structure. comment this out to get access to the full debug output.
@@ -4113,7 +4111,7 @@ internally, to keep track of things like the stack, program, lists etc.
               assoc::KeyItem::Word(w) => match w.data.as_str() {
                   "words" => Some(self.words.clone().fit()),
                   "modules" => Some(self.modules.clone().fit()),
-                  //"lingo" => Some(self.lingo.clone().fit()),
+                  "lingo" => Some(self.lingo.clone().fit()),
                   _ => None,
               },
               _ => None,
@@ -4132,7 +4130,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
       pub fn merge(&mut self, new: Self, namespace: &Namespace) {
           self.words.merge(new.words, namespace);
-          //self.resolve();
+          self.resolve();
       }
 
       pub fn contains_key(&self, key: &assoc::KeyItem) -> bool {
@@ -4148,16 +4146,19 @@ internally, to keep track of things like the stack, program, lists etc.
               let mut grouped: HashMap<Namespace, Vec<(types::Word, Entry)>> = HashMap::new();
 
               for (k, v) in words.iter() {
-                  grouped.entry(k.namespace).or_default().push((
-                      {
-                          // Block out the namespace, since we want to
-                          // find the word using no namespace
-                          let mut kk = k.clone();
-                          kk.namespace = None;
-                          kk
-                      },
-                      v.clone(),
-                  ));
+                  grouped
+                      .entry(k.namespace.unwrap_or_default())
+                      .or_default()
+                      .push((
+                          {
+                              // Block out the namespace, since we want to
+                              // find the word using no namespace
+                              let mut kk = k.clone();
+                              kk.namespace = None;
+                              kk
+                          },
+                          v.clone(),
+                      ));
               }
               grouped
           }
@@ -4165,14 +4166,12 @@ internally, to keep track of things like the stack, program, lists etc.
           //println!("by namespace: {:?}", by_ns);
           let mut cache = Words::fresh();
           let mcache = cache.mutate();
-          // first all the non-namespaced core words that can be overridden
-          mcache.extend(by_ns.get(&None).cloned().unwrap_or_default());
+
           for module in self.modules.iter() {
               //println!("Adding {:?} to cache", module);
               mcache.extend(by_ns.get(module).cloned().unwrap_or_default())
           }
 
-          self.loaded_modules = by_ns.keys().cloned().collect();
           // println!(
           //     "Cache now selected {} words. modules: {:?}",
           //     cache.len(),
@@ -4199,13 +4198,13 @@ internally, to keep track of things like the stack, program, lists etc.
   pub trait Dict {
       /// Returns the difference between this dictionary and a "newer"
       /// one: The additions/updates, and the deletions.
-      fn diff(&self, newer: Words) -> (Vec<(Word, Entry)>, Vec<Word>);
+      fn diff(&self, newer: &Words) -> (Vec<(Word, Entry)>, Vec<Word>);
 
       /// Takes a core module (in string form - should contain a series
       /// of word definitions, not wrapped in a single list), and
       /// inserts all the definitions into the dictionary, with an
       /// optional namespace.
-      fn insert_core_module(&mut self, lexicon: String) -> Result<(), Error>;
+      fn insert_core_module(&mut self, lexicon: String) -> Result<Namespace, Error>;
 
       /// For stdlib words that are both built-in and part of a module
       /// that isn't necessarily loaded as part of the standard
@@ -4231,113 +4230,154 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  use sha2::{self, Digest};
+
+  fn hash(s: String) -> Vec<u8> {
+      sha2::Sha256::digest(s.as_bytes()).to_vec()
+  }
+
+  /// Instead of blindly extending dictionaries, we don't overwrite
+  /// entries that are axiom word defs. The idea is that when there is
+  /// an existing key that is an axiom word, and then we get a new value
+  /// that's also an axiom (no definition) - we don't overwrite the
+  /// existing definition
+  fn merge_entries(orig: &mut Entry, new: Entry) {
+      orig.examples = new.examples;
+      orig.spec = new.spec;
+      orig.doc = new.doc;
+      // Don't overwrite namespace, should be the same anyway.  Don't
+      // blindly overwrite the definition, this could be an axiom word
+      // where we've left the definition out, and we're merging with the
+      // builtin, now that we've read the lexicon. The definition is the
+      // builtin and we want to keep that.
+      match (orig.definition.clone(), new.definition) {
+          (Executable::Axiom(_), _) => {} // don't overwrite
+          (_, Executable::Derived(d)) => {
+              orig.definition = Executable::Derived(d); // both derived? overwrite
+          }
+          (Executable::Derived(_), _) => {} // don't overwrite a derived with axiom, security issue
+      }
+  }
+
+  /// Merge hashmaps with an entry merging function, similar to
+  /// "merge-with" in some other languages.
+  fn merge_smart<K, V, F>(base: &mut HashMap<K, V>, incoming: HashMap<K, V>, merger: F)
+  where
+      K: Eq + Hash,
+      F: Fn(&mut V, V), // Takes mutable reference to old, owned new
+  {
+      for (key, new_val) in incoming {
+          match base.entry(key) {
+              // Case 1: Key exists. We have mutable access to old value.
+              // We pass ownership of `new_val` to the merger.
+              std::collections::hash_map::Entry::Occupied(mut entry) => {
+                  merger(entry.get_mut(), new_val);
+              }
+              // Case 2: Key does not exist.
+              // We insert `new_val` directly.
+              std::collections::hash_map::Entry::Vacant(entry) => {
+                  entry.insert(new_val);
+              }
+          }
+      }
+  }
+
   impl Dict for Words {
-      fn diff(&self, newer: Words) -> (Vec<(Word, Entry)>, Vec<Word>) {
+      fn diff(&self, newer: &Words) -> (Vec<(Word, Entry)>, Vec<Word>) {
           diff_hashmaps(self, &newer)
       }
 
       fn merge(&mut self, new: Words, namespace: &Namespace) {
-          let (adds, deletes) = self.diff(new);
+          let (adds, _) = self.diff(&new);
           // add namepaces to the adds and deletes
           //println!("Merge {} adds, {} deletes", adds.len(), deletes.len());
 
-          let adds: Vec<_> = adds
+          let adds: HashMap<Word, Entry> = adds
               .into_iter()
               .map(|(mut w, mut e)| {
-                  w.namespace = *namespace;
+                  w.namespace = Some(*namespace);
                   e.namespace = *namespace;
                   //println!("Adding {:?}", w);
                   (w, e)
               })
               .collect();
-          let deletes: Vec<_> = deletes
-              .into_iter()
-              .map(|mut w| {
-                  w.namespace = *namespace;
-                  w
-              })
-              .collect();
-          let d = self.mutate();
-
-          d.extend(adds);
-          d.extend(make_deletes(deletes));
-
-          //println!("Contains: {:?}", d.get(&"contains?".fit()))
+          let sm = self.mutate();
+          merge_smart(sm, adds, merge_entries);
       }
 
-      fn insert_core_module(&mut self, lexicon: String) -> Result<(), Error> {
+      /// Load core modules. For now, we cheat and assume it's in the
+      /// format of `[list-of-definitions] join`, and we don't actually
+      /// evaluate the join like we will do later in bootstrapping.
+      fn insert_core_module(&mut self, lexicon: String) -> Result<Namespace, Error> {
           //println!("Parsing: {}", lexicon);
-          let core = CORE.get().unwrap();
-          let items = serialize::parse(lexicon)?;
+          let dict = self.mutate();
+
+          let hash = hash(lexicon.clone());
+          let namespace = Intern::new(hash);
+          let items = serialize::parse(lexicon)?
+              .pop_front()
+              .ok_or_else(|| Error::short_list(1))
+              .and_then(|i| coll::List::try_derive(i))?;
           for r in Box::new(items.iter().cloned()) {
               let (k, def): (assoc::KeyItem, Item) = r.try_fit().unwrap();
               let mut word: Word = k.try_fit().unwrap();
-              word.namespace = *core;
+              word.namespace = Some(namespace);
               let iter: Box<dyn Iterator<Item = Item>> = def.try_fit().unwrap();
               let new_entry: Entry = iter.try_fit().unwrap();
               let new_entry2 = new_entry.clone();
-              let dict = self.mutate();
+
               dict.entry(word)
                   .and_modify(|e| {
                       e.examples = new_entry.examples;
                       e.spec = new_entry.spec;
                       e.doc = new_entry.doc;
-                      e.namespace = *core;
+                      e.namespace = namespace;
                       // Don't overwrite the definition, this should be
                       // an axiom word where we've left the
                       // spec/examples temporarily blank and we're
                       // filling them in now that we've read the
                       // lexicon. The definition is the builtin and we
                       // want to keep that.
-                      //e.definition = new_entry.definition;
+                      e.definition = match (e.definition.clone(), new_entry.definition) {
+                          (Executable::Axiom(a), _) => Executable::Axiom(a),
+                          (_, Executable::Derived(d)) => Executable::Derived(d),
+                          (Executable::Derived(d), _) => Executable::Derived(d), //(None, None) => None
+                      }
                   })
                   .or_insert(new_entry2);
           }
-          Ok(())
+
+          Ok(namespace)
       }
 
       fn builtins() -> Self {
-          let core = CORE.get_or_init(|| Some(Intern::new(vec![114, 138, 222]))); // base64 encodes to "core"
+          // base64 encodes to "core"
+          let core_nss = CORE_NAMESPACES.get_or_init(|| {
+              stdlib_hashes::get_manifest()
+                  .into_iter()
+                  .map(|(k, v)| {
+                      // Convert &'static [u8] -> Vec<u8> -> Intern<Vec<u8>>
+                      (k, Intern::new(v.to_vec()))
+                  })
+                  .collect()
+          });
           let mut dict = HashMap::new();
           for (bw, bd) in BUILTIN_FUNCTIONS.iter() {
+              let ns = core_nss.get(bw.data.as_str()).unwrap();
               let entry = Entry {
                   definition: bd.clone(),
                   examples: None,
                   spec: None,
-                  namespace: None,
+
+                  namespace: ns.clone(),
                   doc: None,
               };
               let mut bw = bw.clone();
-              bw.namespace = *core;
-              dict.insert(Word::derive(bw.clone()), entry);
+              bw.namespace = Some(*ns);
+              dict.insert(bw.clone(), entry);
           }
           Arc::new(dict)
       }
-  }
-
-  /// Each word should run a program that calls fail (already namespaced
-  /// to the stdlib so that the word acts like it isn't in the dictionary
-  /// even though it is.)
-  fn make_deletes(words: Vec<Word>) -> Vec<(Word, Entry)> {
-      words
-          .into_iter()
-          .map(|word| {
-              //println!("Shadowing word: {:?}", word);
-              let err = Error::create(
-                  list!(types::Word::derive(word.clone())),
-                  "word removed by module",
-                  Some::<Item>(fit!("access-denied")),
-              );
-              let entry = Entry {
-                  examples: None,
-                  spec: None,
-                  definition: Executable::Derived(list!(err, "fail")),
-                  namespace: word.namespace,
-                  doc: None,
-              };
-              (word, entry)
-          })
-          .collect()
   }
 
   /// Returns an owned pair given a pair of references
@@ -4384,6 +4424,7 @@ internally, to keep track of things like the stack, program, lists etc.
       type Error = Infallible;
       fn join(mut self, other: Self) -> Result<Self::Output, Self::Error> {
           self.words = self.words.join(other.words)?;
+          self.resolve();
           Ok(self)
       }
   }
@@ -4482,9 +4523,7 @@ internally, to keep track of things like the stack, program, lists etc.
           if let Some(d) = self.doc {
               v.push((fit!("doc"), d.fit()))
           }
-          if let Some(n) = self.namespace {
-              v.push((fit!("namespace"), n.as_ref().clone().fit()))
-          }
+          v.push((fit!("namespace"), self.namespace.as_ref().clone().fit()));
           Box::new(v.into_iter())
       }
   }
@@ -4497,7 +4536,7 @@ internally, to keep track of things like the stack, program, lists etc.
           let v: Vec<(assoc::KeyItem, Item)> = vec![
               (fit!("words"), self.words.fit()),
               (fit!("modules"), self.modules.fit()),
-              //("lingo".fit(), self.lingo.fit()),
+              (fit!("lingo"), self.lingo.fit()),
           ];
           Box::new(v.into_iter())
       }
@@ -4510,7 +4549,7 @@ internally, to keep track of things like the stack, program, lists etc.
           let mut examples: Option<coll::List> = None;
           let mut definition: Option<Executable> = None;
           let mut spec: Option<Spec> = None;
-          let mut namespace: Namespace = None;
+          let mut namespace: Namespace = Default::default();
           let mut doc: Option<String> = None;
           for i in iter {
               let (k, v): (assoc::KeyItem, Item) = i.try_fit()?;
@@ -4561,7 +4600,7 @@ internally, to keep track of things like the stack, program, lists etc.
               //println!("k: {:?}, v: {:?}", k, v);
               if k == fit!("words") {
                   words = v.try_fit()?;
-              } else if k == fit!("ss modules") {
+              } else if k == fit!("modules") {
                   modules = v.try_fit()?;
               } else {
                   continue;
@@ -4571,7 +4610,6 @@ internally, to keep track of things like the stack, program, lists etc.
               words,
               modules,
               lingo: Default::default(),
-              loaded_modules: Default::default(),
           };
           dict.resolve();
           Ok(dict)
@@ -4601,8 +4639,8 @@ internally, to keep track of things like the stack, program, lists etc.
           d.examples.and_then(|l| a.insert(fit!("examples"), l.fit()));
           d.spec.and_then(|l| a.insert(fit!("spec"), l.fit()));
           d.doc.and_then(|l| a.insert(fit!("doc"), l.fit()));
-          d.namespace
-              .and_then(|l| a.insert(fit!("namespace"), l.as_ref().clone().fit()));
+          a.insert(fit!("namespace"), d.namespace.as_ref().clone().fit());
+
           if let Executable::Derived(d) = d.definition {
               a.insert(fit!("definition"), d.fit());
           }
@@ -4856,29 +4894,32 @@ internally, to keep track of things like the stack, program, lists etc.
               include_bytes!("../../kcats/core/strings-builtins.kcats"),
               include_bytes!("../../kcats/core/errors-builtins.kcats"),
               include_bytes!("../../kcats/core/pipes-builtins.kcats"),
-              include_bytes!("../../kcats/core/stack.kcats"),
-              include_bytes!("../../kcats/core/motion.kcats"),
               include_bytes!("../../kcats/core/collections-builtins.kcats"),
               include_bytes!("../../kcats/core/execute-builtins.kcats"),
-              include_bytes!("../../kcats/core/execute.kcats"),
               include_bytes!("../../kcats/core/dictionary-builtins.kcats"),
-              include_bytes!("../../kcats/core/math.kcats"),
-              include_bytes!("../../kcats/core/compare.kcats"),
-              include_bytes!("../../kcats/core/collections.kcats"),
               include_bytes!("../../kcats/core/associations-builtins.kcats"),
-              include_bytes!("../../kcats/core/associations.kcats"),
-              include_bytes!("../../kcats/core/dictionary.kcats"),
               include_bytes!("../../kcats/core/environment-builtins.kcats"),
-              include_bytes!("../../kcats/core/environment.kcats"),
               include_bytes!("../../kcats/core/sets-builtins.kcats"),
+              include_bytes!("../../kcats/stdlib/stack.kcats"),
+              include_bytes!("../../kcats/stdlib/motion.kcats"),
+              include_bytes!("../../kcats/stdlib/execute.kcats"),
+              include_bytes!("../../kcats/stdlib/math.kcats"),
+              include_bytes!("../../kcats/stdlib/compare.kcats"),
+              include_bytes!("../../kcats/stdlib/collections.kcats"),
+              include_bytes!("../../kcats/stdlib/associations.kcats"),
+              include_bytes!("../../kcats/stdlib/dictionary.kcats"),
+              include_bytes!("../../kcats/stdlib/environment.kcats"),
           ];
 
           for &file_contents in &files {
-              let lexicon = String::from_utf8_lossy(file_contents).into_owned();
-              match self.dictionary.words.insert_core_module(lexicon.clone()) {
-                  Ok(_) => {}
+              let module =
+                  edn_format::canonicalize(String::from_utf8_lossy(file_contents).into_owned())?;
+              match self.dictionary.words.insert_core_module(module.clone()) {
+                  Ok(namespace) => {
+                      self.dictionary.modules.push(namespace);
+                  }
                   Err(mut e) => {
-                      e.push(fit!("content"), lexicon.fit());
+                      e.push(fit!("content"), module.fit());
                       return Err(e);
                   }
               }
@@ -4934,33 +4975,28 @@ internally, to keep track of things like the stack, program, lists etc.
       pub fn is_finished(&self) -> bool {
           self.program.is_empty()
       }
-  }
 
-  /// A reducing function that loads modules one at a time. Takes an
-  /// existing env, loads the given module and returns the new env with
-  /// the dictionary that the module built on the stack.
-  fn load_module(mut env: Environment, module: &Word) -> Environment {
-      //println!("Loading module {:?}", module);
-      //println!("Cache: {:?}", env.dictionary.lingo);
-      env.push(module.clone());
-      //println!("Loading module (should be empty?): {:?}", env.program);
-      env.program.prepend(list!(
-          "dictionary",
-          "🔀",
-          list!("module", list!("words"), "🔀", "update"),
-          "•🛡️",
-          "▶️",
-          "•🗑️"
-      ));
-      //println!("Env: {:?}", env);
-      //println!("Dictionary: {:?}", env.dictionary);
-      let mut new_env = futures::executor::block_on(async move { axiom::eval(env).await });
-      //println!("Env: {:?}", new_env);
-      let mut dict: dict::Dictionary = new_env.pop().try_fit().unwrap();
-      dict.resolve();
-      new_env.dictionary = dict;
-      //println!("loaded module {}: {:?}", module, new_env.dictionary);
-      new_env
+      /// A reducing function that loads modules one at a time. Takes an
+      /// existing env, loads the given module and returns the new env with
+      /// the modified dictionary that the module built.
+      pub fn load_module(mut self, module: Item, is_using: bool) -> Environment {
+          //println!("Loading module {:?}", module);
+          //println!("Cache: {:?}", env.dictionary.lingo);
+          self.push(module.clone());
+          self.push(is_using);
+          //println!("Loading module (should be empty?): {:?}", env.program);
+          self.program
+              .prepend(list!("dictionary", "⚓", "pair", "🎁", "using"));
+          //println!("Env: {:?}", self);
+          //println!("Dictionary: {:?}", self.dictionary);
+          self = futures::executor::block_on(async move { axiom::eval(self).await });
+          //println!("Env: {:?}", new_env);
+          let mut dict: dict::Dictionary = self.pop().try_fit().unwrap();
+          dict.resolve();
+          self.dictionary = dict;
+          //println!("loaded module {:?}: {:?}", module, self.dictionary);
+          self
+      }
   }
 
   impl Default for Environment {
@@ -4975,7 +5011,6 @@ internally, to keep track of things like the stack, program, lists etc.
                       words: dict::Words::builtins(),
                       modules: Default::default(),
                       lingo: dict::Words::fresh(),
-                      loaded_modules: Default::default(),
                   },
                   stack: Default::default(),
                   program: Default::default(),
@@ -4984,8 +5019,9 @@ internally, to keep track of things like the stack, program, lists etc.
               env.load_core_modules()
                   .expect("failed to load core modules");
               // add core module as default module
-              env.dictionary.modules.push(*dict::CORE.get().unwrap());
+
               env.dictionary.resolve();
+              // println!("starting dictionary: {:?}", env.dictionary.modules);
               //println!("Dict has {} words", env.dictionary.entries.len());
               let mut env = [
                   fit!("errors"),
@@ -4995,11 +5031,12 @@ internally, to keep track of things like the stack, program, lists etc.
                   fit!("methods"),
                   fit!("generators"),
                   fit!("debug"),
+                  fit!("crypto-builtins"),
                   //"more-generators",
                   //"database",
               ]
-              .iter()
-              .fold(env, load_module);
+              .into_iter()
+              .fold(env, |env, module| env.load_module(module, true));
               // println!(
               //     "After loading modules Dict has {} words",
               //     env.dictionary.entries.len()
@@ -5008,6 +5045,7 @@ internally, to keep track of things like the stack, program, lists etc.
               // above, need to add the rust definitions back that got
               // overwritten.
               env.dictionary.resolve();
+
               //print!("Env: {:?}", env);
               env
           });
@@ -5143,6 +5181,7 @@ internally, to keep track of things like the stack, program, lists etc.
           Ok(env)
       }
   }
+
   impl TryDerive<Item> for Environment {
       fn try_derive(i: Item) -> Result<Self, DeriveError<Item>> {
           //println!("Convert to env: {:?}", i);
@@ -6532,7 +6571,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("resolve", Box::leak(Box::new(resolve))),
           ("reverse", Box::leak(Box::new(f_stack1(reverse)))),
           ("round", Box::leak(Box::new(f_stack1(ok1(round))))),
-          ("second", Box::leak(Box::new(f_stack1(ok1(second))))),
           (
               "sender",
               Box::leak(Box::new(f_stack1(crate::types::container::pipe::channel::sender))),
@@ -6831,10 +6869,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   //     let (_, i) = c.take();
   //     Ok(i.fit())
   // }
-
-  pub fn second(c: coll::List) -> Item {
-      c.get(1).cloned().unwrap_or_default()
-  }
 
   pub fn last(c: coll::Sized) -> Item {
       c.into_iter().last().unwrap_or_default()
@@ -7862,7 +7896,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   env.pop_prog();
                   env.pop();
                   if let Some(e) = env.dictionary.lingo.get(&w) {
-                      w.namespace = e.namespace;
+                      w.namespace = Some(e.namespace);
                   }
                   env.push(w);
               }
@@ -8299,6 +8333,7 @@ rust project or some other language through FFI.
   mod crypto;
   //mod enumtest;
   pub mod serialize;
+  pub mod stdlib_hashes;
   pub mod traits;
   pub mod types;
 
@@ -8527,12 +8562,12 @@ rust project or some other language through FFI.
       //use super::error::Error;
       //use super::*;
       use crate::axiom;
-      use crate::list;
       use crate::serialize::Emit;
       use crate::traits::*;
       use crate::types::container as coll;
       use crate::types::container::{environment::Environment, error::Error};
       use crate::types::{Item, Word};
+      use crate::{fit, list};
 
       use test_case::test_case;
 
@@ -8663,179 +8698,175 @@ rust project or some other language through FFI.
           }
       }
 
+      fn test_lexicon(word: &str, modules: Vec<Item>) {
+          crate::config::configure_platform();
+          let mut e = Environment::default();
+          e = modules
+              .iter()
+              .fold(e, |env, module| env.load_module(module.clone(), true));
+          let r = test_word(e.clone(), word.try_fit().unwrap());
+          assert!(r.is_empty(), "{:?}", r);
+      }
+
+      #[test_case("*" ; "mult")]
       #[test_case("+" ; "plus")]
       #[test_case("-" ; "minus")]
-      #[test_case("=" ; "eq")]
-      #[test_case(">" ; "gt")]
-      #[test_case(">=" ; "gte")]
-      #[test_case("<" ; "lt")]
-      #[test_case("<=" ; "lte")]
-      #[test_case("*" ; "mult")]
       #[test_case("/" ; "divide")]
+      #[test_case("=" ; "eq")]
       #[test_case("abs")]
-      #[test_case("addmethod")]
       #[test_case("and")]
-      #[test_case("📣" ; "is_any")]
-      #[test_case("assemble")]
       #[test_case("assign")]
       #[test_case("association")]
-      #[test_case("assocify")]
       #[test_case("association?" ; "is_association")]
-      #[test_case("bail")]
-      #[test_case("bailer")]
-      #[test_case("between?"; "is_between")]
-      #[test_case("bits")]
-      #[test_case("both?" ; "is_both")]
-      #[test_case("both")]
-      #[test_case("↔️" ; "branch")]
-      #[test_case("butlast")]
+      #[test_case("autoformat")]
       #[test_case("bytes?" ; "is_bytes")]
-      #[test_case("catcher")]
       #[test_case("ceiling")]
       #[test_case("character")]
-      #[test_case("👥" ; "clone")]
-      #[test_case("•👥" ; "clonedown")]
-      #[test_case("••👥" ; "clonedeep")]
-      #[test_case("collect")]
-      //#[test_case("combinations")]
       #[test_case("compare")]
-      #[test_case("🎭" ; "complement")]
       #[test_case("contains?" ; "contains")]
-      #[test_case("📏" ; "count")]
-      #[test_case("cram")]
       #[test_case("cut")]
       #[test_case("dec")]
-      #[test_case("decide")]
       #[test_case("decodejson")]
-      #[test_case("definition")]
       #[test_case("difference")]
-      #[test_case("🪄" ; "dip")]
-      #[test_case("•🪄" ; "dipdown")]
-      #[test_case("••🪄" ; "dipdeep")]
-      #[test_case("🐋" ; "dive")]
-      #[test_case("•🐋" ; "divedown")]
-      #[test_case("••🐋" ; "divedeep")]
-      //#[test_case("draft")]
-      #[test_case("🗑️" ; "drop")]
-      #[test_case("•🗑️" ; "dropdown")]
-      #[test_case("••🗑️" ; "dropdeep")]
-      #[test_case("dropper")]
-      #[test_case("each")]
       #[test_case("emit")]
-      #[test_case("ends?" ; "is_ends")]
-      #[test_case("encode")]
+      #[test_case("empty")]
+      #[test_case("empty?" ; "is_empty")]
       #[test_case("encodejson")]
-      #[test_case("encodeitem")]
       #[test_case("environment")]
       #[test_case("environment?" ; "is_environment")]
-      #[test_case("evaluate")]
       #[test_case("eval-step")]
+      #[test_case("evaluate")]
       #[test_case("even?" ; "is_even")]
-      #[test_case("🧦" ; "evert")]
-      #[test_case("💯" ; "is_every")]
-      #[test_case("▶️"; "execute")]
       #[test_case("exp")]
-      #[test_case("🧲" ; "filter")]
       #[test_case("finished?" ; "is_finished")]
-      #[test_case("first")]
-      #[test_case("flatten")]
-      #[test_case("flip")]
-      #[test_case("🛟" ; "float")]
       #[test_case("floor")]
-      #[test_case("fold")]
-      #[test_case("fork")]
       #[test_case("format")]
-      #[test_case("frequencies")]
-      #[test_case("future")]
       #[test_case("get")]
-      #[test_case("group")]
       #[test_case("hashbytes")]
-      #[test_case("⚖️" ; "_if")]
       #[test_case("inc")]
-      #[test_case("indexed")]
-      #[test_case("indexer")]
-      #[test_case("indexof")]
-      #[test_case("💉" ; "inject")]
-      //#[test_case("inscribe")]
       #[test_case("integer?" ; "is_integer")]
-      #[test_case("interpose")]
       #[test_case("intersection")]
-      #[test_case("🧹" ; "into")]
-      #[test_case("🔗" ; "join")]
-      #[test_case("joiner")]
-      #[test_case("🤹" ; "juggle")]
-      #[test_case("keep")]
-      #[test_case("label")]
-      #[test_case("let")]
-      #[test_case("list?" ; "is_list")]
-      #[test_case("🔍")]
-      #[test_case("🌀"; "_loop")]
       #[test_case("log")]
-      #[test_case("🚜" ; "map")]
-      #[test_case("🧤" ; "_match")]
-      #[test_case("max")]
-      #[test_case("max-by")]
-      #[test_case("min")]
-      #[test_case("min-by")]
       #[test_case("mod")]
-      #[test_case("module")]
-      #[test_case("☯️" ; "not")]
-      #[test_case("empty?" ; "is_empty")]
       #[test_case("namespace")]
       #[test_case("number")]
-      #[test_case("number?" ; "is_number")]
       #[test_case("odd?" ; "is_odd")]
       #[test_case("or")]
-      #[test_case("over")]
-      #[test_case("🎒" ; "pack")]
-      #[test_case("pad")]
-      #[test_case("pair?" ; "is_pair")]
-      #[test_case("parse")]
       #[test_case("parse-edn")]
       #[test_case("parse-utf8")]
-      #[test_case("partition")]
       #[test_case("pipe?" ; "is_pipe")]
-      #[test_case("📮" ; "put")]
-      #[test_case("•📮" ; "putdown")]
-      #[test_case("••📮" ; "putdeep")]
-      #[test_case("prepend")]
-      #[test_case("primrec")]
-      #[test_case("produce")]
-      #[test_case("radix")]
+      #[test_case("pop")]
+      #[test_case("quot")]
       #[test_case("range")]
-      #[test_case("reap")]
-      #[test_case("🩹" ; "recovery")]
-      #[test_case("🪆" ; "recur")]
-      #[test_case("🪗" ; "reduce")]
+      #[test_case("read")]
+      //#[test_case("rem")]
       #[test_case("remove")]
-      #[test_case("repetition")]
-      #[test_case("rest")]
       #[test_case("resolve")]
-      #[test_case("restore")]
-      #[test_case("retry")]
       #[test_case("reverse")]
       #[test_case("round")]
       #[test_case("set")]
       #[test_case("set?" ; "is_set")]
-      #[test_case("🛡️" ; "shield")]
-      #[test_case("•🛡️" ; "shielddown")]
-      #[test_case("••🛡️" ; "shielddeep")]
-      #[test_case("⚓" ; "sink")]
-      #[test_case("skipper")]
       #[test_case("slice")]
-      #[test_case("📸" ; "snapshot")]
-      #[test_case("something?" ; "is_something")]
       #[test_case("sqrt")]
-      #[test_case("starts?" ; "is_starts")]
-      #[test_case("🪜" ; "step")]
       #[test_case("string")]
       #[test_case("string?" ; "is_string")]
+      #[test_case("unnamespace")]
+      #[test_case("word")]
+      #[test_case("word?" ; "is_word")]
+      #[test_case("zero?" ; "is_zero")]
+      #[test_case("••🔀" ; "swapdeep")]
+      #[test_case("•🔀" ; "swapdown")]
+      #[test_case("↔️" ; "branch")]
+      #[test_case("▶️"; "execute")]
+      #[test_case("☯️" ; "not")]
+      #[test_case("⚓" ; "sink")]
+      #[test_case("⛏️" ; "unpack")]
+      #[test_case("🍫" ; "unwrap")]
+      #[test_case("🎒" ; "pack")]
+      #[test_case("👥" ; "clone")]
+      #[test_case("📏" ; "count")]
+      #[test_case("📤" ; "take")]
+      #[test_case("📮" ; "put")]
+      #[test_case("📸" ; "snapshot")]
+      #[test_case("🔀" ; "swap")]
+      #[test_case("🔗" ; "join")]
+      #[test_case("🗑️" ; "drop")]
+      #[test_case("🛟" ; "float")]
+      #[test_case("🧦" ; "evert")]
+      #[test_case("🪄" ; "dip")]
+      #[test_case["last"]]
+      fn test_axiom(word: &str) {
+          test_lexicon(word, vec![])
+      }
+
+      #[test_case("<" ; "lt")]
+      #[test_case("<=" ; "lte")]
+      #[test_case(">" ; "gt")]
+      #[test_case(">=" ; "gte")]
+      #[test_case("addmethod")]
+      #[test_case("assemble")]
+      #[test_case("assocify")]
+      #[test_case("bail")]
+      #[test_case("bailer")]
+      #[test_case("between?"; "is_between")]
+      #[test_case("bits")]
+      #[test_case("both")]
+      #[test_case("both?" ; "is_both")]
+      #[test_case("butlast")]
+      #[test_case("catcher")]
+      #[test_case("collect")]
+      #[test_case("cram")]
+      #[test_case("decide")]
+      #[test_case("definition")]
+      #[test_case("dropper")]
+      #[test_case("each")]
+      #[test_case("empty?" ; "is_empty")]
+      #[test_case("encode")]
+      #[test_case("encodeitem")]
+      #[test_case("ends?" ; "is_ends")]
+      #[test_case("first")]
+      #[test_case("flatten")]
+      #[test_case("flip")]
+      #[test_case("fold")]
+      #[test_case("fork")]
+      #[test_case("frequencies")]
+      #[test_case("future")]
+      #[test_case("group")]
+      #[test_case("indexed")]
+      #[test_case("indexer")]
+      #[test_case("indexof")]
+      #[test_case("interpose")]
+      #[test_case("joiner")]
+      #[test_case("keep")]
+      #[test_case("label")]
+      #[test_case("let")]
+      #[test_case("list?" ; "is_list")]
+      #[test_case("max")]
+      #[test_case("max-by")]
+      #[test_case("min")]
+      #[test_case("min-by")]
+      #[test_case("module")]
+      #[test_case("number?" ; "is_number")]
+      #[test_case("over")]
+      #[test_case("pad")]
+      #[test_case("pair?" ; "is_pair")]
+      #[test_case("parse")]
+      #[test_case("partition")]
+      #[test_case("prepend")]
+      #[test_case("primrec")]
+      #[test_case("produce")]
+      #[test_case("radix")]
+      #[test_case("reap")]
+      #[test_case("repetition")]
+      #[test_case("rest")]
+      #[test_case("restore")]
+      #[test_case("retry")]
+      #[test_case("second")]
+      #[test_case("skipper")]
+      #[test_case("something?" ; "is_something")]
       #[test_case("spawn")]
       #[test_case("splitter")]
-      #[test_case("🔀" ; "swap")]
-      #[test_case("•🔀" ; "swapdown")]
-      #[test_case("••🔀" ; "swapdeep")]
-      #[test_case("📤" ; "take")]
+      #[test_case("starts?" ; "is_starts")]
       #[test_case("taker")]
       #[test_case("times")]
       #[test_case("top")]
@@ -8843,29 +8874,55 @@ rust project or some other language through FFI.
       #[test_case("type")]
       #[test_case("unassign")]
       #[test_case("under")]
-      #[test_case("unnamespace")]
       #[test_case("until")]
-      #[test_case("⛏️" ; "unpack")]
-      #[test_case("🍫" ; "unwrap")]
       #[test_case("update")]
       #[test_case("using")]
       #[test_case("value")]
       #[test_case("walk")]
       #[test_case("when")]
-      #[test_case("⏳" ; "_while")]
       #[test_case("within?" ; "is_within")]
-      #[test_case("word")]
-      #[test_case("word?" ; "is_word")]
-      #[test_case("🎁" ; "wrap")]
       #[test_case("xor")]
-      #[test_case("zero?" ; "is_zero")]
       #[test_case("zip")]
-      fn test_lexicon(word: &str) {
-          crate::config::configure_platform();
-          let e = Environment::default();
+      #[test_case("••🐋" ; "divedeep")]
+      #[test_case("••👥" ; "clonedeep")]
+      #[test_case("••📮" ; "putdeep")]
+      #[test_case("••🗑️" ; "dropdeep")]
+      #[test_case("••🛡️" ; "shielddeep")]
+      #[test_case("••🪄" ; "dipdeep")]
+      #[test_case("•🐋" ; "divedown")]
+      #[test_case("•👥" ; "clonedown")]
+      #[test_case("•📮" ; "putdown")]
+      #[test_case("•🗑️" ; "dropdown")]
+      #[test_case("•🛡️" ; "shielddown")]
+      #[test_case("•🪄" ; "dipdown")]
+      #[test_case("⏳" ; "_while")]
+      #[test_case("⚖️" ; "_if")]
+      #[test_case("🌀"; "_loop")]
+      #[test_case("🎁" ; "wrap")]
+      #[test_case("🎭" ; "complement")]
+      #[test_case("🐋" ; "dive")]
+      #[test_case("💉" ; "inject")]
+      #[test_case("💯" ; "is_every")]
+      #[test_case("📣" ; "is_any")]
+      #[test_case("🔍")]
+      #[test_case("🚜" ; "map")]
+      #[test_case("🛡️" ; "shield")]
+      #[test_case("🤹" ; "juggle")]
+      #[test_case("🧤" ; "_match")]
+      #[test_case("🧲" ; "filter")]
+      #[test_case("🧹" ; "into")]
+      #[test_case("🩹" ; "recovery")]
+      #[test_case("🪆" ; "recur")]
+      #[test_case("🪗" ; "reduce")]
+      #[test_case("🪜" ; "step")]
+      fn test_derived(word: &str) {
+          test_lexicon(word, vec![])
+      }
 
-          let r = test_word(e.clone(), word.try_fit().unwrap());
-          assert!(r.is_empty(), "{:?}", r);
+      #[test_case("key")]
+      #[test_case("verify")]
+      fn test_crypto(word: &str) {
+          test_lexicon(word, vec![fit!("crypto-builtins")])
       }
   }
 #+end_src
@@ -11062,9 +11119,13 @@ significant bit position, eg 33 is 5
 : 253 #b64 "9xFLZf2AmWe7DRojlnYwLsBsq1Iz7mfo8BYH33X3FQ=="
 
 ** TODO Performance optimizations                             :optimization:
-*** CANCELED Compile programs
+*** TODO Compilation
+**** CANCELED initial exploration
+
 - State "CANCELED"   from "TODO"       [2025-08-11 Mon 15:49] \\
-  I don't think we're going to do this - it's too complex and making it truly fast would likely interfere with the language's flexibility.
+
+I don't think we're going to do this - it's too complex and making it
+truly fast would likely interfere with the language's flexibility.
 Here is how it could maybe be done. We already have a type StepFn
 (which takes an env and returns a new one, in a future).
 
@@ -11112,6 +11173,21 @@ complex would be fast, short of a full blown compiler. And then
 whatever compiler that is would have to be available at runtime on all
 platforms - so I can't just compile to C source because I would then
 have to ship a C compiler too.
+**** TODO Second attempt
+The way combinators work now in kcats (they don't execute, the just
+combine snippets), we can in fact implement the word compile, which
+would turn snippets into basically a Vec of rust fns ( fn (e:
+Environment) -> Environment ) and should contain a reference to the
+original list in case we want to treat it like a list later (like, for
+serialization).
+
+This saves the hashmap lookup cost, and otherwise should be
+transparent, except for the sprinkling of the word =compile= in
+combinators like if, map, loop, etc.
+
+One other necessary change would be in recur to stop using splicing -
+that undoes the compilation each iteration. Instead of =✂️4️⃣= we'd write =4️⃣
+▶️=.
 *** DONE Programs as their own immutable type
 - State "DONE"       from "TODO"       [2025-05-12 Mon 20:56]
 Programs executing in a loop are generally not modified (exception -
@@ -18464,3 +18540,194 @@ it's always [] due to the negation logic, so we don't need to pass it to the bod
 #+end_src
 ** INPROGRESS parse-edn should deliver chunks too
 - State "INPROGRESS" from "TODO"       [2025-10-23 Thu 07:49]
+** DONE Make axiom words testable separately
+- State "DONE"       from "INPROGRESS" [2025-12-14 Sun 22:33]
+- State "INPROGRESS" from "TODO"       [2025-12-12 Fri 19:17]
+When these are broken, we shouldn't bother with the rest
+** TODO Module loading by alias fixes
+#+begin_src kcats
+  dictionary
+  [[errors ✅]
+   [crypto []]]
+  [🍫 [[decache] 🛡️ ▶️ •🔀 inscribe] 🪄 •🔀 
+   [ 🗑️ [ [1️⃣] 🍫 📮] 🎒 [modules] 🔀 update] ;; use the newly loaded module if checked
+   [🗑️] ↔️ •🗑️ ] 🪜 ▶️ 
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[modules [#b64 "core" #b64 "Vb9Om_94ZoKOutE83MbeH5EXoGWDjqrs9_xtGg8f4kM" #b64 "bCR4VmWPLte5CjqODcEHz4w01LoeKR-DfxyA0IAZ4Ro"
+           #b64 "trOmyrhUW8QpePNjKQ6RGMkRl2Sd1u-lNrSL4Yg-5yc" #b64 "iNTmQssX0VW551Vnkcf_68I8elrtvUq2Xc7ZAupceDo"
+           #b64 "PcFAzMQBF-ouey_2Oln7hv8ewah8EBFLH2W3u1cNIvg" #b64 "WIAWT-eHEuTY4Kvqg7t2FnOj0C784Wju266OzQGqSe8"
+           #b64 "MOxo0jXIaLxOqyNpeD2PoF91dEs4Ez7nYbR89h4OlSQ" #b64 "Vb9Om_94ZoKOutE83MbeH5EXoGWDjqrs9_xtGg8f4kM"]]
+ [words 286_entries]]
+#+end_src
+
+Gemini suggest fix
+#+begin_src markdown
+Yes, this approach works perfectly and satisfies all your constraints:
+
+1.  **Security:** The specific (Name, Hash) pairing is enforced.
+2.  **No Manual Sync:** `build.rs` does the dirty work.
+3.  **Brittleness Fix:** The Runtime Merge step acts as a "Linker". If Rust has a function that defines `+`, but `build.rs` didn't find `+` in any EDN file, the linker panics at startup.
+
+Here is the implementation strategy.
+
+### 1. `build.rs` (The Mapper)
+
+We need `build.rs` to scan your EDN files, parse out the function names, calculate the file hash, and generate a static map of `Function Name -> File Hash`.
+
+*Assumption: Your function names are globally unique across the stdlib. If `+` appears in two different files, your current `BUILTIN_FUNCTIONS` flat map wouldn't work anyway.*
+
+```rust
+// build.rs
+use std::env;
+use std::fs;
+use std::path::Path;
+use std::io::Write;
+// use your_edn_parser; 
+
+fn main() {
+    let out_dir = env::var("OUT_DIR").unwrap();
+    let dest_path = Path::new(&out_dir).join("stdlib_manifest.rs");
+    let mut f = fs::File::create(&dest_path).unwrap();
+
+    let src_dir = Path::new("src/kcats/stdlib"); // Your path
+    
+    // We will generate a map: "function_name" -> "file_hash"
+    writeln!(f, "pub fn get_manifest() -> std::collections::HashMap<&'static str, &'static str> {{").unwrap();
+    writeln!(f, "    let mut m = std::collections::HashMap::new();").unwrap();
+
+    for entry in fs::read_dir(src_dir).unwrap().flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("joy") { // or .edn
+            
+            let content = fs::read_to_string(&path).unwrap();
+            
+            // 1. Calculate Hash of the file content
+            // (Using whatever caching logic you have)
+            let file_hash = calculate_hash(&content); 
+
+            // 2. Parse EDN to find defined names
+            // This is the only logic specific to your format.
+            // You need to extract ["postbox", "put"] from the file content.
+            let names_found: Vec<String> = parse_names_from_edn(&content);
+
+            for name in names_found {
+                writeln!(f, "    m.insert(\"{}\", \"{}\");", name, file_hash).unwrap();
+            }
+        }
+    }
+
+    writeln!(f, "    m").unwrap();
+    writeln!(f, "}}").unwrap();
+}
+```
+
+This generates:
+```rust
+// stdlib_manifest.rs
+pub fn get_manifest() -> HashMap<&'static str, &'static str> {
+    let mut m = HashMap::new();
+    m.insert("postbox", "QmHashA...");
+    m.insert("put", "QmHashA...");
+    m.insert("+", "QmHashB...");
+    m
+}
+```
+
+### 2. Runtime (The Linker)
+
+Now, inside your interpreter initialization, you merge your existing `BUILTIN_FUNCTIONS` (which has the logic) with the `manifest` (which has the security context).
+
+```rust
+// src/stdlib.rs or main.rs
+
+// Import the generated manifest
+include!(concat!(env!("OUT_DIR"), "/stdlib_manifest.rs"));
+
+pub struct NativeRegistry {
+    // Key: (FileHash, FunctionName) -> FunctionPointer
+    // This is the secure table.
+    registry: HashMap<(String, String), dict::Executable>,
+}
+
+impl NativeRegistry {
+    pub fn build(builtins: &HashMap<Word, dict::Executable>) -> Self {
+        let manifest = get_manifest(); // From generated code
+        let mut registry = HashMap::new();
+
+        for (word, exec) in builtins {
+            let func_name = word.as_str(); // Assuming Word can give us &str
+
+            // THE LINKER CHECK
+            // We look up where this function *should* live according to the source files.
+            match manifest.get(func_name) {
+                Some(file_hash) => {
+                    // Success! We found the file that claims this function.
+                    // We lock this function pointer to THAT hash only.
+                    registry.insert(
+                        (file_hash.to_string(), func_name.to_string()), 
+                        exec.clone() // or copy/reference
+                    );
+                },
+                None => {
+                    // BRITTLENESS CHECK:
+                    // Rust defines a function, but no EDN file claims it.
+                    // This panics at startup so you know you broke the build.
+                    panic!("Orphaned Native Function: '{}' is defined in Rust BUILTIN_FUNCTIONS but not found in any stdlib file.", func_name);
+                }
+            }
+        }
+        
+        // REVERSE CHECK (Optional):
+        // Did we miss implementing something in Rust that the EDN expects?
+        for (name, _) in manifest {
+            // Logic depends on your Word type, simplified here:
+            if !builtins.keys().any(|w| w.as_str() == *name) {
+                println!("WARNING: stdlib defines '{}' but Rust has no implementation.", name);
+            }
+        }
+
+        Self { registry }
+    }
+
+    // This is called when the Interpreter is running a specific module
+    pub fn resolve(&self, callers_file_hash: &str, func_name: &str) -> Option<&dict::Executable> {
+        self.registry.get(&(callers_file_hash.to_string(), func_name.to_string()))
+    }
+}
+```
+
+### Analysis of constraints
+
+1.  **Dangling Pointers (Brittleness):**
+    If you rename `postbox` to `mailbox` in the text file, `manifest.get("postbox")` returns None. The `panic!("Orphaned Native Function...")` fires immediately when you run the project. You are forced to update the Rust string to match.
+
+2.  **Security/Sandboxing:**
+    If a user loads a script `malicious.joy` (Hash: `QmEvil`), and tries to call `postbox`:
+    *   Interpreter asks: `registry.resolve("QmEvil", "postbox")`.
+    *   Registry looks for key key `("QmEvil", "postbox")`.
+    *   It only has `("QmHashA", "postbox")`.
+    *   Returns `None`.
+    *   The malicious script cannot access the raw memory pointer, even though it used the correct name.
+
+3.  **Manual Work:**
+    You only maintain `BUILTIN_FUNCTIONS` (which you have to do anyway to write the code) and the EDN files. The mapping of "Which file owns what" is automated.
+#+end_src
+*** TODO Inscribe should return module hash
+Just in case the caller wants to add it to the resolution list
+#+begin_src kcats
+  dictionary [errors] 🍫 decache
+  [[hashbytes] ;; calculate module hash
+   [string read [words] 🔀 update]] ;; install the module in the dictionary
+  [▶️] 🚜 ▶️ ;; fork 
+  •🗑️ 🍫 •🔀 ••👥 dictmerge
+#+end_src
+
+#+RESULTS:
+#+begin_src kcats
+[[modules [#b64 "core"]]
+ [words 282_entries]]
+#b64 "Vb9Om_94ZoKOutE83MbeH5EXoGWDjqrs9_xtGg8f4kM"
+#+end_src
