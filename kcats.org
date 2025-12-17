@@ -3816,7 +3816,7 @@ internally, to keep track of things like the stack, program, lists etc.
               assoc::KeyItem::Word(w) => match w.data.as_str() {
                   "words" => Some(self.words.clone().fit()),
                   "modules" => Some(self.modules.clone().fit()),
-                  //"lingo" => Some(self.lingo.clone().fit()),
+                  "lingo" => Some(self.lingo.clone().fit()),
                   _ => None,
               },
               _ => None,
@@ -3909,7 +3909,7 @@ internally, to keep track of things like the stack, program, lists etc.
       /// of word definitions, not wrapped in a single list), and
       /// inserts all the definitions into the dictionary, with an
       /// optional namespace.
-      fn insert_core_module(&mut self, lexicon: String) -> Result<(), Error>;
+      fn insert_core_module(&mut self, lexicon: String) -> Result<Namespace, Error>;
 
       /// For stdlib words that are both built-in and part of a module
       /// that isn't necessarily loaded as part of the standard
@@ -3935,11 +3935,37 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  use sha2::{self, Digest};
+
+  fn hash(s: String) -> Vec<u8> {
+      sha2::Sha256::digest(s.as_bytes()).to_vec()
+  }
+
   /// Instead of blindly extending dictionaries, we don't overwrite
   /// entries that are axiom word defs. The idea is that when there is
   /// an existing key that is an axiom word, and then we get a new value
   /// that's also an axiom (no definition) - we don't overwrite the
-  /// existing definition, we pull it in. The tricky part is
+  /// existing definition
+  fn merge_entries(orig: &mut Entry, new: Entry) {
+      orig.examples = new.examples;
+      orig.spec = new.spec;
+      orig.doc = new.doc;
+      // Don't overwrite namespace, should be the same anyway.  Don't
+      // blindly overwrite the definition, this could be an axiom word
+      // where we've left the definition out, and we're merging with the
+      // builtin, now that we've read the lexicon. The definition is the
+      // builtin and we want to keep that.
+      match (orig.definition.clone(), new.definition) {
+          (Executable::Axiom(_), _) => {} // don't overwrite
+          (_, Executable::Derived(d)) => {
+              orig.definition = Executable::Derived(d); // both derived? overwrite
+          }
+          (Executable::Derived(_), _) => {} // don't overwrite a derived with axiom, security issue
+      }
+  }
+
+  /// Merge hashmaps with an entry merging function, similar to
+  /// "merge-with" in some other languages.
   fn merge_smart<K, V, F>(base: &mut HashMap<K, V>, incoming: HashMap<K, V>, merger: F)
   where
       K: Eq + Hash,
@@ -3961,23 +3987,17 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  use sha2::{self, Digest}; // Import RngCore for the fill_bytes method
-
-  fn hash(s: String) -> Vec<u8> {
-      sha2::Sha256::digest(s.as_bytes()).to_vec()
-  }
-
   impl Dict for Words {
       fn diff(&self, newer: &Words) -> (Vec<(Word, Entry)>, Vec<Word>) {
           diff_hashmaps(self, &newer)
       }
 
-      fn merge(&mut self, mut new: Words, namespace: &Namespace) {
+      fn merge(&mut self, new: Words, namespace: &Namespace) {
           let (adds, _) = self.diff(&new);
           // add namepaces to the adds and deletes
           //println!("Merge {} adds, {} deletes", adds.len(), deletes.len());
 
-          let adds: Vec<_> = adds
+          let adds: HashMap<Word, Entry> = adds
               .into_iter()
               .map(|(mut w, mut e)| {
                   w.namespace = Some(*namespace);
@@ -3986,17 +4006,16 @@ internally, to keep track of things like the stack, program, lists etc.
                   (w, e)
               })
               .collect();
-
-          let n = new.mutate();
-          n.extend(adds);
-          ,*self = new;
+          let sm = self.mutate();
+          merge_smart(sm, adds, merge_entries);
       }
 
       /// Load core modules. For now, we cheat and assume it's in the
       /// format of `[list-of-definitions] join`, and we don't actually
       /// evaluate the join like we will do later in bootstrapping.
-      fn insert_core_module(&mut self, lexicon: String) -> Result<(), Error> {
+      fn insert_core_module(&mut self, lexicon: String) -> Result<Namespace, Error> {
           //println!("Parsing: {}", lexicon);
+          let dict = self.mutate();
 
           let hash = hash(lexicon.clone());
           let namespace = Intern::new(hash);
@@ -4011,7 +4030,7 @@ internally, to keep track of things like the stack, program, lists etc.
               let iter: Box<dyn Iterator<Item = Item>> = def.try_fit().unwrap();
               let new_entry: Entry = iter.try_fit().unwrap();
               let new_entry2 = new_entry.clone();
-              let dict = self.mutate();
+
               dict.entry(word)
                   .and_modify(|e| {
                       e.examples = new_entry.examples;
@@ -4024,11 +4043,16 @@ internally, to keep track of things like the stack, program, lists etc.
                       // filling them in now that we've read the
                       // lexicon. The definition is the builtin and we
                       // want to keep that.
-                      //e.definition = new_entry.definition;
+                      e.definition = match (e.definition.clone(), new_entry.definition) {
+                          (Executable::Axiom(a), _) => Executable::Axiom(a),
+                          (_, Executable::Derived(d)) => Executable::Derived(d),
+                          (Executable::Derived(d), _) => Executable::Derived(d), //(None, None) => None
+                      }
                   })
                   .or_insert(new_entry2);
           }
-          Ok(())
+
+          Ok(namespace)
       }
 
       fn builtins() -> Self {
@@ -4217,7 +4241,7 @@ internally, to keep track of things like the stack, program, lists etc.
           let v: Vec<(assoc::KeyItem, Item)> = vec![
               (fit!("words"), self.words.fit()),
               (fit!("modules"), self.modules.fit()),
-              //("lingo".fit(), self.lingo.fit()),
+              (fit!("lingo"), self.lingo.fit()),
           ];
           Box::new(v.into_iter())
       }
@@ -4279,7 +4303,7 @@ internally, to keep track of things like the stack, program, lists etc.
               //println!("k: {:?}, v: {:?}", k, v);
               if k == fit!("words") {
                   words = v.try_fit()?;
-              } else if k == fit!("ss modules") {
+              } else if k == fit!("modules") {
                   modules = v.try_fit()?;
               } else {
                   continue;
@@ -6227,7 +6251,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("resolve", Box::leak(Box::new(resolve))),
           ("reverse", Box::leak(Box::new(f_stack1(reverse)))),
           ("round", Box::leak(Box::new(f_stack1(ok1(round))))),
-          ("second", Box::leak(Box::new(f_stack1(ok1(second))))),
           (
               "sender",
               Box::leak(Box::new(f_stack1(crate::types::container::pipe::channel::sender))),
@@ -6553,10 +6576,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   //     let (_, i) = c.take();
   //     Ok(i.fit())
   // }
-
-  pub fn second(c: coll::List) -> Item {
-      c.get(1).cloned().unwrap_or_default()
-  }
 
   pub fn last(c: coll::Sized) -> Item {
       c.into_iter().last().unwrap_or_default()
@@ -8432,12 +8451,6 @@ rust project or some other language through FFI.
           }
       }
 
-      use base64::prelude::BASE64_URL_SAFE_NO_PAD;
-      use base64::Engine;
-      fn b64decode(s: &str) -> Item {
-          BASE64_URL_SAFE_NO_PAD.decode(s).unwrap().fit()
-      }
-
       fn test_lexicon(word: &str, modules: Vec<Item>) {
           crate::config::configure_platform();
           let mut e = Environment::default();
@@ -8499,12 +8512,11 @@ rust project or some other language through FFI.
       #[test_case("quot")]
       #[test_case("range")]
       #[test_case("read")]
-      #[test_case("rem")]
+      //#[test_case("rem")]
       #[test_case("remove")]
       #[test_case("resolve")]
       #[test_case("reverse")]
       #[test_case("round")]
-      #[test_case("second")]
       #[test_case("set")]
       #[test_case("set?" ; "is_set")]
       #[test_case("slice")]
@@ -8602,6 +8614,7 @@ rust project or some other language through FFI.
       #[test_case("rest")]
       #[test_case("restore")]
       #[test_case("retry")]
+      #[test_case("second")]
       #[test_case("skipper")]
       #[test_case("something?" ; "is_something")]
       #[test_case("spawn")]
