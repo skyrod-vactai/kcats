@@ -1600,7 +1600,7 @@ internally, to keep track of things like the stack, program, lists etc.
       type Output = Sized;
       type Error = Error;
 
-      fn join(self, other: Sized) -> Result<Self::Output, Self::Error> {
+      fn join(self, other: Sized) -> Result<Self::Output, Error> {
           //println!("Joining sized {:?} to sized {:?}", self, other);
           if self.is_empty() {
               return Ok(other);
@@ -1657,11 +1657,11 @@ internally, to keep track of things like the stack, program, lists etc.
       fn take_simple(&mut self) -> Option<Self::Item>;
   }
 
-  // pub trait DemotingTake {
-  //     type Item;
-  //     type Output;
-  //     fn take_demoting(self) -> (Option<Self::Item>, Self::Output);
-  // }
+  pub trait DemotingTake {
+      type Item;
+      type Output;
+      fn take_demoting(self) -> (Option<Self::Item>, Self::Output);
+  }
 
   pub trait Take {
       type Output;
@@ -1687,7 +1687,13 @@ internally, to keep track of things like the stack, program, lists etc.
   impl Count for Sized {
       fn count(&self) -> usize {
           match self {
-              Self::Associative(a) => a.len(),
+              Self::Assoc(a) => a.len(),
+              Self::DictEntry(a) => a.len(),
+              Self::Env(e) => e.len(),
+              Self::Error(e) => e.len(),
+              Self::Words(d) => d.len(),
+              Self::Dictionary(d) => d.len(),
+
               Self::List(l) => l.count(),
               Self::String(s) => s.len(),
               Self::Bytes(b) => b.len(),
@@ -1721,22 +1727,24 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  impl SimpleTake for Sized {
-      //type Output = Self;
+  impl DemotingTake for Sized {
+      type Output = Self;
       type Item = Item;
-      fn take_simple(&mut self) -> Option<Self::Item> {
+      fn take_demoting(self) -> (Option<Self::Item>, Self::Output) {
           //println!("Taking! {:?}", self);
           match self {
-              Self::Associative(ref mut a) => {
+              Sized::List(mut l) => ((&mut l).take_simple(), Sized::List(l)),
+              Sized::String(mut s) => ((&mut s).take_simple().map(Item::derive), Sized::String(s)),
+              Sized::Bytes(mut b) => ((&mut b).take_simple().map(Item::derive), Sized::Bytes(b)),
+              Sized::Set(mut s) => ((&mut s).take_simple(), Sized::Set(s)),
+              Sized::Program(mut p) => ((&mut p).take_simple(), Sized::Program(p)),
+              Sized::Assoc(mut a) => ((&mut a).take_simple().map(Fit::fit), Sized::Assoc(a)),
+              s => {
+                  let mut a = assoc::Associative::try_derive(s.clone()).unwrap();
+
                   let v = a.take_simple();
-                  ,*self = Sized::Associative(a.clone());
-                  v
+                  (v, Sized::derive(a))
               }
-              Sized::List(ref mut l) => l.take_simple(),
-              Sized::String(ref mut s) => s.take_simple().map(Item::derive),
-              Sized::Bytes(ref mut b) => b.take_simple().map(Item::derive),
-              Sized::Set(ref mut s) => s.take_simple(),
-              Sized::Program(ref mut p) => p.take_simple(),
           }
       }
   }
@@ -1872,9 +1880,21 @@ internally, to keep track of things like the stack, program, lists etc.
   /// that it can also be appended to.
   #[derive(Clone)]
   pub enum Sized {
-      /// Associative containers associate Items in pairs, like Map or
-      /// Dict in other languages.
-      Associative(assoc::Associative),
+      /// A generic associative structure where you can associate any
+      /// [KeyItem] with any [Item].
+      Assoc(assoc::Association),
+      /// Represents an [dict::Dictionary] entry structure with
+      /// specific keys.
+      DictEntry(Box<dict::Entry>),
+      /// Represents an execution environment, with specific keys
+      Env(Box<env::Environment>),
+      /// Represents a runtime Error value, with specific keys
+      Error(Error),
+      /// Represents the words available in to use
+      Words(dict::Words),
+      /// Represents a dictionary, including which modules have priority
+      Dictionary(Box<dict::Dictionary>),
+
       /// List containers have multiple Items in a specific order.
       List(Box<List>),
       /// Program containers are optimized for execution of programs, but
@@ -3353,24 +3373,41 @@ internally, to keep track of things like the stack, program, lists etc.
 
   impl TryDerive<coll::Sized> for Associative {
       fn try_derive(s: coll::Sized) -> Result<Self, Error> {
-          match s {
-              coll::Sized::Associative(a) => Ok(a),
-              coll::Sized::String(i) => {
-                  Err(Error::expected(fit!("associative"), coll::Sized::String(i)))
-              }
-              coll::Sized::Bytes(i) => {
-                  Err(Error::expected(fit!("associative"), coll::Sized::Bytes(i)))
-              }
-              s => Ok(Associative::Assoc(Association::try_from_iter(s)?)),
+          Result::<Associative, DeriveError<coll::Sized>>::derive(s).map_err(Error::derive)
+      }
+  }
+
+  impl Derive<Item> for Result<Associative, DeriveError<Item>> {
+      fn derive(i: Item) -> Result<Associative, DeriveError<Item>> {
+          match i {
+              Item::Assoc(a) => Ok(Associative::Assoc(a)),
+              Item::DictEntry(a) => Ok(Associative::DictEntry(a)),
+              Item::Env(a) => Ok(Associative::Env(a)),
+              Item::Error(a) => Ok(Associative::Error(a)),
+              Item::Words(a) => Ok(Associative::Words(a)),
+              Item::Dictionary(a) => Ok(Associative::Dictionary(a)),
+              i => Err(DeriveError::expected(fit!("associative"), i)),
+          }
+      }
+  }
+
+  impl Derive<coll::Sized> for Result<Associative, DeriveError<coll::Sized>> {
+      fn derive(i: coll::Sized) -> Result<Associative, DeriveError<coll::Sized>> {
+          match i {
+              coll::Sized::Assoc(a) => Ok(Associative::Assoc(a)),
+              coll::Sized::DictEntry(a) => Ok(Associative::DictEntry(a)),
+              coll::Sized::Env(a) => Ok(Associative::Env(a)),
+              coll::Sized::Error(a) => Ok(Associative::Error(a)),
+              coll::Sized::Words(a) => Ok(Associative::Words(a)),
+              coll::Sized::Dictionary(a) => Ok(Associative::Dictionary(a)),
+              i => Err(DeriveError::expected(fit!("associative"), i)),
           }
       }
   }
 
   impl TryDerive<Item> for Associative {
       fn try_derive(i: Item) -> Result<Self, Error> {
-          let s =
-              Result::<coll::Sized, DeriveError<Item>>::derive(i.clone()).map_err(Error::derive)?;
-          Associative::try_derive(s)
+          Result::<assoc::Associative, DeriveError<Item>>::derive(i).map_err(Error::derive)
       }
   }
 
@@ -3466,7 +3503,29 @@ internally, to keep track of things like the stack, program, lists etc.
 
   impl Derive<Associative> for Item {
       fn derive(a: Associative) -> Item {
-          coll::Sized::Associative(a).fit()
+          match a {
+              Associative::Assoc(a) => Item::Assoc(a),
+              Associative::DictEntry(a) => Item::DictEntry(a),
+              Associative::Dictionary(a) => Item::Dictionary(a),
+              Associative::Env(a) => Item::Env(a),
+              Associative::Error(a) => Item::Error(a),
+              Associative::Words(a) => Item::Words(a),
+              Associative::Nothing => Item::default(),
+          }
+      }
+  }
+
+  impl Derive<Associative> for coll::Sized {
+      fn derive(a: Associative) -> coll::Sized {
+          match a {
+              Associative::Assoc(a) => coll::Sized::Assoc(a),
+              Associative::DictEntry(a) => coll::Sized::DictEntry(a),
+              Associative::Dictionary(a) => coll::Sized::Dictionary(a),
+              Associative::Env(a) => coll::Sized::Env(a),
+              Associative::Error(a) => coll::Sized::Error(a),
+              Associative::Words(a) => coll::Sized::Words(a),
+              Associative::Nothing => Default::default(),
+          }
       }
   }
 
@@ -4645,7 +4704,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn try_derive(i: Item) -> Result<Self, Error> {
           let s = coll::Sized::try_derive(i)?;
           match s {
-              coll::Sized::Associative(assoc::Associative::DictEntry(d)) => Ok(*d),
+              coll::Sized::DictEntry(d) => Ok(*d),
               c => c.into_iter().try_fit(),
           }
       }
@@ -4672,7 +4731,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn try_derive(i: Item) -> Result<Self, Error> {
           let s = coll::Sized::try_derive(i)?;
           match s {
-              coll::Sized::Associative(assoc::Associative::Words(d)) => Ok(d),
+              coll::Sized::Words(d) => Ok(d),
               c => c.into_iter().try_fit(),
           }
       }
@@ -5195,7 +5254,7 @@ internally, to keep track of things like the stack, program, lists etc.
           let s = coll::Sized::try_derive(i)?;
 
           match s {
-              coll::Sized::Associative(assoc::Associative::Env(e)) => Ok(*e),
+              coll::Sized::Env(e) => Ok(*e),
               l => l.into_iter().try_fit(),
           }
       }
@@ -7160,7 +7219,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
               // Whatever it is, treat it as a map if possible
               (Some(i), k) => {
-                  let a = assoc::Associative::try_derive(i).map_err(Error::derive)?;
+                  let a = assoc::Associative::try_derive(i)?;
                   assoc_map(a, ks, k, v)
               }
           }
@@ -7169,6 +7228,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }
   }
 
+  /// TODO: support demotion properly when removing required fields from assoc
   fn remove(i: coll::Sized, k: Item) -> Result<Item, Error> {
       match i {
           coll::Sized::List(mut l) => {
@@ -7179,14 +7239,33 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               Ok((*l).fit())
           }
           coll::Sized::Set(mut s) => {
-              s.mutate()
-                  .remove(&assoc::KeyItem::try_derive(k).map_err(Error::derive)?);
+              s.mutate().remove(&assoc::KeyItem::try_derive(k)?);
               Ok(s.fit())
           }
-          coll::Sized::Associative(a) => {
-              let (a, _) = a.remove(&assoc::KeyItem::try_derive(k).map_err(Error::derive)?);
-              Ok(a.fit())
+          coll::Sized::Assoc(mut a) => {
+              let am = Arc::mutate(&mut a);
+              let v = am.remove(&(k.try_fit()?));
+              //(Associative::Assoc(a), v)
+              Ok(v.fit())
           }
+          coll::Sized::Words(mut d) => {
+              let dm = Arc::mutate(&mut d);
+              let v = dm.remove(&Word::try_derive(k.clone()).unwrap_or_default());
+              //(Associative::Words(d), v.map(|v| v.fit()))
+              Ok(v.fit())
+          }
+          coll::Sized::Error(mut e) => {
+              let a = e.data.mutate();
+              let v = a.remove(&(k.try_fit()?));
+              //(Associative::Error(e), v)
+              Ok(v.fit())
+          }
+          coll::Sized::Env(e) => {
+              let a = assoc::Association::derive_iter(*e);
+              let (_, v) = assoc::Associative::Assoc(a).remove(&(k.try_fit()?));
+              Ok(v.fit())
+          }
+
           i => Err(Error::expected(fit!("simple-container"), i)),
       }
   }
@@ -7312,9 +7391,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn is_association(i: Item) -> bool {
-      coll::Sized::try_derive(i)
-          .map(|s| matches!(s, coll::Sized::Associative(_)))
-          .unwrap_or(false)
+      Result::<assoc::Associative, DeriveError<Item>>::derive(i).is_ok()
   }
 
   pub fn is_set(i: Item) -> bool {
@@ -8220,61 +8297,79 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                           acc_seq.merge(&potential_updates_list)?;
                           Ok((acc_assoc, acc_seq))
                       }
-                      (coll::Sized::Associative(data), coll::Sized::Associative(pattern)) => {
-                          //println!("destructuring map: {:?}", data_map);
-                          //map destructure
-                          // Iterate over the entries
-                          let mut potential_updates_map: HashMap<Word, Item> = Default::default();
-                          let mut potential_updates_list: PositionalParams<Item> = Default::default();
-                          for (k, ref v) in pattern.to_iter() {
-                              // look up k in data
-                              let vd = data.get(&k.fit());
-                              // if v is a placeholder, vd is our target
-                              if let Some(vd) = vd {
-                                  let r = Word::try_derive(v.clone());
-                                  if let Ok(w) = r {
-                                      if let Some((idx, _)) = stackpoint(&w) {
-                                          let _ = potential_updates_list.set(idx, vd);
-                                      } else if is_map_variable(&w) {
-                                          potential_updates_map.insert(strip_variable(&w), vd);
+
+                      (a, b) => {
+                          // see if it's associative
+                          match (
+                              Result::<assoc::Associative, DeriveError<coll::Sized>>::derive(a),
+                              Result::<assoc::Associative, DeriveError<coll::Sized>>::derive(b),
+                          ) {
+                              (Ok(data), Ok(pattern)) => {
+                                  //println!("destructuring map: {:?}", data_map);
+                                  //map destructure
+                                  // Iterate over the entries
+                                  let mut potential_updates_map: HashMap<Word, Item> =
+                                      Default::default();
+                                  let mut potential_updates_list: PositionalParams<Item> =
+                                      Default::default();
+                                  for (k, ref v) in pattern.to_iter() {
+                                      // look up k in data
+                                      let vd = data.get(&k.fit());
+                                      // if v is a placeholder, vd is our target
+                                      if let Some(vd) = vd {
+                                          let r = Word::try_derive(v.clone());
+                                          if let Ok(w) = r {
+                                              if let Some((idx, _)) = stackpoint(&w) {
+                                                  let _ = potential_updates_list.set(idx, vd);
+                                              } else if is_map_variable(&w) {
+                                                  potential_updates_map
+                                                      .insert(strip_variable(&w), vd);
+                                              } else {
+                                                  (potential_updates_map, potential_updates_list) =
+                                                      destructure(
+                                                          &vd,
+                                                          v,
+                                                          potential_updates_map,
+                                                          potential_updates_list,
+                                                      )?
+                                              }
+                                          } else {
+                                              // value is not a word
+                                              (potential_updates_map, potential_updates_list) =
+                                                  destructure(
+                                                      &vd,
+                                                      v,
+                                                      potential_updates_map,
+                                                      potential_updates_list,
+                                                  )?
+                                          }
                                       } else {
-                                          (potential_updates_map, potential_updates_list) =
-                                              destructure(
-                                                  &vd,
-                                                  v,
-                                                  potential_updates_map,
-                                                  potential_updates_list,
-                                              )?
+                                          // key not present
+                                          // if pattern value is placeholder, we need to return a []
+                                          let r = Word::try_derive(v.clone());
+                                          if let Ok(w) = r {
+                                              if let Some((idx, _)) = stackpoint(&w) {
+                                                  let _ = potential_updates_list
+                                                      .set(idx, Default::default());
+                                              }
+                                          }
                                       }
-                                  } else {
-                                      // value is not a word
-                                      (potential_updates_map, potential_updates_list) = destructure(
-                                          &vd,
-                                          v,
-                                          potential_updates_map,
-                                          potential_updates_list,
-                                      )?
                                   }
-                              } else {
-                                  // key not present
-                                  // if pattern value is placeholder, we need to return a []
-                                  let r = Word::try_derive(v.clone());
-                                  if let Ok(w) = r {
-                                      if let Some((idx, _)) = stackpoint(&w) {
-                                          let _ = potential_updates_list.set(idx, Default::default());
-                                      }
+                                  acc_assoc.extend(potential_updates_map);
+                                  let _ = acc_seq.merge(&potential_updates_list);
+                                  Ok((acc_assoc, acc_seq))
+                              }
+                              (Ok(a), Err(b)) => Err(match_err(a, b.src)),
+                              (Err(a), Ok(b)) => Err(match_err(a.src, b)),
+                              (Err(a), Err(b)) => {
+                                  let a = a.src;
+                                  let b = b.src;
+                                  if a == b {
+                                      Ok((acc_assoc, acc_seq))
+                                  } else {
+                                      Err(match_err(a, b))
                                   }
                               }
-                          }
-                          acc_assoc.extend(potential_updates_map);
-                          let _ = acc_seq.merge(&potential_updates_list);
-                          Ok((acc_assoc, acc_seq))
-                      }
-                      (a, b) => {
-                          if a == b {
-                              Ok((acc_assoc, acc_seq))
-                          } else {
-                              Err(match_err(a, b))
                           }
                       }
                   }
@@ -10383,17 +10478,17 @@ Implement the =handoff= type
       pub fn insert_item(&self, i: Item, id: uuid::Uuid) -> axiom::ItemResult {
           let s = coll::Sized::try_derive(i)?;
           match s {
-              coll::Sized::Associative(a) => {
+              coll::Sized::List(l) => {
+                  self.insert_iter(None, *l)?;
+              }
+              s => {
+                  let a = assoc::Associative::try_derive(s)?;
                   for (k, v) in a.to_iter() {
                       //println!("Insert! {:?} {:?}", k, v);
                       let w: types::Word = k.try_fit()?;
                       self.insert_attribute(id, Item::Word(w), v)?;
                   }
               }
-              coll::Sized::List(l) => {
-                  self.insert_iter(None, *l)?;
-              }
-              s => return Err(Error::expected(fit!("db-object"), s)),
           }
           Ok(Item::default())
       }
