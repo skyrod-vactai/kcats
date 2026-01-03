@@ -177,6 +177,7 @@ unless you own either the trait or the type), we'll opt for making our
 own traits rather than using the "newtype" pattern of making our own
 types to wrap stdlib types.
 #+begin_src rust :tangle src/traits.rs :mkdirp yes
+  use crate::fit;
   use crate::types;
   use crate::types::container::error::Error;
   use core::fmt::{self, Debug};
@@ -249,6 +250,13 @@ types to wrap stdlib types.
   {
       fn derive(r: Result<T, DeriveError<I>>) -> Self {
           r.map_err(Error::derive)
+      }
+  }
+
+  /// Convert Error to DeriveError
+  impl Derive<Error> for DeriveError<types::Item> {
+      fn derive(e: Error) -> DeriveError<types::Item> {
+          DeriveError::expected(fit!("fixme"), e.actual().cloned().unwrap_or_default())
       }
   }
 
@@ -1607,13 +1615,28 @@ internally, to keep track of things like the stack, program, lists etc.
           } else if other.is_empty() {
               return Ok(self);
           }
+
           Ok(match (self, other) {
-              (Sized::Associative(a), Sized::List(l)) => Sized::Associative(a.join(*l)?),
-              (Sized::List(l), Sized::Associative(a)) => Sized::Associative(l.join(a)?),
-              (Sized::Associative(a), Sized::Associative(b)) => {
-                  Sized::Associative(a.join(b).unwrap())
+              (Sized::Assoc(a), Sized::Assoc(b)) => Sized::Assoc(a.join(b).unwrap()),
+              (Sized::DictEntry(a), Sized::DictEntry(b)) => {
+                  Sized::DictEntry(Box::new(a.join(*b).unwrap()))
               }
+              (Sized::Error(a), Sized::Error(b)) => Sized::Error(a.join(b).unwrap()),
+              (Sized::Words(a), Sized::Words(b)) => Sized::Words(a.join(b).unwrap()),
+              (Sized::Words(a), Sized::List(b)) => {
+                  // maybe it's an assoc
+                  let ba: assoc::Association = assoc::Association::try_from_iter(b.iter().cloned())?;
+                  a.join(ba).unwrap().fit()
+              }
+              (Sized::Env(a), Sized::Env(b)) => Sized::Env(Box::new(a.join(*b).unwrap())),
+              (Sized::Dictionary(a), Sized::Dictionary(b)) => {
+                  a.join(*b).map(|d| Sized::Dictionary(Box::new(d))).unwrap()
+              }
+
               (Sized::List(a), Sized::List(b)) => Sized::List(Box::new(a.join(*b).unwrap())),
+              (Sized::List(a), Sized::Assoc(b)) => Sized::Assoc(a.join(b)?),
+              (Sized::Assoc(a), Sized::List(b)) => Sized::Assoc(a.join(*b)?),
+
               (Sized::Set(a), Sized::Set(b)) => Sized::Set(a.join(b).unwrap()),
               (Sized::List(a), Sized::Set(b)) => Sized::Set(a.join(b)?),
               (Sized::Set(mut a), Sized::List(b)) => {
@@ -1657,11 +1680,11 @@ internally, to keep track of things like the stack, program, lists etc.
       fn take_simple(&mut self) -> Option<Self::Item>;
   }
 
-  pub trait DemotingTake {
-      type Item;
-      type Output;
-      fn take_demoting(self) -> (Option<Self::Item>, Self::Output);
-  }
+  // pub trait DemotingTake {
+  //     type Item;
+  //     type Output;
+  //     fn take_demoting(self) -> (Option<Self::Item>, Self::Output);
+  // }
 
   pub trait Take {
       type Output;
@@ -1707,9 +1730,6 @@ internally, to keep track of things like the stack, program, lists etc.
       fn has(&self, other: &Item) -> bool {
           //println!("Has: {:?}\n{:?}", self, other);
           match (self, other) {
-              (Sized::Associative(a), other) => {
-                  assoc::KeyItem::try_derive(other.clone()).is_ok_and(|k| a.contains_key(&k))
-              }
               (Sized::List(l), other) => l.contains(other),
               (Sized::Set(s), Item::Set(other)) => other.is_subset(s),
               (Sized::Set(s), other) => {
@@ -1722,28 +1742,36 @@ internally, to keep track of things like the stack, program, lists etc.
                       Err(_) => false,
                   },
               },
-              _ => false,
+              (s, other) => {
+                  // (Sized::Associative(a), other) => {
+                  // assoc::KeyItem::try_derive(other.clone()).is_ok_and(|k| a.contains_key(&k))
+                  //}
+                  let c =
+                      Result::<assoc::Associative, DeriveError<Sized>>::derive(s.clone()).unwrap();
+                  assoc::KeyItem::try_derive(other.clone()).is_ok_and(|k| c.contains_key(&k))
+              }
           }
       }
   }
 
-  impl DemotingTake for Sized {
-      type Output = Self;
+  impl SimpleTake for Sized {
+      //type Output = Self;
       type Item = Item;
-      fn take_demoting(self) -> (Option<Self::Item>, Self::Output) {
+      fn take_simple(&mut self) -> Option<Self::Item> {
           //println!("Taking! {:?}", self);
           match self {
-              Sized::List(mut l) => ((&mut l).take_simple(), Sized::List(l)),
-              Sized::String(mut s) => ((&mut s).take_simple().map(Item::derive), Sized::String(s)),
-              Sized::Bytes(mut b) => ((&mut b).take_simple().map(Item::derive), Sized::Bytes(b)),
-              Sized::Set(mut s) => ((&mut s).take_simple(), Sized::Set(s)),
-              Sized::Program(mut p) => ((&mut p).take_simple(), Sized::Program(p)),
-              Sized::Assoc(mut a) => ((&mut a).take_simple().map(Fit::fit), Sized::Assoc(a)),
-              s => {
-                  let mut a = assoc::Associative::try_derive(s.clone()).unwrap();
+              Sized::List(ref mut l) => l.take_simple(),
+              Sized::String(ref mut s) => s.take_simple().map(Item::derive),
+              Sized::Bytes(ref mut b) => b.take_simple().map(Item::derive),
+              Sized::Set(ref mut s) => s.take_simple(),
+              Sized::Program(ref mut p) => p.take_simple(),
+              Sized::Assoc(ref mut a) => a.take_simple().map(Fit::fit),
+              ref s => {
+                  let mut a = assoc::Associative::try_derive((*s).clone()).ok()?;
 
                   let v = a.take_simple();
-                  (v, Sized::derive(a))
+                  ,*self = Sized::derive(a);
+                  v
               }
           }
       }
@@ -1915,12 +1943,17 @@ internally, to keep track of things like the stack, program, lists etc.
   impl fmt::Debug for Sized {
       fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
           match self {
-              Sized::Associative(a) => write!(f, "{:?}", a),
               Sized::List(l) => write!(f, "List{:?}", l),
               Sized::Set(s) => write!(f, "{:?}", s),
               Sized::String(s) => write!(f, "{:?}", s),
               Sized::Bytes(b) => write!(f, "{:?}", b),
               Sized::Program(p) => write!(f, "{:?}", p),
+              Sized::DictEntry(p) => write!(f, "{:?}", p),
+              Sized::Dictionary(p) => write!(f, "{:?}", p),
+              Sized::Env(p) => write!(f, "{:?}", p),
+              Sized::Error(p) => write!(f, "{:?}", p),
+              Sized::Assoc(p) => write!(f, "{:?}", p),
+              Sized::Words(p) => write!(f, "{:?}", p),
           }
       }
   }
@@ -1929,11 +1962,15 @@ internally, to keep track of things like the stack, program, lists etc.
   impl PartialEq for Sized {
       fn eq(&self, other: &Self) -> bool {
           match (self, other) {
-              (Sized::Associative(a), Sized::Associative(b)) => a == b,
               (Sized::List(a), Sized::List(b)) => a == b,
               (Sized::String(a), Sized::String(b)) => a == b,
               (Sized::Bytes(a), Sized::Bytes(b)) => a == b,
               (Sized::Set(a), Sized::Set(b)) => a == b,
+              (Sized::Assoc(a), Sized::Assoc(b)) => a == b,
+              (Sized::DictEntry(a), Sized::DictEntry(b)) => a == b,
+              (Sized::Env(a), Sized::Env(b)) => a == b,
+              (Sized::Error(a), Sized::Error(b)) => a == b,
+              (Sized::Dictionary(a), Sized::Dictionary(b)) => a == b,
               _ => self.is_empty() && other.is_empty(),
           }
       }
@@ -2069,13 +2106,10 @@ internally, to keep track of things like the stack, program, lists etc.
           self.count() == 0
       }
 
-      /// Takes an item from the back (end) of the container.
+      /// Takes an item from the back (end) of the container, if it is
+      /// ordered, otherwise an arbitrary element.
       pub fn pop(self) -> (Self, Option<Item>) {
           match self {
-              Sized::Associative(mut a) => {
-                  let v = a.take_simple();
-                  (Sized::Associative(a), v)
-              }
               Sized::List(mut l) => {
                   let i = l.pop_back();
                   (Sized::List(l), i)
@@ -2100,6 +2134,12 @@ internally, to keep track of things like the stack, program, lists etc.
                   let i = p.pop().cloned();
                   (Sized::Program(p), i)
               }
+              s => {
+                  // should be an associative
+                  let mut c = Result::<assoc::Associative, DeriveError<Sized>>::derive(s).unwrap();
+                  let x = c.take_simple();
+                  (Sized::derive(c), x)
+              }
           }
       }
 
@@ -2110,7 +2150,6 @@ internally, to keep track of things like the stack, program, lists etc.
                   c.push_back(i);
                   Ok(Sized::List(c))
               }
-              (Sized::Associative(a), l) => Ok(Sized::Associative(a.put(l)?)),
               (Sized::Set(mut s), i) => {
                   s.mutate().insert(assoc::KeyItem::try_derive(i)?);
                   Ok(Sized::Set(s))
@@ -2129,6 +2168,10 @@ internally, to keep track of things like the stack, program, lists etc.
                   p.extend(list![i]);
                   Ok(Sized::Program(p))
               }
+              (s, i) => {
+                  let c = Result::<assoc::Associative, DeriveError<Sized>>::derive(s)?;
+                  Ok((c.put(i)?).fit())
+              }
           }
       }
 
@@ -2138,14 +2181,13 @@ internally, to keep track of things like the stack, program, lists etc.
       /// [Sized::String], etc)
       pub fn empty(&self) -> Sized {
           match self {
-              Sized::Associative(_) => {
-                  Sized::Associative(assoc::Associative::Assoc(assoc::Association::fresh()))
-              }
               Sized::List(_) => Sized::List(Box::default()),
               Sized::Set(_) => Sized::Set(Set::default()),
               Sized::String(_) => Sized::String(String::new()),
               Sized::Bytes(_) => Sized::Bytes(vec![]),
               Sized::Program(_) => Sized::Program(Program::default()),
+              // We assume it must be an associative at this point
+              _ => Sized::Assoc(assoc::Association::fresh()),
           }
       }
   }
@@ -2171,7 +2213,6 @@ internally, to keep track of things like the stack, program, lists etc.
 
       fn into_iter(self) -> Self::IntoIter {
           match self {
-              Sized::Associative(map) => Box::new(map.to_iter().map(|kv| kv.fit())),
               Sized::List(list) => {
                   let items: Vec<_> = list.iter().cloned().collect();
                   Box::new(items.into_iter())
@@ -2192,6 +2233,11 @@ internally, to keep track of things like the stack, program, lists etc.
                   Box::new(items.into_iter())
               }
               Sized::Program(p) => Box::new(List::derive(p).into_iter()),
+              s => {
+                  // should be associative if we get here
+                  let map = Result::<assoc::Associative, DeriveError<Sized>>::derive(s).unwrap();
+                  Box::new(map.to_iter().map(|kv| kv.fit()))
+              }
           }
       }
   }
@@ -2219,8 +2265,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn try_derive(s: Sized) -> Result<Self, Error> {
           match s {
               Sized::List(l) => Ok(*l),
-              Sized::Associative(a) => Ok(List::derive_iter(a.to_iter().map(Item::derive))),
-              i => Err(Error::expected(fit!("list"), i)),
+              s => Ok(List::derive_iter(s.to_iter().map(Item::derive))),
           }
       }
   }
@@ -2295,13 +2340,12 @@ internally, to keep track of things like the stack, program, lists etc.
               Item::Bytes(b) => Ok(Sized::Bytes(b)),
               Item::String(s) => Ok(Sized::String(s)),
               Item::List(l) => Ok(Sized::List(l)),
-              Item::Assoc(a) => Ok(Sized::Associative(assoc::Associative::Assoc(a))),
-              Item::Error(a) => Ok(Sized::Associative(assoc::Associative::Error(a))),
-              Item::Dictionary(a) => Ok(Sized::Associative(assoc::Associative::Dictionary(a))),
-              Item::DictEntry(a) => Ok(Sized::Associative(assoc::Associative::DictEntry(a))),
-              Item::Words(a) => Ok(Sized::Associative(assoc::Associative::Words(a))),
-              Item::Env(a) => Ok(Sized::Associative(assoc::Associative::Env(a))),
-              Item::Nothing => Ok(Sized::Associative(assoc::Associative::Nothing)),
+              Item::Assoc(a) => Ok(Sized::Assoc(a)),
+              Item::Error(a) => Ok(Sized::Error(a)),
+              Item::Dictionary(a) => Ok(Sized::Dictionary(a)),
+              Item::DictEntry(a) => Ok(Sized::DictEntry(a)),
+              Item::Words(a) => Ok(Sized::Words(a)),
+              Item::Env(a) => Ok(Sized::Env(a)),
               Item::Set(s) => Ok(Sized::Set(s)),
               Item::Program(p) => Ok(Sized::Program(p)),
               i => Err(DeriveError::expected(fit!("sized"), i)),
@@ -2316,13 +2360,12 @@ internally, to keep track of things like the stack, program, lists etc.
               Item::Bytes(b) => Ok(Sized::Bytes(b)),
               Item::String(s) => Ok(Sized::String(s)),
               Item::List(l) => Ok(Sized::List(l)),
-              Item::Assoc(a) => Ok(Sized::Associative(assoc::Associative::Assoc(a))),
-              Item::Error(a) => Ok(Sized::Associative(assoc::Associative::Error(a))),
-              Item::Dictionary(a) => Ok(Sized::Associative(assoc::Associative::Dictionary(a))),
-              Item::DictEntry(a) => Ok(Sized::Associative(assoc::Associative::DictEntry(a))),
-              Item::Words(a) => Ok(Sized::Associative(assoc::Associative::Words(a))),
-              Item::Env(a) => Ok(Sized::Associative(assoc::Associative::Env(a))),
-              Item::Nothing => Ok(Sized::Associative(assoc::Associative::Nothing)),
+              Item::Assoc(a) => Ok(Sized::Assoc(a)),
+              Item::Error(a) => Ok(Sized::Error(a)),
+              Item::Dictionary(a) => Ok(Sized::Dictionary(a)),
+              Item::DictEntry(a) => Ok(Sized::DictEntry(a)),
+              Item::Words(a) => Ok(Sized::Words(a)),
+              Item::Env(a) => Ok(Sized::Env(a)),
               Item::Set(s) => Ok(Sized::Set(s)),
               Item::Program(p) => Ok(Sized::Program(p)),
               i => Err(Error::expected(fit!("sized"), i)),
@@ -2339,27 +2382,12 @@ internally, to keep track of things like the stack, program, lists etc.
               Item::Bytes(b) => Ok(Receptacle::Sized(Sized::Bytes(b))),
               Item::String(s) => Ok(Receptacle::Sized(Sized::String(s))),
               Item::List(l) => Ok(Receptacle::Sized(Sized::List(l))),
-              Item::Assoc(a) => Ok(Receptacle::Sized(Sized::Associative(
-                  assoc::Associative::Assoc(a),
-              ))),
-              Item::Error(a) => Ok(Receptacle::Sized(Sized::Associative(
-                  assoc::Associative::Error(a),
-              ))),
-              Item::Dictionary(a) => Ok(Receptacle::Sized(Sized::Associative(
-                  assoc::Associative::Dictionary(a),
-              ))),
-              Item::DictEntry(a) => Ok(Receptacle::Sized(Sized::Associative(
-                  assoc::Associative::DictEntry(a),
-              ))),
-              Item::Words(a) => Ok(Receptacle::Sized(Sized::Associative(
-                  assoc::Associative::Words(a),
-              ))),
-              Item::Env(a) => Ok(Receptacle::Sized(Sized::Associative(
-                  assoc::Associative::Env(a),
-              ))),
-              Item::Nothing => Ok(Receptacle::Sized(Sized::Associative(
-                  assoc::Associative::Nothing,
-              ))),
+              Item::Assoc(a) => Ok(Receptacle::Sized(Sized::Assoc(a))),
+              Item::Error(a) => Ok(Receptacle::Sized(Sized::Error(a))),
+              Item::Dictionary(a) => Ok(Receptacle::Sized(Sized::Dictionary(a))),
+              Item::DictEntry(a) => Ok(Receptacle::Sized(Sized::DictEntry(a))),
+              Item::Words(a) => Ok(Receptacle::Sized(Sized::Words(a))),
+              Item::Env(a) => Ok(Receptacle::Sized(Sized::Env(a))),
               Item::Set(s) => Ok(Receptacle::Sized(Sized::Set(s))),
               Item::Program(p) => Ok(Receptacle::Sized(Sized::Program(p))),
               i => Err(Error::expected(fit!("receptacle"), i)),
@@ -2436,17 +2464,12 @@ internally, to keep track of things like the stack, program, lists etc.
               Dispenser::Sized(Sized::String(s)) => Item::String(s),
               Dispenser::Sized(Sized::List(l)) => Item::List(l),
               Dispenser::Sized(Sized::Set(s)) => Item::Set(s),
-              Dispenser::Sized(Sized::Associative(assoc::Associative::Assoc(a))) => Item::Assoc(a),
-              Dispenser::Sized(Sized::Associative(assoc::Associative::Dictionary(a))) => {
-                  Item::Dictionary(a)
-              }
-              Dispenser::Sized(Sized::Associative(assoc::Associative::DictEntry(a))) => {
-                  Item::DictEntry(a)
-              }
-              Dispenser::Sized(Sized::Associative(assoc::Associative::Words(a))) => Item::Words(a),
-              Dispenser::Sized(Sized::Associative(assoc::Associative::Env(a))) => Item::Env(a),
-              Dispenser::Sized(Sized::Associative(assoc::Associative::Error(a))) => Item::Error(a),
-              Dispenser::Sized(Sized::Associative(assoc::Associative::Nothing)) => Item::Nothing,
+              Dispenser::Sized(Sized::Assoc(a)) => Item::Assoc(a),
+              Dispenser::Sized(Sized::Dictionary(a)) => Item::Dictionary(a),
+              Dispenser::Sized(Sized::DictEntry(a)) => Item::DictEntry(a),
+              Dispenser::Sized(Sized::Words(a)) => Item::Words(a),
+              Dispenser::Sized(Sized::Env(a)) => Item::Env(a),
+              Dispenser::Sized(Sized::Error(a)) => Item::Error(a),
               Dispenser::Sized(Sized::Program(p)) => Item::Program(p),
               Dispenser::Out(o) => Item::Out(o),
               Dispenser::Tunnel(t) => Item::Tunnel(t),
@@ -2462,17 +2485,12 @@ internally, to keep track of things like the stack, program, lists etc.
               Receptacle::Sized(Sized::List(l)) => Item::List(l),
               Receptacle::Sized(Sized::Set(s)) => Item::Set(s),
               Receptacle::Sized(Sized::Program(p)) => Item::Program(p),
-              Receptacle::Sized(Sized::Associative(assoc::Associative::Assoc(a))) => Item::Assoc(a),
-              Receptacle::Sized(Sized::Associative(assoc::Associative::Dictionary(a))) => {
-                  Item::Dictionary(a)
-              }
-              Receptacle::Sized(Sized::Associative(assoc::Associative::DictEntry(a))) => {
-                  Item::DictEntry(a)
-              }
-              Receptacle::Sized(Sized::Associative(assoc::Associative::Nothing)) => Item::Nothing,
-              Receptacle::Sized(Sized::Associative(assoc::Associative::Words(a))) => Item::Words(a),
-              Receptacle::Sized(Sized::Associative(assoc::Associative::Env(a))) => Item::Env(a),
-              Receptacle::Sized(Sized::Associative(assoc::Associative::Error(a))) => Item::Error(a),
+              Receptacle::Sized(Sized::Assoc(a)) => Item::Assoc(a),
+              Receptacle::Sized(Sized::Dictionary(a)) => Item::Dictionary(a),
+              Receptacle::Sized(Sized::DictEntry(a)) => Item::DictEntry(a),
+              Receptacle::Sized(Sized::Words(a)) => Item::Words(a),
+              Receptacle::Sized(Sized::Env(a)) => Item::Env(a),
+              Receptacle::Sized(Sized::Error(a)) => Item::Error(a),
               Receptacle::In(o) => Item::In(o),
               Receptacle::Tunnel(t) => Item::Tunnel(t),
           }
@@ -2492,27 +2510,13 @@ internally, to keep track of things like the stack, program, lists etc.
               Item::String(s) => Ok(Dispenser::Sized(Sized::String(s))),
               Item::List(l) => Ok(Dispenser::Sized(Sized::List(l))),
               Item::Set(s) => Ok(Dispenser::Sized(Sized::Set(s))),
-              Item::Assoc(a) => Ok(Dispenser::Sized(Sized::Associative(
-                  assoc::Associative::Assoc(a),
-              ))),
-              Item::Error(a) => Ok(Dispenser::Sized(Sized::Associative(
-                  assoc::Associative::Error(a),
-              ))),
-              Item::Dictionary(a) => Ok(Dispenser::Sized(Sized::Associative(
-                  assoc::Associative::Dictionary(a),
-              ))),
-              Item::DictEntry(a) => Ok(Dispenser::Sized(Sized::Associative(
-                  assoc::Associative::DictEntry(a),
-              ))),
-              Item::Words(a) => Ok(Dispenser::Sized(Sized::Associative(
-                  assoc::Associative::Words(a),
-              ))),
-              Item::Env(a) => Ok(Dispenser::Sized(Sized::Associative(
-                  assoc::Associative::Env(a),
-              ))),
-              Item::Nothing => Ok(Dispenser::Sized(Sized::Associative(
-                  assoc::Associative::Nothing,
-              ))),
+              Item::Assoc(a) => Ok(Dispenser::Sized(Sized::Assoc(a))),
+              Item::Error(a) => Ok(Dispenser::Sized(Sized::Error(a))),
+              Item::Dictionary(a) => Ok(Dispenser::Sized(Sized::Dictionary(a))),
+              Item::DictEntry(a) => Ok(Dispenser::Sized(Sized::DictEntry(a))),
+              Item::Words(a) => Ok(Dispenser::Sized(Sized::Words(a))),
+              Item::Env(a) => Ok(Dispenser::Sized(Sized::Env(a))),
+              Item::Nothing => Ok(Dispenser::Sized(Sized::default())),
               Item::Program(p) => Ok(Dispenser::Sized(Sized::Program(p))),
               Item::Out(s) => Ok(Dispenser::Out(s)),
               Item::Tunnel(s) => Ok(Dispenser::Tunnel(s)),
@@ -2600,18 +2604,6 @@ internally, to keep track of things like the stack, program, lists etc.
               S: serde::Serializer,
           {
               match self {
-                  Sized::Associative(a) => {
-                      // Start serializing a map
-                      let assoc = assoc::Association::derive(a.clone());
-                      let mut map = serializer.serialize_map(Some(assoc.len()))?;
-                      for (key, value) in assoc.iter() {
-                          // Serialize each entry in the map
-                          map.serialize_entry(&key, &value)?;
-                      }
-                      // Finish serializing the map
-                      map.end()
-                  }
-
                   Sized::List(ref l) => {
                       // Serialize a list (sequence)
                       let mut seq = serializer.serialize_seq(Some(l.len()))?;
@@ -2640,6 +2632,19 @@ internally, to keep track of things like the stack, program, lists etc.
                       seq.end()
                   }
                   Sized::String(s) => serializer.serialize_str(s.as_str()),
+                  s => {
+                      let a = Result::<assoc::Associative, DeriveError<Sized>>::derive(s.clone())
+                          .unwrap();
+                      // Start serializing a map
+                      let assoc = assoc::Association::derive(a);
+                      let mut map = serializer.serialize_map(Some(assoc.len()))?;
+                      for (key, value) in assoc.iter() {
+                          // Serialize each entry in the map
+                          map.serialize_entry(&key, &value)?;
+                      }
+                      // Finish serializing the map
+                      map.end()
+                  }
               }
           }
       }
@@ -3032,9 +3037,27 @@ internally, to keep track of things like the stack, program, lists etc.
       type Output = Association;
       type Error = Error;
       fn join(self, other: coll::List) -> Result<Self::Output, Self::Error> {
-          //println!("Joining list to association");
           let la = Association::try_from_iter(other.iter().cloned())?;
           Ok(self.join(Associative::Assoc(la)).unwrap())
+      }
+  }
+
+  impl coll::Join<Association> for coll::List {
+      type Output = Association;
+      type Error = Error;
+      fn join(self, other: Association) -> Result<Self::Output, Self::Error> {
+          let la = Association::try_from_iter(self.iter().cloned())?;
+          Ok(la.join(other).unwrap())
+      }
+  }
+
+  impl coll::Join<Association> for Association {
+      type Output = Association;
+      type Error = Infallible;
+      fn join(mut self, other: Association) -> Result<Self::Output, Self::Error> {
+          self.mutate()
+              .extend(other.iter().map(|(k, v)| (k.clone(), v.clone())));
+          Ok(self)
       }
   }
 
@@ -3386,6 +3409,10 @@ internally, to keep track of things like the stack, program, lists etc.
               Item::Error(a) => Ok(Associative::Error(a)),
               Item::Words(a) => Ok(Associative::Words(a)),
               Item::Dictionary(a) => Ok(Associative::Dictionary(a)),
+              //Item::List(l) => Association::derive_iter(l.iter().cloned()),
+              Item::List(l) => Association::try_from_iter(l.iter().cloned())
+                  .map(Associative::Assoc)
+                  .map_err(DeriveError::derive),
               i => Err(DeriveError::expected(fit!("associative"), i)),
           }
       }
@@ -3400,6 +3427,9 @@ internally, to keep track of things like the stack, program, lists etc.
               coll::Sized::Error(a) => Ok(Associative::Error(a)),
               coll::Sized::Words(a) => Ok(Associative::Words(a)),
               coll::Sized::Dictionary(a) => Ok(Associative::Dictionary(a)),
+              coll::Sized::List(l) => Association::try_from_iter(l.iter().cloned())
+                  .map(Associative::Assoc)
+                  .map_err(|_| DeriveError::expected(fit!("associative"), coll::Sized::List(l))),
               i => Err(DeriveError::expected(fit!("associative"), i)),
           }
       }
@@ -3873,6 +3903,16 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  impl<T> From<DeriveError<T>> for Error
+  where
+      T: Fit<Item>,
+  {
+      fn from(e: DeriveError<T>) -> Error {
+          //return an Error
+          Error::expected(e.expected.fit(), e.src.fit())
+      }
+  }
+
   impl Derive<Infallible> for Error {
       fn derive(_x: Infallible) -> Self {
           match _x {} // Since Infallible can never be instantiated, this will never run
@@ -3950,6 +3990,18 @@ internally, to keep track of things like the stack, program, lists etc.
               .chain(std::iter::once((fit!("handled"), self.is_handled.fit())))
               .collect();
           Box::new(items.into_iter())
+      }
+  }
+
+  /// When joining two identically shaped map-like structs, it's just
+  /// last one wins. This isn't ideal because errors aren't necessarily
+  /// identical fields (they support arbitrary fields but that's a bit
+  /// of a implmentation detail for now)
+  impl coll::Join<Error> for Error {
+      type Output = Error;
+      type Error = Infallible;
+      fn join(self, other: Self) -> Result<Self::Output, Self::Error> {
+          Ok(other)
       }
   }
 #+end_src
@@ -4508,8 +4560,18 @@ internally, to keep track of things like the stack, program, lists etc.
       type Error = Infallible;
       fn join(mut self, other: Self) -> Result<Self::Output, Self::Error> {
           self.words = self.words.join(other.words)?;
+          self.modules.extend(other.modules.into_iter());
           self.resolve();
           Ok(self)
+      }
+  }
+
+  /// When joining two identically shaped map-like structs, it's just last one wins.
+  impl coll::Join<Entry> for Entry {
+      type Output = Entry;
+      type Error = Infallible;
+      fn join(self, other: Self) -> Result<Self::Output, Self::Error> {
+          Ok(other)
       }
   }
 
@@ -4813,6 +4875,7 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::types::*;
 
   use once_cell::sync::Lazy;
+  use std::convert::Infallible;
   use std::future;
 
   /// A struct to hold the state of an executing kcats program. The
@@ -5292,6 +5355,16 @@ internally, to keep track of things like the stack, program, lists etc.
           //let am = assoc.mutate();
           //am.remove(&("dictionary".fit()));
           assoc.fit()
+      }
+  }
+
+  /// When joining two identically shaped map-like structs, it's just
+  /// last one wins.
+  impl coll::Join<Environment> for Environment {
+      type Output = Environment;
+      type Error = Infallible;
+      fn join(self, other: Self) -> Result<Self::Output, Self::Error> {
+          Ok(other)
       }
   }
 #+end_src
@@ -7391,7 +7464,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn is_association(i: Item) -> bool {
-      Result::<assoc::Associative, DeriveError<Item>>::derive(i).is_ok()
+      match i {
+          Item::Assoc(_) => true,
+          _ => false,
+      }
   }
 
   pub fn is_set(i: Item) -> bool {
