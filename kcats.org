@@ -383,24 +383,15 @@ internally, to keep track of things like the stack, program, lists etc.
   /// A Word causes a kcats program to do something, usually taking some
   /// items derive the top of the stack, and using them to create new
   /// stack items. (examples: `swap`, `+`, `dip`).
-  #[derive(Clone, Eq, PartialOrd, Ord, Default, Hash, PartialEq)]
-  pub struct Word {
+  #[derive(Clone, Eq, PartialOrd, Ord, Default, Hash, PartialEq, Debug)]
+  pub struct WordData {
       pub data: Intern<String>,
       pub quoted: bool,
       pub namespace: Option<dict::Namespace>,
   }
 
-  impl fmt::Debug for Word {
-      fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-          if self.quoted {
-              write!(f, "[{}]", Item::Word(self.clone()).emit())
-          } else {
-              write!(f, "{}", Item::Word(self.clone()).emit())
-          }
-      }
-  }
+  pub type Word = Intern<WordData>;
 
-  // these are wrong, not every string is a valid word
   impl TryDerive<String> for Word {
       fn try_derive(s: String) -> Result<Self, Error> {
           serialize::parse(s).and_then(|mut l| {
@@ -497,14 +488,16 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  impl Word {
+  impl WordData {
       /// Strips prefix from the data part of the word (leaves namespace
       /// unaffected). Works just like the String version of this method
       pub fn strip_prefix(&self, prefix: &str) -> Option<Word> {
-          self.data.strip_prefix(prefix).map(|d| Word {
-              data: Intern::new(d.to_string()),
-              namespace: self.namespace,
-              quoted: self.quoted,
+          self.data.strip_prefix(prefix).map(|d| {
+              Intern::new(WordData {
+                  data: Intern::new(d.to_string()),
+                  namespace: self.namespace,
+                  quoted: self.quoted,
+              })
           })
       }
   }
@@ -580,7 +573,7 @@ internally, to keep track of things like the stack, program, lists etc.
       /// A character value, like 'a', or '\n'.
       Char(Char),
       /// A builtin function
-      Builtin(axiom::Builtin),
+      Builtin(Box<axiom::Builtin>),
       /// A container value (that [Item]s can be taken from)
       //Sized(coll::Sized),
       /// Associative containers associate Items in pairs, like Map or
@@ -607,14 +600,14 @@ internally, to keep track of things like the stack, program, lists etc.
       List(Box<coll::List>),
       /// Program containers are optimized for execution of programs, but
       /// also act like Lists
-      Program(Program),
+      Program(Box<Program>),
       /// Set containers have multiple Items in no particular order, and
       /// each Item can only appear once.
       Set(Set),
       //TODO: these should be inside an Arc too
       /// A String is a chunk of text, like a list of individual
       /// characters.
-      String(String),
+      String(Box<String>),
       /// Bytes is the lowest common denominator form of data, useful
       /// for when no other type applies.
       Bytes(Bytes),
@@ -649,7 +642,13 @@ internally, to keep track of things like the stack, program, lists etc.
 
               Item::Out(o) => write!(f, "{:?}", o),
               Item::Tunnel(t) => write!(f, "{:?}", t),
-              Item::Word(w) => write!(f, "{:?}", w),
+              Item::Word(w) => {
+                  if w.quoted {
+                      write!(f, "[{}]", Item::Word(w.clone()).emit())
+                  } else {
+                      write!(f, "{}", Item::Word(w.clone()).emit())
+                  }
+              }
               Item::In(i) => write!(f, "{:?}", i),
           }
       }
@@ -682,7 +681,7 @@ internally, to keep track of things like the stack, program, lists etc.
               (Item::Word(a), Item::Word(b)) => a == b,
               (Item::Bytes(a), Item::Bytes(b)) => a == b,
               (Item::Program(a), Item::Program(b)) => a == b,
-              (Item::Program(a), Item::List(b)) => coll::List::derive(a.clone()) == **b,
+              (Item::Program(a), Item::List(b)) => coll::List::derive((**a).clone()) == **b,
 
               (Item::String(a), Item::String(b)) => a == b,
               (Item::List(a), Item::List(b)) => a == b,
@@ -813,7 +812,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
   impl Derive<String> for Item {
       fn derive(i: String) -> Self {
-          Item::String(i)
+          Item::String(Box::new(i))
       }
   }
 
@@ -826,6 +825,18 @@ internally, to keep track of things like the stack, program, lists etc.
   impl Derive<Word> for Item {
       fn derive(w: Word) -> Self {
           Item::Word(w)
+      }
+  }
+
+  impl Derive<WordData> for Item {
+      fn derive(w: WordData) -> Self {
+          Item::Word(Intern::new(w))
+      }
+  }
+
+  impl Derive<WordData> for Word {
+      fn derive(w: WordData) -> Self {
+          Intern::new(w)
       }
   }
 
@@ -975,7 +986,7 @@ internally, to keep track of things like the stack, program, lists etc.
           where
               E: de::Error,
           {
-              Ok(Item::String(v.to_string()))
+              Ok(Item::String(Box::new(v.to_string())))
           }
 
           fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E>
@@ -1070,7 +1081,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   }
 
                   Item::Program(p) => {
-                      let l = coll::List::derive(p.clone());
+                      let l = coll::List::derive((**p).clone());
                       // Serialize a list (sequence)
                       let mut seq = serializer.serialize_seq(Some(l.len()))?;
                       for element in l.iter() {
@@ -1307,7 +1318,7 @@ internally, to keep track of things like the stack, program, lists etc.
               Item::Int(i) => Ok(Number::Int(i)),
               Item::Float(f) => Ok(Number::Float(f)),
               Item::Char(c) => Ok(Number::Int(c as Int)),
-              Item::String(s) => fromstr(s),
+              Item::String(s) => fromstr(*s),
               i => Err(Error::expected(fit!("number"), i)),
           }
       }
@@ -2338,7 +2349,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn derive(i: Item) -> Self {
           match i {
               Item::Bytes(b) => Ok(Sized::Bytes(b)),
-              Item::String(s) => Ok(Sized::String(s)),
+              Item::String(s) => Ok(Sized::String(*s)),
               Item::List(l) => Ok(Sized::List(l)),
               Item::Assoc(a) => Ok(Sized::Assoc(a)),
               Item::Error(a) => Ok(Sized::Error(a)),
@@ -2347,7 +2358,7 @@ internally, to keep track of things like the stack, program, lists etc.
               Item::Words(a) => Ok(Sized::Words(a)),
               Item::Env(a) => Ok(Sized::Env(a)),
               Item::Set(s) => Ok(Sized::Set(s)),
-              Item::Program(p) => Ok(Sized::Program(p)),
+              Item::Program(p) => Ok(Sized::Program(*p)),
               i => Err(DeriveError::expected(fit!("sized"), i)),
               //try_convert_enum!(item, Item => Sized, [Bytes, String, List, Associative, Set, Program], |i| Self::DeriveError::expected(fit!("sized"), i) )
           }
@@ -2358,7 +2369,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn try_derive(item: Item) -> Result<Self, Error> {
           match item {
               Item::Bytes(b) => Ok(Sized::Bytes(b)),
-              Item::String(s) => Ok(Sized::String(s)),
+              Item::String(s) => Ok(Sized::String(*s)),
               Item::List(l) => Ok(Sized::List(l)),
               Item::Assoc(a) => Ok(Sized::Assoc(a)),
               Item::Error(a) => Ok(Sized::Error(a)),
@@ -2367,7 +2378,7 @@ internally, to keep track of things like the stack, program, lists etc.
               Item::Words(a) => Ok(Sized::Words(a)),
               Item::Env(a) => Ok(Sized::Env(a)),
               Item::Set(s) => Ok(Sized::Set(s)),
-              Item::Program(p) => Ok(Sized::Program(p)),
+              Item::Program(p) => Ok(Sized::Program(*p)),
               i => Err(Error::expected(fit!("sized"), i)),
               //try_convert_enum!(item, Item => Sized, [Bytes, String, List, Associative, Set, Program], |i| Self::DeriveError::expected(fit!("sized"), i) )
           }
@@ -2380,7 +2391,7 @@ internally, to keep track of things like the stack, program, lists etc.
               Item::In(i) => Ok(Receptacle::In(i)),
               Item::Tunnel(t) => Ok(Receptacle::Tunnel(t)),
               Item::Bytes(b) => Ok(Receptacle::Sized(Sized::Bytes(b))),
-              Item::String(s) => Ok(Receptacle::Sized(Sized::String(s))),
+              Item::String(s) => Ok(Receptacle::Sized(Sized::String(*s))),
               Item::List(l) => Ok(Receptacle::Sized(Sized::List(l))),
               Item::Assoc(a) => Ok(Receptacle::Sized(Sized::Assoc(a))),
               Item::Error(a) => Ok(Receptacle::Sized(Sized::Error(a))),
@@ -2389,7 +2400,7 @@ internally, to keep track of things like the stack, program, lists etc.
               Item::Words(a) => Ok(Receptacle::Sized(Sized::Words(a))),
               Item::Env(a) => Ok(Receptacle::Sized(Sized::Env(a))),
               Item::Set(s) => Ok(Receptacle::Sized(Sized::Set(s))),
-              Item::Program(p) => Ok(Receptacle::Sized(Sized::Program(p))),
+              Item::Program(p) => Ok(Receptacle::Sized(Sized::Program(*p))),
               i => Err(Error::expected(fit!("receptacle"), i)),
           }
       }
@@ -2461,7 +2472,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn derive(d: Dispenser) -> Self {
           match d {
               Dispenser::Sized(Sized::Bytes(b)) => Item::Bytes(b),
-              Dispenser::Sized(Sized::String(s)) => Item::String(s),
+              Dispenser::Sized(Sized::String(s)) => Item::String(Box::new(s)),
               Dispenser::Sized(Sized::List(l)) => Item::List(l),
               Dispenser::Sized(Sized::Set(s)) => Item::Set(s),
               Dispenser::Sized(Sized::Assoc(a)) => Item::Assoc(a),
@@ -2470,7 +2481,7 @@ internally, to keep track of things like the stack, program, lists etc.
               Dispenser::Sized(Sized::Words(a)) => Item::Words(a),
               Dispenser::Sized(Sized::Env(a)) => Item::Env(a),
               Dispenser::Sized(Sized::Error(a)) => Item::Error(a),
-              Dispenser::Sized(Sized::Program(p)) => Item::Program(p),
+              Dispenser::Sized(Sized::Program(p)) => Item::Program(Box::new(p)),
               Dispenser::Out(o) => Item::Out(o),
               Dispenser::Tunnel(t) => Item::Tunnel(t),
           }
@@ -2481,10 +2492,10 @@ internally, to keep track of things like the stack, program, lists etc.
       fn derive(r: Receptacle) -> Self {
           match r {
               Receptacle::Sized(Sized::Bytes(b)) => Item::Bytes(b),
-              Receptacle::Sized(Sized::String(s)) => Item::String(s),
+              Receptacle::Sized(Sized::String(s)) => Item::String(Box::new(s)),
               Receptacle::Sized(Sized::List(l)) => Item::List(l),
               Receptacle::Sized(Sized::Set(s)) => Item::Set(s),
-              Receptacle::Sized(Sized::Program(p)) => Item::Program(p),
+              Receptacle::Sized(Sized::Program(p)) => Item::Program(Box::new(p)),
               Receptacle::Sized(Sized::Assoc(a)) => Item::Assoc(a),
               Receptacle::Sized(Sized::Dictionary(a)) => Item::Dictionary(a),
               Receptacle::Sized(Sized::DictEntry(a)) => Item::DictEntry(a),
@@ -2507,7 +2518,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn try_derive(item: Item) -> Result<Self, Error> {
           match item {
               Item::Bytes(b) => Ok(Dispenser::Sized(Sized::Bytes(b))),
-              Item::String(s) => Ok(Dispenser::Sized(Sized::String(s))),
+              Item::String(s) => Ok(Dispenser::Sized(Sized::String(*s))),
               Item::List(l) => Ok(Dispenser::Sized(Sized::List(l))),
               Item::Set(s) => Ok(Dispenser::Sized(Sized::Set(s))),
               Item::Assoc(a) => Ok(Dispenser::Sized(Sized::Assoc(a))),
@@ -2517,7 +2528,7 @@ internally, to keep track of things like the stack, program, lists etc.
               Item::Words(a) => Ok(Dispenser::Sized(Sized::Words(a))),
               Item::Env(a) => Ok(Dispenser::Sized(Sized::Env(a))),
               Item::Nothing => Ok(Dispenser::Sized(Sized::default())),
-              Item::Program(p) => Ok(Dispenser::Sized(Sized::Program(p))),
+              Item::Program(p) => Ok(Dispenser::Sized(Sized::Program(*p))),
               Item::Out(s) => Ok(Dispenser::Out(s)),
               Item::Tunnel(s) => Ok(Dispenser::Tunnel(s)),
               i => Err(Error::expected(fit!("iterable"), i)),
@@ -3309,7 +3320,7 @@ internally, to keep track of things like the stack, program, lists etc.
               Associative::Env(e) => e.get(k),
               Associative::DictEntry(d) => d.get(k),
               Associative::Words(d) => match k {
-                  KeyItem::Word(w) => d.get(&w.clone().fit()).map(|x| x.clone().fit()),
+                  KeyItem::Word(w) => d.get(w).map(|x| x.clone().fit()),
                   _ => None,
               },
               &Associative::Nothing => None,
@@ -3325,7 +3336,7 @@ internally, to keep track of things like the stack, program, lists etc.
               Associative::DictEntry(d) => d.contains_key(k),
               Associative::Dictionary(d) => d.contains_key(k),
               Associative::Words(d) => match k {
-                  KeyItem::Word(w) => d.contains_key(&w.clone().fit()),
+                  KeyItem::Word(w) => d.contains_key(w),
                   _ => false,
               },
               &Associative::Nothing => false,
@@ -4015,7 +4026,7 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::traits::*;
   use crate::types::container::associative::Convert;
   use crate::types::container::{self as coll, Count, Mutey};
-  use crate::types::{self, Bytes, Error, Item, Word};
+  use crate::types::{self, Bytes, Error, Item, Word, WordData};
   use crate::{fit, list};
   use core::fmt;
   use internment::Intern;
@@ -4289,9 +4300,9 @@ internally, to keep track of things like the stack, program, lists etc.
                           {
                               // Block out the namespace, since we want to
                               // find the word using no namespace
-                              let mut kk = k.clone();
+                              let mut kk = k.as_ref().clone();
                               kk.namespace = None;
-                              kk
+                              kk.fit()
                           },
                           v.clone(),
                       ));
@@ -4313,7 +4324,11 @@ internally, to keep track of things like the stack, program, lists etc.
           //     cache.len(),
           //     by_ns.keys()
           // );
-          //println!("resolve: contains? {:?}", cache.get(&"contains?".fit()));
+          // println!(
+          //     "resolve: contains? {:?}",
+          //     cache.get(Word::try_derive("contains?").unwrap().as_ref())
+          // );
+          //println!("Example key {:?}", cache.keys().find(|_| true));
           self.lingo = cache;
           //println!("After resolve: {:?}", self);
       }
@@ -4430,11 +4445,12 @@ internally, to keep track of things like the stack, program, lists etc.
 
           let adds: HashMap<Word, Entry> = adds
               .into_iter()
-              .map(|(mut w, mut e)| {
+              .map(|(w, mut e)| {
+                  let mut w = w.as_ref().clone();
                   w.namespace = Some(*namespace);
                   e.namespace = *namespace;
                   //println!("Adding {:?}", w);
-                  (w, e)
+                  (Intern::new(w), e)
               })
               .collect();
           let sm = self.mutate();
@@ -4456,13 +4472,13 @@ internally, to keep track of things like the stack, program, lists etc.
               .and_then(|i| coll::List::try_derive(i))?;
           for r in Box::new(items.iter().cloned()) {
               let (k, def): (assoc::KeyItem, Item) = r.try_fit().unwrap();
-              let mut word: Word = k.try_fit().unwrap();
+              let mut word: WordData = Word::try_derive(k).unwrap().as_ref().clone();
               word.namespace = Some(namespace);
               let iter: Box<dyn Iterator<Item = Item>> = def.try_fit().unwrap();
               let new_entry: Entry = iter.try_fit().unwrap();
               let new_entry2 = new_entry.clone();
 
-              dict.entry(word)
+              dict.entry(word.fit())
                   .and_modify(|e| {
                       e.examples = new_entry.examples;
                       e.spec = new_entry.spec;
@@ -4508,9 +4524,9 @@ internally, to keep track of things like the stack, program, lists etc.
                   namespace: ns.clone(),
                   doc: None,
               };
-              let mut bw = bw.clone();
+              let mut bw = bw.as_ref().clone();
               bw.namespace = Some(*ns);
-              dict.insert(bw.clone(), entry);
+              dict.insert(bw.fit(), entry);
           }
           Arc::new(dict)
       }
@@ -5840,7 +5856,7 @@ example, in order to read/write to/from disk).
               )
               .fit()
           }),
-          edn_format::Value::Symbol(s) => Ok(Item::Word(Word {
+          edn_format::Value::Symbol(s) => Ok(Item::Word(Intern::new(WordData {
               data: Intern::new(s.name().to_string()),
               namespace: s
                   .namespace()
@@ -5848,7 +5864,7 @@ example, in order to read/write to/from disk).
                   .transpose()?
                   .map(Intern::new),
               quoted: false,
-          })),
+          }))),
           // we don't have booleans in kcats, so if we see 'false' that
           // is the word false which is not defined in the base
           // language, but might be user-defined later.
@@ -5943,7 +5959,7 @@ example, in order to read/write to/from disk).
               ),
               Item::Program(v) => edn_format::Value::Vector(
                   //TODO not efficient, maybe make an iterator for program
-                  coll::List::derive(v.clone())
+                  coll::List::derive((**v).clone())
                       .into_iter()
                       .map(|i| (&i).into())
                       .collect::<Vec<edn_format::Value>>(),
@@ -6568,7 +6584,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   impl Derive<Builtin> for Item {
       fn derive(a: Builtin) -> Item {
-          Item::Builtin(a)
+          Item::Builtin(Box::new(a))
       }
   }
 
@@ -7060,8 +7076,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   /// unwrapping, just flag it as quoted, and the
   /// evaluator will just push it unexamined.
   fn dip_quote(i: &mut Item) {
-      if let Item::Word(ref mut w) = i {
-          w.quoted = true;
+      if let Item::Word(w) = i {
+          let mut j = w.as_ref().clone();
+          j.quoted = true;
+          ,*i = Item::Word(Intern::new(j));
       }
   }
 
@@ -7506,7 +7524,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   if word.quoted {
                       // word was quoted (see axiom::dip), just push onto stack
                       // and remove the quotedness
-                      let mut w = word.clone();
+                      let mut w = word.as_ref().clone();
                       env.pop_prog();
 
                       w.quoted = false;
@@ -8024,7 +8042,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   fn namespace(word: Word, ns: Bytes) -> Word {
-      let mut word = word;
+      let mut word = word.as_ref().clone();
       word.namespace = Some(Intern::new(ns));
       word.fit()
   }
@@ -8032,7 +8050,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   fn unnamespace(mut env: Environment) -> Future<Environment> {
       if let Some(i) = env.stack.pop_front() {
           match Word::try_derive(i) {
-              Ok(mut w) => {
+              Ok(w) => {
+                  let mut w = w.as_ref().clone();
                   env.pop_prog();
                   if let Some(ns) = w.namespace {
                       w.namespace = None;
@@ -8056,12 +8075,13 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   fn resolve(mut env: Environment) -> Future<Environment> {
       if let Some(i) = env.stack.pop_front() {
           match Word::try_derive(i) {
-              Ok(mut w) => {
+              Ok(w) => {
                   env.pop_prog();
+                  let mut w2 = w.as_ref().clone();
                   if let Some(e) = env.dictionary.lingo.get(&w) {
-                      w.namespace = Some(e.namespace);
+                      w2.namespace = Some(e.namespace);
                   }
-                  env.push(w);
+                  env.push(w2);
               }
               Err(e) => {
                   env.push(e);
@@ -8840,8 +8860,8 @@ rust project or some other language through FFI.
               }
               false
           }
-
-          if let Some(d) = standard_env.dictionary.lingo.get(&w.clone().fit()) {
+          //println!("Testing! {:?}", w);
+          if let Some(d) = standard_env.dictionary.lingo.get(&w) {
               d.examples
                   .clone()
                   .unwrap()
@@ -8869,6 +8889,7 @@ rust project or some other language through FFI.
                   })
                   .collect::<Vec<Error>>()
           } else {
+              //println!("Couldn't find word. Dict is {:?}", )
               vec![Error::create(
                   list!("dictionary", list!(w.clone()), "lookup"),
                   "word is not defined",
@@ -9118,9 +9139,11 @@ We'll also define how to run unit tests.
   use kcats::config::configure_platform;
   use kcats::serialize::{self, Emit};
   pub use kcats::traits::*;
+  use kcats::types;
   use kcats::types::container::environment::Environment;
-  use kcats::types::container::List;
+  use kcats::types::container::{error, pipe::Out, List};
   use std::io::{self, BufRead, Read, Write};
+  use std::mem;
 
   fn print_result(env: Environment) {
       if env.program.is_empty() {
@@ -9255,6 +9278,12 @@ We'll also define how to run unit tests.
   /// in several different modes.
   #[tokio::main]
   async fn main() {
+      println!("Size of Item: {}", mem::size_of::<types::Item>());
+      println!("Size of String: {}", mem::size_of::<String>());
+      println!("Size of Error: {}", mem::size_of::<error::Error>());
+      println!("Size of Word: {}", mem::size_of::<types::Word>());
+      println!("Size of Out (pipe): {}", mem::size_of::<Out>());
+
       // Set up process-wide paths and panic if this fails
       configure_platform();
       // read command line options, to look for -i switch
@@ -9336,7 +9365,7 @@ The basic pipe contracts.
       Socket(Arc<RwLock<net::Socket>>),
       /// A pipe that takes items to send through a channel to another
       /// part of the running program
-      Handoff(channel::Handoff<Item>),
+      Handoff(Box<channel::Handoff<Item>>),
       /// A pipe that takes bytes to write to standard out
       Standard,
   }
@@ -9362,11 +9391,11 @@ The basic pipe contracts.
       ServerSocket(Arc<RwLock<net::ServerSocket>>),
       /// A pipe that produces items from a channel that comes from
       /// another part of the program
-      Handoff(channel::Handoff<Item>),
+      Handoff(Box<channel::Handoff<Item>>),
       /// A pipe that produces a dummy value after a given amount of
       /// time. Can be used as a timeout mechanism when waiting on
       /// multiple pipes at once.
-      Timer(channel::Timer),
+      Timer(Box<channel::Timer>),
       /// A pipe that produces timestamps of the current UNIX time
       Time,
       /// A pipe that produces bytes from standard in.
@@ -9397,7 +9426,7 @@ The basic pipe contracts.
       Socket(Arc<RwLock<net::Socket>>),
       /// A pipe that produces or accepts values to/from a channel that
       /// connects to another part of the program.
-      Handoff(channel::Handoff<Item>),
+      Handoff(Box<channel::Handoff<Item>>),
       /// A pipe to standard in/out that produces/accepts bytes.
       Standard,
   }
@@ -10241,7 +10270,7 @@ Implement the =handoff= type
 
   pub fn handoff(mut env: Environment) -> types::Future<Environment> {
       env.pop_prog();
-      env.push(pipe::Tunnel::Handoff(Handoff::new(false)));
+      env.push(pipe::Tunnel::Handoff(Box::new(Handoff::new(false))));
       env.fit()
   }
 
@@ -10346,9 +10375,9 @@ Implement the =handoff= type
   impl TryDerive<Item> for Handoff<Item> {
       fn try_derive(i: Item) -> Result<Self, Error> {
           match i {
-              Item::Out(pipe::Out::Handoff(p)) => Ok(p),
-              Item::In(pipe::In::Handoff(p)) => Ok(p),
-              Item::Tunnel(pipe::Tunnel::Handoff(p)) => Ok(p),
+              Item::Out(pipe::Out::Handoff(p)) => Ok(*p),
+              Item::In(pipe::In::Handoff(p)) => Ok(*p),
+              Item::Tunnel(pipe::Tunnel::Handoff(p)) => Ok(*p),
               i => Err(Error::expected(fit!("handoff"), i)),
           }
       }
@@ -10358,14 +10387,14 @@ Implement the =handoff= type
   pub fn sender(i: Item) -> axiom::ItemResult {
       let mut h = Handoff::try_derive(i).map_err(Error::derive)?;
       h.close_take();
-      Ok(Item::In(pipe::In::Handoff(h)))
+      Ok(Item::In(pipe::In::Handoff(Box::new(h))))
   }
 
   // drop the sender side of the handoff and return the handoff item
   pub fn receiver(i: Item) -> axiom::ItemResult {
       let mut h = Handoff::try_derive(i).map_err(Error::derive)?;
       h.close_put();
-      Ok(Item::Out(pipe::Out::Handoff(h)))
+      Ok(Item::Out(pipe::Out::Handoff(Box::new(h))))
   }
 
   #[derive(Debug)]
@@ -10425,7 +10454,7 @@ Implement the =handoff= type
 
   impl Derive<Timer> for Item {
       fn derive(t: Timer) -> Self {
-          Item::Out(pipe::Out::Timer(t))
+          Item::Out(pipe::Out::Timer(Box::new(t)))
       }
   }
 
@@ -10625,7 +10654,7 @@ Implement the =handoff= type
       if let Some(w) = s.strip_prefix("w|") {
           w.try_fit()
       } else if let Some(s) = s.strip_prefix("s|") {
-          Ok(Item::String(s.to_string()))
+          Ok(Item::String(Box::new(s.to_string())))
       } else if let Some(c) = s.strip_prefix("c|") {
           let char_seq = c;
           if char_seq.chars().count() == 1 {
@@ -10661,7 +10690,7 @@ Implement the =handoff= type
               Item::Float(f) => f.to_sql(),
               Item::Char(c) => Ok(EncodeAs::Char(*c).encode()),
               Item::Word(w) => Ok(EncodeAs::Word(w.clone()).encode()),
-              Item::String(s) => Ok(EncodeAs::String(s.clone()).encode()),
+              Item::String(s) => Ok(EncodeAs::String((**s).clone()).encode()),
               Item::Bytes(b) => b.to_sql(),
               _ => todo!("convert item variants to sql values"),
           }
@@ -15994,7 +16023,7 @@ of modules.
   use std::mem;
   extern crate internment;
   use internment::Intern;
-
+  
   fn main() {
       // Let's suppose this is our large type
       struct MyLargeType(Vec<u8>);
