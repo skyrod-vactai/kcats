@@ -362,10 +362,9 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::types::container::dictionary as dict;
   use crate::types::container::environment as env;
   use crate::types::container::error::Error;
-  use crate::types::container::pipe;
+  use crate::types::container::pipe::{channel, fs, net};
   use crate::types::container::program::Program;
   use crate::{fit, list};
-
   use core::default::Default;
   use core::fmt;
   use im;
@@ -374,8 +373,9 @@ internally, to keep track of things like the stack, program, lists etc.
   use std::collections::HashMap;
   use std::hash::Hash;
   use std::marker::Sync;
-
   use std::pin::Pin;
+  use std::sync::Arc;
+  use tokio::sync::RwLock;
 
   pub mod container;
   pub mod number;
@@ -611,12 +611,25 @@ internally, to keep track of things like the stack, program, lists etc.
       /// Bytes is the lowest common denominator form of data, useful
       /// for when no other type applies.
       Bytes(Bytes),
-      Out(pipe::Out),
-
-      /// A container value (that [Item]s can be put into)
-      In(pipe::In),
-      /// A pipe supporting both in and out
-      Tunnel(pipe::Tunnel),
+      //Out(pipe::Out),
+      /// Pipe types
+      /// A pipe that produces bytes from a file on disk
+      StaticFile(Arc<RwLock<fs::StaticFile>>),
+      /// A pipe that produces bytes from a TCP/IP socket
+      Socket(Arc<RwLock<net::Socket>>),
+      /// A pipe that produces sockets from a TCP/IP server socket
+      ServerSocket(Arc<RwLock<net::ServerSocket>>),
+      /// A pipe that produces items from a channel that comes from
+      /// another part of the program
+      Handoff(Box<channel::Handoff<Item>>),
+      /// A pipe that produces a dummy value after a given amount of
+      /// time. Can be used as a timeout mechanism when waiting on
+      /// multiple pipes at once.
+      Timer(Box<channel::Timer>),
+      /// A pipe that produces timestamps of the current UNIX time
+      Time,
+      /// A pipe that produces bytes from standard in.
+      Standard,
   }
 
   impl fmt::Debug for Item {
@@ -640,8 +653,13 @@ internally, to keep track of things like the stack, program, lists etc.
               Item::Nothing => write!(f, "Nothing!"),
               Item::String(s) => write!(f, "{:?}", s),
 
-              Item::Out(o) => write!(f, "{:?}", o),
-              Item::Tunnel(t) => write!(f, "{:?}", t),
+              Item::Handoff(h) => write!(f, "{:?}", h),
+              Item::Socket(s) => write!(f, "{:?}", s),
+              Item::ServerSocket(s) => write!(f, "{:?}", s),
+              Item::StaticFile(ff) => write!(f, "{:?}", ff),
+              Item::Timer(t) => write!(f, "{:?}", t),
+              Item::Standard => write!(f, "{:?}", Item::Standard),
+              Item::Time => write!(f, "{:?}", Item::Time),
               Item::Word(w) => {
                   if w.quoted {
                       write!(f, "[{}]", Item::Word(w.clone()).emit())
@@ -649,7 +667,6 @@ internally, to keep track of things like the stack, program, lists etc.
                       write!(f, "{}", Item::Word(w.clone()).emit())
                   }
               }
-              Item::In(i) => write!(f, "{:?}", i),
           }
       }
   }
@@ -694,10 +711,12 @@ internally, to keep track of things like the stack, program, lists etc.
               (Item::Dictionary(a), Item::Dictionary(b)) => a == b,
               (Item::Nothing, Item::Nothing) => true,
 
-              (Item::Out(a), Item::Out(b)) => a == b,
-              (Item::Tunnel(a), Item::Tunnel(b)) => a == b,
-
-              (Item::In(a), Item::In(b)) => a == b,
+              (Item::StaticFile(s1), Item::StaticFile(s2)) => Arc::ptr_eq(s1, s2),
+              (Item::Socket(s1), Item::Socket(s2)) => Arc::ptr_eq(s1, s2),
+              (Item::ServerSocket(s1), Item::ServerSocket(s2)) => Arc::ptr_eq(s1, s2),
+              (Item::Handoff(h1), Item::Handoff(h2)) => h1 == h2,
+              (Item::Time, Item::Time) => true,
+              (Item::Standard, Item::Standard) => true,
 
               (Item::Char(a), Item::Char(b)) => a == b,
               (a, b) => a.is_empty() && b.is_empty(),
@@ -931,8 +950,13 @@ internally, to keep track of things like the stack, program, lists etc.
       use crate::serialize::Display;
       use crate::traits::*;
       use crate::types::container as coll;
-      use crate::types::container::associative as assoc;
+      use crate::types::container::{
+          associative as assoc,
+          pipe::{standard, time},
+      };
+
       use crate::types::Error;
+      use futures::executor;
       use serde::de::{self, Deserialize, Deserializer, Visitor};
       use serde::ser::{Serialize, SerializeMap, SerializeSeq, Serializer};
       use std::collections::HashMap;
@@ -1100,9 +1124,22 @@ internally, to keep track of things like the stack, program, lists etc.
                   }
                   Item::String(s) => serializer.serialize_str(s.as_str()),
 
-                  Item::Out(ref out) => (*out).representation().serialize(serializer),
-                  Item::Tunnel(ref t) => t.representation().serialize(serializer),
-                  Item::In(ref i) => i.representation().serialize(serializer),
+                  Item::StaticFile(f) => {
+                      executor::block_on(async move { f.read().await.representation() })
+                          .serialize(serializer)
+                  }
+                  Item::Socket(f) => {
+                      executor::block_on(async move { f.read().await.representation() })
+                          .serialize(serializer)
+                  }
+                  Item::ServerSocket(f) => {
+                      executor::block_on(async move { f.read().await.representation() })
+                          .serialize(serializer)
+                  }
+                  Item::Handoff(h) => h.representation().serialize(serializer),
+                  Item::Timer(t) => t.representation().serialize(serializer),
+                  Item::Time => time::representation().serialize(serializer),
+                  Item::Standard => standard::representation().serialize(serializer),
               }
           }
       }
@@ -2388,8 +2425,10 @@ internally, to keep track of things like the stack, program, lists etc.
   impl TryDerive<Item> for Receptacle {
       fn try_derive(item: Item) -> Result<Self, Error> {
           match item {
-              Item::In(i) => Ok(Receptacle::In(i)),
-              Item::Tunnel(t) => Ok(Receptacle::Tunnel(t)),
+              Item::StaticFile(f) => Ok(Receptacle::In(pipe::In::StaticFile(f))),
+              Item::Socket(s) => Ok(Receptacle::In(pipe::In::Socket(s))),
+              Item::Handoff(h) => Ok(Receptacle::In(pipe::In::Handoff(h))),
+              Item::Standard => Ok(Receptacle::In(pipe::In::Standard)),
               Item::Bytes(b) => Ok(Receptacle::Sized(Sized::Bytes(b))),
               Item::String(s) => Ok(Receptacle::Sized(Sized::String(*s))),
               Item::List(l) => Ok(Receptacle::Sized(Sized::List(l))),
@@ -2482,8 +2521,8 @@ internally, to keep track of things like the stack, program, lists etc.
               Dispenser::Sized(Sized::Env(a)) => Item::Env(a),
               Dispenser::Sized(Sized::Error(a)) => Item::Error(a),
               Dispenser::Sized(Sized::Program(p)) => Item::Program(Box::new(p)),
-              Dispenser::Out(o) => Item::Out(o),
-              Dispenser::Tunnel(t) => Item::Tunnel(t),
+              Dispenser::Out(o) => o.fit(),
+              Dispenser::Tunnel(t) => t.fit(),
           }
       }
   }
@@ -2502,8 +2541,8 @@ internally, to keep track of things like the stack, program, lists etc.
               Receptacle::Sized(Sized::Words(a)) => Item::Words(a),
               Receptacle::Sized(Sized::Env(a)) => Item::Env(a),
               Receptacle::Sized(Sized::Error(a)) => Item::Error(a),
-              Receptacle::In(o) => Item::In(o),
-              Receptacle::Tunnel(t) => Item::Tunnel(t),
+              Receptacle::In(o) => o.fit(),
+              Receptacle::Tunnel(t) => t.fit(),
           }
       }
   }
@@ -2529,8 +2568,14 @@ internally, to keep track of things like the stack, program, lists etc.
               Item::Env(a) => Ok(Dispenser::Sized(Sized::Env(a))),
               Item::Nothing => Ok(Dispenser::Sized(Sized::default())),
               Item::Program(p) => Ok(Dispenser::Sized(Sized::Program(*p))),
-              Item::Out(s) => Ok(Dispenser::Out(s)),
-              Item::Tunnel(s) => Ok(Dispenser::Tunnel(s)),
+              Item::StaticFile(f) => Ok(Dispenser::Out(pipe::Out::StaticFile(f))),
+              Item::Socket(f) => Ok(Dispenser::Out(pipe::Out::Socket(f))),
+              Item::ServerSocket(f) => Ok(Dispenser::Out(pipe::Out::ServerSocket(f))),
+              Item::Handoff(f) => Ok(Dispenser::Out(pipe::Out::Handoff(f))),
+              Item::Timer(f) => Ok(Dispenser::Out(pipe::Out::Timer(f))),
+              Item::Standard => Ok(Dispenser::Out(pipe::Out::Standard)),
+              Item::Time => Ok(Dispenser::Out(pipe::Out::Time)),
+
               i => Err(Error::expected(fit!("iterable"), i)),
           }
       }
@@ -5212,8 +5257,13 @@ internally, to keep track of things like the stack, program, lists etc.
           (w, _) if *w == *S_ITEM => true,
           (
               w,
-              Item::Out(_)
-              | Item::Tunnel(_)
+              Item::Standard
+              | Item::Handoff(_)
+              | Item::Socket(_)
+              | Item::ServerSocket(_)
+              | Item::StaticFile(_)
+              | Item::Time
+              | Item::Timer(_)
               | Item::String(_)
               | Item::Bytes(_)
               | Item::Dictionary(_)
@@ -5229,7 +5279,10 @@ internally, to keep track of things like the stack, program, lists etc.
           ) if *w == *S_DISPENSER => true,
           (
               w,
-              Item::Tunnel(_)
+              Item::Standard
+              | Item::Handoff(_)
+              | Item::Socket(_)
+              | Item::StaticFile(_)
               | Item::String(_)
               | Item::Bytes(_)
               | Item::Dictionary(_)
@@ -5252,7 +5305,16 @@ internally, to keep track of things like the stack, program, lists etc.
           (w, Item::String(_)) if *w == *S_STRING => true,
           (w, Item::Word(_)) if *w == *S_WORD => true,
 
-          (w, Item::Out(_) | Item::Tunnel(_) | Item::In(_)) if *w == *S_PIPE => true,
+          (
+              w,
+              Item::Standard
+              | Item::Handoff(_)
+              | Item::Socket(_)
+              | Item::ServerSocket(_)
+              | Item::StaticFile(_)
+              | Item::Time
+              | Item::Timer(_),
+          ) if *w == *S_PIPE => true,
 
           (w, Item::List(_) | Item::Program(_)) if *w == *S_LIST || *w == *S_PROGRAM => true,
 
@@ -5825,15 +5887,17 @@ example, in order to read/write to/from disk).
   use crate::fit;
   use crate::traits::*;
   use crate::types::container::{
-      self as coll, associative as assoc, environment::Environment, error::Error,
+      self as coll, associative as assoc, environment::Environment, error::Error, pipe::standard,
+      pipe::time,
   };
   use crate::types::*;
 
   use base64::prelude::BASE64_URL_SAFE_NO_PAD;
   use base64::Engine;
   use edn_format::ParserOptions;
-  use internment::Intern;
+  use futures::executor;
 
+  use internment::Intern;
   use std::fmt;
   use std::string;
 
@@ -5925,9 +5989,19 @@ example, in order to read/write to/from disk).
                   }
               }),
               //Item::Entry(w) => edn_format::Value::Symbol(edn_format::Symbol::from_name(&w.word)),
-              Item::Out(o) => (&o.representation()).into(),
-              Item::Tunnel(t) => (&t.representation()).into(),
-              Item::In(i) => (&i.representation()).into(),
+              Item::Standard => edn_format::Value::from(&standard::representation()),
+              Item::StaticFile(f) => edn_format::Value::from(&executor::block_on(async move {
+                  f.read().await.representation()
+              })),
+              Item::ServerSocket(f) => edn_format::Value::from(&executor::block_on(async move {
+                  f.read().await.representation()
+              })),
+              Item::Socket(f) => edn_format::Value::from(&executor::block_on(async move {
+                  f.read().await.representation()
+              })),
+              Item::Handoff(t) => (&t.representation()).into(),
+              Item::Timer(t) => edn_format::Value::from(&t.representation()),
+              Item::Time => edn_format::Value::from(&time::representation()),
               Item::Words(e) => edn_format::Value::Symbol(edn_format::Symbol::from_name(
                   format!("{}_entries", e.len()).as_str(),
               )),
@@ -6333,7 +6407,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   use crate::types::container::pipe::db;
   use crate::types::container::{
       self as coll, associative as assoc, dictionary as dict, environment::Environment, error::Error,
-      pipe, Container, Count, Join, Mutey, Ordered, Take,
+      Container, Count, Join, Mutey, Ordered, Take,
   };
   use crate::types::number::{Float, Int, Number};
   use crate::types::*;
@@ -7005,7 +7079,16 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn is_pipe(i: Item) -> bool {
-      matches!(i, Item::Out(_) | Item::Tunnel(_) | Item::In(_))
+      matches!(
+          i,
+          Item::Handoff(_)
+              | Item::Socket(_)
+              | Item::ServerSocket(_)
+              | Item::StaticFile(_)
+              | Item::Standard
+              | Item::Timer(_)
+              | Item::Time
+      )
   }
 
   pub fn is_number(i: Item) -> bool {
@@ -7895,13 +7978,13 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn timestamps(mut env: Environment) -> Future<Environment> {
       env.pop_prog();
-      env.push(Item::Out(pipe::Out::Time));
+      env.push(Item::Time);
       env.fit()
   }
 
   pub fn standard(mut env: Environment) -> Future<Environment> {
       env.pop_prog();
-      env.push(Item::Tunnel(pipe::Tunnel::Standard));
+      env.push(Item::Standard);
       env.fit()
   }
 
@@ -9139,11 +9222,9 @@ We'll also define how to run unit tests.
   use kcats::config::configure_platform;
   use kcats::serialize::{self, Emit};
   pub use kcats::traits::*;
-  use kcats::types;
   use kcats::types::container::environment::Environment;
-  use kcats::types::container::{error, pipe::Out, List};
+  use kcats::types::container::List;
   use std::io::{self, BufRead, Read, Write};
-  use std::mem;
 
   fn print_result(env: Environment) {
       if env.program.is_empty() {
@@ -9278,11 +9359,11 @@ We'll also define how to run unit tests.
   /// in several different modes.
   #[tokio::main]
   async fn main() {
-      println!("Size of Item: {}", mem::size_of::<types::Item>());
-      println!("Size of String: {}", mem::size_of::<String>());
-      println!("Size of Error: {}", mem::size_of::<error::Error>());
-      println!("Size of Word: {}", mem::size_of::<types::Word>());
-      println!("Size of Out (pipe): {}", mem::size_of::<Out>());
+      // println!("Size of Item: {}", mem::size_of::<types::Item>());
+      // println!("Size of String: {}", mem::size_of::<String>());
+      // println!("Size of Error: {}", mem::size_of::<error::Error>());
+      // println!("Size of Word: {}", mem::size_of::<types::Word>());
+      // println!("Size of Out (pipe): {}", mem::size_of::<Out>());
 
       // Set up process-wide paths and panic if this fails
       configure_platform();
@@ -9652,27 +9733,47 @@ The basic pipe contracts.
 
   impl Derive<Tunnel> for Item {
       fn derive(t: Tunnel) -> Self {
-          Item::Tunnel(t)
+          match t {
+              Tunnel::Handoff(h) => Item::Handoff(h),
+              Tunnel::Socket(s) => Item::Socket(s),
+              Tunnel::StaticFile(f) => Item::StaticFile(f),
+              Tunnel::Standard => Item::Standard,
+          }
       }
   }
 
   impl Derive<Out> for Item {
       fn derive(t: Out) -> Self {
-          Item::Out(t)
+          match t {
+              Out::Handoff(h) => Item::Handoff(h),
+              Out::ServerSocket(s) => Item::ServerSocket(s),
+              Out::Socket(s) => Item::Socket(s),
+              Out::StaticFile(f) => Item::StaticFile(f),
+              Out::Timer(t) => Item::Timer(t),
+              Out::Standard => Item::Standard,
+              Out::Time => Item::Time,
+          }
       }
   }
 
   impl Derive<In> for Item {
       fn derive(t: In) -> Self {
-          Item::In(t)
+          match t {
+              In::Handoff(h) => Item::Handoff(h),
+              In::Socket(s) => Item::Socket(s),
+              In::StaticFile(f) => Item::StaticFile(f),
+              In::Standard => Item::Standard,
+          }
       }
   }
 
   impl TryDerive<Item> for In {
       fn try_derive(i: Item) -> Result<Self, Error> {
           match i {
-              Item::In(i) => Ok(i),
-              Item::Tunnel(t) => Ok(t.fit()),
+              Item::Handoff(h) => Ok(In::Handoff(h)),
+              Item::Socket(s) => Ok(In::Socket(s)),
+              Item::StaticFile(f) => Ok(In::StaticFile(f)),
+              Item::Standard => Ok(In::Standard),
               i => Err(Error::expected(fit!("pipe"), i)),
           }
       }
@@ -9681,8 +9782,13 @@ The basic pipe contracts.
   impl TryDerive<Item> for Out {
       fn try_derive(i: Item) -> Result<Self, Error> {
           match i {
-              Item::Out(o) => Ok(o),
-              Item::Tunnel(t) => Ok(t.fit()),
+              Item::Handoff(h) => Ok(Out::Handoff(h)),
+              Item::ServerSocket(s) => Ok(Out::ServerSocket(s)),
+              Item::Socket(s) => Ok(Out::Socket(s)),
+              Item::StaticFile(f) => Ok(Out::StaticFile(f)),
+              Item::Timer(t) => Ok(Out::Timer(t)),
+              Item::Standard => Ok(Out::Standard),
+              Item::Time => Ok(Out::Time),
               i => Err(Error::expected(fit!("pipe"), i)),
           }
       }
@@ -9815,7 +9921,7 @@ How to interact with the network (TCP/IP sockets)
   use crate::traits::*;
   use crate::types::container::associative as assoc;
   use crate::types::container::error::Error;
-  use crate::types::container::pipe::{self, FutureTake};
+  use crate::types::container::pipe::FutureTake;
   use crate::types::number::Int;
   use crate::types::{self, Bytes, Item};
   use crate::{fit, list};
@@ -10003,7 +10109,7 @@ How to interact with the network (TCP/IP sockets)
 
   impl Derive<Socket> for Item {
       fn derive(ss: Socket) -> Item {
-          Item::Tunnel(pipe::Tunnel::Socket(Arc::new(RwLock::new(ss))))
+          Item::Socket(Arc::new(RwLock::new(ss)))
       }
   }
 #+end_src
@@ -10303,14 +10409,10 @@ Implement the =handoff= type
           .iter()
           .cloned()
           .map(move |i| match i {
-              Item::Out(pipe::Out::Handoff(p)) => {
-                  Ok(ChannelOp::Receive(Arc::new(p.receiver.unwrap())))
-              }
-              Item::Tunnel(pipe::Tunnel::Handoff(p)) => {
-                  Ok(ChannelOp::Receive(Arc::new(p.receiver.unwrap())))
-              }
+              Item::Handoff(p) => Ok(ChannelOp::Receive(Arc::new(p.receiver.unwrap()))),
+
               // Handle timeout channels - start the timer and add receive op
-              Item::Out(pipe::Out::Timer(t)) => {
+              Item::Timer(t) => {
                   let mut t = t.clone();
                   t.start();
                   Ok(ChannelOp::Receive(Arc::new(t.receiver.unwrap())))
@@ -10321,14 +10423,11 @@ Implement the =handoff= type
                   let i = l.get(1);
                   match (p, i) {
                       (Some(p), Some(i)) => match (p, i) {
-                          (Item::In(pipe::In::Handoff(p)), i) => Ok(ChannelOp::Send(
+                          (Item::Handoff(p), i) => Ok(ChannelOp::Send(
                               Arc::new(p.sender.clone().unwrap()),
                               i.clone(),
                           )),
-                          (Item::Tunnel(pipe::Tunnel::Handoff(p)), i) => Ok(ChannelOp::Send(
-                              Arc::new(p.sender.clone().unwrap()),
-                              i.clone(),
-                          )),
+
                           (p, _i) => Err(error::Error::expected(fit!("handoff"), p.clone())),
                       },
                       _ => Err(error::Error::short_list(2)),
@@ -10375,9 +10474,7 @@ Implement the =handoff= type
   impl TryDerive<Item> for Handoff<Item> {
       fn try_derive(i: Item) -> Result<Self, Error> {
           match i {
-              Item::Out(pipe::Out::Handoff(p)) => Ok(*p),
-              Item::In(pipe::In::Handoff(p)) => Ok(*p),
-              Item::Tunnel(pipe::Tunnel::Handoff(p)) => Ok(*p),
+              Item::Handoff(p) => Ok(*p),
               i => Err(Error::expected(fit!("handoff"), i)),
           }
       }
@@ -10387,14 +10484,14 @@ Implement the =handoff= type
   pub fn sender(i: Item) -> axiom::ItemResult {
       let mut h = Handoff::try_derive(i).map_err(Error::derive)?;
       h.close_take();
-      Ok(Item::In(pipe::In::Handoff(Box::new(h))))
+      Ok(Item::Handoff(Box::new(h)))
   }
 
   // drop the sender side of the handoff and return the handoff item
   pub fn receiver(i: Item) -> axiom::ItemResult {
       let mut h = Handoff::try_derive(i).map_err(Error::derive)?;
       h.close_put();
-      Ok(Item::Out(pipe::Out::Handoff(Box::new(h))))
+      Ok(Item::Handoff(Box::new(h)))
   }
 
   #[derive(Debug)]
@@ -10454,7 +10551,7 @@ Implement the =handoff= type
 
   impl Derive<Timer> for Item {
       fn derive(t: Timer) -> Self {
-          Item::Out(pipe::Out::Timer(Box::new(t)))
+          Item::Timer(Box::new(t))
       }
   }
 
