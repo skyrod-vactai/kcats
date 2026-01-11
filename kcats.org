@@ -367,10 +367,13 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::{fit, list};
   use core::default::Default;
   use core::fmt;
+  use futures::future::Either;
+  use futures::future::FutureExt;
   use im;
   use internment::Intern;
   use lazy_static::lazy_static;
   use std::collections::HashMap;
+  use std::future::{self, IntoFuture};
   use std::hash::Hash;
   use std::marker::Sync;
   use std::pin::Pin;
@@ -684,14 +687,50 @@ internally, to keep track of things like the stack, program, lists etc.
 
   /// A Future value, used for async execution, which is how
   /// multithreading is implemented in kcats.
-  pub type Ftr<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
-  pub enum Future<'a, T> {
+  pub type Future<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+  pub enum Sometime<'a, T> {
       Now(T),
-      Future(Ftr<'a, T>),
+      Future(Future<'a, T>),
   }
+
+  impl<'a, T> Sometime<'a, T> {
+      pub fn map<U, F>(self, op: F) -> Sometime<'a, U>
+      where
+          F: FnOnce(T) -> U + Send + 'static,
+          T: 'static,
+      {
+          match self {
+              Sometime::Now(t) => Sometime::Now(op(t)),
+              Sometime::Future(t) => Sometime::Future(Box::pin(t.map(op))),
+          }
+      }
+  }
+
+  impl<'a, T> IntoFuture for Sometime<'a, T> {
+      type Output = T;
+      // Either is a utility enum that implements Future
+      // if both Left and Right enable it.
+      // It avoids allocating a Box for the 'Now' case!
+      type IntoFuture = Either<
+          future::Ready<T>,                                          // Left: The fast path
+          Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>, // Right: The slow path
+      >;
+
+      fn into_future(self) -> Self::IntoFuture {
+          match self {
+              // Fast path: Zero allocation.
+              // We just wrap the value in a Ready struct.
+              Sometime::Now(val) => Either::Left(future::ready(val)),
+
+              // Slow path: Pass the existing Box through.
+              Sometime::Future(fut) => Either::Right(fut),
+          }
+      }
+  }
+
   /// A type for a function that advances the execution of a kcats
   /// [env::Environment] by one step.
-  pub type StepFn = dyn Fn(env::Environment) -> Future<'static, env::Environment> + Sync + Send;
+  pub type StepFn = dyn Fn(env::Environment) -> Sometime<'static, env::Environment> + Sync + Send;
 
   impl PartialEq for Item {
       fn eq(&self, other: &Self) -> bool {
@@ -1439,8 +1478,6 @@ internally, to keep track of things like the stack, program, lists etc.
   pub mod pipe;
   pub mod program;
 
-  use futures::FutureExt;
-
   use self::associative as assoc;
   use crate::traits::*;
   use crate::types::container::pipe::FutureTake;
@@ -1452,7 +1489,7 @@ internally, to keep track of things like the stack, program, lists etc.
   use core::fmt;
   use im;
   use std::convert::Infallible;
-  use std::{collections::HashSet, future, sync};
+  use std::{collections::HashSet, sync};
   use sync::Arc;
 
   /// A generic List type
@@ -1748,7 +1785,7 @@ internally, to keep track of things like the stack, program, lists etc.
   pub trait Take {
       type Output;
       type Item;
-      fn take(self) -> Future<'static, (Result<Option<Self::Item>, Error>, Self::Output)>;
+      fn take(self) -> Sometime<'static, (Result<Option<Self::Item>, Error>, Self::Output)>;
   }
 
   /// A blanket impl for Take, for any type that already implements SimpleTake.
@@ -1759,9 +1796,9 @@ internally, to keep track of things like the stack, program, lists etc.
       type Output = T;
       type Item = Item;
 
-      fn take(mut self) -> Future<'static, (Result<Option<Self::Item>, Error>, Self::Output)> {
+      fn take(mut self) -> Sometime<'static, (Result<Option<Self::Item>, Error>, Self::Output)> {
           let item = self.take_simple();
-          Future::Now((Ok(item.map(Fit::fit)), self))
+          Sometime::Now((Ok(item.map(Fit::fit)), self))
       }
   }
 
@@ -2040,7 +2077,7 @@ internally, to keep track of things like the stack, program, lists etc.
   impl Take for Dispenser {
       type Output = Self;
       type Item = Item;
-      fn take(self) -> Future<'static, (Result<Option<Self::Item>, Error>, Self::Output)> {
+      fn take(self) -> Sometime<'static, (Result<Option<Self::Item>, Error>, Self::Output)> {
           match self {
               Dispenser::Sized(mut s) => {
                   let v = s.take_simple();
@@ -2049,12 +2086,12 @@ internally, to keep track of things like the stack, program, lists etc.
                   //     (Dispenser::SIzed(s), Self::result_to_option(r))
                   // })
 
-                  Future::Now((Ok(v), Dispenser::Sized(s)))
+                  Sometime::Now((Ok(v), Dispenser::Sized(s)))
               }
-              Dispenser::Out(mut o) => Future::Future(Box::pin(async move {
+              Dispenser::Out(mut o) => Sometime::Future(Box::pin(async move {
                   (o.take_future().await, Dispenser::Out(o))
               })),
-              Dispenser::Tunnel(mut t) => Future::Future(Box::pin(async move {
+              Dispenser::Tunnel(mut t) => Sometime::Future(Box::pin(async move {
                   (t.take_future().await, Dispenser::Tunnel(t))
               })),
           }
@@ -2202,33 +2239,33 @@ internally, to keep track of things like the stack, program, lists etc.
       }
 
       /// Puts an item into the container, at the end.
-      pub fn put(&mut self, other: Item) -> Result<(), Error> {
+      pub fn put(self, other: Item) -> Result<Self, Error> {
           match (self, other) {
-              (Sized::List(c), i) => {
+              (Sized::List(mut c), i) => {
                   c.push_back(i);
-                  Ok(())
+                  Ok(Sized::List(c))
               }
-              (Sized::Set(ref mut s), i) => {
+              (Sized::Set(mut s), i) => {
                   s.mutate().insert(assoc::KeyItem::try_derive(i)?);
-                  Ok(())
+                  Ok(Sized::Set(s))
               }
-              (Sized::Bytes(ref mut b), Item::Int(i)) => {
+              (Sized::Bytes(mut b), Item::Int(i)) => {
                   b.push(i as u8);
-                  Ok(())
+                  Ok(Sized::Bytes(b))
               }
               (Sized::Bytes(_), i) => Err(Error::expected(fit!("integer"), i)),
-              (Sized::String(s), Item::Char(c)) => {
+              (Sized::String(mut s), Item::Char(c)) => {
                   s.push(c);
-                  Ok(())
+                  Ok(Sized::String(s))
               }
               (Sized::String(_), i) => Err(Error::expected(fit!("char"), i)),
-              (Sized::Program(ref mut p), i) => {
+              (Sized::Program(mut p), i) => {
                   p.extend(list![i]);
-                  Ok(())
+                  Ok(Sized::Program(p))
               }
               (s, i) => {
-                  let mut c = assoc::Associative::try_derive(s.clone())?;
-                  c.put(i)
+                  let c = assoc::Associative::try_derive(s.clone())?;
+                  Ok(c.put(i)?.fit())
               }
           }
       }
@@ -2253,11 +2290,11 @@ internally, to keep track of things like the stack, program, lists etc.
   impl Receptacle {
       /// Puts the given [Item] into this container, items are added at
       /// the end.
-      pub fn put(&mut self, i: Item) -> Future<Result<(), Error>> {
+      pub fn put(self, i: Item) -> Sometime<'static, Result<Receptacle, Error>> {
           match self {
-              Receptacle::Sized(s) => Future::Now(s.put(i)),
-              Receptacle::In(ref mut p) => p.put(i),
-              Receptacle::Tunnel(ref mut t) => t.put(i),
+              Receptacle::Sized(s) => Sometime::Now(s.put(i).map(|s| Receptacle::Sized(s))),
+              Receptacle::In(p) => p.put(i).map(|r| r.map(|i| Receptacle::In(i))),
+              Receptacle::Tunnel(t) => t.put(i).map(|r| r.map(|t| Receptacle::Tunnel(t))),
           }
       }
   }
@@ -3250,21 +3287,14 @@ internally, to keep track of things like the stack, program, lists etc.
       /// Association. Demotion typically happens when you insert a key
       /// into a type that doesn't support that key, you'll get a more
       /// generic type back instead.
-      pub fn insert(&mut self, k: KeyItem, v: Item) -> Option<Item> {
+      pub fn insert(self, k: KeyItem, v: Item) -> (Associative, Option<Item>) {
           //println!("Insert! {:?}", self);
 
-          //swap the original slot so we
-          // have an owned value to work with, just make sure to swap it
-          // back before finishing. This lets us replace with other
-          // variants if necessary.
-          let mut a = std::mem::replace(self, Associative::Nothing);
-
-          match a {
+          match self {
               Associative::Assoc(mut a) => {
                   let am = coll::Arc::mutate(&mut a);
                   let replaced = am.insert(k, v);
-                  ,*self = Associative::Assoc(a);
-                  replaced
+                  (Associative::Assoc(a), replaced)
               }
               Associative::Words(mut d) => {
                   match (k, v) {
@@ -3273,15 +3303,14 @@ internally, to keep track of things like the stack, program, lists etc.
                           if let Ok(e) = dict::Entry::try_derive(e) {
                               let dm = coll::Arc::mutate(&mut d);
                               let replaced = dm.insert(w.fit(), e).map(Item::derive);
-                              ,*self = Associative::Words(d);
-                              replaced
+                              (Associative::Words(d), replaced)
                           } else {
                               // TODO silently failing to insert here is bad
                               println!("Warning, failed to insert into dictionary: {:?}", e2);
-                              None
+                              (Associative::Words(d), None)
                           }
                       }
-                      _ => None,
+                      _ => (Associative::Words(d), None),
                   }
               }
               Associative::Env(mut e) => {
@@ -3303,14 +3332,9 @@ internally, to keep track of things like the stack, program, lists etc.
                                       Ok(l) => {
                                           let old = e.stack.clone();
                                           e.stack = l.fit();
-                                          ,*self = Associative::Env(e);
-                                          Some(old.fit())
+                                          (Associative::Env(e), Some(old.fit()))
                                       }
-                                      Err(_) => {
-                                          let (a2, i) = demote(*e, k, v);
-                                          ,*self = a2;
-                                          i
-                                      }
+                                      Err(_) => demote(*e, k, v),
                                   }
                               }
                               "program" => {
@@ -3319,14 +3343,9 @@ internally, to keep track of things like the stack, program, lists etc.
                                       Ok(l) => {
                                           let old = e.program.clone();
                                           e.program = l.fit();
-                                          ,*self = Associative::Env(e);
-                                          Some(old.fit())
+                                          (Associative::Env(e), Some(old.fit()))
                                       }
-                                      Err(_) => {
-                                          let (a2, i) = demote(*e, k, v);
-                                          ,*self = a2;
-                                          i
-                                      }
+                                      Err(_) => demote(*e, k, v),
                                   }
                               }
                               "dictionary" => {
@@ -3335,95 +3354,85 @@ internally, to keep track of things like the stack, program, lists etc.
                                       Ok(d) => {
                                           let old = e.dictionary.clone();
                                           e.dictionary = d;
-                                          ,*self = Associative::Env(e);
-                                          Some(old.fit())
+                                          (Associative::Env(e), Some(old.fit()))
                                       }
-                                      Err(_) => {
-                                          let (a2, i) = demote(*e, k, v);
-                                          ,*self = a2;
-                                          i
-                                      }
+                                      Err(_) => demote(*e, k, v),
                                   }
                               }
 
-                              _ => {
-                                  let (a2, i) = demote(*e, k, v);
-                                  ,*self = a2;
-                                  i
-                              }
+                              _ => demote(*e, k, v),
                           }
                       }
-                      k => {
-                          let (a2, i) = demote(*e, k, v);
-                          ,*self = a2;
-                          i
-                      }
+                      k => demote(*e, k, v),
                   }
               }
-              Associative::DictEntry(ref mut de) => match k {
-                  KeyItem::Word(ref w) => {
-                      let w: &str = w.fit();
-                      if w == "definition" {
-                          let l = coll::List::try_derive(v);
-                          match l {
-                              Ok(l) => {
-                                  de.definition = dict::Executable::Derived(l);
-                                  None // TODO: return the old def
+              Associative::DictEntry(mut de) => {
+                  match k {
+                      KeyItem::Word(ref w) => {
+                          let w: &str = w.fit();
+
+                          if w == "definition" {
+                              let l = coll::List::try_derive(v);
+                              match l {
+                                  Ok(l) => {
+                                      de.definition = dict::Executable::Derived(l);
+                                      // TODO: return the old def
+                                  }
+                                  Err(_) => {}
                               }
-                              Err(_) => None,
-                          }
-                      } else if w == "examples" {
-                          let l = coll::List::try_derive(v);
-                          match l {
-                              Ok(l) => {
-                                  de.examples = Some(l);
-                                  None // TODO: return the old examples
+                          } else if w == "examples" {
+                              let l = coll::List::try_derive(v);
+                              match l {
+                                  Ok(l) => {
+                                      de.examples = Some(l);
+                                      // TODO: return the old examples
+                                  }
+                                  Err(_) => {}
                               }
-                              Err(_) => None,
-                          }
-                      } else if w == "spec" {
-                          let l = coll::List::try_derive(v);
-                          match l {
-                              Ok(l) => {
-                                  de.spec = l.try_fit().ok();
-                                  None // TODO: return the old spec
+                          } else if w == "spec" {
+                              let l = coll::List::try_derive(v);
+                              match l {
+                                  Ok(l) => {
+                                      de.spec = l.try_fit().ok();
+                                      // TODO: return the old spec
+                                  }
+                                  Err(_) => {}
                               }
-                              Err(_) => None,
                           }
-                      } else {
-                          None
                       }
+                      _ => {}
                   }
-                  _ => None,
-              },
-              Associative::Dictionary(ref mut d) => match k {
-                  KeyItem::Word(ref w) => {
-                      let w: &str = w.fit();
-                      if w == "words" {
-                          let e = dict::Words::try_derive(v);
-                          match e {
-                              Ok(words) => {
-                                  d.words = words;
-                                  None // TODO: return the old entries
+                  (Associative::DictEntry(de), None)
+              }
+              Associative::Dictionary(mut d) => {
+                  match k {
+                      KeyItem::Word(ref w) => {
+                          let w: &str = w.fit();
+                          if w == "words" {
+                              let e = dict::Words::try_derive(v);
+                              match e {
+                                  Ok(words) => {
+                                      d.words = words;
+                                      // TODO: return the old entries
+                                  }
+                                  Err(_) => {}
                               }
-                              Err(_) => None,
-                          }
-                      } else if w == "modules" {
-                          let l = Vec::<dict::Namespace>::try_derive(v);
-                          match l {
-                              Ok(modules) => {
-                                  d.modules = modules;
-                                  d.resolve();
-                                  None // TODO: return the old modules
+                          } else if w == "modules" {
+                              let l = Vec::<dict::Namespace>::try_derive(v);
+                              match l {
+                                  Ok(modules) => {
+                                      d.modules = modules;
+                                      d.resolve();
+                                      // TODO: return the old modules
+                                  }
+                                  Err(_) => {}
                               }
-                              Err(_) => None,
                           }
-                      } else {
-                          None
                       }
-                  }
-                  _ => None,
-              },
+                      _ => {}
+                  };
+                  (Associative::Dictionary(d), None)
+              }
               _ => todo!("insert Implementations for error, dictionary, env etc"),
           }
       }
@@ -3433,18 +3442,18 @@ internally, to keep track of things like the stack, program, lists etc.
       /// this if the Item is the right type: a key/value pair. If it's
       /// the right type, we [Self::insert] the value using the key,
       /// otherwise return an error.
-      pub fn put(&mut self, other: Item) -> Result<(), Error> {
+      pub fn put(self, other: Item) -> Result<Self, Error> {
           match (self, other) {
-              (Associative::Words(ref mut this), other) => {
+              (Associative::Words(mut this), other) => {
                   let (word, entry) = <(Word, dict::Entry)>::try_derive(other)?;
                   let thismut = this.mutate();
                   thismut.insert(word.fit(), entry.fit());
-                  Ok(())
+                  Ok(Associative::Words(this))
               }
-              (ref mut this, other) => {
+              (this, other) => {
                   let entry: (KeyItem, Item) = other.try_fit()?;
-                  this.insert(entry.0, entry.1);
-                  Ok(())
+                  let this = this.insert(entry.0, entry.1).0;
+                  Ok(this)
               }
           }
       }
@@ -5026,12 +5035,11 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::traits::*;
   use crate::types::container::dictionary::Dict;
   use crate::types::container::program::Program;
-  use crate::types::container::{self as coll, Mutey};
+  use crate::types::container::{self as coll};
   use crate::types::*;
 
   use once_cell::sync::Lazy;
   use std::convert::Infallible;
-  use std::future;
 
   /// A struct to hold the state of an executing kcats program. The
   /// `stack` is the data being manipulated, the `program` is program
@@ -5443,9 +5451,9 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  impl Derive<Environment> for Future<'static, Environment> {
-      fn derive(env: Environment) -> Future<'static, Environment> {
-          Future::Now(env)
+  impl Derive<Environment> for Sometime<'static, Environment> {
+      fn derive(env: Environment) -> Sometime<'static, Environment> {
+          Sometime::Now(env)
       }
   }
 
@@ -6486,7 +6494,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   /// A higher order function that executes a simpler function `f`,
   /// where `f` takes a stack item and returns a [Result] of another
   /// stack item.
-  fn f_stack1<F, Output, SpecInput, E>(f: F) -> impl Fn(Environment) -> Future<'static, Environment>
+  fn f_stack1<F, Output, SpecInput, E>(f: F) -> impl Fn(Environment) -> Sometime<'static, Environment>
   where
       F: Fn(SpecInput) -> Result<Output, E> + 'static,
       SpecInput: TryDerive<Item> + Fit<Item> + Clone,
@@ -6528,7 +6536,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   /// stack item.
   fn f_stack2<F, Output, SpecInputY, SpecInputX, E>(
       f: F,
-  ) -> impl Fn(Environment) -> Future<'static, Environment>
+  ) -> impl Fn(Environment) -> Sometime<'static, Environment>
   where
       F: Fn(SpecInputY, SpecInputX) -> Result<Output, E> + 'static,
       SpecInputX: for<'a> TryDerive<&'a Item> + Fit<Item> + Clone,
@@ -6580,7 +6588,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   /// stack item.
   fn f_stack3<F, Output, SpecInputZ, SpecInputY, SpecInputX, E>(
       f: F,
-  ) -> impl Fn(Environment) -> Future<'static, Environment>
+  ) -> impl Fn(Environment) -> Sometime<'static, Environment>
   where
       F: Fn(SpecInputZ, SpecInputY, SpecInputX) -> Result<Output, E> + 'static,
       SpecInputX: for<'a> TryDerive<&'a Item> + Fit<Item> + Clone,
@@ -6638,20 +6646,20 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   fn f_stack2_async(
-      f: fn(Item, Item) -> Future<'static, ItemResult>,
-  ) -> impl Fn(Environment) -> Future<'static, Environment> {
+      f: fn(Item, Item) -> Sometime<'static, ItemResult>,
+  ) -> impl Fn(Environment) -> Sometime<'static, Environment> {
       move |mut env: Environment| {
           let x = env.pop();
           let y = env.pop();
           match f(x, y) {
-              Future::Now(r) => {
+              Sometime::Now(r) => {
                   if r.is_ok() {
                       env.pop_prog();
                   }
                   env.push(r);
-                  Future::Now(env)
+                  Sometime::Now(env)
               }
-              Future::Future(r) => Future::Future(Box::pin(r.map(|r| {
+              Sometime::Future(r) => Sometime::Future(Box::pin(r.map(|r| {
                   if r.is_ok() {
                       env.pop_prog();
                   }
@@ -6667,7 +6675,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   /// append that error to the env. The function `f` should return
   /// either unit or an Error. If it returns an [Error] it will be
   /// pushed onto the stack.
-  fn f_result<F>(f: F) -> impl Fn(Environment) -> Future<'static, Environment>
+  fn f_result<F>(f: F) -> impl Fn(Environment) -> Sometime<'static, Environment>
   where
       F: Fn(&mut Environment) -> Result<(), Error>,
   {
@@ -7026,20 +7034,20 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       i.join(j)
   }
 
-  pub fn put(mut env: Environment) -> Future<'static, Environment> {
+  pub fn put(mut env: Environment) -> Sometime<'static, Environment> {
       let i = env.pop();
       match coll::Receptacle::try_derive(env.pop()) {
-          Ok(mut p) => {
+          Ok(p) => {
               let r = p.put(i);
               match r {
-                  Future::Now(_) => {
+                  Sometime::Now(p) => {
                       env.pop_prog();
                       env.push(Item::derive(p));
-                      Future::Now(env)
+                      Sometime::Now(env)
                   }
-                  Future::Future(fu) => Future::Future(Box::pin(fu.map(|f| {
+                  Sometime::Future(fu) => Sometime::Future(Box::pin(fu.map(|f| {
                       match f {
-                          Ok(_) => {
+                          Ok(p) => {
                               env.pop_prog();
                               env.push(Item::derive(p))
                           }
@@ -7057,54 +7065,54 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }
   }
 
-  pub fn clone(mut env: Environment) -> Future<'static, Environment> {
+  pub fn clone(mut env: Environment) -> Sometime<'static, Environment> {
       let clone = env.tos().unwrap().clone();
       env.pop_prog();
       env.push(clone);
       env.fit()
   }
 
-  fn swap2(mut env: Environment, offset: usize) -> Future<'static, Environment> {
+  fn swap2(mut env: Environment, offset: usize) -> Sometime<'static, Environment> {
       env.stack.swap(offset, offset + 1);
       env.fit()
   }
 
-  pub fn swap(mut env: Environment) -> Future<'static, Environment> {
+  pub fn swap(mut env: Environment) -> Sometime<'static, Environment> {
       env.pop_prog();
       swap2(env, 0)
   }
 
-  pub fn swapdown(mut env: Environment) -> Future<'static, Environment> {
+  pub fn swapdown(mut env: Environment) -> Sometime<'static, Environment> {
       env.pop_prog();
       swap2(env, 1)
   }
 
-  pub fn swapdeep(mut env: Environment) -> Future<'static, Environment> {
+  pub fn swapdeep(mut env: Environment) -> Sometime<'static, Environment> {
       env.pop_prog();
       swap2(env, 2)
   }
 
-  pub fn sink(mut env: Environment) -> Future<'static, Environment> {
+  pub fn sink(mut env: Environment) -> Sometime<'static, Environment> {
       env.stack.swap(0, 2);
       env.stack.swap(0, 1);
       env.pop_prog();
       env.fit()
   }
 
-  pub fn float(mut env: Environment) -> Future<'static, Environment> {
+  pub fn float(mut env: Environment) -> Sometime<'static, Environment> {
       env.stack.swap(0, 2);
       env.stack.swap(1, 2);
       env.pop_prog();
       env.fit()
   }
 
-  pub fn drop(mut env: Environment) -> Future<'static, Environment> {
+  pub fn drop(mut env: Environment) -> Sometime<'static, Environment> {
       env.pop();
       env.pop_prog();
       env.fit()
   }
 
-  pub fn eq(mut env: Environment) -> Future<'static, Environment> {
+  pub fn eq(mut env: Environment) -> Sometime<'static, Environment> {
       let i = env.pop();
       let j = env.pop();
       env.pop_prog();
@@ -7172,7 +7180,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       c.into_iter().last().unwrap_or_default()
   }
 
-  pub fn execute(mut env: Environment) -> Future<'static, Environment> {
+  pub fn execute(mut env: Environment) -> Sometime<'static, Environment> {
       let i = env.pop();
       if let Item::Builtin(b) = i {
           (*b.f)(env).fit()
@@ -7190,14 +7198,14 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }
   }
 
-  pub fn wrap(mut env: Environment) -> Future<'static, Environment> {
+  pub fn wrap(mut env: Environment) -> Sometime<'static, Environment> {
       let item = env.pop();
       env.pop_prog();
       env.push(list!(item));
       env.fit()
   }
 
-  pub fn unwrap(mut env: Environment) -> Future<'static, Environment> {
+  pub fn unwrap(mut env: Environment) -> Sometime<'static, Environment> {
       //println!("Unwrap: {:?} {:?}", env.stack, env.program.stacktrace());
       match coll::List::try_derive(env.pop()) {
           Ok(l) => {
@@ -7224,7 +7232,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }
   }
 
-  pub fn dip(mut env: Environment) -> Future<'static, Environment> {
+  pub fn dip(mut env: Environment) -> Sometime<'static, Environment> {
       match coll::List::try_derive(env.pop()) {
           Ok(program) => {
               let mut item = env.pop();
@@ -7240,7 +7248,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       env.fit()
   }
 
-  pub fn dipdown(mut env: Environment) -> Future<'static, Environment> {
+  pub fn dipdown(mut env: Environment) -> Sometime<'static, Environment> {
       match coll::List::try_derive(env.pop()) {
           Ok(program) => {
               let mut item1 = env.pop();
@@ -7256,7 +7264,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       env.fit()
   }
 
-  pub fn take(mut env: Environment) -> Future<'static, Environment> {
+  pub fn take(mut env: Environment) -> Sometime<'static, Environment> {
       // TODO: handle Nothing case
       fn finish(
           mut env: Environment,
@@ -7270,11 +7278,11 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }
       match coll::Dispenser::try_derive(env.pop()) {
           Ok(d) => match d.take() {
-              Future::Now(r) => {
+              Sometime::Now(r) => {
                   let (i, c) = r;
                   finish(env, i, c).fit()
               }
-              Future::Future(r) => Future::Future(Box::pin(async move {
+              Sometime::Future(r) => Sometime::Future(Box::pin(async move {
                   let (i, c) = r.await;
                   finish(env, i, c)
               })),
@@ -7287,7 +7295,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }
   }
 
-  pub fn pop(mut env: Environment) -> Future<'static, Environment> {
+  pub fn pop(mut env: Environment) -> Sometime<'static, Environment> {
       match coll::Sized::try_derive(env.pop()) {
           Ok(it) => {
               let (c, i) = it.pop();
@@ -7306,7 +7314,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       !i.is_empty()
   }
 
-  pub fn branch(mut env: Environment) -> Future<'static, Environment> {
+  pub fn branch(mut env: Environment) -> Sometime<'static, Environment> {
       match (
           coll::List::try_derive(env.pop()),
           coll::List::try_derive(env.pop()),
@@ -7339,7 +7347,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       env.fit()
   }
 
-  pub fn step(mut env: Environment) -> Future<'static, Environment> {
+  pub fn step(mut env: Environment) -> Sometime<'static, Environment> {
       fn finish(
           mut env: Environment,
           r: Result<Option<Item>, Error>,
@@ -7363,8 +7371,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let p = coll::List::try_derive(env.pop()).unwrap();
       let dispenser = coll::Dispenser::try_derive(env.pop()).unwrap();
       match dispenser.take() {
-          Future::Now((r, dispenser)) => finish(env, r, dispenser, p).fit(),
-          Future::Future(f) => Future::Future(Box::pin(async move {
+          Sometime::Now((r, dispenser)) => finish(env, r, dispenser, p).fit(),
+          Sometime::Future(f) => Sometime::Future(Box::pin(async move {
               let (r, dispenser) = f.await;
               finish(env, r, dispenser, p)
           })),
@@ -7396,7 +7404,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   //(fn [{[l & others] 'stack :as env}]
   //            (assoc env 'stack (apply list (vec others) l)))
 
-  pub fn evert(mut env: Environment) -> Future<'static, Environment> {
+  pub fn evert(mut env: Environment) -> Sometime<'static, Environment> {
       let mut l = coll::List::try_derive(env.pop()).unwrap();
       mem::swap(&mut env.stack, &mut l);
       env.pop_prog();
@@ -7404,7 +7412,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       env.fit()
   }
 
-  pub fn snapshot(mut env: Environment) -> Future<'static, Environment> {
+  pub fn snapshot(mut env: Environment) -> Sometime<'static, Environment> {
       env.pop_prog();
       env.push(env.stack.clone());
       env.fit()
@@ -7433,18 +7441,16 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }
 
       fn assoc_map(
-          mut a: assoc::Associative,
+          a: assoc::Associative,
           ks: &[assoc::KeyItem],
           k: &assoc::KeyItem,
           v: Item,
       ) -> Result<Item, Error> {
           let inner = a.get(k).clone();
           if ks.is_empty() {
-              a.insert(k.clone(), v);
-              Ok(a.fit())
+              Ok(a.insert(k.clone(), v).0.fit())
           } else {
-              a.insert(k.clone(), assoc_in(inner, ks, v)?);
-              Ok(a.fit())
+              Ok(a.insert(k.clone(), assoc_in(inner, ks, v)?).0.fit())
           }
       }
 
@@ -7680,7 +7686,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   /// Inner function of the interpreter, each call to this function
   /// advances the [Environment] one step of execution.
-  pub fn eval_step(mut env: Environment) -> Future<'static, Environment> {
+  pub fn eval_step(mut env: Environment) -> Sometime<'static, Environment> {
       //println!("{:?}", env.stack);
       //println!("Dictionary size: {}", env.dictionary.len());
       let next_item = env.program.peek();
@@ -7854,8 +7860,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           }
           if !env.program.is_empty() {
               env = match eval_step(env) {
-                  Future::Now(env) => env,
-                  Future::Future(fenv) => fenv.await,
+                  Sometime::Now(env) => env,
+                  Sometime::Future(fenv) => fenv.await,
               };
           } else {
               break;
@@ -7864,7 +7870,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       env
   }
 
-  pub fn eval_step_outer(mut env: Environment) -> Future<'static, Environment> {
+  pub fn eval_step_outer(mut env: Environment) -> Sometime<'static, Environment> {
       let tos = env.pop();
       let inner_env = Environment::try_derive(tos);
 
@@ -7873,14 +7879,14 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               env.pop_prog();
               if inner.program.is_empty() {
                   env.push(Item::default());
-                  Future::Now(env)
+                  Sometime::Now(env)
               } else {
                   match eval_step(inner) {
-                      Future::Now(inner) => {
+                      Sometime::Now(inner) => {
                           env.push(inner);
-                          Future::Now(env)
+                          Sometime::Now(env)
                       }
-                      Future::Future(finner) => Future::Future(Box::pin(finner.map(|e| {
+                      Sometime::Future(finner) => Sometime::Future(Box::pin(finner.map(|e| {
                           env.push(e);
                           env
                       }))),
@@ -7894,9 +7900,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }
   }
 
-  pub fn evaluate(mut env: Environment) -> Future<'static, Environment> {
+  pub fn evaluate(mut env: Environment) -> Sometime<'static, Environment> {
       match Environment::try_derive(env.tos().unwrap()) {
-          Ok(inner) => Future::Future(Box::pin(eval(inner).map(|inner_done| {
+          Ok(inner) => Sometime::Future(Box::pin(eval(inner).map(|inner_done| {
               env.pop_prog();
               env.pop();
               env.push(inner_done);
@@ -7909,7 +7915,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }
   }
 
-  pub fn dictionary(mut env: Environment) -> Future<'static, Environment> {
+  pub fn dictionary(mut env: Environment) -> Sometime<'static, Environment> {
       //println!("adding dictionary");
       let d = env.dictionary.clone();
       env.pop_prog();
@@ -7931,7 +7937,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   /// If there's an unhandled error on the stack, handle it, otherwise
   /// no-op.
-  fn handle(mut env: Environment) -> Future<'static, Environment> {
+  fn handle(mut env: Environment) -> Sometime<'static, Environment> {
       env.pop_prog();
       match env.stack.front_mut() {
           None => {}
@@ -7946,7 +7952,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   /// Self-inserts whatever is next in the program.
-  pub fn self_insert(mut env: Environment) -> Future<'static, Environment> {
+  pub fn self_insert(mut env: Environment) -> Sometime<'static, Environment> {
       let t = env.pop_prog();
       env.push(t);
       env.fit()
@@ -7972,12 +7978,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           dict::Namespace::try_derive(env.stack.get(2).unwrap()).map_err(Error::derive)?;
 
       existing.merge(modified, &namespace);
-      // not sure if this is really needed - was here for use during
-      // bootstrapping when some builtins are not yet loaded but need to
-      // be
-      // if namespace.is_none() {
-      //     env.dictionary.words.add_builtins();
-      // }
+
       // pop the word dictmerge
       env.pop_prog();
       env.pop();
@@ -8028,7 +8029,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   /// Takes an inner environment from the top of the stack, and spawns a
   /// tokio task to evaluate that environment.
-  pub fn animate(mut env: Environment) -> Future<'static, Environment> {
+  pub fn animate(mut env: Environment) -> Sometime<'static, Environment> {
       let tos = env.pop();
       let inner_env = Environment::try_derive(tos);
       match inner_env {
@@ -8067,13 +8068,13 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       format!("{:?}", i)
   }
 
-  pub fn timestamps(mut env: Environment) -> Future<'static, Environment> {
+  pub fn timestamps(mut env: Environment) -> Sometime<'static, Environment> {
       env.pop_prog();
       env.push(Item::Time);
       env.fit()
   }
 
-  pub fn standard(mut env: Environment) -> Future<'static, Environment> {
+  pub fn standard(mut env: Environment) -> Sometime<'static, Environment> {
       env.pop_prog();
       env.push(Item::Standard);
       env.fit()
@@ -8221,7 +8222,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       word.fit()
   }
 
-  fn unnamespace(mut env: Environment) -> Future<'static, Environment> {
+  fn unnamespace(mut env: Environment) -> Sometime<'static, Environment> {
       if let Some(i) = env.stack.pop_front() {
           match Word::try_derive(i) {
               Ok(w) => {
@@ -8246,7 +8247,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       env.fit()
   }
 
-  fn resolve(mut env: Environment) -> Future<'static, Environment> {
+  fn resolve(mut env: Environment) -> Sometime<'static, Environment> {
       if let Some(i) = env.stack.pop_front() {
           match Word::try_derive(i) {
               Ok(w) => {
@@ -9313,11 +9314,9 @@ We'll also define how to run unit tests.
   use kcats::config::configure_platform;
   use kcats::serialize::{self, Emit};
   pub use kcats::traits::*;
-  use kcats::types;
   use kcats::types::container::environment::Environment;
   use kcats::types::container::List;
   use std::io::{self, BufRead, Read, Write};
-  use std::mem;
 
   fn print_result(env: Environment) {
       if env.program.is_empty() {
@@ -9522,9 +9521,7 @@ The basic pipe contracts.
 
   pub trait FutureTake {
       type Item;
-      fn take_future<'a>(
-          &'a mut self,
-      ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Self::Item>, Error>> + Send + 'a>>;
+      fn take_future<'a>(&'a mut self) -> types::Future<'a, Result<Option<Self::Item>, Error>>;
   }
 
   /// A pipe that accepts items.
@@ -9638,18 +9635,22 @@ The basic pipe contracts.
 
   impl In {
       /// Puts the [Item] into the pipe. Blocks if the pipe is full.
-      pub fn put(&mut self, i: Item) -> types::Future<Result<(), Error>> {
+      pub fn put(self, i: Item) -> types::Sometime<'static, Result<In, Error>> {
           match self {
-              In::StaticFile(f) => {
-                  let f = f.clone();
-                  types::Future::Future(Box::pin(async move { f.write().await.put(i).await }))
-              }
-              In::Socket(f) => {
-                  let f = f.clone();
-                  types::Future::Future(Box::pin(async move { f.write().await.put(i).await }))
-              }
-              In::Handoff(ref mut h) => h.put(i), //_ => Err(Error::expected("foo")),
-              In::Standard => standard::put(i),
+              In::StaticFile(f) => types::Sometime::Future(Box::pin(async move {
+                  f.write()
+                      .await
+                      .put(i)
+                      .await
+                      .map(|_| In::StaticFile(f.clone()))
+              })),
+              In::Socket(s) => types::Sometime::Future(Box::pin(async move {
+                  s.write().await.put(i).await.map(|_| In::Socket(s.clone()))
+              })),
+              In::Handoff(mut h) => types::Sometime::Future(Box::pin(async move {
+                  h.put(i).await.map(|_| In::Handoff(h.clone()))
+              })), //_ => Err(Error::expected("foo")),
+              In::Standard => standard::put(i).map(|r| r.map(|_| In::Standard)),
           }
       }
   }
@@ -9688,18 +9689,26 @@ The basic pipe contracts.
   impl Tunnel {
       /// Puts the [Item] into the tunnel, blocks if the send side of
       /// the tunnel is full.
-      pub fn put(&mut self, i: Item) -> types::Future<'static, Result<(), Error>> {
+      pub fn put(self, i: Item) -> types::Sometime<'static, Result<Tunnel, Error>> {
           match self {
-              Tunnel::StaticFile(f) => {
-                  let f = f.clone();
-                  types::Future::Future(Box::pin(async move { f.write().await.put(i).await }))
-              }
-              Tunnel::Socket(f) => {
-                  let f = f.clone();
-                  types::Future::Future(Box::pin(async move { f.write().await.put(i).await }))
-              }
-              Tunnel::Handoff(ref mut h) => h.put(i),
-              Tunnel::Standard => standard::put(i),
+              Tunnel::StaticFile(f) => types::Sometime::Future(Box::pin(async move {
+                  f.write()
+                      .await
+                      .put(i)
+                      .await
+                      .map(|_| Tunnel::StaticFile(f.clone()))
+              })),
+              Tunnel::Socket(s) => types::Sometime::Future(Box::pin(async move {
+                  s.write()
+                      .await
+                      .put(i)
+                      .await
+                      .map(|_| Tunnel::Socket(s.clone()))
+              })),
+              Tunnel::Handoff(mut h) => types::Sometime::Future(Box::pin(async move {
+                  h.put(i).await.map(|_| Tunnel::Handoff(h.clone()))
+              })), //_ => Err(Error::expected("foo")),
+              Tunnel::Standard => standard::put(i).map(|r| r.map(|_| Tunnel::Standard)),
           }
       }
   }
@@ -9894,7 +9903,6 @@ How to interact with files on disk
   use crate::types::*;
 
   use std::future;
-  use std::pin::Pin;
   use std::ptr;
   use std::sync::Arc;
   use tokio::fs::File;
@@ -9918,10 +9926,7 @@ How to interact with files on disk
 
   impl FutureTake for StaticFile {
       type Item = Bytes;
-      fn take_future<'a>(
-          &'a mut self,
-      ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Self::Item>, Error>> + Send + 'a>>
-      {
+      fn take_future<'a>(&'a mut self) -> Future<'a, Result<Option<Self::Item>, Error>> {
           match self.file.as_mut() {
               Some(f) => {
                   let mut bs = [0u8; 102400];
@@ -9941,10 +9946,7 @@ How to interact with files on disk
   }
 
   impl StaticFile {
-      pub fn put<'a>(
-          &'a mut self,
-          i: Item,
-      ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
+      pub fn put<'a>(&'a mut self, i: Item) -> Future<'a, Result<(), Error>> {
           match self.file.as_mut() {
               Some(f) => {
                   let b = Bytes::try_derive(i);
@@ -10058,10 +10060,7 @@ How to interact with the network (TCP/IP sockets)
   }
 
   impl Socket {
-      pub fn put<'a>(
-          &'a mut self,
-          i: Item,
-      ) -> Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>> {
+      pub fn put<'a>(&'a mut self, i: Item) -> types::Future<'a, Result<(), Error>> {
           //println!("Putting {:?}", i);
           let b = types::Bytes::try_derive(i);
           match b {
@@ -10157,21 +10156,21 @@ How to interact with the network (TCP/IP sockets)
       Ok((addr, port))
   }
 
-  pub fn server_socket(i: Item, j: Item) -> types::Future<'static, ItemResult> {
+  pub fn server_socket(i: Item, j: Item) -> types::Sometime<'static, ItemResult> {
       match socket_addr(i, j) {
-          Ok(addr) => types::Future::Future(Box::pin(TcpListener::bind(addr).map(|r| match r {
+          Ok(addr) => types::Sometime::Future(Box::pin(TcpListener::bind(addr).map(|r| match r {
               Ok(s) => Ok(
                   super::Out::ServerSocket(Arc::new(RwLock::new(ServerSocket { socket: s }))).fit(),
               ),
               Err(e) => Err(e.into()),
           }))),
-          Err(e) => types::Future::Now(Err(e)),
+          Err(e) => types::Sometime::Now(Err(e)),
       }
   }
 
-  pub fn socket(i: Item, j: Item) -> types::Future<'static, ItemResult> {
+  pub fn socket(i: Item, j: Item) -> types::Sometime<'static, ItemResult> {
       match host_addr(i, j) {
-          Ok(addr) => types::Future::Future(Box::pin(TcpStream::connect(addr.clone()).map(
+          Ok(addr) => types::Sometime::Future(Box::pin(TcpStream::connect(addr.clone()).map(
               move |r| match r {
                   Ok(s) => Ok(
                       super::Tunnel::Socket(Arc::new(RwLock::new(Socket { socket: s, addr }))).fit(),
@@ -10179,7 +10178,7 @@ How to interact with the network (TCP/IP sockets)
                   Err(e) => Err(e.into()),
               },
           ))),
-          Err(e) => types::Future::Now(Err(e)),
+          Err(e) => types::Sometime::Now(Err(e)),
       }
   }
 
@@ -10259,7 +10258,8 @@ How to interact with the network (TCP/IP sockets)
   use crate::types::container::error::Error;
   use crate::types::{self, *};
   use std::future;
-  use std::io::{self, Read, Write};
+  use std::io::{self, Read};
+  use tokio::io::AsyncWriteExt; // AsyncWriteExt brings in write_all
 
   pub fn take_future<'a>(
   ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<Item>, Error>> + Send + 'a>> {
@@ -10273,14 +10273,16 @@ How to interact with the network (TCP/IP sockets)
       Box::pin(future::ready(f))
   }
 
-  pub fn put(i: Item) -> types::Future<'static, Result<(), Error>> {
+  pub fn put(i: Item) -> types::Sometime<'static, Result<(), Error>> {
       let bs = Bytes::try_derive(i);
       match bs {
-          Ok(bs) => {
-              let f = io::stdout().write(&bs);
-              types::Future::Future(Box::pin(future::ready(f.map_err(|e| e.into()).map(|_| ()))))
-          }
-          Err(e) => types::Future::Now(Err(e)),
+          Ok(bs) => types::Sometime::Future(Box::pin(async move {
+              tokio::io::stdout()
+                  .write_all(&bs)
+                  .await
+                  .map_err(|e| e.into())
+          })),
+          Err(e) => types::Sometime::Now(Err(e)),
       }
   }
 
@@ -10371,7 +10373,7 @@ Implement the =handoff= type
           }
       }
 
-      pub fn put(&mut self, i: Item) -> types::Future<'static, Result<(), error::Error>> {
+      pub fn put(&mut self, i: Item) -> types::Sometime<'static, Result<(), error::Error>> {
           // println!(
           //     "Putting into channel: {} into {:?} on {:?}",
           //     i.clone(),
@@ -10383,7 +10385,7 @@ Implement the =handoff= type
           };
           if let Some(ch) = self.sender.clone() {
               if axiom::is_truthy(&i) {
-                  types::Future::Future(Box::pin(async move {
+                  types::Sometime::Future(Box::pin(async move {
                       ch.send_async(i)
                           .await
                           .map_err(|_| pipe::closed_error(false))
@@ -10392,10 +10394,10 @@ Implement the =handoff= type
                   // If we're putting 'nothing', that indicates end of
                   // input, so we drop the sender.
                   self.close_put();
-                  types::Future::Now(Ok(()))
+                  types::Sometime::Now(Ok(()))
               }
           } else {
-              types::Future::Now(Err(pipe::closed_error(false)))
+              types::Sometime::Now(Err(pipe::closed_error(false)))
           }
       }
 
@@ -10466,7 +10468,7 @@ Implement the =handoff= type
       }
   }
 
-  pub fn handoff(mut env: Environment) -> types::Future<'static, Environment> {
+  pub fn handoff(mut env: Environment) -> types::Sometime<'static, Environment> {
       env.pop_prog();
       env.push(pipe::Tunnel::Handoff(Box::new(Handoff::new(false))));
       env.fit()
