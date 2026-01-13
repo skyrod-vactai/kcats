@@ -10897,6 +10897,195 @@ Implement the =handoff= type
           )
       }
   }
+
+  use std::collections::HashMap;
+
+  #[derive(Debug, Clone)]
+  pub struct Constraint {
+      pub entity: Item,
+      pub attribute: Item,
+      pub value: Item,
+  }
+
+  impl TryDerive<coll::List> for Constraint {
+      fn try_derive(mut l: coll::List) -> Result<Constraint, Error> {
+          if l.len() != 3 {
+              Err(error::Error::list_count(3))
+          } else {
+              let entity: Item = l.pop_front().unwrap().try_fit()?;
+              let attribute: Item = l.pop_front().unwrap().try_fit()?;
+              let value: Item = l.pop_front().unwrap().try_fit()?;
+              Ok(Constraint {
+                  entity,
+                  attribute,
+                  value,
+              })
+          }
+      }
+  }
+
+  fn is_var(v: &Item) -> bool {
+      if let Item::Word(s) = v {
+          s.data.ends_with('?')
+      } else {
+          false
+      }
+  }
+
+  fn var_name(s: &str) -> &str {
+      s.trim_end_matches('?')
+  }
+
+  /// Returns (SQL String, Parameters Map)
+  pub fn datalog_to_sql(
+      constraints: Vec<Constraint>,
+      selection: Vec<Item>,
+  ) -> Result<(String, HashMap<String, Item>), Error> {
+      if constraints.is_empty() {
+          return Ok(("SELECT 1".to_string(), HashMap::new()));
+      }
+
+      // 1. Setup
+      let mut var_map: HashMap<types::Word, Vec<(usize, String)>> = HashMap::new();
+      let mut conditions: Vec<Vec<String>> = vec![Vec::new(); constraints.len()];
+      let mut params: HashMap<String, Item> = HashMap::new();
+
+      for (idx, c) in constraints.iter().enumerate() {
+          let alias = format!("c{}", idx);
+
+          // --- Process Entity ---
+          if is_var(&c.entity) {
+              var_map
+                  .entry(c.entity.clone().try_fit().unwrap())
+                  .or_default()
+                  .push((idx, "Entity".to_string()));
+          } else {
+              // It's a literal: Create placeholder and store value
+              let p_name = format!(":{}entity", alias); // e.g., :c0entity
+              conditions[idx].push(format!("{}.Entity = {}", alias, p_name));
+              params.insert(p_name, c.entity.clone());
+          }
+
+          // --- Process Attribute ---
+          if is_var(&c.attribute) {
+              var_map
+                  .entry(c.attribute.clone().try_fit().unwrap())
+                  .or_default()
+                  .push((idx, "Attribute".to_string()));
+          } else {
+              let p_name = format!(":{}attribute", alias); // e.g., :c0attribute
+              conditions[idx].push(format!("{}.Attribute = {}", alias, p_name));
+              params.insert(p_name, c.attribute.clone());
+          }
+
+          // --- Process Value ---
+          if is_var(&c.value) {
+              var_map
+                  .entry(c.value.clone().try_fit().unwrap())
+                  .or_default()
+                  .push((idx, "Value".to_string()));
+          } else {
+              let p_name = format!(":{}value", alias); // e.g., :c0value
+              conditions[idx].push(format!("{}.Value = {}", alias, p_name));
+              params.insert(p_name, c.value.clone());
+          }
+      }
+
+      // 2. Generate Linkage (Join) Conditions based on variables
+      // (Logic remains the same as before, no params needed for joins)
+      for (_, occurrences) in var_map.iter() {
+          if occurrences.len() > 1 {
+              let (first_tbl_idx, first_col) = &occurrences[0];
+
+              for (curr_tbl_idx, curr_col) in occurrences.iter().skip(1) {
+                  let cond = format!(
+                      "c{}.{} = c{}.{}",
+                      curr_tbl_idx, curr_col, first_tbl_idx, first_col
+                  );
+                  conditions[*curr_tbl_idx].push(cond);
+              }
+          }
+      }
+
+      // 3. Build SELECT Clause
+      let select_parts: Vec<String> = selection
+          .iter()
+          .cloned()
+          .map(|var| {
+              let r = types::Word::try_derive(var);
+              match r {
+                  Ok(w) => Ok(if let Some(locs) = var_map.get(&w) {
+                      let (tbl_idx, col) = &locs[0];
+                      format!("c{}.{} AS {}", tbl_idx, col, var_name(w.data.as_str()))
+                  } else {
+                      format!("NULL AS {}", var_name(w.data.as_str()))
+                  }),
+                  Err(e) => Err(e),
+              }
+          })
+          .collect::<Result<Vec<String>, Error>>()?;
+
+      let select_clause = format!("SELECT {}", select_parts.join(", "));
+
+      // 4. Build FROM and JOIN Clauses
+      let mut query = select_clause;
+      query.push_str("\nFROM EAV as c0");
+
+      for i in 1..constraints.len() {
+          let alias = format!("c{}", i);
+          let on_clause = if conditions[i].is_empty() {
+              "1=1".to_string()
+          } else {
+              conditions[i].join(" AND ")
+          };
+          query.push_str(&format!("\nJOIN EAV {} ON {}", alias, on_clause));
+      }
+
+      // 5. Build WHERE Clause
+      if !conditions[0].is_empty() {
+          query.push_str(&format!("\nWHERE {}", conditions[0].join(" AND ")));
+      }
+
+      Ok((query, params))
+  }
+
+  // pub fn build_query(mut env: Environment) -> Result<(), Error> {
+  //     let selection = coll::List::try_derive(env.pop())?;
+  //     let constraintslist = coll::List::try_derive(env.pop())?;
+  //     let constraints: Vec<Constraint> = constraintslist.try_fit()?;
+  //     let (sql, params) = datalog_to_sql(constraints, selection.fit())?;
+  // }
+
+  #[cfg(test)]
+  mod tests {
+      use super::*;
+      use crate::{fit, list};
+      use std::collections::HashMap;
+
+      #[test]
+      fn test_simple() {
+          let constraints: Vec<Constraint> = vec![
+              list!["book?", "subjects", "love"].try_fit().unwrap(),
+              list!["book?", "title", "title?"].try_fit().unwrap(),
+              list!["book?", "author-last", "author-last?"]
+                  .try_fit()
+                  .unwrap(),
+          ];
+          let selection: Vec<Item> =
+              vec![Item::Word(fit!("author-last?")), Item::Word(fit!("title?"))];
+          let (sql, params) = datalog_to_sql(constraints, selection).unwrap();
+          assert_eq!(sql, "SELECT c2.Value AS author-last, c1.Value AS title\nFROM EAV as c0\nJOIN EAV c1 ON c1.Attribute = :c1attribute AND c1.Entity = c0.Entity\nJOIN EAV c2 ON c2.Attribute = :c2attribute AND c2.Entity = c0.Entity\nWHERE c0.Attribute = :c0attribute AND c0.Value = :c0value");
+          assert_eq!(
+              params,
+              HashMap::from([
+                  (":c0attribute".to_string(), Item::Word(fit!("subjects"))),
+                  (":c0value".to_string(), Item::Word(fit!("love"))),
+                  (":c1attribute".to_string(), Item::Word(fit!("title"))),
+                  (":c2attribute".to_string(), Item::Word(fit!("author-last"))),
+              ]),
+          )
+      }
+  }
 #+end_src
 * Issues
 ** INPROGRESS [#C] Use a single word for all derivation/conversion  :stdlib:
