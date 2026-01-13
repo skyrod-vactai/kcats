@@ -216,6 +216,16 @@ types to wrap stdlib types.
               expected: self.expected,
           }
       }
+
+      pub fn update<F, U>(self, f: F) -> DeriveError<U>
+      where
+          F: FnOnce(T) -> U,
+      {
+          DeriveError {
+              src: f(self.src),
+              expected: self.expected,
+          }
+      }
   }
   /// a trait similar to [std::convert::TryFrom]
   pub trait TryDerive<T>: Sized {
@@ -254,9 +264,12 @@ types to wrap stdlib types.
   }
 
   /// Convert Error to DeriveError
-  impl Derive<Error> for DeriveError<types::Item> {
-      fn derive(e: Error) -> DeriveError<types::Item> {
-          DeriveError::expected(fit!("fixme"), e.actual().cloned().unwrap_or_default())
+  impl<I> Derive<Error> for DeriveError<I>
+  where
+      I: Derive<types::Item>,
+  {
+      fn derive(e: Error) -> DeriveError<I> {
+          DeriveError::expected(fit!("fixme"), e.actual().cloned().unwrap_or_default().fit())
       }
   }
 
@@ -280,28 +293,6 @@ types to wrap stdlib types.
   //         self.into_iter()
   //     }
   // }
-
-  pub trait DeriveIterator<A>: Sized {
-      fn derive_iter<T: IntoIterator<Item = A>>(iter: T) -> Self;
-  }
-
-  pub trait TryDeriveIterator<A>: Sized {
-      fn try_from_iter<I>(l: I) -> Result<Self, Error>
-      where
-          I: IntoIterator<Item = types::Item>;
-  }
-
-  pub trait MyCollect: Iterator {
-      fn my_collect<B>(self) -> B
-      where
-          B: DeriveIterator<Self::Item>,
-          Self: Sized,
-      {
-          B::derive_iter(self)
-      }
-  }
-
-  impl<I: Iterator> MyCollect for I {}
 
   //blanket impl
   impl<T, U> Fit<U> for T
@@ -346,6 +337,28 @@ types to wrap stdlib types.
   pub trait Fresh {
       fn fresh() -> Self;
   }
+
+  pub trait RewrapExt: IntoIterator + Sized {
+      /// Infallible: Uses Derive. Returns the container directly.
+      fn rewrap<Target, U>(self) -> Target
+      where
+          Target: FromIterator<U>,
+          U: Derive<Self::Item>,
+      {
+          self.into_iter().map(U::derive).collect()
+      }
+
+      /// Fallible: Uses TryDerive. Returns Result<Target, E>.
+      fn try_rewrap<Target, U>(self) -> Result<Target, Error>
+      where
+          Target: FromIterator<U>,
+          U: TryDerive<Self::Item>,
+      {
+          self.into_iter().map(U::try_derive).collect()
+      }
+  }
+
+  impl<I: IntoIterator> RewrapExt for I {}
 #+end_src
 *** Internal data types
 **** Basic internal types
@@ -1512,24 +1525,6 @@ internally, to keep track of things like the stack, program, lists etc.
   impl Derive<List> for Item {
       fn derive(l: List) -> Item {
           Item::List(Box::new(l))
-      }
-  }
-
-  impl DeriveIterator<Item> for List {
-      fn derive_iter<I>(iter: I) -> Self
-      where
-          I: IntoIterator<Item = Item>,
-      {
-          im::Vector::from_iter(iter)
-      }
-  }
-
-  impl DeriveIterator<Char> for List {
-      fn derive_iter<I>(iter: I) -> Self
-      where
-          I: IntoIterator<Item = Char>,
-      {
-          iter.into_iter().map(Item::derive).collect::<List>()
       }
   }
 
@@ -3000,7 +2995,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
   pub type Associationy<K, V> = HashMap<K, V>;
   pub type AssociationContent = Associationy<KeyItem, Item>;
-  pub type Association = coll::Arc<AssociationContent>;
+  pub type Association = Arc<AssociationContent>;
 
   /// A KeyItem is all the Item types that can be used as a key in an
   /// Associative structure. In order to be a key, the type has to be
@@ -3023,17 +3018,6 @@ internally, to keep track of things like the stack, program, lists etc.
 
   pub type KeyListContent = coll::Listy<KeyItem>;
   pub type KeyList = KeyListContent;
-
-  impl TryDeriveIterator<Item> for KeyList {
-      fn try_from_iter<I>(l: I) -> Result<Self, Error>
-      where
-          I: IntoIterator<Item = Item>,
-      {
-          l.into_iter()
-              .map(|i| KeyItem::try_derive(i))
-              .collect::<Result<KeyList, Error>>()
-      }
-  }
 
   /// An Associative is a container type that associates one Item (the
   /// key) with another (the value). It has the property where you can
@@ -3064,7 +3048,7 @@ internally, to keep track of things like the stack, program, lists etc.
           match i {
               KeyItem::Int(i) => Item::Int(i),
               KeyItem::String(i) => i.fit(),
-              KeyItem::List(l) => coll::List::derive_iter(l.iter().cloned().map(Item::derive)).fit(),
+              KeyItem::List(l) => l.iter().cloned().rewrap::<coll::List, Item>().fit(),
               KeyItem::Word(w) => Item::Word(w),
               KeyItem::Bytes(bs) => bs.fit(),
               KeyItem::Char(c) => Item::Char(c),
@@ -3095,9 +3079,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
                   coll::Sized::Bytes(i) => Ok(KeyItem::Bytes(i)),
 
-                  coll::Sized::List(l) => {
-                      Ok(KeyItem::List(KeyList::try_from_iter(l.iter().cloned())?))
-                  }
+                  coll::Sized::List(l) => Ok(KeyItem::List(l.iter().cloned().try_rewrap()?)),
                   s => {
                       println!("Bad keyitem {:?}", s);
                       Err(Error::expected(fit!("KeyItem"), Item::derive(s)))
@@ -3137,7 +3119,7 @@ internally, to keep track of things like the stack, program, lists etc.
       type Output = Association;
       type Error = Error;
       fn join(self, other: coll::List) -> Result<Self::Output, Self::Error> {
-          let la = Association::try_from_iter(other.iter().cloned())?;
+          let la = Arc::new(other.iter().cloned().try_rewrap()?);
           Ok(self.join(Associative::Assoc(la)).unwrap())
       }
   }
@@ -3146,7 +3128,7 @@ internally, to keep track of things like the stack, program, lists etc.
       type Output = Association;
       type Error = Error;
       fn join(self, other: Association) -> Result<Self::Output, Self::Error> {
-          let la = Association::try_from_iter(self.iter().cloned())?;
+          let la: Association = Arc::new(self.iter().cloned().try_rewrap()?);
           Ok(la.join(other).unwrap())
       }
   }
@@ -3316,7 +3298,7 @@ internally, to keep track of things like the stack, program, lists etc.
               Associative::Env(mut e) => {
                   let demote = |o: env::Environment, k: assoc::KeyItem, v: Item| {
                       //println!("Demotion!!! {:?}", o);
-                      let mut a = assoc::Association::derive_iter(o);
+                      let mut a: assoc::Association = Arc::new(o.rewrap());
                       let am = a.mutate();
                       let old = am.insert(k, v);
                       (assoc::Associative::Assoc(a), old)
@@ -3512,7 +3494,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   (Associative::Error(e), v)
               }
               Associative::Env(e) => {
-                  let a = Association::derive_iter(*e);
+                  let a: Association = Arc::new((*e).rewrap());
                   Associative::Assoc(a).remove(k)
               }
               _ => todo!("Removing from other associative types"),
@@ -3547,12 +3529,6 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  impl Derive<Associative> for coll::List {
-      fn derive(a: Associative) -> Self {
-          coll::List::derive_iter(a.to_iter())
-      }
-  }
-
   impl TryDerive<coll::Sized> for Associative {
       fn try_derive(s: coll::Sized) -> Result<Self, Error> {
           Result::<Associative, DeriveError<coll::Sized>>::derive(s).map_err(Error::derive)
@@ -3569,7 +3545,10 @@ internally, to keep track of things like the stack, program, lists etc.
               Item::Words(a) => Ok(Associative::Words(a)),
               Item::Dictionary(a) => Ok(Associative::Dictionary(a)),
               //Item::List(l) => Association::derive_iter(l.iter().cloned()),
-              Item::List(l) => Association::try_from_iter(l.iter().cloned())
+              Item::List(l) => l
+                  .into_iter()
+                  .try_rewrap::<AssociationContent, Entry>()
+                  .map(Arc::new)
                   .map(Associative::Assoc)
                   .map_err(DeriveError::derive),
               i => Err(DeriveError::expected(fit!("associative"), i)),
@@ -3586,9 +3565,8 @@ internally, to keep track of things like the stack, program, lists etc.
               coll::Sized::Error(a) => Ok(Associative::Error(a)),
               coll::Sized::Words(a) => Ok(Associative::Words(a)),
               coll::Sized::Dictionary(a) => Ok(Associative::Dictionary(a)),
-              coll::Sized::List(l) => Association::try_from_iter(l.iter().cloned())
-                  .map(Associative::Assoc)
-                  .map_err(|_| DeriveError::expected(fit!("associative"), coll::Sized::List(l))),
+              coll::Sized::List(l) => <Result<Associative, DeriveError<coll::List>>>::derive(*l)
+                  .map_err(|e| e.update(|s| coll::Sized::List(Box::new(s)))),
               i => Err(DeriveError::expected(fit!("associative"), i)),
           }
       }
@@ -3600,21 +3578,21 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  impl Derive<coll::List> for Result<Associative, DeriveError<coll::List>> {
+      fn derive(l: coll::List) -> Result<Associative, DeriveError<coll::List>> {
+          l.iter()
+              .cloned()
+              .try_rewrap::<AssociationContent, Entry>()
+              .map(Arc::new)
+              .map(Associative::Assoc)
+              .map_err(Fit::fit)
+          //.map_err(|e| <DeriveError<coll::List>>::derive(e))
+      }
+  }
+
   // Convert anything that can be iterated over as Items, to an
   // Association. The items must be pairs that are
   // convertable to Entry, otherwise it will return an error.
-  impl TryDeriveIterator<Item> for Association {
-      fn try_from_iter<I>(l: I) -> Result<Self, Error>
-      where
-          I: IntoIterator<Item = Item>,
-      {
-          Ok(sync::Arc::new(
-              l.into_iter()
-                  .map(|i| Entry::try_derive(i.clone()))
-                  .collect::<Result<HashMap<KeyItem, Item>, Error>>()?,
-          ))
-      }
-  }
 
   impl Derive<HashMap<KeyItem, Item>> for Association {
       fn derive(h: HashMap<KeyItem, Item>) -> Self {
@@ -3622,36 +3600,9 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  impl DeriveIterator<Entry> for Association {
-      fn derive_iter<I>(iter: I) -> Self
-      where
-          I: IntoIterator<Item = Entry>,
-      {
-          sync::Arc::new(iter.into_iter().collect::<HashMap<KeyItem, Item>>())
-      }
-  }
-
-  impl DeriveIterator<Entry> for coll::List {
-      fn derive_iter<I>(iter: I) -> Self
-      where
-          I: IntoIterator<Item = Entry>,
-      {
-          iter.into_iter().map(|e| e.fit()).collect::<coll::List>()
-      }
-  }
-
-  impl DeriveIterator<KeyItem> for KeyList {
-      fn derive_iter<I>(iter: I) -> Self
-      where
-          I: IntoIterator<Item = KeyItem>,
-      {
-          iter.into_iter().collect::<KeyList>()
-      }
-  }
-
   impl Derive<Entry> for Item {
       fn derive(e: Entry) -> Item {
-          coll::List::derive_iter([Item::derive(e.0), e.1]).fit()
+          list![e.0, e.1].fit()
       }
   }
 
@@ -3673,7 +3624,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn derive(a: Associative) -> Association {
           match a {
               Associative::Assoc(a) => a,
-              a => Association::derive_iter(a.to_iter()),
+              a => Arc::new(a.to_iter().rewrap()),
           }
       }
   }
@@ -3731,24 +3682,6 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  impl<T, E, C> DeriveIterator<Result<T, E>> for Result<C, E>
-  where
-      C: DeriveIterator<T>,
-  {
-      fn derive_iter<I: IntoIterator<Item = Result<T, E>>>(iter: I) -> Self {
-          let mut result = Vec::new();
-
-          for item in iter {
-              match item {
-                  Ok(value) => result.push(value),
-                  Err(e) => return Err(e),
-              }
-          }
-
-          Ok(C::derive_iter(result))
-      }
-  }
-
   pub trait Convert<KA, VA> {
       /// Convert from any type of hashmap to any other, assuming the keys
       /// and values convert
@@ -3785,7 +3718,7 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   mod serde {
-      use super::{KeyItem, KeyList};
+      use super::KeyItem;
       use crate::traits::*;
       use serde::de::{self, Deserialize, Deserializer, Visitor};
       use serde::ser::{Serialize, SerializeSeq};
@@ -3836,7 +3769,7 @@ internally, to keep track of things like the stack, program, lists etc.
               while let Some(item) = seq.next_element::<KeyItem>()? {
                   items.push(item);
               }
-              Ok(KeyItem::List(KeyList::derive_iter(items)))
+              Ok(KeyItem::List(items.rewrap()))
           }
       }
 
@@ -3939,7 +3872,10 @@ internally, to keep track of things like the stack, program, lists etc.
           }
           Error {
               is_handled: false,
-              data: assoc::Association::derive_iter(data),
+              data: std::sync::Arc::new(
+                  data.rewrap::<assoc::AssociationContent, assoc::Entry>()
+                      .fit(),
+              ),
           }
       }
 
@@ -4994,7 +4930,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
   impl Derive<(Word, Entry)> for Item {
       fn derive((k, v): (Word, Entry)) -> Item {
-          coll::List::derive_iter([Item::Word(k.fit()), Item::derive(v.clone())]).fit()
+          list![k, v].fit()
       }
   }
 
@@ -5473,10 +5409,8 @@ internally, to keep track of things like the stack, program, lists etc.
 
   impl serialize::Display for Environment {
       fn representation(&self) -> Item {
-          let assoc = assoc::Association::derive_iter(self.clone());
-          //let am = assoc.mutate();
-          //am.remove(&("dictionary".fit()));
-          assoc.fit()
+          let a: assoc::AssociationContent = self.clone().rewrap();
+          Arc::new(a).fit()
       }
   }
 
@@ -5771,6 +5705,7 @@ words for them (hashing, encryption, signing)
   use rand::RngCore as RandRngCore;
   use rand_core::{CryptoRng, RngCore};
   use sha2::{self, Digest}; // Import RngCore for the fill_bytes method
+  use std::sync::Arc;
 
   pub fn hash(i: Item) -> ItemResult {
       let b = Bytes::try_derive(i).unwrap();
@@ -5831,11 +5766,14 @@ words for them (hashing, encryption, signing)
           seed: vec![],
           salt: sbs,
       });
-      Ok(assoc::Association::derive_iter([
-          (fit!("type"), fit!("elliptic-curve-key")),
-          (fit!("secret"), kp.secret.as_ref().to_vec().fit()),
-          (fit!("public"), kp.public.as_ref().to_vec().fit()),
-      ])
+      Ok(Arc::new(
+          [
+              (fit!("type"), fit!("elliptic-curve-key")),
+              (fit!("secret"), kp.secret.as_ref().to_vec().fit()),
+              (fit!("public"), kp.public.as_ref().to_vec().fit()),
+          ]
+          .rewrap::<assoc::AssociationContent, assoc::Entry>(),
+      )
       .fit())
   }
 
@@ -5952,49 +5890,44 @@ example, in order to read/write to/from disk).
   const BYTE_TAG: &str = "b64";
 
   /// Parses a serialized value into an [Item].
-  fn to_item(item: &edn_format::Value) -> Result<Item, Error> {
-      //println!("to item {:?}", item);
-      match item {
-          edn_format::Value::Integer(i) => Ok(Item::Int(*i)),
-          edn_format::Value::Vector(v) => Ok({
-              coll::List::derive_iter(
-                  v.iter()
-                      .map(to_item)
-                      .collect::<Result<coll::List, Error>>()?,
-              )
-              .fit()
-          }),
-          edn_format::Value::Symbol(s) => Ok(Item::Word(Intern::new(WordData {
-              data: Intern::new(s.name().to_string()),
-              namespace: s
-                  .namespace()
-                  .map(|ns| BASE64_URL_SAFE_NO_PAD.decode(ns))
-                  .transpose()?
-                  .map(Intern::new),
-              quoted: false,
-          }))),
-          // we don't have booleans in kcats, so if we see 'false' that
-          // is the word false which is not defined in the base
-          // language, but might be user-defined later.
-          edn_format::Value::Boolean(b) => Ok(if *b { fit!("yes") } else { fit!("false") }),
-          edn_format::Value::String(s) => Ok(s.to_string().fit()),
-          edn_format::Value::Float(f) => Ok(Item::Float(f.into_inner())),
-          edn_format::Value::TaggedElement(tag, e) => {
-              if *tag == edn_format::Symbol::from_name(BYTE_TAG) {
-                  if let edn_format::Value::String(s) = &**e {
-                      Ok(BASE64_URL_SAFE_NO_PAD
-                          .decode(s.clone().into_bytes())
-                          .unwrap()
-                          .fit())
+  impl TryDerive<&edn_format::Value> for Item {
+      fn try_derive(item: &edn_format::Value) -> Result<Item, Error> {
+          //println!("to item {:?}", item);
+          match item {
+              edn_format::Value::Integer(i) => Ok(Item::Int(*i)),
+              edn_format::Value::Vector(v) => Ok(v.try_rewrap::<coll::List, Item>()?.fit()),
+              edn_format::Value::Symbol(s) => Ok(Item::Word(Intern::new(WordData {
+                  data: Intern::new(s.name().to_string()),
+                  namespace: s
+                      .namespace()
+                      .map(|ns| BASE64_URL_SAFE_NO_PAD.decode(ns))
+                      .transpose()?
+                      .map(Intern::new),
+                  quoted: false,
+              }))),
+              // we don't have booleans in kcats, so if we see 'false' that
+              // is the word false which is not defined in the base
+              // language, but might be user-defined later.
+              edn_format::Value::Boolean(b) => Ok(if *b { fit!("yes") } else { fit!("false") }),
+              edn_format::Value::String(s) => Ok(s.to_string().fit()),
+              edn_format::Value::Float(f) => Ok(Item::Float(f.into_inner())),
+              edn_format::Value::TaggedElement(tag, e) => {
+                  if *tag == edn_format::Symbol::from_name(BYTE_TAG) {
+                      if let edn_format::Value::String(s) = &**e {
+                          Ok(BASE64_URL_SAFE_NO_PAD
+                              .decode(s.clone().into_bytes())
+                              .unwrap()
+                              .fit())
+                      } else {
+                          Err(Error::parse("Invalid tag datatype for byte literal"))
+                      }
                   } else {
-                      Err(Error::parse("Invalid tag datatype for byte literal"))
+                      Err(Error::parse("Unsupported tag"))
                   }
-              } else {
-                  Err(Error::parse("Unsupported tag"))
               }
+              edn_format::Value::Character(c) => Ok(Item::Char(*c)),
+              _ => Err(Error::parse("Unsupported data literal")),
           }
-          edn_format::Value::Character(c) => Ok(Item::Char(*c)),
-          _ => Err(Error::parse("Unsupported data literal")),
       }
   }
 
@@ -6088,16 +6021,18 @@ example, in order to read/write to/from disk).
       }
   }
 
+  impl TryDerive<Result<edn_format::Value, edn_format::ParserError>> for Item {
+      fn try_derive(r: Result<edn_format::Value, edn_format::ParserError>) -> Result<Item, Error> {
+          match r {
+              Ok(expr) => Ok((&expr).try_fit()?),
+              Err(e) => Err(Error::from(e)),
+          }
+      }
+  }
+
   pub fn parse(s: String) -> Result<coll::List, Error> {
       let parser = edn_format::Parser::from_iter(s.chars(), edn_format::ParserOptions::default());
-      Ok(coll::List::derive_iter(
-          parser
-              .map(move |r| match r {
-                  Ok(expr) => Ok(to_item(&expr)?),
-                  Err(e) => Err(Error::from(e)),
-              })
-              .collect::<Result<Vec<Item>, Error>>()?,
-      ))
+      Ok(parser.try_rewrap()?)
   }
 
   /// A streaming parser function that takes the state of the parsing
@@ -6130,7 +6065,7 @@ example, in order to read/write to/from disk).
 
           match parser.next() {
               Some(Ok(v)) => {
-                  obj_buffer.push_back(to_item(&v)?);
+                  obj_buffer.push_back((&v).try_fit()?);
               }
               Some(Err(edn_format::ParserError::UnexpectedEndOfInput)) => {
                   // Restore iterator to state before failed parse
@@ -7383,15 +7318,13 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       //allow stepping backwards eg 20 15 -2 range = [20 18 16]
       // to = -20 from = -10 step -2
       if stepby < 0 {
-          let mut v = coll::List::derive_iter(
-              ((to - stepby)..(from + 1))
-                  .step_by(-stepby as usize)
-                  .map(Item::derive),
-          );
+          let mut v: coll::List = ((to - stepby)..(from + 1))
+              .step_by(-stepby as usize)
+              .rewrap();
           v.reverse();
           v
       } else {
-          coll::List::derive_iter((from..to).step_by(stepby as usize).map(Item::derive))
+          (from..to).step_by(stepby as usize).rewrap()
       }
   }
 
@@ -7525,7 +7458,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               Ok(v.fit())
           }
           coll::Sized::Env(e) => {
-              let a = assoc::Association::derive_iter(*e);
+              let a: assoc::Association = Arc::new((*e).rewrap());
               let (_, v) = assoc::Associative::Assoc(a).remove(&(k.try_fit()?));
               Ok(v.fit())
           }
@@ -7553,7 +7486,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   }
                   (a, k) => {
                       let a: assoc::Associative = a.try_fit()?;
-                      let mut a = assoc::Association::derive_iter(a.to_iter());
+                      let mut a: assoc::Association = Arc::new(a.to_iter().rewrap());
                       let am = a.mutate();
                       let mut res: Option<Result<_, Error>> = None;
                       am.entry(k.clone()).and_modify(|v| {
@@ -8141,7 +8074,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let it = l.into_iter().map(as_pair);
       let mut it = it.collect::<Result<Vec<(Item, assoc::KeyItem)>, Error>>()?;
       it.sort_unstable_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Less));
-      Ok(coll::List::derive_iter(it.into_iter().map(|(k, _)| k)))
+      Ok(it.into_iter().map(|(k, _)| k).rewrap())
   }
 
   fn slice(arr: coll::Sized, mut start: Int, mut end: Int) -> ItemResult {
@@ -10670,7 +10603,7 @@ Implement the =handoff= type
   use crate::axiom;
   use crate::config;
   use crate::traits::*;
-  use crate::types::container::{self as coll, associative as assoc, error::Error};
+  use crate::types::container::{self as coll, associative as assoc, error, error::Error};
   use crate::types::{self, Item};
   use crate::{fit, list};
 
