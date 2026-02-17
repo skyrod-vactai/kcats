@@ -177,113 +177,16 @@ unless you own either the trait or the type), we'll opt for making our
 own traits rather than using the "newtype" pattern of making our own
 types to wrap stdlib types.
 #+begin_src rust :tangle src/traits.rs :mkdirp yes
+  use crate::derivation::*;
   use crate::fit;
   use crate::types;
-  use crate::types::container::error::Error;
+  use crate::types::container::error::{Error, Nested, NestedDeriveError};
   use core::fmt::{self, Debug};
-
-  // Define custom traits that mimic std ones
-  /// a trait similar to [std::convert::From]
-  pub trait Derive<T>: Sized {
-      fn derive(value: T) -> Self;
-  }
-
-  pub struct DeriveError<T> {
-      pub src: T,
-      pub expected: types::Word,
-  }
-
-  impl<T> Debug for DeriveError<T>
-  where
-      T: Debug,
-  {
-      fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-          write!(
-              f,
-              "DeriveError[src: {:?}, expected: {:?}]",
-              self.src, self.expected
-          )
-      }
-  }
-  impl<T> DeriveError<T> {
-      pub fn expected(expected: types::Word, src: T) -> DeriveError<T> {
-          DeriveError { src, expected }
-      }
-
-      pub fn swap<U>(self, updated: U) -> DeriveError<U> {
-          DeriveError {
-              src: updated,
-              expected: self.expected,
-          }
-      }
-
-      pub fn update<F, U>(self, f: F) -> DeriveError<U>
-      where
-          F: FnOnce(T) -> U,
-      {
-          DeriveError {
-              src: f(self.src),
-              expected: self.expected,
-          }
-      }
-  }
-  /// a trait similar to [std::convert::TryFrom]
-  pub trait TryDerive<T>: Sized {
-      fn try_derive(value: T) -> Result<Self, Error>;
-  }
-
-  //impl TryDeriveSoft<F, F> for T
-
-  /// a trait similar to [std::convert::Into]
-  pub trait Fit<T>: Sized {
-      fn fit(self) -> T;
-  }
-
-  /// a trait similar to [std::convert::TryInto]
-  pub trait TryFit<T>: Sized {
-      fn try_fit(self) -> Result<T, Error>;
-  }
-
-  /// Convert DeriveError to Error
-  impl<I> Derive<DeriveError<I>> for Error
-  where
-      I: Fit<types::Item>,
-  {
-      fn derive(de: DeriveError<I>) -> Error {
-          Error::expected(de.expected, Some(de.src.fit()))
-      }
-  }
-
-  impl<T, I> Derive<Result<T, DeriveError<I>>> for Result<T, Error>
-  where
-      I: Fit<types::Item>,
-  {
-      fn derive(r: Result<T, DeriveError<I>>) -> Self {
-          r.map_err(Error::derive)
-      }
-  }
-
-  /// Convert Error to DeriveError
-  impl<I> Derive<Error> for DeriveError<I>
-  where
-      I: Derive<types::Item>,
-  {
-      fn derive(e: Error) -> DeriveError<I> {
-          DeriveError::expected(fit!("fixme"), e.actual().cloned().unwrap_or_default().fit())
-      }
-  }
 
   /// a trait that marks iterable types that can return arbitrary
   /// numbers of items. For example lists, maps, etc. But not things
   /// like Result or Option.
   pub trait IntoList {}
-
-  pub trait ToIterator {
-      type Item;
-      type IntoIter: Iterator<Item = Self::Item>;
-
-      fn to_iter(self) -> Self::IntoIter;
-  }
 
   // impl<T> ToIterator for Vec<T> {
   //     type Item = T;
@@ -294,71 +197,61 @@ types to wrap stdlib types.
   //     }
   // }
 
-  //blanket impl
-  impl<T, U> Fit<U> for T
-  where
-      U: Derive<T>,
-  {
-      fn fit(self) -> U {
-          U::derive(self)
-      }
-  }
-
-  // impl<T, U> TryFit<U> for T
-  // where
-  //     U: TryDerive<T>,
-  // {
-  //     fn try_fit<E>(self) -> Result<U, E> {
-  //         U::try_derive::<E>(self)
-  //     }
-  // }
-
-  impl<T, U> TryFit<U> for T
-  where
-      U: TryDerive<T>,
-  {
-      fn try_fit(self) -> Result<U, Error> {
-          U::try_derive(self)
-      }
-  }
-
-  impl<T> Derive<T> for T {
-      fn derive(value: T) -> T {
-          value
-      }
-  }
-
-  impl<T> TryDerive<T> for T {
-      fn try_derive(value: T) -> Result<Self, Error> {
-          Ok(value)
-      }
-  }
-
   pub trait Fresh {
       fn fresh() -> Self;
   }
 
-  pub trait RewrapExt: IntoIterator + Sized {
+  pub trait RewrapExt: ToIterator + Sized {
       /// Infallible: Uses Derive. Returns the container directly.
       fn rewrap<Target, U>(self) -> Target
       where
           Target: FromIterator<U>,
           U: Derive<Self::Item>,
       {
-          self.into_iter().map(U::derive).collect()
+          self.to_iter().map(U::derive).collect()
       }
 
-      /// Fallible: Uses TryDerive. Returns Result<Target, E>.
-      fn try_rewrap<Target, U>(self) -> Result<Target, Error>
+      /// Fallible: Uses Derive specifically for DeriveErrors. Returns Result<Target, E>.
+
+      fn try_rewrap<Target, Inner>(self) -> Result<Target, NestedDeriveError<Self>>
       where
-          Target: FromIterator<U>,
-          U: TryDerive<Self::Item>,
+          Self::Item:
+              Clone + Fit<Result<<Target as IntoIterator>::Item, NestedDeriveError<Self::Item>>>,
+          Target: FromIterator<<Target as IntoIterator>::Item> + IntoIterator,
       {
-          self.into_iter().map(U::try_derive).collect()
+          let original = self.clone();
+          self.to_iter()
+              .map(Fit::fit)
+              .collect::<Result<Target, NestedDeriveError<Self::Item>>>()
+              .map_err(|inner_err| NestedDeriveError {
+                  src: original,
+                  expected: inner_err.expected,
+                  inner: inner_err,
+              })
       }
   }
 
-  impl<I: IntoIterator> RewrapExt for I {}
+  impl<I: ToIterator + Clone> RewrapExt for I {}
+
+  pub trait ToIterator: Clone {
+      type Item;
+      type IntoIter: Iterator<Item = Self::Item>;
+
+      fn to_iter(self) -> Self::IntoIter;
+  }
+
+  // Blanket impl for anything that's Clone + IntoIterator
+  impl<T> ToIterator for T
+  where
+      T: Clone + IntoIterator,
+  {
+      type Item = T::Item;
+      type IntoIter = T::IntoIter;
+
+      fn to_iter(self) -> Self::IntoIter {
+          IntoIterator::into_iter(self)
+      }
+  }
 #+end_src
 *** Internal data types
 **** Basic internal types
@@ -962,6 +855,16 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
+  /// We aren't doing a blanket T=>T identity conversion because it
+  /// conflicts with other useful impls. The main one we need is this
+  /// one, for when we have a trait bounds of Fit<Item> and it might get
+  /// passed an Item already.
+  impl TryDerive<Item> for Item {
+      fn try_derive(i: Item) -> Result<Self, Error> {
+          Ok(i)
+      }
+  }
+
   /// A generic impl to convert an Item to a vec of the given
   /// type. Assumes the Item is some sort of container and converts each
   /// item in the container.
@@ -1493,8 +1396,11 @@ internally, to keep track of things like the stack, program, lists etc.
 
   use self::associative as assoc;
   use crate::traits::*;
-  use crate::types::container::pipe::FutureTake;
   use crate::types::container::program::Program;
+  use crate::types::container::{
+      error::{Error, NestedDeriveError},
+      pipe::FutureTake,
+  };
   use crate::types::number::Int;
   use crate::types::*;
   //use crate::{convert_enum, try_convert_enum};
@@ -1836,8 +1742,8 @@ internally, to keep track of things like the stack, program, lists etc.
                   // (Sized::Associative(a), other) => {
                   // assoc::KeyItem::try_derive(other.clone()).is_ok_and(|k| a.contains_key(&k))
                   //}
-                  let c =
-                      Result::<assoc::Associative, DeriveError<Sized>>::derive(s.clone()).unwrap();
+                  let c = Result::<assoc::Associative, NestedDeriveError<Sized>>::derive(s.clone())
+                      .unwrap();
                   assoc::KeyItem::try_derive(other.clone()).is_ok_and(|k| c.contains_key(&k))
               }
           }
@@ -2226,7 +2132,8 @@ internally, to keep track of things like the stack, program, lists etc.
               }
               s => {
                   // should be an associative
-                  let mut c = Result::<assoc::Associative, DeriveError<Sized>>::derive(s).unwrap();
+                  let mut c =
+                      Result::<assoc::Associative, NestedDeriveError<Sized>>::derive(s).unwrap();
                   let x = c.take_simple();
                   (Sized::derive(c), x)
               }
@@ -2322,7 +2229,8 @@ internally, to keep track of things like the stack, program, lists etc.
               Sized::Program(p) => Box::new(List::derive(p).into_iter()),
               s => {
                   // should be associative if we get here
-                  let map = Result::<assoc::Associative, DeriveError<Sized>>::derive(s).unwrap();
+                  let map =
+                      Result::<assoc::Associative, NestedDeriveError<Sized>>::derive(s).unwrap();
                   Box::new(map.to_iter().map(|kv| kv.fit()))
               }
           }
@@ -2354,18 +2262,6 @@ internally, to keep track of things like the stack, program, lists etc.
               Sized::List(l) => Ok(*l),
               s => Ok(List::derive_iter(s.to_iter().map(Item::derive))),
           }
-      }
-  }
-
-  // Implement Derive for Item where T is an Iterator
-  impl<T, I> Derive<T> for Item
-  where
-      T: ToIterator<Item = I> + IntoList,
-      I: Fit<Item>,
-  {
-      fn derive(iter: T) -> Self {
-          let l: List = iter.to_iter().map(Fit::fit).my_collect();
-          Item::derive(l)
       }
   }
 
@@ -2421,7 +2317,7 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  impl Derive<Item> for Result<Sized, DeriveError<Item>> {
+  impl Derive<Item> for Result<Sized, NestedDeriveError<Item>> {
       fn derive(i: Item) -> Self {
           match i {
               Item::Bytes(b) => Ok(Sized::Bytes(*b)),
@@ -2435,8 +2331,8 @@ internally, to keep track of things like the stack, program, lists etc.
               Item::Env(a) => Ok(Sized::Env(a)),
               Item::Set(s) => Ok(Sized::Set(s)),
               Item::Program(p) => Ok(Sized::Program(*p)),
-              i => Err(DeriveError::expected(fit!("sized"), i)),
-              //try_convert_enum!(item, Item => Sized, [Bytes, String, List, Associative, Set, Program], |i| Self::DeriveError::expected(fit!("sized"), i) )
+              i => Err(NestedDeriveError::expected(fit!("sized"), i)),
+              //try_convert_enum!(item, Item => Sized, [Bytes, String, List, Associative, Set, Program], |i| Self::NestedDeriveError::expected(fit!("sized"), i) )
           }
       }
   }
@@ -2456,7 +2352,7 @@ internally, to keep track of things like the stack, program, lists etc.
               Item::Set(s) => Ok(Sized::Set(s)),
               Item::Program(p) => Ok(Sized::Program(*p)),
               i => Err(Error::expected(fit!("sized"), i)),
-              //try_convert_enum!(item, Item => Sized, [Bytes, String, List, Associative, Set, Program], |i| Self::DeriveError::expected(fit!("sized"), i) )
+              //try_convert_enum!(item, Item => Sized, [Bytes, String, List, Associative, Set, Program], |i| Self::NestedDeriveError::expected(fit!("sized"), i) )
           }
       }
   }
@@ -2649,22 +2545,13 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  impl ToIterator for Sized {
-      type Item = Item;
-      type IntoIter = Box<dyn Iterator<Item = Item>>;
-
-      fn to_iter<'a>(self) -> Self::IntoIter {
-          self.into_iter()
-      }
-  }
-
   impl IntoList for Vec<Item> {}
 
   mod serde {
       use super::{Dispenser, List, Receptacle, Sized};
       use crate::serialize::Display;
       use crate::traits::*;
-      use crate::types::container::associative as assoc;
+      use crate::types::container::{associative as assoc, error::NestedDeriveError};
       use serde::ser::{Serialize, SerializeMap, SerializeSeq};
 
       impl Serialize for Dispenser {
@@ -2728,8 +2615,9 @@ internally, to keep track of things like the stack, program, lists etc.
                   }
                   Sized::String(s) => serializer.serialize_str(s.as_str()),
                   s => {
-                      let a = Result::<assoc::Associative, DeriveError<Sized>>::derive(s.clone())
-                          .unwrap();
+                      let a =
+                          Result::<assoc::Associative, NestedDeriveError<Sized>>::derive(s.clone())
+                              .unwrap();
                       // Start serializing a map
                       let assoc = assoc::Association::derive(a);
                       let mut map = serializer.serialize_map(Some(assoc.len()))?;
@@ -2986,7 +2874,7 @@ internally, to keep track of things like the stack, program, lists etc.
   use super::{dictionary as dict, environment as env};
   use crate::traits::*;
   use crate::types::container as coll;
-  use crate::types::container::{Count, Join, Mutey};
+  use crate::types::container::{error::NestedDeriveError, Count, Join, Mutey};
   use crate::types::number::Int;
   use crate::types::*;
   use std::collections::HashSet;
@@ -3502,15 +3390,15 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  impl ToIterator for Association {
-      type Item = Entry;
-      type IntoIter = Box<dyn Iterator<Item = Entry>>;
+  // impl ToIterator for Association {
+  //     type Item = Entry;
+  //     type IntoIter = Box<dyn Iterator<Item = Entry>>;
 
-      fn to_iter<'a>(self) -> Self::IntoIter {
-          let items: Vec<_> = self.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-          Box::new(items.into_iter())
-      }
-  }
+  //     fn to_iter<'a>(self) -> Self::IntoIter {
+  //         let items: Vec<_> = self.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+  //         Box::new(items.into_iter())
+  //     }
+  // }
 
   impl ToIterator for Associative {
       type Item = Entry;
@@ -3531,12 +3419,12 @@ internally, to keep track of things like the stack, program, lists etc.
 
   impl TryDerive<coll::Sized> for Associative {
       fn try_derive(s: coll::Sized) -> Result<Self, Error> {
-          Result::<Associative, DeriveError<coll::Sized>>::derive(s).map_err(Error::derive)
+          Result::<Associative, NestedDeriveError<coll::Sized>>::derive(s).map_err(Error::derive)
       }
   }
 
-  impl Derive<Item> for Result<Associative, DeriveError<Item>> {
-      fn derive(i: Item) -> Result<Associative, DeriveError<Item>> {
+  impl Derive<Item> for Result<Associative, NestedDeriveError<Item>> {
+      fn derive(i: Item) -> Result<Associative, NestedDeriveError<Item>> {
           match i {
               Item::Assoc(a) => Ok(Associative::Assoc(a)),
               Item::DictEntry(a) => Ok(Associative::DictEntry(a)),
@@ -3550,14 +3438,14 @@ internally, to keep track of things like the stack, program, lists etc.
                   .try_rewrap::<AssociationContent, Entry>()
                   .map(Arc::new)
                   .map(Associative::Assoc)
-                  .map_err(DeriveError::derive),
-              i => Err(DeriveError::expected(fit!("associative"), i)),
+                  .map_err(NestedDeriveError::derive),
+              i => Err(NestedDeriveError::expected(fit!("associative"), i)),
           }
       }
   }
 
-  impl Derive<coll::Sized> for Result<Associative, DeriveError<coll::Sized>> {
-      fn derive(i: coll::Sized) -> Result<Associative, DeriveError<coll::Sized>> {
+  impl Derive<coll::Sized> for Result<Associative, NestedDeriveError<coll::Sized>> {
+      fn derive(i: coll::Sized) -> Result<Associative, NestedDeriveError<coll::Sized>> {
           match i {
               coll::Sized::Assoc(a) => Ok(Associative::Assoc(a)),
               coll::Sized::DictEntry(a) => Ok(Associative::DictEntry(a)),
@@ -3565,28 +3453,30 @@ internally, to keep track of things like the stack, program, lists etc.
               coll::Sized::Error(a) => Ok(Associative::Error(a)),
               coll::Sized::Words(a) => Ok(Associative::Words(a)),
               coll::Sized::Dictionary(a) => Ok(Associative::Dictionary(a)),
-              coll::Sized::List(l) => <Result<Associative, DeriveError<coll::List>>>::derive(*l)
-                  .map_err(|e| e.update(|s| coll::Sized::List(Box::new(s)))),
-              i => Err(DeriveError::expected(fit!("associative"), i)),
+              coll::Sized::List(l) => {
+                  <Result<Associative, NestedDeriveError<coll::List>>>::derive(*l)
+                      .map_err(|e| e.update(|s| coll::Sized::List(Box::new(s))))
+              }
+              i => Err(NestedDeriveError::expected(fit!("associative"), i)),
           }
       }
   }
 
   impl TryDerive<Item> for Associative {
       fn try_derive(i: Item) -> Result<Self, Error> {
-          Result::<assoc::Associative, DeriveError<Item>>::derive(i).map_err(Error::derive)
+          Result::<assoc::Associative, NestedDeriveError<Item>>::derive(i).map_err(Error::derive)
       }
   }
 
-  impl Derive<coll::List> for Result<Associative, DeriveError<coll::List>> {
-      fn derive(l: coll::List) -> Result<Associative, DeriveError<coll::List>> {
+  impl Derive<coll::List> for Result<Associative, NestedDeriveError<coll::List>> {
+      fn derive(l: coll::List) -> Result<Associative, NestedDeriveError<coll::List>> {
           l.iter()
               .cloned()
               .try_rewrap::<AssociationContent, Entry>()
               .map(Arc::new)
               .map(Associative::Assoc)
               .map_err(Fit::fit)
-          //.map_err(|e| <DeriveError<coll::List>>::derive(e))
+          //.map_err(|e| <NestedDeriveError<coll::List>>::derive(e))
       }
   }
 
@@ -3809,13 +3699,15 @@ internally, to keep track of things like the stack, program, lists etc.
 **** Error types
 #+begin_src rust :tangle src/types/container/error.rs :mkdirp yes
   use super::associative as assoc;
+  use crate::derivation::*;
+  use crate::serialize::Display;
   use crate::traits::*;
   use crate::types::container::{self as coll, Mutey};
   use crate::types::number::Int;
   use crate::types::{Item, Word};
   use crate::{fit, list};
+  use core::fmt::{self, Debug};
   use std::convert::Infallible;
-
   /// Represents a runtime error type. Contains generic fields to hold
   /// things like what type of error, the actual vs expected conditions,
   /// etc. Also holds whether the error has been handled or not, which
@@ -3828,30 +3720,110 @@ internally, to keep track of things like the stack, program, lists etc.
       pub is_handled: bool,
   }
 
-  pub trait Nested {
-      fn caused<F>(self, other_fn: F) -> Self
-      where
-          F: FnOnce() -> Error;
+  pub struct NestedDeriveError<Src> {
+      pub src: Src,
+      pub inner: Option<Box<dyn std::error::Error>>,
+      pub expected: Word,
   }
 
-  impl<T, E> Nested for Result<T, E>
+  impl<T> Debug for NestedDeriveError<T>
   where
-      E: Nested,
+      T: Debug,
   {
-      fn caused<F>(self, other_fn: F) -> Self
-      where
-          F: FnOnce() -> Error,
-      {
-          self.map_err(|e| e.caused(other_fn))
+      fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+          write!(
+              f,
+              "DeriveError[src: {:?}, expected: {:?}, inner: {:?}]",
+              self.src, self.expected, self.inner
+          )
+      }
+  }
+  impl<T> NestedDeriveError<T> {
+      pub fn expected(expected: Word, src: T) -> NestedDeriveError<T> {
+          NestedDeriveError {
+              src,
+              expected,
+              inner: None,
+          }
       }
   }
 
-  impl Nested for Error {
-      fn caused<F>(mut self, other_fn: F) -> Error
+  impl<Src> NestedDeriveError<Src> {
+      pub fn swap<Dest>(self, updated: Dest) -> NestedDeriveError<Dest> {
+          NestedDeriveError {
+              src: updated,
+              expected: self.expected,
+              inner: self.inner,
+          }
+      }
+
+      pub fn update<Dest, F>(self, f: F) -> NestedDeriveError<Dest>
       where
-          F: FnOnce() -> Error,
+          F: FnOnce(Src) -> Dest,
       {
-          let other = other_fn();
+          NestedDeriveError {
+              src: f(self.src),
+              expected: self.expected,
+              inner: self.inner,
+          }
+      }
+      pub fn clear_inner(self) -> NestedDeriveError<Src> {
+          NestedDeriveError {
+              src: self.src,
+              expected: self.expected,
+              inner: None,
+          }
+      }
+  }
+
+  /// Convert DeriveError to Error
+  impl<I> Derive<NestedDeriveError<I>> for Error
+  where
+      I: Fit<Item>,
+  {
+      fn derive(de: NestedDeriveError<I>) -> Error {
+          Error::expected(de.expected, Some(de.src.fit()))
+      }
+  }
+
+  impl<T, I> Derive<Result<T, NestedDeriveError<I>>> for Result<T, Error>
+  where
+      I: Fit<Item>,
+  {
+      fn derive(r: Result<T, NestedDeriveError<I>>) -> Self {
+          r.map_err(Error::derive)
+      }
+  }
+
+  /// Convert Error to DeriveError
+  impl<I> Derive<Error> for NestedDeriveError<I>
+  where
+      I: Derive<Item>,
+  {
+      fn derive(e: Error) -> NestedDeriveError<I> {
+          NestedDeriveError::expected(fit!("fixme"), e.actual().cloned().unwrap_or_default().fit())
+      }
+  }
+
+  pub trait Nested<T> {
+      fn nest(self, child: T) -> Self;
+  }
+
+  impl<T, E> Nested<Result<T, E>> for Result<T, E>
+  where
+      E: Nested<E>,
+  {
+      fn nest(self, child: Result<T, E>) -> Self {
+          match (self, child) {
+              (Err(s), Err(child)) => Err(s.nest(child)),
+              (Ok(s), _) => Ok(s),
+              (Err(s), Ok(_)) => Err(s),
+          }
+      }
+  }
+
+  impl Nested<Error> for Error {
+      fn nest(mut self, other: Error) -> Self {
           self.data.mutate().insert(fit!("cause"), other.fit());
           self
       }
@@ -3978,33 +3950,47 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  impl<T> Derive<DeriveError<T>> for Item
+  impl<T> Derive<NestedDeriveError<T>> for Item
   where
       T: Fit<Item>,
   {
-      fn derive(e: DeriveError<T>) -> Item {
+      fn derive(e: NestedDeriveError<T>) -> Item {
           //return an Error
           Item::Error(e.fit())
       }
   }
 
-  impl<T> From<DeriveError<T>> for Item
+  impl<T> From<NestedDeriveError<T>> for Item
   where
       T: Fit<Item>,
   {
-      fn from(e: DeriveError<T>) -> Item {
+      fn from(e: NestedDeriveError<T>) -> Item {
           //return an Error
           Item::Error(e.fit())
       }
   }
 
-  impl<T> From<DeriveError<T>> for Error
+  impl<T> From<NestedDeriveError<T>> for Error
   where
       T: Fit<Item>,
   {
-      fn from(e: DeriveError<T>) -> Error {
+      fn from(de: NestedDeriveError<T>) -> Error {
           //return an Error
-          Error::expected(e.expected.fit(), e.src.fit())
+          let err = Error::expected(de.expected.fit(), de.src.fit());
+          if let Some(inner) = de.inner {
+              err.nest(std::error::Error::from(inner))
+          } else {
+              err
+          }
+      }
+  }
+
+  impl<T> From<NestedDeriveError<T>> for Error
+  where
+      T: Fit<Item>,
+  {
+      fn from(de: NestedDeriveError<T>) -> Error {
+          Error::expected(de.expected.fit(), de.src.fit())
       }
   }
 
@@ -4217,24 +4203,6 @@ internally, to keep track of things like the stack, program, lists etc.
   impl Derive<Spec> for Item {
       fn derive(s: Spec) -> Item {
           list!(s.0, s.1).fit()
-      }
-  }
-
-  impl ToIterator for Vec<SpecElement> {
-      type Item = SpecElement;
-      type IntoIter = std::vec::IntoIter<SpecElement>;
-
-      fn to_iter(self) -> Self::IntoIter {
-          self.into_iter()
-      }
-  }
-
-  impl ToIterator for Vec<Namespace> {
-      type Item = Namespace;
-      type IntoIter = std::vec::IntoIter<Namespace>;
-
-      fn to_iter(self) -> Self::IntoIter {
-          self.into_iter()
       }
   }
 
@@ -4948,18 +4916,18 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  impl ToIterator for Words {
-      type Item = assoc::Entry;
-      type IntoIter = Box<dyn Iterator<Item = assoc::Entry>>;
+  // impl ToIterator for Words {
+  //     type Item = assoc::Entry;
+  //     type IntoIter = Box<dyn Iterator<Item = assoc::Entry>>;
 
-      fn to_iter<'a>(self) -> Self::IntoIter {
-          let items: Vec<_> = self
-              .iter()
-              .map(|(k, v)| (assoc::KeyItem::Word(k.clone().fit()), v.clone().fit()))
-              .collect();
-          Box::new(items.into_iter())
-      }
-  }
+  //     fn to_iter<'a>(self) -> Self::IntoIter {
+  //         let items: Vec<_> = self
+  //             .iter()
+  //             .map(|(k, v)| (assoc::KeyItem::Word(k.clone().fit()), v.clone().fit()))
+  //             .collect();
+  //         Box::new(items.into_iter())
+  //     }
+  // }
 #+end_src
 **** Environment types
 #+begin_src rust :tangle src/types/container/environment.rs :mkdirp yes
@@ -5857,6 +5825,127 @@ words for them (hashing, encryption, signing)
       Ok(random_bytes(n as usize).fit())
   }
 #+end_src
+*** Derivation
+This describes how we convert from one type to another (which the interpreter does a lot)
+#+begin_src rust :tangle src/derivation.rs :mkdirp yes
+  use crate::types::container::error::{Error, Nested, NestedDeriveError};
+  use crate::types::*;
+  use std::fmt;
+
+  pub trait DeriveMode: Sized + 'static {
+      type Detail<Bounce>;
+
+      fn predicate_failed<Bounce>(src: Bounce, expected: Word) -> Self::Detail<Bounce>;
+      fn nest_error<Bounce>(outer: Bounce, inner: Bounce) -> Bounce;
+  }
+
+  // --- Fast mode ---
+
+  pub struct Fast;
+
+  impl DeriveMode for Fast {
+      type Detail<Src> = Src;
+
+      #[inline(always)]
+      fn predicate_failed<Src>(src: Src, _expected: Word) -> Src {
+          src
+      }
+
+      fn nest_error<Src>(outer: Src, inner: Src) -> Src {
+          outer // nesting not allowed here, we short circuit and return the outer original value
+      }
+  }
+
+  // --- Detailed mode ---
+
+  pub struct Detailed;
+
+  impl DeriveMode for Detailed {
+      type Detail<Err> = Error;
+
+      fn predicate_failed<Err>(src: Err, expected: Word) -> Error {
+          Error::expected(expected, Default::default())
+      }
+
+      fn nest_error<Err>(outer: Err, inner: Err) -> Err {
+          outer.nest(inner)
+      }
+  }
+
+  // Define custom traits that mimic std ones
+  /// a trait similar to [std::convert::From]
+  pub trait Derive<T>: Sized {
+      fn derive(value: T) -> Self;
+  }
+
+  /// a trait similar to [std::convert::TryFrom]
+  pub trait TryDerive<T, M: DeriveMode = Detailed>: Sized {
+      fn try_derive(value: T) -> Result<Self, M::Detail<T>>;
+  }
+
+  //impl TryDeriveSoft<F, F> for T
+
+  /// a trait similar to [std::convert::Into]
+  pub trait Fit<T>: Sized {
+      fn fit(self) -> T;
+  }
+
+  /// a trait similar to [std::convert::TryInto]
+  pub trait TryFit<T>: Sized {
+      fn try_fit(self) -> Result<T, Error>;
+  }
+
+  //blanket impl
+  impl<T, U> Fit<U> for T
+  where
+      U: Derive<T>,
+  {
+      fn fit(self) -> U {
+          U::derive(self)
+      }
+  }
+
+  // impl<T, U> TryFit<U> for T
+  // where
+  //     U: TryDerive<T>,
+  // {
+  //     fn try_fit<E>(self) -> Result<U, E> {
+  //         U::try_derive::<E>(self)
+  //     }
+  // }
+
+  impl<T, U> TryFit<U> for T
+  where
+      U: TryDerive<T>,
+  {
+      fn try_fit(self) -> Result<U, Error> {
+          U::try_derive(self)
+      }
+  }
+
+  impl<T> Derive<T> for T {
+      fn derive(value: T) -> T {
+          value
+      }
+  }
+
+  /// Blanket impl for everything that implements derive and returns a Result
+  // impl<T, U, E> TryDerive<T> for U
+  // where
+  //     U: Derive<Result<U, E>>,
+  // {
+  //     fn try_derive(value: T) -> Result<U, Error> {}
+  // }
+
+  impl<T, S> TryDerive<S> for T
+  where
+      Result<T, Error>: Derive<S>,
+  {
+      fn try_derive(value: S) -> Result<T, Error> {
+          Result::<T, Error>::derive(value).map_err(Into::into)
+      }
+  }
+#+end_src
 *** Serialization
 We'll define how kcats data structure are parsed and written (for
 example, in order to read/write to/from disk).
@@ -5869,7 +5958,10 @@ example, in order to read/write to/from disk).
   use crate::fit;
   use crate::traits::*;
   use crate::types::container::{
-      self as coll, associative as assoc, environment::Environment, error::Error, pipe::standard,
+      self as coll, associative as assoc,
+      environment::Environment,
+      error::{Error, NestedDeriveError},
+      pipe::standard,
       pipe::time,
   };
   use crate::types::*;
@@ -5890,12 +5982,19 @@ example, in order to read/write to/from disk).
   const BYTE_TAG: &str = "b64";
 
   /// Parses a serialized value into an [Item].
-  impl TryDerive<&edn_format::Value> for Item {
-      fn try_derive(item: &edn_format::Value) -> Result<Item, Error> {
+  impl Derive<edn_format::Value> for Result<Item, NestedDeriveError<edn_format::Value>> {
+      fn derive(item: edn_format::Value) -> Result<Item, NestedDeriveError<edn_format::Value>> {
           //println!("to item {:?}", item);
           match item {
-              edn_format::Value::Integer(i) => Ok(Item::Int(*i)),
-              edn_format::Value::Vector(v) => Ok(v.try_rewrap::<coll::List, Item>()?.fit()),
+              edn_format::Value::Integer(i) => Ok(Item::Int(i)),
+              // the problem here is the function level doesn't know if
+              // there's an inner conversion being done or not. It
+              // assumes not, but here there is one. We need some
+              // polymorphism here. For now we just clear the inner.
+              edn_format::Value::Vector(v) => Ok(v
+                  .try_rewrap::<coll::List, ()>()
+                  .map_err(|e| e.update(edn_format::Value::Vector).clear_inner())?
+                  .fit()),
               edn_format::Value::Symbol(s) => Ok(Item::Word(Intern::new(WordData {
                   data: Intern::new(s.name().to_string()),
                   namespace: s
@@ -5908,12 +6007,12 @@ example, in order to read/write to/from disk).
               // we don't have booleans in kcats, so if we see 'false' that
               // is the word false which is not defined in the base
               // language, but might be user-defined later.
-              edn_format::Value::Boolean(b) => Ok(if *b { fit!("yes") } else { fit!("false") }),
+              edn_format::Value::Boolean(b) => Ok(if b { fit!("yes") } else { fit!("false") }),
               edn_format::Value::String(s) => Ok(s.to_string().fit()),
               edn_format::Value::Float(f) => Ok(Item::Float(f.into_inner())),
               edn_format::Value::TaggedElement(tag, e) => {
-                  if *tag == edn_format::Symbol::from_name(BYTE_TAG) {
-                      if let edn_format::Value::String(s) = &**e {
+                  if tag == edn_format::Symbol::from_name(BYTE_TAG) {
+                      if let edn_format::Value::String(s) = *e {
                           Ok(BASE64_URL_SAFE_NO_PAD
                               .decode(s.clone().into_bytes())
                               .unwrap()
@@ -6024,7 +6123,7 @@ example, in order to read/write to/from disk).
   impl TryDerive<Result<edn_format::Value, edn_format::ParserError>> for Item {
       fn try_derive(r: Result<edn_format::Value, edn_format::ParserError>) -> Result<Item, Error> {
           match r {
-              Ok(expr) => Ok((&expr).try_fit()?),
+              Ok(expr) => Ok(expr.try_fit()?),
               Err(e) => Err(Error::from(e)),
           }
       }
@@ -6387,7 +6486,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   #[cfg(feature = "database")]
   use crate::types::container::pipe::db;
   use crate::types::container::{
-      self as coll, associative as assoc, dictionary as dict, environment::Environment, error::Error,
+      self as coll, associative as assoc, dictionary as dict,
+      environment::Environment,
+      error::{self, Error, NestedDeriveError},
       Container, Count, Join, Mutey, Ordered, Take,
   };
   use crate::types::number::{Float, Int, Number};
@@ -7486,7 +7587,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   }
                   (a, k) => {
                       let a: assoc::Associative = a.try_fit()?;
-                      let mut a: assoc::Association = Arc::new(a.to_iter().rewrap());
+                      let mut a: assoc::Association = Arc::new(a.rewrap());
                       let am = a.mutate();
                       let mut res: Option<Result<_, Error>> = None;
                       am.entry(k.clone()).and_modify(|v| {
@@ -8424,8 +8525,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       ) -> Result<(HashMap<Word, Item>, PositionalParams<Item>), Error> {
           // see if both are maps
           //println!("Destructure: {:?} with {:?}", data, pattern);
-          let data: Result<coll::Sized, DeriveError<Item>> = data.clone().fit();
-          let pattern: Result<coll::Sized, DeriveError<Item>> = pattern.clone().fit();
+          let data: Result<coll::Sized, NestedDeriveError<Item>> = data.clone().fit();
+          let pattern: Result<coll::Sized, NestedDeriveError<Item>> = pattern.clone().fit();
           match (data, pattern) {
               (Ok(data), Ok(pattern)) => {
                   // We got containers
@@ -8505,8 +8606,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       (a, b) => {
                           // see if it's associative
                           match (
-                              Result::<assoc::Associative, DeriveError<coll::Sized>>::derive(a),
-                              Result::<assoc::Associative, DeriveError<coll::Sized>>::derive(b),
+                              Result::<assoc::Associative, NestedDeriveError<coll::Sized>>::derive(a),
+                              Result::<assoc::Associative, NestedDeriveError<coll::Sized>>::derive(b),
                           ) {
                               (Ok(data), Ok(pattern)) => {
                                   //println!("destructuring map: {:?}", data_map);
@@ -8639,11 +8740,11 @@ rust project or some other language through FFI.
   pub mod axiom;
   mod crypto;
   //mod enumtest;
+  pub mod derivation;
   pub mod serialize;
   pub mod stdlib_hashes;
   pub mod traits;
   pub mod types;
-
   #[cfg(target_os = "android")]
   mod android {
       use crate::axiom;
@@ -19319,3 +19420,28 @@ fn main() {
     // Output: {1, 2, 3}
 }
 #+end_src
+** TODO Error handling design
+*** Overview
+I need a type solution where we get the properties we want in a way that isn't awkward to use.
+*** Requirements
++ When the caller wants a fast conversion attempt from type A to B
+  (he's probing to see what it can be converted to), if it fails he
+  gets a thin wrapper around the instance of A very quickly
++ When the caller wants a detailed conversion (the user needs to know
+  what went wrong if it fails), he can get a detailed Error
++ Conversions can be nested. Conversoins should do the right thing on
+  the inner values - if the outer type is supposed to be a fast
+  conversion, the inner value should do the same. And if it's supposed
+  to be detailed, the inner failure should be passed back up so the
+  user knows where it went wrong.
++ If possible avoid code duplication - the two different types of
+  conversion both involve simlilar match statements. but re-use is
+  difficult because you have to keep track of the original callers
+  intent, if you have detailed impl call the fast one (for example).
++ The caller should be able to specify which method (fast/detailed) to
+  use just by the return type, if possible. Separate methods are not
+  as good, but acceptable. It should be possible to pass the target
+  type down to inner conversions.
++ Trait objects might be ok, as long as the trait handles everything
+  we might do with the error later: print it out, get the cause,
+  convert it back to an Item etc. 
