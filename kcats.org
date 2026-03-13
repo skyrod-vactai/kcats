@@ -180,8 +180,6 @@ types to wrap stdlib types.
   use crate::derivation::*;
   use crate::fit;
   use crate::types;
-  use crate::types::container::error::{Error, Nested};
-  use core::fmt::{self, Debug};
 
   /// a trait that marks iterable types that can return arbitrary
   /// numbers of items. For example lists, maps, etc. But not things
@@ -208,26 +206,24 @@ types to wrap stdlib types.
           Target: FromIterator<U>,
           U: Derive<Self::Item>,
       {
-          self.to_iter().map(U::derive).collect()
+          self.into_iter().map(U::derive).collect()
       }
 
       /// Fallible: Uses Derive specifically for DeriveErrors. Returns Result<Target, E>.
 
-      fn try_rewrap<Target, M>(self) -> Result<Target, <M as Mode<Self>>::Err>
+      fn try_rewrap<Target, M: Mode>(self) -> Result<Target, M::Err<Self>>
       where
-          M: Mode<Self>
-              + Mode<Self::Item>
-              + ModeErr<types::Word, Self, <M as Mode<Self>>::Err>
-              + ModeNest<<M as Mode<Self>>::Err, <M as Mode<Self::Item>>::Err>,
-          Self::Item: Clone + TryFit<<Target as IntoIterator>::Item, M>,
+          M: Mode,
+          Self: Fit<types::Item>,
+          Self::Item: Clone + TryFit<<Target as IntoIterator>::Item>,
           Target: FromIterator<<Target as IntoIterator>::Item> + IntoIterator,
       {
           let original = self.clone();
-          self.to_iter()
-              .map(|x| x.try_fit())
+          self.into_iter()
+              .map(|x| x.try_fit_with::<M>())
               .collect::<Result<Target, _>>()
               .map_err(|inner_err| {
-                  let outer = <M as ModeErr<_, _, _>>::expected(fit!("container"), original);
+                  let outer = M::expected(fit!("container"), original);
                   M::nest_error(outer, inner_err)
               })
       }
@@ -283,9 +279,6 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   pub type Word = Intern<WordData>;
-
-  pub trait DetailedMode<Src>: Mode<Src, Err = Error> + ModeErr<Word, Src, Error> {}
-  impl<Src, T: Mode<Src, Err = Error> + ModeErr<Word, Src, Error>> DetailedMode<Src> for T {}
 
   impl TryDerive<String> for Word {
       fn try_derive(s: String) -> Result<Self, Error> {
@@ -895,7 +888,6 @@ internally, to keep track of things like the stack, program, lists etc.
       use super::Item;
       use crate::derivation::*;
       use crate::serialize::Display;
-      use crate::traits::*;
       use crate::types::container as coll;
       use crate::types::container::{
           associative as assoc,
@@ -1103,7 +1095,6 @@ internally, to keep track of things like the stack, program, lists etc.
   use super::container::error::Error;
   use crate::derivation::*;
   use crate::fit;
-  use crate::traits::*;
   use crate::types::Item;
   use num_integer::Roots;
   use serde::ser::{Serialize, Serializer};
@@ -1546,8 +1537,9 @@ internally, to keep track of things like the stack, program, lists etc.
       type Error = Error;
       fn join(self, other: List) -> Result<Self::Output, <Self as Join<List>>::Error> {
           //println!("Joining list to associative");
-          let la =
-              assoc::Associative::Assoc(assoc::Association::try_from_iter(other.iter().cloned())?);
+          let la = assoc::Associative::Assoc(Arc::new(
+              other.try_rewrap::<assoc::AssociationContent, Detailed>(&Detailed)?,
+          ));
           Ok(self.join(la).unwrap())
       }
   }
@@ -1557,8 +1549,9 @@ internally, to keep track of things like the stack, program, lists etc.
       type Error = Error;
       fn join(self, other: assoc::Associative) -> Result<Self::Output, Self::Error> {
           //println!("Joining associative to list");
-          let sa =
-              assoc::Associative::Assoc(assoc::Association::try_from_iter(self.iter().cloned())?);
+          let sa = assoc::Associative::Assoc(Arc::new(
+              self.try_rewrap::<assoc::AssociationContent, Detailed>(&Detailed)?,
+          ));
           Ok(sa.join(other).unwrap())
       }
   }
@@ -1611,7 +1604,8 @@ internally, to keep track of things like the stack, program, lists etc.
               (Sized::Words(a), Sized::Words(b)) => Sized::Words(a.join(b).unwrap()),
               (Sized::Words(a), Sized::List(b)) => {
                   // maybe it's an assoc
-                  let ba: assoc::Association = assoc::Association::try_from_iter(b.iter().cloned())?;
+                  let ba: assoc::Association =
+                      other.try_rewrap::<assoc::AssociationContent, Detailed>(&Detailed)?;
                   a.join(ba).unwrap().fit()
               }
               (Sized::Env(a), Sized::Env(b)) => Sized::Env(Box::new(a.join(*b).unwrap())),
@@ -2218,7 +2212,7 @@ internally, to keep track of things like the stack, program, lists etc.
               Sized::Program(p) => Box::new(List::derive(p).into_iter()),
               s => {
                   // should be associative if we get here
-                  let map = assoc::Associative::derive(s).unwrap();
+                  let map = assoc::Associative::try_derive(s).unwrap();
                   Box::new(map.to_iter().map(|kv| kv.fit()))
               }
           }
@@ -2226,17 +2220,17 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<Dispenser> for Sized {
-      fn try_derive(c: Dispenser) -> Result<Self, Error> {
+      fn try_derive_with<M: Mode>(c: Dispenser, _mode: &M) -> Result<Self, M::Err<Dispenser>> {
           //println!("from iterable {:?}", c);
           match c {
               Dispenser::Sized(s) => Ok(s),
-              i => Err(Error::expected(fit!("sized"), i)),
+              i => Err(M::expected(fit!("sized"), i)),
           }
       }
   }
 
   impl TryDerive<Receptacle> for Sized {
-      fn try_derive(c: Receptacle) -> Result<Self, Error> {
+      fn try_derive_with<M: Mode>(c: Receptacle, mode: &M) -> Result<Self, Error> {
           match c {
               Receptacle::Sized(s) => Ok(s),
               i => Err(Error::expected(fit!("sized"), i)),
@@ -2245,17 +2239,18 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<Sized> for List {
-      fn try_derive(s: Sized) -> Result<Self, Error> {
+      fn try_derive_with<M: Mode>(s: Sized, mode: M) -> Result<Self, M::Err<Sized>> {
           match s {
               Sized::List(l) => Ok(*l),
-              s => Ok(List::derive_iter(s.to_iter().map(Item::derive))),
+              s => Ok(s.rewrap::<List, Item>()),
           }
       }
   }
 
   impl TryDerive<List> for Vec<dict::Namespace> {
-      fn try_derive(l: List) -> Result<Self, Error> {
-          l.iter().cloned().map(dict::Namespace::try_derive).collect()
+      fn try_derive_with<M: Mode>(l: List, mode: &M) -> Result<Self, M::Err<List>> {
+          // l.iter().cloned().map(dict::Namespace::try_derive).collect()
+          l.try_rewrap::<Self, M>(mode)
       }
   }
 
@@ -2278,7 +2273,7 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<List> for String {
-      fn try_derive(l: List) -> Result<Self, Error> {
+      fn try_derive_with<M: Mode>(l: List) -> Result<Self, Error> {
           let v = l
               .iter()
               .cloned()
@@ -2289,24 +2284,25 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<List> for Bytes {
-      fn try_derive(l: List) -> Result<Self, Error> {
+      fn try_derive_with<M: Mode>(l: List) -> Result<Self, M::Err<List>> {
           let v = l
               .iter()
               .cloned()
-              .map(|i| number::Int::try_derive(i).map(|i| i as u8))
+              .map(|i| number::Int::try_derive::<M>(i).map(|i| i as u8))
               .collect::<Result<Bytes, Error>>()?;
           Ok(v)
       }
   }
 
   impl TryDerive<Item> for List {
-      fn try_derive(i: Item) -> Result<Self, Error> {
-          Sized::try_derive(i).and_then(List::try_derive)
+      fn try_derive_with<M: Mode>(i: Item) -> Result<Self, M::Err<Item>> {
+          let s = Sized::try_derive_with::<M>(i)?;
+          List::try_derive_with::<M>(s).map_err(|e| M::revert(e, Fit::fit))
       }
   }
 
-  impl<M: Mode> TryDerive<Item, M> for Sized {
-      fn try_derive(item: Item) -> Result<Self, M::Detail<Item>> {
+  impl TryDerive<Item> for Sized {
+      fn try_derive_with<M: Mode>(item: Item) -> Result<Self, M::Err<Item>> {
           match item {
               Item::Bytes(b) => Ok(Sized::Bytes(*b)),
               Item::String(s) => Ok(Sized::String(*s)),
@@ -2326,7 +2322,7 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<Item> for Receptacle {
-      fn try_derive(item: Item) -> Result<Self, Error> {
+      fn try_derive_with<M: Mode>(item: Item) -> Result<Self, M::Err<Item>> {
           match item {
               Item::StaticFile(f) => Ok(Receptacle::In(pipe::In::StaticFile(f))),
               Item::Socket(s) => Ok(Receptacle::In(pipe::In::Socket(s))),
@@ -2343,34 +2339,34 @@ internally, to keep track of things like the stack, program, lists etc.
               Item::Env(a) => Ok(Receptacle::Sized(Sized::Env(a))),
               Item::Set(s) => Ok(Receptacle::Sized(Sized::Set(s))),
               Item::Program(p) => Ok(Receptacle::Sized(Sized::Program(*p))),
-              i => Err(Error::expected(fit!("receptacle"), i)),
+              i => Err(M::expected(fit!("receptacle"), i)),
           }
       }
   }
 
   impl TryDerive<Dispenser> for Receptacle {
-      fn try_derive(c: Dispenser) -> Result<Self, Error> {
+      fn try_derive_with<M: Mode>(c: Dispenser) -> Result<Self, M::Err<Dispenser>> {
           match c {
               Dispenser::Sized(s) => Ok(Receptacle::Sized(s)),
               Dispenser::Tunnel(t) => Ok(Receptacle::Tunnel(t)),
-              i => Err(Error::expected(fit!("receptacle"), i)),
+              i => Err(M::expected(fit!("receptacle"), i)),
           }
       }
   }
 
   impl TryDerive<Receptacle> for Dispenser {
-      fn try_derive(c: Receptacle) -> Result<Self, Error> {
+      fn try_derive_with<M: Mode>(c: Receptacle) -> Result<Self, M::Err<Receptacle>> {
           match c {
               Receptacle::Sized(s) => Ok(Dispenser::Sized(s)),
               Receptacle::Tunnel(t) => Ok(Dispenser::Tunnel(t)),
-              i => Err(Error::expected(fit!("iterable"), i)),
+              i => Err(M::expected(fit!("iterable"), i)),
           }
       }
   }
 
   impl TryDerive<Item> for Box<dyn Iterator<Item = Item>> {
-      fn try_derive(item: Item) -> Result<Self, Error> {
-          Ok(Sized::try_derive(item)?.into_iter())
+      fn try_derive_with<M: Mode>(item: Item) -> Result<Self, M::Err<Item>> {
+          Ok(Sized::try_derive_with::<M>(item)?.into_iter())
       }
   }
 
@@ -2457,7 +2453,7 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<Item> for Dispenser {
-      fn try_derive(item: Item) -> Result<Self, Error> {
+      fn try_derive_with<M: Mode>(item: Item) -> Result<Self, M::Err<Item>> {
           match item {
               Item::Bytes(b) => Ok(Dispenser::Sized(Sized::Bytes(*b))),
               Item::String(s) => Ok(Dispenser::Sized(Sized::String(*s))),
@@ -2479,19 +2475,17 @@ internally, to keep track of things like the stack, program, lists etc.
               Item::Standard => Ok(Dispenser::Out(pipe::Out::Standard)),
               Item::Time => Ok(Dispenser::Out(pipe::Out::Time)),
 
-              i => Err(Error::expected(fit!("iterable"), i)),
+              i => Err(M::expected(fit!("iterable"), i)),
           }
       }
   }
 
   impl TryDerive<Item> for Set {
-      fn try_derive(item: Item) -> Result<Self, Error> {
-          let s = Sized::try_derive(item)?;
-          let hs: HashSet<assoc::KeyItem> = s
-              .into_iter()
-              .map(|i| i.try_fit())
-              .collect::<Result<_, Error>>()?;
-          Ok(Set::derive(hs))
+      fn try_derive_with<M: Mode>(item: Item) -> Result<Self, M::Err<Item>> {
+          let s = Sized::try_derive_with::<M>(item)?;
+          s.try_rewrap::<HashSet<assoc::KeyItem>, M>()
+              .map(Arc::new)
+              .map_err(|e| M::revert(e, Item::derive))
       }
   }
 
@@ -2519,7 +2513,6 @@ internally, to keep track of things like the stack, program, lists etc.
       use super::{Dispenser, List, Receptacle, Sized};
       use crate::derivation::*;
       use crate::serialize::Display;
-      use crate::traits::*;
       use crate::types::container::associative as assoc;
       use serde::ser::{Serialize, SerializeMap, SerializeSeq};
 
@@ -2604,7 +2597,6 @@ internally, to keep track of things like the stack, program, lists etc.
 
 #+begin_src rust :tangle src/types/container/program.rs :mkdirp yes
   use crate::derivation::*;
-  use crate::traits::*;
   use crate::types::container as cont;
   use crate::types::container::Error;
   use crate::types::container::SimpleTake;
@@ -3389,11 +3381,8 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  impl<M> TryDerive<Item, M> for Associative
-  where
-      M: Mode<Item> + ModeErr<Word, Item, <M as Mode<Item>>::Err>,
-  {
-      fn try_derive(i: Item) -> Result<Associative, <M as Mode<Item>>::Err> {
+  impl TryDerive<Item> for Associative {
+      fn try_derive_with<M: Mode>(i: Item, mode: &M) -> Result<Associative, M::Err<Item>> {
           match i {
               Item::Assoc(a) => Ok(Associative::Assoc(a)),
               Item::DictEntry(a) => Ok(Associative::DictEntry(a)),
@@ -3403,16 +3392,20 @@ internally, to keep track of things like the stack, program, lists etc.
               Item::Dictionary(a) => Ok(Associative::Dictionary(a)),
               //Item::List(l) => Association::derive_iter(l.iter().cloned()),
               Item::List(l) => l
-                  .try_rewrap::<AssociationContent, M>()
+                  .try_rewrap::<AssociationContent, M>(mode)
                   .map(Arc::new)
-                  .map(Associative::Assoc),
+                  .map(Associative::Assoc)
+                  .map_err(|e| mode.map_err(e, |s| Item::List(Box::new(s)))),
               i => Err(M::expected(fit!("associative"), i)),
           }
       }
   }
 
-  impl<M: Mode> TryDerive<coll::Sized, M> for Associative {
-      fn try_derive(i: coll::Sized) -> Result<Associative, M::Detail<coll::Sized>> {
+  impl TryDerive<coll::Sized> for Associative {
+      fn try_derive_with<M: Mode>(
+          i: coll::Sized,
+          mode: &M,
+      ) -> Result<Associative, M::Err<coll::Sized>> {
           match i {
               coll::Sized::Assoc(a) => Ok(Associative::Assoc(a)),
               coll::Sized::DictEntry(a) => Ok(Associative::DictEntry(a)),
@@ -3421,7 +3414,8 @@ internally, to keep track of things like the stack, program, lists etc.
               coll::Sized::Words(a) => Ok(Associative::Words(a)),
               coll::Sized::Dictionary(a) => Ok(Associative::Dictionary(a)),
               coll::Sized::List(l) => {
-                  <Associative as TryDerive<_, M>>::try_derive(l)
+                  Associative::try_derive_with(*l, mode)
+                      .map_err(|e| mode.map_err(e, |s| coll::Sized::List(Box::new(s))))
 
                   // <Result<Associative, NestedDeriveError<coll::List>>>::derive(*l)
                   //     .map_err(|e| e.update(|s| coll::Sized::List(Box::new(s))))
@@ -3431,11 +3425,12 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  impl<M: Mode> TryDerive<coll::List, M> for Associative {
-      fn try_derive(l: coll::List) -> Result<Associative, M::Detail<coll::List>> {
-          l.iter()
-              .cloned()
-              .try_rewrap::<AssociationContent, Entry>()
+  impl TryDerive<coll::List> for Associative {
+      fn try_derive_with<M: Mode>(
+          l: coll::List,
+          mode: &M,
+      ) -> Result<Associative, M::Err<coll::List>> {
+          l.try_rewrap::<AssociationContent, M>(mode)
               .map(Arc::new)
               .map(Associative::Assoc)
       }
@@ -3458,7 +3453,7 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<Item> for Entry {
-      fn try_derive(i: Item) -> Result<Entry, Error> {
+      fn try_derive_with<M: Mode>(i: Item, mode: &M) -> Result<Entry, Error> {
           let s = coll::Sized::try_derive(i)?;
           if s.count() != 2 {
               Err(Error::expected(fit!("pair"), s))
@@ -3660,14 +3655,12 @@ internally, to keep track of things like the stack, program, lists etc.
 **** Error types
 #+begin_src rust :tangle src/types/container/error.rs :mkdirp yes
   use super::associative as assoc;
-  use crate::derivation::{self as derive, *};
-  use crate::serialize::Display;
+  use crate::derivation::*;
   use crate::traits::*;
   use crate::types::container::{self as coll, Mutey};
   use crate::types::number::Int;
   use crate::types::{Item, Word};
   use crate::{fit, list};
-  use core::fmt::{self, Debug};
   use std::convert::Infallible;
 
   /// Represents a runtime error type. Contains generic fields to hold
@@ -3710,33 +3703,6 @@ internally, to keep track of things like the stack, program, lists etc.
           self.cause = Some(Box::new(other.fit()));
           self
       }
-  }
-
-  impl<Source> derive::ModeErr<Word, Source, Error> for derive::Detailed
-  where
-      Source: Fit<Item>,
-  {
-      fn expected(expected: Word, src: Source) -> Error {
-          Error::expected(expected, src)
-      }
-  }
-
-  impl<Outer, Inner> derive::ModeNest<Outer, Inner> for derive::Detailed
-  where
-      Outer: Nested<Inner>,
-      Inner: Fit<Error>,
-  {
-      fn nest_error(outer: Outer, inner: Inner) -> Outer {
-          outer.nest(inner)
-      }
-  }
-
-  impl<Src> derive::Mode<Src> for Detailed {
-      type Err = Error;
-  }
-
-  impl<Src> derive::Mode<Src> for Fast {
-      type Err = Src;
   }
 
   impl Error {
@@ -5700,24 +5666,22 @@ This describes how we convert from one type to another (which the interpreter do
 #+begin_src rust :tangle src/derivation.rs :mkdirp yes
   use crate::types::container::error::{Error, Nested};
   use crate::types::*;
-  use std::convert::Infallible;
-  use std::fmt;
 
   /// A marker trait for types that can be blanket converted to themselves
   pub trait Identity {}
 
   ///Trait to specify how one type is converted to another, specifically
   /// how failures are dealt with.
-  pub trait ModeErr<PredName, Source, Err>: Sized + 'static {
-      fn expected(expected: PredName, src: Source) -> Err;
-  }
 
-  pub trait ModeNest<Outer, Inner>: Sized + 'static {
-      fn nest_error(outer: Outer, inner: Inner) -> Outer;
-  }
+  pub trait Mode: Sized + 'static {
+      type Err<Src>;
 
-  pub trait Mode<Src>: Sized + 'static {
-      type Err;
+      fn expected<Src: Fit<Item>>(expected: Word, src: Src) -> Self::Err<Src>;
+      fn nest_error<Outer: Fit<Item>, Inner: Fit<Item>>(
+          outer: Self::Err<Outer>,
+          inner: Self::Err<Inner>,
+      ) -> Self::Err<Outer>;
+      fn revert<Src, Dst>(err: Self::Err<Src>, f: impl FnOnce(Src) -> Dst) -> Self::Err<Dst>;
   }
 
   // --- Fast mode ---
@@ -5728,31 +5692,35 @@ This describes how we convert from one type to another (which the interpreter do
 
   pub struct Detailed;
 
-  impl<PredName, Source> ModeErr<PredName, Source, Source> for Fast {
-      #[inline(always)]
-      fn expected(_expected: PredName, src: Source) -> Source {
+  impl Mode for Detailed {
+      type Err<Src> = Error;
+
+      fn expected<Src: Fit<Item>>(expected: Word, src: Src) -> Error {
+          Error::expected(expected, src.fit())
+      }
+
+      fn nest_error<Outer: Fit<Item>, Inner: Fit<Item>>(outer: Error, inner: Error) -> Error {
+          outer.nest(inner)
+      }
+
+      fn revert<Src, Dst>(err: Error, _f: impl FnOnce(Src) -> Dst) -> Error {
+          err
+      }
+  }
+
+  impl Mode for Fast {
+      type Err<Src> = Src;
+
+      fn expected<Src: Fit<Item>>(_expected: Word, src: Src) -> Src {
           src
       }
-  }
 
-  impl<Outer, Inner> ModeNest<Outer, Inner> for Fast {
-      #[inline(always)]
-      fn nest_error(outer: Outer, inner: Inner) -> Outer {
-          outer // nesting not allowed here, we short circuit and return the outer original value
+      fn nest_error<Outer: Fit<Item>, Inner: Fit<Item>>(outer: Outer, _inner: Inner) -> Outer {
+          outer
       }
-  }
 
-  /// If derivation can't fail we have placeholder impl that doesn't do
-  /// anything, because it'll never be asked to.
-  impl<P, S> ModeErr<P, S, Infallible> for Infallible {
-      fn expected(_expected: P, _src: S) -> Infallible {
-          unreachable!("supposed to be infallible")
-      }
-  }
-
-  impl<I> ModeNest<Infallible, I> for Infallible {
-      fn nest_error(_o: Infallible, _i: I) -> Infallible {
-          unreachable!("supposed to be infallible")
+      fn revert<Src, Orig>(err: Src, f: impl FnOnce(Src) -> Orig) -> Orig {
+          f(err)
       }
   }
 
@@ -5763,11 +5731,13 @@ This describes how we convert from one type to another (which the interpreter do
   }
 
   /// a trait similar to [std::convert::TryFrom]
-  pub trait TryDerive<Src, M: Mode<Src> = Detailed>: Sized {
-      fn try_derive(value: Src) -> Result<Self, <M as Mode<Src>>::Err>;
-  }
+  pub trait TryDerive<Src>: Sized {
+      fn try_derive_with<M: Mode>(value: Src) -> Result<Self, M::Err<Src>>;
 
-  //impl TryDeriveSoft<F, F> for T
+      fn try_derive(value: Src) -> Result<Self, Error> {
+          Self::try_derive_with::<Detailed>(value)
+      }
+  }
 
   /// a trait similar to [std::convert::Into]
   pub trait Fit<T>: Sized {
@@ -5775,8 +5745,12 @@ This describes how we convert from one type to another (which the interpreter do
   }
 
   /// a trait similar to [std::convert::TryInto]
-  pub trait TryFit<Target, M: Mode<Self> = Detailed>: Sized {
-      fn try_fit(self) -> Result<Target, <M as Mode<Self>>::Err>;
+  pub trait TryFit<Target>: Sized {
+      fn try_fit_with<M: Mode>(self) -> Result<Target, M::Err<Self>>;
+
+      fn try_fit(self) -> Result<Target, Error> {
+          Self::try_fit_with::<Detailed>(self)
+      }
   }
 
   //blanket impl
@@ -5798,12 +5772,12 @@ This describes how we convert from one type to another (which the interpreter do
   //     }
   // }
 
-  impl<Src, Target, M: Mode<Src>> TryFit<Target, M> for Src
+  impl<Src, Target> TryFit<Target> for Src
   where
-      Target: TryDerive<Src, M>,
+      Target: TryDerive<Src>,
   {
-      fn try_fit(self) -> Result<Target, <M as Mode<Src>>::Err> {
-          Target::try_derive(self)
+      fn try_fit_with<M: Mode>(self) -> Result<Target, M::Err<Src>> {
+          Target::try_derive_with::<M>(self)
       }
   }
 
@@ -5816,11 +5790,11 @@ This describes how we convert from one type to another (which the interpreter do
       }
   }
 
-  impl<T, M: Mode<Self>> TryDerive<T, M> for T
+  impl<T> TryDerive<T> for T
   where
-      T: Identity,
+      T: Identity + Fit<Item>,
   {
-      fn try_derive(value: T) -> Result<T, <M as Mode<Self>>::Err> {
+      fn try_derive_with<M: Mode>(value: T, _mode: &M) -> Result<T, M::Err<T>> {
           Ok(value)
       }
   }
@@ -5886,8 +5860,8 @@ example, in order to read/write to/from disk).
   const BYTE_TAG: &str = "b64";
 
   /// Parses a serialized value into an [Item].
-  impl TryDerive<edn_format::Value, Detailed> for Item {
-      fn try_derive(item: edn_format::Value) -> Result<Item, Error> {
+  impl TryDerive<edn_format::Value> for Item {
+      fn try_derive_with<M: Mode>(item: edn_format::Value, _mode: &M) -> Result<Item, Error> {
           //println!("to item {:?}", item);
           match item {
               edn_format::Value::Integer(i) => Ok(Item::Int(i)),
@@ -5896,7 +5870,7 @@ example, in order to read/write to/from disk).
               // assumes not, but here there is one. We need some
               // polymorphism here. For now we just clear the inner.
               edn_format::Value::Vector(v) => Ok(v
-                  .try_rewrap::<coll::List, ()>()
+                  .try_rewrap::<coll::List, Detailed>()
                   .map_err(|e| e.update(edn_format::Value::Vector).clear_inner())?
                   .fit()),
               edn_format::Value::Symbol(s) => Ok(Item::Word(Intern::new(WordData {
@@ -6391,9 +6365,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   #[cfg(feature = "database")]
   use crate::types::container::pipe::db;
   use crate::types::container::{
-      self as coll, associative as assoc, dictionary as dict,
-      environment::Environment,
-      error::{self, Error},
+      self as coll, associative as assoc, dictionary as dict, environment::Environment, error::Error,
       Container, Count, Join, Mutey, Ordered, Take,
   };
   use crate::types::number::{Float, Int, Number};
@@ -6434,12 +6406,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   /// A higher order function that executes a simpler function `f`,
   /// where `f` takes a stack item and returns a [Result] of another
   /// stack item.
-  fn f_stack1<F, Arg1, Output, ArgMode: Mode<Item>, Err>(
-      f: F,
-  ) -> impl Fn(Environment) -> Sometime<'static, Environment>
+  fn f_stack1<F, Arg1, Output, Err>(f: F) -> impl Fn(Environment) -> Sometime<'static, Environment>
   where
       F: Fn(Arg1) -> Result<Output, Err> + 'static,
-      Arg1: TryDerive<Item, ArgMode> + Fit<Item> + Clone,
+      Arg1: TryDerive<Item> + Fit<Item> + Clone,
       //ArgMode::Detail<Item>: Fit<Error>,
       Err: Fit<Error>,
       //for<'a> <SpecInput as TryDerive<&'a Item>>::Error: Fit<Error>,
@@ -6448,7 +6418,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       move |mut env: Environment| {
           let x = env.stack.pop_front().ok_or_else(Error::stack_underflow);
           match x {
-              Ok(i) => match Arg1::try_derive(i) {
+              Ok(i) => match <Arg1>::try_derive(i) {
                   Ok(i) => {
                       let res = f(i);
                       match res {
@@ -6668,7 +6638,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("*", Box::leak(Box::new(f_stack2(ok2(mult))))),
           ("+", Box::leak(Box::new(f_stack2(ok2(plus))))),
           ("get", Box::leak(Box::new(f_stack2(lookup)))),
-          ("sort-indexed", Box::leak(Box::new(f_stack1::<_, _, _, Detailed, _>(sort_by_key)))),
+          ("sort-indexed", Box::leak(Box::new(f_stack1(sort_by_key)))),
           ("-", Box::leak(Box::new(f_stack2(ok2(minus))))),
           ("/", Box::leak(Box::new(f_stack2(div)))),
           //("<", Box::leak(Box::new(f_stack2(lt)))),
@@ -6682,7 +6652,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("assign", Box::leak(Box::new(f_stack3(assign)))),
           (
               "association",
-              Box::leak(Box::new(f_stack1::<_, Item,  assoc::Associative, Detailed, Error>(
+              Box::leak(Box::new(f_stack1(
                   assoc::Associative::try_derive,
               ))),
           ),
@@ -6700,7 +6670,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("cache", Box::leak(Box::new(f_result(write_blob)))),
           (
               "character",
-              Box::leak(Box::new(f_stack1::<_, Item, Char, _, _>(Char::try_derive))),
+              Box::leak(Box::new(f_stack1(Char::try_derive))),
           ),
           ("👥", Box::leak(Box::new(clone))),
           ("contains?", Box::leak(Box::new(f_stack2(ok2(contains))))),
@@ -6724,7 +6694,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("encodejson", Box::leak(Box::new(f_stack1(encode_json)))),
           (
               "environment",
-              Box::leak(Box::new(f_stack1::<_, Item, Environment, _, _>(Environment::try_derive))),
+              Box::leak(Box::new(f_stack1(Environment::try_derive))),
           ),
           ("environment?", Box::leak(Box::new(f_stack1(ok1(is_environment))))),
           ("error?", Box::leak(Box::new(f_stack1(ok1(is_error))))),
@@ -6771,7 +6741,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("mod", Box::leak(Box::new(f_stack2(mod_)))),
           ("☯️", Box::leak(Box::new(f_stack1(ok1(not))))),
           ("namespace", Box::leak(Box::new(f_stack2(ok2(namespace))))),
-          ("number", Box::leak(Box::new(f_stack1::<_, Item, Number, _, _>(
+          ("number", Box::leak(Box::new(f_stack1(
               Number::try_derive,
           )))),
           ("number?", Box::leak(Box::new(f_stack1(ok1(is_number))))),
@@ -7115,6 +7085,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       c.into_iter().last().unwrap_or_default()
   }
 
+  impl Identity for Sometime<'static, Environment> {}
+
   pub fn execute(mut env: Environment) -> Sometime<'static, Environment> {
       let i = env.pop();
       if let Item::Builtin(b) = i {
@@ -7231,7 +7203,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn pop(mut env: Environment) -> Sometime<'static, Environment> {
-      match coll::Sized::try_derive(env.pop()) {
+      match <coll::Sized as TryDerive<_>>::try_derive(env.pop()) {
           Ok(it) => {
               let (c, i) = it.pop();
               env.pop_prog();
@@ -7470,7 +7442,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   fn unassoc_in(i: Item, ks: &[assoc::KeyItem]) -> Result<Item, Error> {
       if let [k, ks @ ..] = ks {
           if ks.is_empty() {
-              let a = assoc::Associative::try_derive(i)?;
+              let a = <assoc::Associative as TryDerive<_>>::try_derive(i)?;
               Ok(a.remove(k).0.fit())
           } else {
               match (i, k) {
@@ -9435,7 +9407,6 @@ The basic pipe contracts.
   use super::error::Error;
   use crate::derivation::*;
   use crate::fit;
-  use crate::traits::*;
   use crate::types::container::{self as coll, SimpleTake};
   use crate::types::{self, Item};
   use std::pin::Pin;
@@ -9831,7 +9802,6 @@ The basic pipe contracts.
 How to interact with files on disk
 #+begin_src rust :tangle src/types/container/pipe/fs.rs :mkdirp yes
   use crate::axiom::ItemResult;
-  use crate::traits::*;
   use crate::types::container::associative as assoc;
   use crate::types::container::error::Error;
   use crate::types::*;
@@ -9945,7 +9915,6 @@ How to interact with the network (TCP/IP sockets)
 #+begin_src rust :tangle src/types/container/pipe/net.rs :mkdirp yes
   use crate::axiom::ItemResult;
   use crate::derivation::*;
-  use crate::traits::*;
   use crate::types::container::associative as assoc;
   use crate::types::container::error::Error;
   use crate::types::container::pipe::FutureTake;
@@ -10237,7 +10206,6 @@ Implement the =handoff= type
   use crate::axiom;
   use crate::derivation::*;
   use crate::fit;
-  use crate::traits::*;
   use crate::types::container as coll;
   use crate::types::container::error::Error;
   use crate::types::container::pipe::FutureTake;
@@ -10606,7 +10574,6 @@ Implement the =handoff= type
   use crate::axiom;
   use crate::config;
   use crate::derivation::*;
-  use crate::traits::*;
   use crate::types::container::{self as coll, associative as assoc, error, error::Error};
   use crate::types::{self, Item};
   use crate::{fit, list};
