@@ -281,19 +281,26 @@ internally, to keep track of things like the stack, program, lists etc.
   pub type Word = Intern<WordData>;
 
   impl TryDerive<String> for Word {
-      fn try_derive(s: String) -> Result<Self, Error> {
-          serialize::parse(s).and_then(|mut l| {
-              if l.len() == 1 {
-                  match l.pop_front().unwrap() {
-                      Item::Word(w) => Ok(w),
-                      _ => Err(Error::parse("Words cannot contain delimiters")),
+      fn try_derive_with<M: Mode>(s: String) -> Result<Self, M::Err<String>> {
+          match serialize::parse::<M>(s.clone()) {
+              Ok(mut l) => {
+                  if l.len() == 1 {
+                      match l.pop_front().unwrap() {
+                          Item::Word(w) => Ok(w),
+                          _ => Err(M::from(s, || {
+                              Error::parse("Words cannot contain delimiters")
+                          })),
+                      }
+                  } else if l.is_empty() {
+                      Err(M::from(s, || Error::parse("Words cannot be empty")))
+                  } else {
+                      Err(M::from(s, || {
+                          Error::parse("Words cannot contain whitespace")
+                      }))
                   }
-              } else if l.is_empty() {
-                  Err(Error::parse("Words cannot be empty"))
-              } else {
-                  Err(Error::parse("Words cannot contain whitespace"))
               }
-          })
+              Err(e) => Err(M::from(s, e)),
+          }
       }
   }
 
@@ -359,8 +366,8 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<&str> for Word {
-      fn try_derive(s: &str) -> Result<Self, Error> {
-          Word::try_derive(s.to_string())
+      fn try_derive_with<M: Mode>(s: &str) -> Result<Self, M::Err<&str>> {
+          Word::try_derive_with::<M>(s.to_string())
       }
   }
 
@@ -663,14 +670,14 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<Item> for String {
-      fn try_derive(i: Item) -> Result<Self, Error> {
+      fn try_derive_with<M: Mode>(i: Item) -> Result<Self, M::Err<Item>> {
           match i {
               Item::Word(w) => Ok(w.data.as_str().to_string().fit()),
               i => {
-                  let s = coll::Sized::try_derive(i)?;
+                  let s = coll::Sized::try_derive_with::<M>(i)?;
                   match s {
                       coll::Sized::String(i) => Ok(i),
-                      i => Err(Error::expected(fit!("string"), Item::derive(i))),
+                      i => Err(M::expected(fit!("string"), Item::derive(i))),
                   }
               }
           }
@@ -680,13 +687,13 @@ internally, to keep track of things like the stack, program, lists etc.
   /// Converts Item to Word but also considers a quoted word as a word,
   /// eg \[foo\] -> foo.
   impl TryDerive<Item> for Word {
-      fn try_derive(i: Item) -> Result<Self, Error> {
+      fn try_derive_with<M: Mode>(i: Item) -> Result<Self, M::Err<Item>> {
           match i {
               Item::Word(i) => Ok(i),
               i => {
-                  let s = coll::Sized::try_derive(i.clone())?;
+                  let s = coll::Sized::try_derive_with::<M>(i.clone())?;
                   match s {
-                      coll::Sized::String(s) => s.try_fit(),
+                      coll::Sized::String(s) => s.try_fit_with::<M>().swap_original(|_| i),
                       s => {
                           let l = coll::List::try_derive(s);
                           match l {
@@ -1538,7 +1545,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn join(self, other: List) -> Result<Self::Output, <Self as Join<List>>::Error> {
           //println!("Joining list to associative");
           let la = assoc::Associative::Assoc(Arc::new(
-              other.try_rewrap::<assoc::AssociationContent, Detailed>(&Detailed)?,
+              other.try_rewrap::<assoc::AssociationContent, Detailed>()?,
           ));
           Ok(self.join(la).unwrap())
       }
@@ -1550,7 +1557,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn join(self, other: assoc::Associative) -> Result<Self::Output, Self::Error> {
           //println!("Joining associative to list");
           let sa = assoc::Associative::Assoc(Arc::new(
-              self.try_rewrap::<assoc::AssociationContent, Detailed>(&Detailed)?,
+              self.try_rewrap::<assoc::AssociationContent, Detailed>()?,
           ));
           Ok(sa.join(other).unwrap())
       }
@@ -1605,7 +1612,7 @@ internally, to keep track of things like the stack, program, lists etc.
               (Sized::Words(a), Sized::List(b)) => {
                   // maybe it's an assoc
                   let ba: assoc::Association =
-                      other.try_rewrap::<assoc::AssociationContent, Detailed>(&Detailed)?;
+                      other.try_rewrap::<assoc::AssociationContent, Detailed>()?;
                   a.join(ba).unwrap().fit()
               }
               (Sized::Env(a), Sized::Env(b)) => Sized::Env(Box::new(a.join(*b).unwrap())),
@@ -2220,7 +2227,7 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<Dispenser> for Sized {
-      fn try_derive_with<M: Mode>(c: Dispenser, _mode: &M) -> Result<Self, M::Err<Dispenser>> {
+      fn try_derive_with<M: Mode>(c: Dispenser) -> Result<Self, M::Err<Dispenser>> {
           //println!("from iterable {:?}", c);
           match c {
               Dispenser::Sized(s) => Ok(s),
@@ -2230,16 +2237,16 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<Receptacle> for Sized {
-      fn try_derive_with<M: Mode>(c: Receptacle, mode: &M) -> Result<Self, Error> {
+      fn try_derive_with<M: Mode>(c: Receptacle) -> Result<Self, M::Err<Receptacle>> {
           match c {
               Receptacle::Sized(s) => Ok(s),
-              i => Err(Error::expected(fit!("sized"), i)),
+              i => Err(M::expected(fit!("sized"), i)),
           }
       }
   }
 
   impl TryDerive<Sized> for List {
-      fn try_derive_with<M: Mode>(s: Sized, mode: M) -> Result<Self, M::Err<Sized>> {
+      fn try_derive_with<M: Mode>(s: Sized) -> Result<Self, M::Err<Sized>> {
           match s {
               Sized::List(l) => Ok(*l),
               s => Ok(s.rewrap::<List, Item>()),
@@ -2248,9 +2255,9 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<List> for Vec<dict::Namespace> {
-      fn try_derive_with<M: Mode>(l: List, mode: &M) -> Result<Self, M::Err<List>> {
+      fn try_derive_with<M: Mode>(l: List) -> Result<Self, M::Err<List>> {
           // l.iter().cloned().map(dict::Namespace::try_derive).collect()
-          l.try_rewrap::<Self, M>(mode)
+          l.try_rewrap::<Self, M>()
       }
   }
 
@@ -2273,7 +2280,7 @@ internally, to keep track of things like the stack, program, lists etc.
   }
 
   impl TryDerive<List> for String {
-      fn try_derive_with<M: Mode>(l: List) -> Result<Self, Error> {
+      fn try_derive_with<M: Mode>(l: List) -> Result<Self, M::Err<List>> {
           let v = l
               .iter()
               .cloned()
@@ -2288,8 +2295,8 @@ internally, to keep track of things like the stack, program, lists etc.
           let v = l
               .iter()
               .cloned()
-              .map(|i| number::Int::try_derive::<M>(i).map(|i| i as u8))
-              .collect::<Result<Bytes, Error>>()?;
+              .map(|i| number::Int::try_derive_with::<M>(i).map(|i| i as u8))
+              .collect::<Result<Bytes, M::Err<List>>>()?;
           Ok(v)
       }
   }
@@ -3830,6 +3837,15 @@ internally, to keep track of things like the stack, program, lists etc.
   impl Derive<Infallible> for Error {
       fn derive(_x: Infallible) -> Self {
           match _x {} // Since Infallible can never be instantiated, this will never run
+      }
+  }
+
+  impl<Thunk> Derive<Thunk> for Error
+  where
+      Thunk: FnOnce() -> Error,
+  {
+      fn derive(t: Thunk) -> Self {
+          t()
       }
   }
 
@@ -5582,8 +5598,8 @@ words for them (hashing, encryption, signing)
   }
 
   impl TryDerive<Item> for signing::Keypair {
-      fn try_derive(i: Item) -> Result<Self, Error> {
-          let sk: signing::SecretKey = i.try_fit()?;
+      fn try_derive_with<M: Mode>(i: Item) -> Result<Self, M::Err<Item>> {
+          let sk: signing::SecretKey = i.try_fit_with::<M>()?;
           let pk: signing::PublicKey = (&sk).into();
           Ok(signing::Keypair {
               secret: sk,
@@ -5593,17 +5609,17 @@ words for them (hashing, encryption, signing)
   }
 
   impl TryDerive<Item> for signing::SecretKey {
-      fn try_derive(i: Item) -> Result<Self, Error> {
-          let a = assoc::Associative::try_derive(i)?;
+      fn try_derive_with<M: Mode>(i: Item) -> Result<Self, M::Err<Item>> {
+          let a = assoc::Associative::try_derive_with::<M>(i)?;
           if a.get(&fit!("type")) == Some(fit!("elliptic-curve-key")) {
               let sk = signing::SecretKey::from_bytes(
                   &Bytes::try_derive(a.get(&fit!("secret")).ok_or_else(
-                      || Error::expected(fit!("secret"), a), //Error::expected(fit!("secret"), None::<Item>)
+                      || M::expected(fit!("secret"), a), //Error::expected(fit!("secret"), None::<Item>)
                   )?)?[..],
               )?;
               Ok(sk)
           } else {
-              Err(Error::expected(fit!("elliptic-curve-key"), a))
+              Err(M::expected(fit!("elliptic-curve-key"), a))
           }
       }
   }
@@ -5615,8 +5631,8 @@ words for them (hashing, encryption, signing)
   }
 
   impl TryDerive<Item> for signing::PublicKey {
-      fn try_derive(i: Item) -> Result<Self, Error> {
-          let a = assoc::Associative::try_derive(i)?;
+      fn try_derive_with<M: Mode>(i: Item) -> Result<Self, M::Err<Item>> {
+          let a = assoc::Associative::try_derive_with::<M>(i)?;
           if a.get(&fit!("type")) == Some(fit!("elliptic-curve-key")) {
               let pk = signing::PublicKey::from_bytes(
                   &Bytes::try_derive(
@@ -5627,7 +5643,7 @@ words for them (hashing, encryption, signing)
               .map_err(|_e| Error::expected(fit!("valid-public-key"), Item::default()))?;
               Ok(pk)
           } else {
-              Err(Error::expected(fit!("public-key"), Item::derive(a)))
+              Err(M::expected(fit!("public-key"), Item::derive(a)))
           }
       }
   }
@@ -5670,13 +5686,16 @@ This describes how we convert from one type to another (which the interpreter do
   /// A marker trait for types that can be blanket converted to themselves
   pub trait Identity {}
 
-  ///Trait to specify how one type is converted to another, specifically
-  /// how failures are dealt with.
-
+  /// Trait to specify how one type is converted to another,
+  /// specifically how failures are dealt with.
   pub trait Mode: Sized + 'static {
       type Err<Src>;
 
-      fn expected<Src: Fit<Item>>(expected: Word, src: Src) -> Self::Err<Src>;
+      fn expected<Src: Fit<Item> + 'static>(expected: Word, src: Src) -> Self::Err<Src>;
+      fn from<Src: Fit<Item> + 'static, Err: Fit<Error> + 'static>(
+          src: Src,
+          err: Err,
+      ) -> Self::Err<Src>;
       fn nest_error<Outer: Fit<Item>, Inner: Fit<Item>>(
           outer: Self::Err<Outer>,
           inner: Self::Err<Inner>,
@@ -5684,26 +5703,43 @@ This describes how we convert from one type to another (which the interpreter do
       fn revert<Src, Dst>(err: Self::Err<Src>, f: impl FnOnce(Src) -> Dst) -> Self::Err<Dst>;
   }
 
-  // --- Fast mode ---
-
+  /// A unit struct to indicate we're deriving one type from another
+  /// "fast" - if it fails we don't want a heavy informative error, just
+  /// give the original back so we cantry something else. Use this when
+  /// failure is somewhat "expected" and no explanation needs to be
+  /// bubbled up.
   pub struct Fast;
 
-  // --- Detailed mode ---
-
+  /// A unit struct to indicate we're deriving one type from another
+  /// "detailed" - if it fails, give as much information as possible
+  /// about what went wrong.
   pub struct Detailed;
 
+  /// A function that returns [Error]
+  pub type ErrThunk = Box<dyn FnOnce() -> Error>;
+
   impl Mode for Detailed {
-      type Err<Src> = Error;
+      type Err<Src> = ErrThunk;
 
-      fn expected<Src: Fit<Item>>(expected: Word, src: Src) -> Error {
-          Error::expected(expected, src.fit())
+      fn expected<Src: Fit<Item> + 'static>(expected: Word, src: Src) -> Self::Err<Src> {
+          Box::new(move || Error::expected(expected, src))
       }
 
-      fn nest_error<Outer: Fit<Item>, Inner: Fit<Item>>(outer: Error, inner: Error) -> Error {
-          outer.nest(inner)
+      fn from<Src: Fit<Item> + 'static, Err: Fit<Error> + 'static>(
+          _src: Src,
+          err: Err,
+      ) -> Self::Err<Src> {
+          Box::new(move || err.fit())
       }
 
-      fn revert<Src, Dst>(err: Error, _f: impl FnOnce(Src) -> Dst) -> Error {
+      fn nest_error<Outer: Fit<Item>, Inner: Fit<Item>>(
+          outer: ErrThunk,
+          inner: ErrThunk,
+      ) -> ErrThunk {
+          Box::new(move || outer().nest(inner()))
+      }
+
+      fn revert<Src, Dst>(err: ErrThunk, _f: impl FnOnce(Src) -> Dst) -> ErrThunk {
           err
       }
   }
@@ -5715,12 +5751,41 @@ This describes how we convert from one type to another (which the interpreter do
           src
       }
 
+      fn from<Src: Fit<Item>, Err: Fit<Error>>(src: Src, _err: Err) -> Self::Err<Src> {
+          src
+      }
+
       fn nest_error<Outer: Fit<Item>, Inner: Fit<Item>>(outer: Outer, _inner: Inner) -> Outer {
           outer
       }
 
       fn revert<Src, Orig>(err: Src, f: impl FnOnce(Src) -> Orig) -> Orig {
           f(err)
+      }
+  }
+
+  /// A trait that allows one original value to be swapped for
+  /// another. This is useful when doing derivations that have multiple
+  /// steps. If the first step fails, we just return whatever we started
+  /// with, but if the 2nd step fails, we have to go back to whatever
+  /// was the input to the first step.
+  pub trait SwapOriginal<F> {
+      type Output;
+      fn swap_original(self, f: F) -> Self::Output;
+  }
+
+  /// An implementation that updates the return value (Ok) of a result,
+  /// otherwise does nothing.
+
+  impl<O, N, K, F, M> SwapOriginal<F> for Result<K, M::Err<O>>
+  where
+      M: Mode,
+      F: FnOnce(O) -> N, // just the inner src transform, not the whole Err
+  {
+      type Output = Result<K, M::Err<N>>;
+
+      fn swap_original(self, f: F) -> Self::Output {
+          self.map_err(|e| M::revert(e, f))
       }
   }
 
@@ -5735,7 +5800,7 @@ This describes how we convert from one type to another (which the interpreter do
       fn try_derive_with<M: Mode>(value: Src) -> Result<Self, M::Err<Src>>;
 
       fn try_derive(value: Src) -> Result<Self, Error> {
-          Self::try_derive_with::<Detailed>(value)
+          Self::try_derive_with::<Detailed>(value).map_err(|e| e())
       }
   }
 
@@ -5749,7 +5814,7 @@ This describes how we convert from one type to another (which the interpreter do
       fn try_fit_with<M: Mode>(self) -> Result<Target, M::Err<Self>>;
 
       fn try_fit(self) -> Result<Target, Error> {
-          Self::try_fit_with::<Detailed>(self)
+          Self::try_fit_with::<Detailed>(self).map_err(|e| e())
       }
   }
 
@@ -5794,7 +5859,7 @@ This describes how we convert from one type to another (which the interpreter do
   where
       T: Identity + Fit<Item>,
   {
-      fn try_derive_with<M: Mode>(value: T, _mode: &M) -> Result<T, M::Err<T>> {
+      fn try_derive_with<M: Mode>(value: T) -> Result<T, M::Err<T>> {
           Ok(value)
       }
   }
@@ -5861,7 +5926,9 @@ example, in order to read/write to/from disk).
 
   /// Parses a serialized value into an [Item].
   impl TryDerive<edn_format::Value> for Item {
-      fn try_derive_with<M: Mode>(item: edn_format::Value, _mode: &M) -> Result<Item, Error> {
+      fn try_derive_with<M: Mode>(
+          item: edn_format::Value,
+      ) -> Result<Item, M::Err<edn_format::Value>> {
           //println!("to item {:?}", item);
           match item {
               edn_format::Value::Integer(i) => Ok(Item::Int(i)),
@@ -5870,7 +5937,7 @@ example, in order to read/write to/from disk).
               // assumes not, but here there is one. We need some
               // polymorphism here. For now we just clear the inner.
               edn_format::Value::Vector(v) => Ok(v
-                  .try_rewrap::<coll::List, Detailed>()
+                  .try_rewrap::<coll::List, M>()
                   .map_err(|e| e.update(edn_format::Value::Vector).clear_inner())?
                   .fit()),
               edn_format::Value::Symbol(s) => Ok(Item::Word(Intern::new(WordData {
@@ -5999,17 +6066,22 @@ example, in order to read/write to/from disk).
   }
 
   impl TryDerive<Result<edn_format::Value, edn_format::ParserError>> for Item {
-      fn try_derive(r: Result<edn_format::Value, edn_format::ParserError>) -> Result<Item, Error> {
+      fn try_derive_with<M: Mode>(
+          r: Result<edn_format::Value, edn_format::ParserError>,
+      ) -> Result<Item, M::Err<Result<edn_format::Value, edn_format::ParserError>>> {
           match r {
-              Ok(expr) => Ok(expr.try_fit()?),
+              Ok(val) => match val.clone().try_fit_with::<M>() {
+                  Ok(val) => Ok(val),
+                  Err(pe) => Err(M::from(Ok(val), pe)), //TODO: problem is edn_format structs are not items, maybe allow them to be convertible?
+              },
               Err(e) => Err(Error::from(e)),
           }
       }
   }
 
-  pub fn parse(s: String) -> Result<coll::List, Error> {
+  pub fn parse<M: Mode>(s: String) -> Result<coll::List, Error> {
       let parser = edn_format::Parser::from_iter(s.chars(), edn_format::ParserOptions::default());
-      Ok(parser.try_rewrap()?)
+      Ok(parser.try_rewrap::<M>()?)
   }
 
   /// A streaming parser function that takes the state of the parsing
