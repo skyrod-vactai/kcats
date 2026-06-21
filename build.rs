@@ -1,7 +1,6 @@
 use cache::cache;
 use directories::ProjectDirs;
 //use std::env;
-use edn_format;
 use std::error::Error;
 use std::fs::File;
 use std::fs::{self};
@@ -25,6 +24,7 @@ impl std::fmt::Display for MyError {
 
 impl std::error::Error for MyError {}
 
+#[allow(clippy::type_complexity)]
 fn hash_and_cache(
     cache: &mut cache::Cache,
     path: &Path,
@@ -67,7 +67,7 @@ fn hash_and_cache(
                             }
                         }?;
                         let names = defs
-                            .into_iter()
+                            .iter()
                             .map(|i| match i {
                                 edn_format::Value::Vector(l) => match l.first().cloned() {
                                     Some(edn_format::Value::Symbol(s)) => Ok(s.name().to_string()),
@@ -165,7 +165,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     .unwrap();
     for (module_name, (_, fn_names)) in r.iter() {
         let sanitized_name = module_name.replace("-", "_").to_uppercase();
-        for name in fn_names.into_iter() {
+        for name in fn_names.iter() {
             writeln!(f, "    m.insert(\"{}\", {});", name, sanitized_name).unwrap();
         }
     }
