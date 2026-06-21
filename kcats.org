@@ -6984,7 +6984,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn clone(mut env: Environment) -> Sometime<'static, Environment> {
-      let clone = env.tos().unwrap().clone();
+      let clone = env.tos().expect("stack spec guarantees presence").clone();
       env.pop_prog();
       env.push(clone);
       env.fit()
@@ -7243,7 +7243,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               env.pop_prog();
               //env.pop();
               //env.pop();
-              let b = env.tos().unwrap();
+              let b = env.tos().expect("stack spec guarantees presence");
 
               let selected_branch = if is_truthy(b) {
                   true_branch
@@ -7259,7 +7259,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               env.push_err(e)
           }
           (i, Err(e)) => {
-              env.push(e.actual().unwrap());
+              env.push(e.actual().expect("error actual guarantees presence"));
               env.push(i);
               env.push(e)
           }
@@ -7288,8 +7288,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           }
           env
       }
-      let p = coll::List::try_derive(env.pop()).unwrap();
-      let dispenser = coll::Dispenser::try_derive(env.pop()).unwrap();
+      let p = coll::List::try_derive(env.pop()).expect("stack spec guarantees List");
+      let dispenser = coll::Dispenser::try_derive(env.pop()).expect("stack spec guarantees Dispenser");
       match dispenser.take() {
           Sometime::Now((r, dispenser)) => finish(env, r, dispenser, p).fit(),
           Sometime::Future(f) => Sometime::Future(Box::pin(async move {
@@ -7323,7 +7323,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   //            (assoc env 'stack (apply list (vec others) l)))
 
   pub fn evert(mut env: Environment) -> Sometime<'static, Environment> {
-      let mut l = coll::List::try_derive(env.pop()).unwrap();
+      let mut l = coll::List::try_derive(env.pop()).expect("stack spec guarantees List");
       mem::swap(&mut env.stack, &mut l);
       env.pop_prog();
       env.push(l);
@@ -7816,7 +7816,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn evaluate(mut env: Environment) -> Sometime<'static, Environment> {
-      match Environment::try_derive(env.tos().unwrap()) {
+      match Environment::try_derive(env.tos().expect("stack spec guarantees Environment")) {
           Ok(inner) => Sometime::Future(Box::pin(eval(inner).map(|inner_done| {
               env.pop_prog();
               env.pop();
@@ -7868,7 +7868,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn fail(env: &mut Environment) -> Result<(), Error> {
-      let mut err = Error::try_derive(env.tos().unwrap()).map_err(Error::derive)?;
+      let mut err = Error::try_derive(env.tos().expect("stack spec guarantees Error")).map_err(Error::derive)?;
       err.is_handled = false;
       env.pop_prog();
       env.pop();
@@ -7880,11 +7880,11 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   /// with all the changes marked with the given namespace.
   pub fn dictmerge(env: &mut Environment) -> Result<(), Error> {
       //println!("dictmerge: {:?}", env);
-      let modified = dict::Dictionary::try_derive(env.tos().unwrap()).map_err(Error::derive)?;
+      let modified = dict::Dictionary::try_derive(env.tos().expect("stack spec guarantees Dictionary")).map_err(Error::derive)?;
       let mut existing =
-          dict::Dictionary::try_derive(env.stack.get(1).unwrap()).map_err(Error::derive)?;
+          dict::Dictionary::try_derive(env.stack.get(1).expect("stack spec guarantees Dictionary")).map_err(Error::derive)?;
       let namespace =
-          dict::Namespace::try_derive(env.stack.get(2).unwrap()).map_err(Error::derive)?;
+          dict::Namespace::try_derive(env.stack.get(2).expect("stack spec guarantees Namespace")).map_err(Error::derive)?;
 
       existing.merge(modified, &namespace);
 
@@ -8679,28 +8679,32 @@ rust project or some other language through FFI.
           }
 
           log("Taking pointer ownership");
-          // Take ownership of the Environment
+          // Take ownership of the Environment safely
           unsafe {
-              let mut env_val = std::ptr::read(env);
+              let env_ref = &mut *env;
+              let mut env_val = std::mem::replace(env_ref, Environment::default());
               log("Parsing input");
               match serialize::parse_input(&mut env_val, program) {
                   Ok(_) => {
                       // Execute the eval and re-assign the result back to the env pointer
                       log("Executing environment");
-                      env_val = RUNTIME.block_on(async move { axiom::eval(env_val).await });
+                      env_val = RUNTIME.block_on(async { axiom::eval(env_val).await });
                       log("Formatting result");
                       let result =
                           serialize::auto_format(env_val.stack.iter().emit().as_str(), 10, 40);
                       // Write the updated environment back to the pointer
-                      std::ptr::write(env, env_val);
+                      ,*env_ref = env_val;
 
                       // Convert the evaluation result back to a C string
                       jnienv.new_string(result).unwrap().as_raw()
                   }
-                  Err(e) => jnienv
-                      .new_string(format!("Error: {:?}", e))
-                      .unwrap()
-                      .as_raw(),
+                  Err(e) => {
+                      ,*env_ref = env_val;
+                      jnienv
+                          .new_string(format!("Error: {:?}", e))
+                          .unwrap()
+                          .as_raw()
+                  }
               }
           }
       }
@@ -9243,10 +9247,7 @@ We'll also define how to run unit tests.
 
   fn get_stdin() -> String {
       let mut buf = String::new();
-      for line in io::stdin().lock().lines() {
-          buf.push_str(&line.unwrap());
-          buf.push('\n');
-      }
+      let _ = io::stdin().read_to_string(&mut buf);
       buf
   }
 
@@ -9269,7 +9270,6 @@ We'll also define how to run unit tests.
   // stdin, then reads that many bytes and returns a string.
   async fn read_input() -> Option<String> {
       //spawn a thread to read from stdin
-      //println!("Reading input");
       tokio::spawn(async move {
           let mut stdin = io::stdin().lock();
           let mut buf = String::new();
@@ -9279,20 +9279,21 @@ We'll also define how to run unit tests.
           }
           // parse an integer from buf
           let read_len = buf.trim();
-          //println!("Read length {}", read_len);
           let len = read_len.parse::<usize>().unwrap_or_default();
           if len == 0 {
               return None;
           }
           // read len bytes from stdin
           let mut buf = vec![0; len];
-          stdin.read_exact(&mut buf).unwrap();
+          if stdin.read_exact(&mut buf).is_err() {
+              return None;
+          }
 
           // convert the bytes to a string
-          Some(String::from_utf8(buf).unwrap())
+          String::from_utf8(buf).ok()
       })
       .await
-      .unwrap()
+      .unwrap_or(None)
   }
 
   async fn print_with_length(env: &Environment) {
@@ -9359,46 +9360,42 @@ We'll also define how to run unit tests.
   /// in several different modes.
   #[tokio::main]
   async fn main() {
-      // println!("Size of Item: {}", mem::size_of::<types::Item>());
-      // println!("Size of Bytes: {}", mem::size_of::<types::Bytes>());
-
       // Set up process-wide paths and panic if this fails
       configure_platform();
-      // read command line options, to look for -i switch
+      // read command line options
       let args: Vec<String> = std::env::args().collect();
-      // if args contains "-i", read via handle_stdin
-      if args.contains(&"-i".to_string()) {
+      
+      if args.iter().any(|a| a == "-i") {
           interactive_mode().await;
-      } else if args.contains(&"-r".to_string()) {
+      } else if args.iter().any(|a| a == "-r") {
           repl().await;
-      } else if args.contains(&"-f".to_string()) {
-          let filename = args.get(2).unwrap();
-          let mut file = std::fs::File::open(filename).unwrap();
-          let mut buf = String::new();
-          file.read_to_string(&mut buf).unwrap();
-          read_eval_print(buf).await;
-      } else if args.contains(&"-p".to_string()) {
-          let program = args.get(2).unwrap();
-          read_eval_print(program.clone()).await;
+      } else if let Some(idx) = args.iter().position(|a| a == "-f") {
+          if let Some(filename) = args.get(idx + 1) {
+              if let Ok(mut file) = std::fs::File::open(filename) {
+                  let mut buf = String::new();
+                  if file.read_to_string(&mut buf).is_ok() {
+                      read_eval_print(buf).await;
+                  } else {
+                      println!("Error reading file: {}", filename);
+                  }
+              } else {
+                  println!("Error opening file: {}", filename);
+              }
+          } else {
+              println!("Missing filename after -f");
+          }
+      } else if let Some(idx) = args.iter().position(|a| a == "-p") {
+          if let Some(program) = args.get(idx + 1) {
+              read_eval_print(program.clone()).await;
+          } else {
+              println!("Missing program text after -p");
+          }
       } else {
           // otherwise, read from stdin
           read_eval_print(get_stdin()).await;
       }
   }
 
-  // if let (Item::List(program), Item::List(expected)) = (program, expected) {
-
-  //     } else {
-  //         Err(Error::from("Example should be a pair"))
-  //     }
-
-  // for ex in d.examples().iter() {
-  //             let e = List::try_derive(*ex).ok().unwrap();
-  //             let p = List::try_derive(*e.get(0).unwrap()).ok().unwrap();
-  //             let exp = List::try_derive(*e.get(1).unwrap()).ok().unwrap();
-
-  //             test_example(axiom::standard_env.clone(), w, p,exp)
-  //         }.retain(|i| i.is_some()).collect::<Vec<Error>>()
 #+end_src
 *** Pipes (input/output)
 Kcats will confine all i/o to pipes. You can put values into pipes and
