@@ -1432,6 +1432,7 @@ internally, to keep track of things like the stack, program, lists etc.
   pub mod error;
   pub mod pipe;
   pub mod program;
+  pub mod stack;
 
   use self::associative as assoc;
   use crate::derivation::*;
@@ -2889,6 +2890,176 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 #+end_src
+
+#+begin_src rust :tangle src/types/container/stack.rs :mkdirp yes
+  use crate::types::container::List;
+  use crate::types::Item;
+  use std::sync::Arc;
+
+  #[derive(Clone, PartialEq, Default, Debug)]
+  pub struct StackData {
+      pub tos: Option<Item>,
+      pub nos: Option<Item>,
+      pub nnd: Option<Item>,
+      pub rest: List,
+  }
+
+  pub type Stack = StackData;
+
+  impl StackData {
+      pub fn push_front(&mut self, item: Item) {
+          if self.tos.is_none() {
+              self.tos = Some(item);
+          } else if self.nos.is_none() {
+              self.nos = self.tos.take();
+              self.tos = Some(item);
+          } else if self.nnd.is_none() {
+              self.nnd = self.nos.take();
+              self.nos = self.tos.take();
+              self.tos = Some(item);
+          } else {
+              self.rest.push_front(self.nnd.take().unwrap());
+              self.nnd = self.nos.take();
+              self.nos = self.tos.take();
+              self.tos = Some(item);
+          }
+      }
+
+      pub fn pop_front(&mut self) -> Option<Item> {
+          if let Some(tos) = self.tos.take() {
+              self.tos = self.nos.take();
+              self.nos = self.nnd.take();
+              if !self.rest.is_empty() {
+                  self.nnd = Some(self.rest.pop_front().unwrap());
+              }
+              Some(tos)
+          } else {
+              None
+          }
+      }
+
+      pub fn len(&self) -> usize {
+          self.tos.is_some() as usize
+              + self.nos.is_some() as usize
+              + self.nnd.is_some() as usize
+              + self.rest.len()
+      }
+
+      pub fn is_empty(&self) -> bool {
+          self.tos.is_none() && self.rest.is_empty()
+      }
+
+      pub fn front(&self) -> Option<&Item> {
+          self.tos.as_ref()
+      }
+
+      pub fn to_list(&self) -> List {
+          let mut list = self.rest.clone();
+          if let Some(nnd) = &self.nnd {
+              list.push_front(nnd.clone());
+          }
+          if let Some(nos) = &self.nos {
+              list.push_front(nos.clone());
+          }
+          if let Some(tos) = &self.tos {
+              list.push_front(tos.clone());
+          }
+          list
+      }
+      
+      pub fn get(&self, index: usize) -> Option<&Item> {
+          let cached = self.tos.is_some() as usize
+              + self.nos.is_some() as usize
+              + self.nnd.is_some() as usize;
+          if index < cached {
+              match index {
+                  0 => self.tos.as_ref(),
+                  1 => self.nos.as_ref(),
+                  2 => self.nnd.as_ref(),
+                  _ => unreachable!(),
+              }
+          } else {
+              self.rest.get(index - cached)
+          }
+      }
+      
+      pub fn front_mut(&mut self) -> Option<&mut Item> {
+          if let Some(tos) = self.tos.as_mut() {
+              Some(tos)
+          } else {
+              self.rest.front_mut()
+          }
+      }
+      
+      pub fn from_list(mut list: List) -> Self {
+          let tos = list.pop_front();
+          let nos = list.pop_front();
+          let nnd = list.pop_front();
+          Self {
+              tos,
+              nos,
+              nnd,
+              rest: list,
+          }
+      }
+  }
+
+  use crate::derivation::{Derive, TryDerive};
+  use crate::types::container::error::Error;
+
+  impl Derive<Stack> for List {
+      fn derive(s: Stack) -> List {
+          s.to_list()
+      }
+  }
+
+  impl Derive<List> for Stack {
+      fn derive(l: List) -> Stack {
+          StackData::from_list(l)
+      }
+  }
+
+  impl Derive<Stack> for Item {
+      fn derive(s: Stack) -> Item {
+          Item::List(Box::new(s.to_list()))
+      }
+  }
+
+  impl TryDerive<Item> for Stack {
+      fn try_derive(i: Item) -> Result<Stack, Error> {
+          let l = List::try_derive(i)?;
+          Ok(StackData::from_list(l))
+      }
+  }
+
+  impl StackData {
+      pub fn replace1(&mut self, item: Item) {
+          self.tos = Some(item);
+      }
+
+      pub fn replace2(&mut self, item: Item) {
+          self.tos = Some(item);
+          self.nos = self.nnd.take();
+          if !self.rest.is_empty() {
+              self.nnd = Some(self.rest.pop_front().unwrap());
+          }
+      }
+
+      pub fn replace3(&mut self, item: Item) {
+          self.tos = Some(item);
+          self.nos = if !self.rest.is_empty() { Some(self.rest.pop_front().unwrap()) } else { None };
+          self.nnd = if !self.rest.is_empty() { Some(self.rest.pop_front().unwrap()) } else { None };
+      }
+
+      pub fn swap(&mut self, a: usize, b: usize) {
+          if a == b { return; }
+          // Very simplistic swap for now, can be optimized later
+          let mut list = self.to_list();
+          list.swap(a, b);
+          ,*self = StackData::from_list(list);
+      }
+  }
+#+end_src 
 **** Associative types
 #+begin_src rust :tangle src/types/container/associative.rs :mkdirp yes
   //! Support for Associative data types (similar contract to Rust's
@@ -4836,7 +5007,7 @@ internally, to keep track of things like the stack, program, lists etc.
   /// functions available to the program.
   #[derive(Clone, PartialEq)]
   pub struct Environment {
-      pub stack: coll::List,
+      pub stack: coll::stack::Stack,
       pub program: Program,
       pub dictionary: dict::Dictionary,
   }
@@ -4886,7 +5057,7 @@ internally, to keep track of things like the stack, program, lists etc.
       pub fn get(&self, key: &assoc::KeyItem) -> Option<Item> {
           match key {
               assoc::KeyItem::Word(w) => match w.data.as_str() {
-                  "stack" => Some(self.stack.clone().fit()),
+                  "stack" => Some(self.stack.to_list().fit()),
                   "program" => Some(self.program.clone().fit()),
                   "dictionary" => Some(self.dictionary.clone().fit()),
                   _ => None,
@@ -5218,7 +5389,7 @@ internally, to keep track of things like the stack, program, lists etc.
           }
 
           let env = Environment {
-              stack: stack.unwrap_or_default(),
+              stack: coll::stack::StackData::from_list(stack.unwrap_or_default()),
               program: program.unwrap_or_default(),
               dictionary: dictionary.unwrap_or_else(|| Environment::default().dictionary),
           };
@@ -5256,7 +5427,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
       fn into_iter(self) -> Self::IntoIter {
           let v: Vec<(assoc::KeyItem, Item)> = vec![
-              (fit!("stack"), self.stack.fit()),
+              (fit!("stack"), self.stack.to_list().fit()),
               (fit!("program"), self.program.fit()),
               (fit!("dictionary"), self.dictionary.fit()),
           ];
@@ -6143,7 +6314,7 @@ example, in order to read/write to/from disk).
           write!(
               f,
               "{{ stack: {}, program: {} }}",
-              (&Item::derive(self.stack.clone())).emit(),
+              (&Item::derive(self.stack.to_list())).emit(),
               (&Item::derive(self.program.clone())).emit(),
           )
       }
@@ -6493,9 +6664,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   match res {
                       Ok(r) => {
                           env.pop_prog();
-                          env.pop();
-                          env.pop();
-                          env.push(r);
+                          env.stack.replace2(r.fit());
                       }
                       Err(e) => {
                           env.push_err(e.fit());
@@ -6551,10 +6720,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   match res {
                       Ok(r) => {
                           env.pop_prog();
-                          env.pop();
-                          env.pop();
-                          env.pop();
-                          env.push(r);
+                          env.stack.replace3(r.fit());
                       }
                       Err(e) => {
                           env.push_err(e.fit());
@@ -7031,10 +7197,13 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn eq(mut env: Environment) -> Sometime<'static, Environment> {
-      let i = env.pop();
-      let j = env.pop();
+      let is_eq = {
+          let i = env.stack.get(0).expect("stack spec guarantees presence");
+          let j = env.stack.get(1).expect("stack spec guarantees presence");
+          i == j
+      };
       env.pop_prog();
-      env.push(i == j);
+      env.stack.replace2(is_eq.fit());
       env.fit()
   }
 
@@ -7324,7 +7493,9 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn evert(mut env: Environment) -> Sometime<'static, Environment> {
       let mut l = coll::List::try_derive(env.pop()).expect("stack spec guarantees List");
-      mem::swap(&mut env.stack, &mut l);
+      let tmp = env.stack.to_list();
+      env.stack = crate::types::container::stack::StackData::from_list(l);
+      let mut l = tmp;
       env.pop_prog();
       env.push(l);
       env.fit()
@@ -7332,7 +7503,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn snapshot(mut env: Environment) -> Sometime<'static, Environment> {
       env.pop_prog();
-      env.push(env.stack.clone());
+      env.push(env.stack.to_list());
       env.fit()
   }
 
@@ -8267,7 +8438,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       }
 
       let (_, last_stack_item_used, filled) = template.iter().cloned().fold(
-          Ok((env.stack.clone(), &mut last_stack_item_used, Vec::new())),
+          Ok((env.stack.to_list(), &mut last_stack_item_used, Vec::new())),
           splice,
       )?;
       env.pop_prog();
@@ -8691,7 +8862,7 @@ rust project or some other language through FFI.
                       env_val = RUNTIME.block_on(async { axiom::eval(env_val).await });
                       log("Formatting result");
                       let result =
-                          serialize::auto_format(env_val.stack.iter().emit().as_str(), 10, 40);
+                          serialize::auto_format(env_val.stack.to_list().iter().emit().as_str(), 10, 40);
                       // Write the updated environment back to the pointer
                       ,*env_ref = env_val;
 
@@ -8904,8 +9075,8 @@ rust project or some other language through FFI.
               } else {
                   println!(
                       "PASSED: expected {} got {}",
-                      (exp_env.stack.iter().emit()),
-                      (prog_env.stack.iter().emit())
+                      (exp_env.stack.to_list().iter().emit()),
+                      (prog_env.stack.to_list().iter().emit())
                   );
               }
               None
@@ -8913,8 +9084,8 @@ rust project or some other language through FFI.
               println!(
                   "\nFAILED: '{}'\nEXPECTED: {}\nACTUAL:   {}\n",
                   description.unwrap_or_default(),
-                  (exp_env.stack.iter().emit()),
-                  (prog_env.stack.iter().emit())
+                  (exp_env.stack.to_list().iter().emit()),
+                  (prog_env.stack.to_list().iter().emit())
               );
               // println!(
               //     "Debug: expected {:?} got {:?}",
@@ -8923,7 +9094,7 @@ rust project or some other language through FFI.
               Some(Error::test_assertion(
                   program,
                   expected_prog,
-                  prog_env.stack,
+                  prog_env.stack.to_list(),
               ))
           }
       }
@@ -9234,12 +9405,12 @@ We'll also define how to run unit tests.
       if env.program.is_empty() {
           println!(
               "{}",
-              serialize::auto_format(env.stack.iter().emit().as_str(), 20, 80)
+              serialize::auto_format(env.stack.to_list().iter().emit().as_str(), 20, 80)
           );
       } else {
           println!(
               "stack: {}\nprogram: {}",
-              serialize::auto_format(env.stack.iter().emit().as_str(), 20, 80),
+              serialize::auto_format(env.stack.to_list().iter().emit().as_str(), 20, 80),
               serialize::auto_format(List::derive(env.program).iter().emit().as_str(), 20, 80)
           )
       }
@@ -9297,14 +9468,14 @@ We'll also define how to run unit tests.
   }
 
   async fn print_with_length(env: &Environment) {
-      let result = serialize::auto_format(env.stack.iter().emit().as_str(), 20, 80);
+      let result = serialize::auto_format(env.stack.to_list().iter().emit().as_str(), 20, 80);
 
       // first print the length of the result
       println!("{}\n{}", result.len(), result);
   }
 
   async fn print(env: &Environment) {
-      let result = serialize::auto_format(env.stack.iter().emit().as_str(), 20, 80);
+      let result = serialize::auto_format(env.stack.to_list().iter().emit().as_str(), 20, 80);
       println!("{}", result);
   }
 
