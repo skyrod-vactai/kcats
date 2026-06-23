@@ -2761,12 +2761,36 @@ internally, to keep track of things like the stack, program, lists etc.
                   snippet.clone().slice(self.next_idx..last)
               }
               ProgramNode::Recur { pred, then, rec1, rec2, .. } => {
+                  let mut true_branch_list = cont::List::new();
+                  
+                  // 1. `then`
+                  if let ProgramNode::Seq(s) = &*then.clone() {
+                      true_branch_list.append(s.clone());
+                  } else {
+                      true_branch_list.push_back(Item::Program(Box::new(Program(vec![Frame { node: then.clone(), next_idx: 0 }]))));
+                  }
+
+                  // 2. `[pred] [then] [rec1] [rec2]`
+                  true_branch_list.push_back(Item::Program(Box::new(Program(vec![Frame { node: pred.clone(), next_idx: 0 }]))));
+                  true_branch_list.push_back(Item::Program(Box::new(Program(vec![Frame { node: then.clone(), next_idx: 0 }]))));
+                  true_branch_list.push_back(Item::Program(Box::new(Program(vec![Frame { node: rec1.clone(), next_idx: 0 }]))));
+                  true_branch_list.push_back(Item::Program(Box::new(Program(vec![Frame { node: rec2.clone(), next_idx: 0 }]))));
+                  
+                  // 3. `🪆`
+                  true_branch_list.push_back(crate::fit!("🪆"));
+                  
+                  // 4. `rec2`
+                  if let ProgramNode::Seq(s) = &*rec2.clone() {
+                      true_branch_list.append(s.clone());
+                  } else {
+                      true_branch_list.push_back(Item::Program(Box::new(Program(vec![Frame { node: rec2.clone(), next_idx: 0 }]))));
+                  }
+
                   let mut l = cont::List::new();
-                  l.push_back(Item::Program(Box::new(Program(vec![Frame { node: rec2.clone(), next_idx: 0 }]))));
-                  l.push_back(Item::Program(Box::new(Program(vec![Frame { node: rec1.clone(), next_idx: 0 }]))));
-                  l.push_back(Item::Program(Box::new(Program(vec![Frame { node: then.clone(), next_idx: 0 }]))));
                   l.push_back(Item::Program(Box::new(Program(vec![Frame { node: pred.clone(), next_idx: 0 }]))));
-                  l.push_back(crate::fit!("🪆"));
+                  l.push_back(Item::Program(Box::new(Program(vec![Frame { node: Arc::new(ProgramNode::Seq(true_branch_list)), next_idx: 0 }]))));
+                  l.push_back(Item::Program(Box::new(Program(vec![Frame { node: rec1.clone(), next_idx: 0 }]))));
+                  l.push_back(crate::fit!("⚖️"));
                   l
               }
           }
@@ -2786,18 +2810,18 @@ internally, to keep track of things like the stack, program, lists etc.
       /// advance_control_flow handles the internal state progression for dynamic
       /// tree nodes (like PushCycle). It returns true if it performed an action
       /// and should be called again.
-      pub fn advance_control_flow(&mut self, stack: &mut crate::types::container::stack::Stack) -> bool {
+      pub fn advance_control_flow(&mut self, stack: &mut crate::types::container::stack::Stack) -> Result<bool, crate::types::container::error::Error> {
           self.clean();
           let frame_node;
           let phase;
           {
-              let Some(frame) = self.0.last_mut() else { return false; };
+              let Some(frame) = self.0.last_mut() else { return Ok(false); };
               match &*frame.node {
                   ProgramNode::Recur { .. } => {
                       frame_node = frame.node.clone();
                       phase = frame.next_idx;
                   }
-                  _ => return false,
+                  _ => return Ok(false),
               }
           }
 
@@ -2806,9 +2830,11 @@ internally, to keep track of things like the stack, program, lists etc.
                   if phase == 0 {
                       self.0.last_mut().unwrap().next_idx = 1;
                       self.0.push(Frame { node: pred.clone(), next_idx: 0 });
-                      return true;
+                      return Ok(true);
                   } else if phase == 1 {
-                      let b = stack.pop_front().expect("stack spec guarantees presence");
+                      let Some(b) = stack.pop_front() else {
+                          return Err(crate::types::container::error::Error::stack_underflow());
+                      };
                       if crate::axiom::is_truthy(&b) {
                           self.0.last_mut().unwrap().next_idx = 2;
                           self.0.push(Frame { node: then.clone(), next_idx: 0 });
@@ -2816,21 +2842,21 @@ internally, to keep track of things like the stack, program, lists etc.
                           self.0.last_mut().unwrap().next_idx = 4;
                           self.0.push(Frame { node: rec1.clone(), next_idx: 0 });
                       }
-                      return true;
+                      return Ok(true);
                   } else if phase == 2 {
                       self.0.last_mut().unwrap().next_idx = 3;
                       let self_clone = self_ref.upgrade().expect("self_ref should be alive");
                       stack.push_front(Item::Program(Box::new(Program(vec![Frame { node: self_clone, next_idx: 0 }]))));
-                      return true;
+                      return Ok(true);
                   } else if phase == 3 {
                       self.0.last_mut().unwrap().next_idx = 4;
                       self.0.push(Frame { node: rec2.clone(), next_idx: 0 });
-                      return true;
+                      return Ok(true);
                   }
               }
               _ => {}
           }
-          false
+          Ok(false)
       }
 
       ///return a reference to the current instruction and advance to
@@ -7669,10 +7695,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   //            (assoc env 'stack (apply list (vec others) l)))
 
   pub fn evert(mut env: Environment) -> Sometime<'static, Environment> {
-      let mut l = coll::List::try_derive(env.pop()).expect("stack spec guarantees List");
+      let l = coll::List::try_derive(env.pop()).expect("stack spec guarantees List");
       let tmp = env.stack.to_list();
       env.stack = crate::types::container::stack::StackData::from_list(l);
-      let mut l = tmp;
+      let l = tmp;
       env.pop_prog();
       env.push(l);
       env.fit()
@@ -7954,7 +7980,13 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       //println!("Dictionary size: {}", env.dictionary.len());
       //println!("Program: {:?}", env.program);
 
-      while env.program.advance_control_flow(&mut env.stack) {}
+      while match env.program.advance_control_flow(&mut env.stack) {
+          Ok(advanced) => advanced,
+          Err(e) => {
+              env.push_err(e);
+              return env.fit();
+          }
+      } {}
 
       let next_item = env.program.peek();
 
@@ -8327,14 +8359,12 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           coll::List::try_derive(pred).unwrap_or_default(),
       ));
 
-      let cycle_node = Arc::new_cyclic(|weak| {
-          ProgramNode::Recur {
-              pred: pred_node,
-              then: then_node,
-              rec1: rec1_node,
-              rec2: rec2_node,
-              self_ref: weak.clone(),
-          }
+      let cycle_node = Arc::new_cyclic(|weak| ProgramNode::Recur {
+          pred: pred_node,
+          then: then_node,
+          rec1: rec1_node,
+          rec2: rec2_node,
+          self_ref: weak.clone(),
       });
 
       let mut prog = Program::default();
