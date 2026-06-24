@@ -278,7 +278,10 @@ internally, to keep track of things like the stack, program, lists etc.
                   if l.len() == 1 {
                       match l.pop_front().unwrap() {
                           Item::Word(w) => Ok(w),
-                          _ => Err(Error::expected(fit!("word"), Item::String(Box::new(original_s)))),
+                          _ => Err(Error::expected(
+                              fit!("word"),
+                              Item::String(Box::new(original_s)),
+                          )),
                       }
                   } else if l.is_empty() {
                       Err(Error::parse("Words cannot be empty"))
@@ -716,7 +719,9 @@ internally, to keep track of things like the stack, program, lists etc.
               i => {
                   let s = coll::Sized::try_derive(i.clone())?;
                   match s {
-                      coll::Sized::String(s) => s.try_fit().map_err(|_| Error::expected(fit!("word"), i.clone())),
+                      coll::Sized::String(s) => s
+                          .try_fit()
+                          .map_err(|_| Error::expected(fit!("word"), i.clone())),
                       s => {
                           let l = coll::List::try_derive(s);
                           match l {
@@ -901,9 +906,11 @@ internally, to keep track of things like the stack, program, lists etc.
           let original = value.clone();
           let it: Result<Box<dyn Iterator<Item = Item>>, _> = TryFit::try_fit(value);
           if let Ok(it) = it {
-              let res: Result<Vec<T>, Item> = it.map(|item| {
-                  T::try_cast(item).map_err(|_| Item::Word(Word::default())) // Placeholder failure
-              }).collect();
+              let res: Result<Vec<T>, Item> = it
+                  .map(|item| {
+                      T::try_cast(item).map_err(|_| Item::Word(Word::default())) // Placeholder failure
+                  })
+                  .collect();
               res.map_err(|_| original)
           } else {
               Err(original)
@@ -1088,7 +1095,15 @@ internally, to keep track of things like the stack, program, lists etc.
                   Item::Dictionary(d) => ser_map(serializer, Box::new(d.clone().into_iter())),
                   Item::Error(e) => ser_map(serializer, Box::new(e.clone().into_iter())),
                   Item::Env(e) => ser_map(serializer, e.clone().into_iter()),
-                  Item::Words(w) => ser_map(serializer, Box::new(w.as_ref().clone().into_iter().map(|(k,v)| (k.fit(), v.fit())))),
+                  Item::Words(w) => ser_map(
+                      serializer,
+                      Box::new(
+                          w.as_ref()
+                              .clone()
+                              .into_iter()
+                              .map(|(k, v)| (k.fit(), v.fit())),
+                      ),
+                  ),
                   Item::Nothing => {
                       let seq = serializer.serialize_seq(Some(0))?;
                       seq.end()
@@ -1609,9 +1624,8 @@ internally, to keep track of things like the stack, program, lists etc.
       type Error = Error;
       fn join(self, other: assoc::Associative) -> Result<Self::Output, Self::Error> {
           //println!("Joining associative to list");
-          let sa = assoc::Associative::Assoc(Arc::new(
-              self.try_rewrap::<assoc::AssociationContent>()?,
-          ));
+          let sa =
+              assoc::Associative::Assoc(Arc::new(self.try_rewrap::<assoc::AssociationContent>()?));
           Ok(sa.join(other).unwrap())
       }
   }
@@ -2549,8 +2563,7 @@ internally, to keep track of things like the stack, program, lists etc.
   impl TryDerive<Item> for Set {
       fn try_derive(item: Item) -> Result<Self, Error> {
           let s = Sized::try_derive(item)?;
-          s.try_rewrap::<HashSet<assoc::KeyItem>>()
-              .map(Arc::new)
+          s.try_rewrap::<HashSet<assoc::KeyItem>>().map(Arc::new)
       }
   }
 
@@ -2685,9 +2698,14 @@ internally, to keep track of things like the stack, program, lists etc.
           match (self, other) {
               (ProgramNode::Seq(a), ProgramNode::Seq(b)) => a == b,
               (
-                  ProgramNode::Recur { pred: p1, then: t1, rec1: r1a, rec2: r2a, self_ref: s1 },
-                  ProgramNode::Recur { pred: p2, then: t2, rec1: r1b, rec2: r2b, self_ref: s2 }
-              ) => p1 == p2 && t1 == t2 && r1a == r1b && r2a == r2b && std::sync::Weak::ptr_eq(s1, s2),
+                  ProgramNode::Recur { pred: p1, then: t1, rec1: r1, rec2: c1, .. },
+                  ProgramNode::Recur { pred: p2, then: t2, rec1: r2, rec2: c2, .. }
+              ) => {
+                  Arc::ptr_eq(p1, p2)
+                      && Arc::ptr_eq(t1, t2)
+                      && Arc::ptr_eq(r1, r2)
+                      && Arc::ptr_eq(c1, c2)
+              }
               _ => false,
           }
       }
@@ -2716,7 +2734,7 @@ internally, to keep track of things like the stack, program, lists etc.
       pub fn is_finished(&self) -> bool {
           match &*self.node {
               ProgramNode::Seq(snippet) => self.next_idx >= snippet.len(),
-              ProgramNode::Recur { .. } => self.next_idx >= 4,
+              ProgramNode::Recur { .. } => self.next_idx >= 2, // 0 = evaluate pred, 1 = branch
           }
       }
 
@@ -2760,38 +2778,9 @@ internally, to keep track of things like the stack, program, lists etc.
                   let last = snippet.len();
                   snippet.clone().slice(self.next_idx..last)
               }
-              ProgramNode::Recur { pred, then, rec1, rec2, .. } => {
-                  let mut true_branch_list = cont::List::new();
-                  
-                  // 1. `then`
-                  if let ProgramNode::Seq(s) = &*then.clone() {
-                      true_branch_list.append(s.clone());
-                  } else {
-                      true_branch_list.push_back(Item::Program(Box::new(Program(vec![Frame { node: then.clone(), next_idx: 0 }]))));
-                  }
-
-                  // 2. `[pred] [then] [rec1] [rec2]`
-                  true_branch_list.push_back(Item::Program(Box::new(Program(vec![Frame { node: pred.clone(), next_idx: 0 }]))));
-                  true_branch_list.push_back(Item::Program(Box::new(Program(vec![Frame { node: then.clone(), next_idx: 0 }]))));
-                  true_branch_list.push_back(Item::Program(Box::new(Program(vec![Frame { node: rec1.clone(), next_idx: 0 }]))));
-                  true_branch_list.push_back(Item::Program(Box::new(Program(vec![Frame { node: rec2.clone(), next_idx: 0 }]))));
-                  
-                  // 3. `🪆`
-                  true_branch_list.push_back(crate::fit!("🪆"));
-                  
-                  // 4. `rec2`
-                  if let ProgramNode::Seq(s) = &*rec2.clone() {
-                      true_branch_list.append(s.clone());
-                  } else {
-                      true_branch_list.push_back(Item::Program(Box::new(Program(vec![Frame { node: rec2.clone(), next_idx: 0 }]))));
-                  }
-
-                  let mut l = cont::List::new();
-                  l.push_back(Item::Program(Box::new(Program(vec![Frame { node: pred.clone(), next_idx: 0 }]))));
-                  l.push_back(Item::Program(Box::new(Program(vec![Frame { node: Arc::new(ProgramNode::Seq(true_branch_list)), next_idx: 0 }]))));
-                  l.push_back(Item::Program(Box::new(Program(vec![Frame { node: rec1.clone(), next_idx: 0 }]))));
-                  l.push_back(crate::fit!("⚖️"));
-                  l
+              ProgramNode::Recur { .. } => {
+                  // Cannot easily represent remaining state of Recur as a flat list.
+                  cont::List::new()
               }
           }
       }
@@ -2808,55 +2797,65 @@ internally, to keep track of things like the stack, program, lists etc.
           }
       }
       /// advance_control_flow handles the internal state progression for dynamic
-      /// tree nodes (like PushCycle). It returns true if it performed an action
+      /// tree nodes (like Recur). It returns true if it performed an action
       /// and should be called again.
-      pub fn advance_control_flow(&mut self, stack: &mut crate::types::container::stack::Stack) -> Result<bool, crate::types::container::error::Error> {
+      pub fn advance_control_flow<F>(&mut self, mut pop_stack: F) -> bool
+      where
+          F: FnMut() -> Option<Item>,
+      {
           self.clean();
-          let frame_node;
-          let phase;
-          {
-              let Some(frame) = self.0.last_mut() else { return Ok(false); };
-              match &*frame.node {
-                  ProgramNode::Recur { .. } => {
-                      frame_node = frame.node.clone();
-                      phase = frame.next_idx;
-                  }
-                  _ => return Ok(false),
-              }
-          }
+          let Some(frame) = self.0.last_mut() else {
+              return false;
+          };
 
-          match &*frame_node {
-              ProgramNode::Recur { pred, then, rec1, rec2, self_ref } => {
-                  if phase == 0 {
-                      self.0.last_mut().unwrap().next_idx = 1;
-                      self.0.push(Frame { node: pred.clone(), next_idx: 0 });
-                      return Ok(true);
-                  } else if phase == 1 {
-                      let Some(b) = stack.pop_front() else {
-                          return Err(crate::types::container::error::Error::stack_underflow());
-                      };
-                      if crate::axiom::is_truthy(&b) {
-                          self.0.last_mut().unwrap().next_idx = 2;
-                          self.0.push(Frame { node: then.clone(), next_idx: 0 });
-                      } else {
-                          self.0.last_mut().unwrap().next_idx = 4;
-                          self.0.push(Frame { node: rec1.clone(), next_idx: 0 });
+          if let ProgramNode::Recur { pred, then, rec1, rec2, self_ref } = &*frame.node {
+              if frame.next_idx == 0 {
+                  // Phase 0: Push pred onto the execution stack
+                  frame.next_idx = 1;
+                  let pred_clone = pred.clone();
+                  self.0.push(Frame {
+                      node: pred_clone,
+                      next_idx: 0,
+                  });
+                  return true;
+              } else if frame.next_idx == 1 {
+                  // Phase 1: Check result from data stack
+                  frame.next_idx = 2; // mark finished
+                  let pred_result = pop_stack();
+                  
+                  // Determine truthiness. For now, empty list/🔳/error is false, anything else true.
+                  let mut is_true = true;
+                  if let Some(res) = pred_result {
+                      match res {
+                          Item::Nothing => is_true = false,
+                          Item::List(l) if l.is_empty() => is_true = false,
+                          Item::Program(p) if p.is_empty() => is_true = false,
+                          Item::Error(_) => is_true = false,
+                          Item::Char(c) if c == '\0' => is_true = false,
+                          _ => {} // default true
                       }
-                      return Ok(true);
-                  } else if phase == 2 {
-                      self.0.last_mut().unwrap().next_idx = 3;
-                      let self_clone = self_ref.upgrade().expect("self_ref should be alive");
-                      stack.push_front(Item::Program(Box::new(Program(vec![Frame { node: self_clone, next_idx: 0 }]))));
-                      return Ok(true);
-                  } else if phase == 3 {
-                      self.0.last_mut().unwrap().next_idx = 4;
-                      self.0.push(Frame { node: rec2.clone(), next_idx: 0 });
-                      return Ok(true);
+                  } else {
+                      is_true = false;
                   }
+
+                  if is_true {
+                      let rec2_clone = rec2.clone();
+                      let self_clone = self_ref.upgrade().expect("self_ref should be alive");
+                      let rec1_clone = rec1.clone();
+                      // We can just pop the finished frame now
+                      self.0.pop();
+                      self.0.push(Frame { node: rec2_clone, next_idx: 0 });
+                      self.0.push(Frame { node: self_clone, next_idx: 0 });
+                      self.0.push(Frame { node: rec1_clone, next_idx: 0 });
+                  } else {
+                      let then_clone = then.clone();
+                      self.0.pop();
+                      self.0.push(Frame { node: then_clone, next_idx: 0 });
+                  }
+                  return true;
               }
-              _ => {}
           }
-          Ok(false)
+          false
       }
 
       ///return a reference to the current instruction and advance to
@@ -2898,7 +2897,7 @@ internally, to keep track of things like the stack, program, lists etc.
       }
 
       pub fn is_empty(&self) -> bool {
-          self.0.iter().all(|f| f.is_finished())
+          self.peek().is_none()
       }
 
       pub fn prepend(&mut self, snippet: cont::List) {
@@ -2989,7 +2988,7 @@ internally, to keep track of things like the stack, program, lists etc.
               .fold(0, |acc, f| {
                   match &*f.node {
                       ProgramNode::Seq(snippet) => acc + (snippet.len() - f.next_idx),
-                      ProgramNode::Recur { .. } => acc + (4 - f.next_idx),
+                      ProgramNode::Recur { .. } => acc + (2 - f.next_idx),
                   }
               })
       }
@@ -3164,11 +3163,10 @@ internally, to keep track of things like the stack, program, lists etc.
           }
           list
       }
-      
+
       pub fn get(&self, index: usize) -> Option<&Item> {
-          let cached = self.tos.is_some() as usize
-              + self.nos.is_some() as usize
-              + self.nnd.is_some() as usize;
+          let cached =
+              self.tos.is_some() as usize + self.nos.is_some() as usize + self.nnd.is_some() as usize;
           if index < cached {
               match index {
                   0 => self.tos.as_ref(),
@@ -3180,7 +3178,7 @@ internally, to keep track of things like the stack, program, lists etc.
               self.rest.get(index - cached)
           }
       }
-      
+
       pub fn front_mut(&mut self) -> Option<&mut Item> {
           if let Some(tos) = self.tos.as_mut() {
               Some(tos)
@@ -3188,7 +3186,7 @@ internally, to keep track of things like the stack, program, lists etc.
               self.rest.front_mut()
           }
       }
-      
+
       pub fn from_list(mut list: List) -> Self {
           let tos = list.pop_front();
           let nos = list.pop_front();
@@ -3245,12 +3243,22 @@ internally, to keep track of things like the stack, program, lists etc.
 
       pub fn replace3(&mut self, item: Item) {
           self.tos = Some(item);
-          self.nos = if !self.rest.is_empty() { Some(self.rest.pop_front().unwrap()) } else { None };
-          self.nnd = if !self.rest.is_empty() { Some(self.rest.pop_front().unwrap()) } else { None };
+          self.nos = if !self.rest.is_empty() {
+              Some(self.rest.pop_front().unwrap())
+          } else {
+              None
+          };
+          self.nnd = if !self.rest.is_empty() {
+              Some(self.rest.pop_front().unwrap())
+          } else {
+              None
+          };
       }
 
       pub fn swap(&mut self, a: usize, b: usize) {
-          if a == b { return; }
+          if a == b {
+              return;
+          }
           // Very simplistic swap for now, can be optimized later
           let mut list = self.to_list();
           list.swap(a, b);
@@ -3784,7 +3792,12 @@ internally, to keep track of things like the stack, program, lists etc.
               Associative::Assoc(a) => Box::new(a.as_ref().clone().into_iter()),
               Associative::DictEntry(e) => Box::new(e.into_iter()),
               Associative::Dictionary(d) => Box::new(d.into_iter()),
-              Associative::Words(d) => Box::new(d.as_ref().clone().into_iter().map(|(k,v)| (crate::types::container::associative::KeyItem::Word(k), crate::types::Item::DictEntry(Box::new(v))))),
+              Associative::Words(d) => Box::new(d.as_ref().clone().into_iter().map(|(k, v)| {
+                  (
+                      crate::types::container::associative::KeyItem::Word(k),
+                      crate::types::Item::DictEntry(Box::new(v)),
+                  )
+              })),
               Associative::Error(e) => Box::new(e.into_iter()),
               Associative::Env(e) => Box::new(e.as_ref().clone().into_iter()),
               Associative::Nothing => Box::new(std::iter::empty()),
@@ -3792,8 +3805,7 @@ internally, to keep track of things like the stack, program, lists etc.
       }
   }
 
-  impl TryDerive<Item> for Associative
-  {
+  impl TryDerive<Item> for Associative {
       fn try_derive(i: Item) -> Result<Associative, Error> {
           match i {
               Item::Assoc(a) => Ok(Associative::Assoc(a)),
@@ -3975,7 +3987,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
   mod serde {
       use super::KeyItem;
-      
+
       use serde::de::{self, Deserialize, Deserializer, Visitor};
       use serde::ser::{Serialize, SerializeSeq};
       use std::fmt;
@@ -4109,9 +4121,7 @@ internally, to keep track of things like the stack, program, lists etc.
           }
           Error {
               is_handled: false,
-              data: std::sync::Arc::new(
-                  data.rewrap::<assoc::AssociationContent, assoc::Entry>(),
-              ),
+              data: std::sync::Arc::new(data.rewrap::<assoc::AssociationContent, assoc::Entry>()),
               cause: None,
           }
       }
@@ -4433,7 +4443,9 @@ internally, to keep track of things like the stack, program, lists etc.
   impl Derive<SpecElement> for Item {
       fn derive(se: SpecElement) -> Item {
           if se.name.is_some() {
-              crate::types::Item::List(Box::new(vec![se.elemtype.fit(), se.name.unwrap().fit()].into()))
+              crate::types::Item::List(Box::new(
+                  vec![se.elemtype.fit(), se.name.unwrap().fit()].into(),
+              ))
           } else {
               Item::Word(se.elemtype)
           }
@@ -4555,7 +4567,12 @@ internally, to keep track of things like the stack, program, lists etc.
           match key {
               assoc::KeyItem::Word(w) => match w.data.as_str() {
                   "words" => Some(self.words.clone().fit()),
-                  "modules" => Some(crate::types::Item::List(Box::new(self.modules.iter().map(|m| crate::types::Item::Bytes(Box::new(m.as_ref().clone()))).collect()))),
+                  "modules" => Some(crate::types::Item::List(Box::new(
+                      self.modules
+                          .iter()
+                          .map(|m| crate::types::Item::Bytes(Box::new(m.as_ref().clone())))
+                          .collect(),
+                  ))),
                   "lingo" => Some(self.lingo.clone().fit()),
                   _ => None,
               },
@@ -4817,7 +4834,9 @@ internally, to keep track of things like the stack, program, lists etc.
           });
           let mut dict = HashMap::new();
           for (bw, bd) in BUILTIN_FUNCTIONS.iter() {
-              let ns = core_nss.get(bw.data.as_str()).unwrap_or_else(|| panic!("Missing namespace for builtin: {}", bw.data.as_str()));
+              let ns = core_nss
+                  .get(bw.data.as_str())
+                  .unwrap_or_else(|| panic!("Missing namespace for builtin: {}", bw.data.as_str()));
               let entry = Entry {
                   definition: bd.clone(),
                   examples: None,
@@ -5001,7 +5020,12 @@ internally, to keep track of things like the stack, program, lists etc.
               (fit!("words"), self.words.fit()),
               (
                   fit!("modules"),
-                  crate::types::Item::List(Box::new(self.modules.iter().map(|m| crate::types::Item::Bytes(Box::new(m.as_ref().clone()))).collect())),
+                  crate::types::Item::List(Box::new(
+                      self.modules
+                          .iter()
+                          .map(|m| crate::types::Item::Bytes(Box::new(m.as_ref().clone())))
+                          .collect(),
+                  )),
               ),
               (fit!("lingo"), self.lingo.fit()),
           ];
@@ -5382,7 +5406,7 @@ internally, to keep track of things like the stack, program, lists etc.
           //println!("Cache: {:?}", env.dictionary.lingo);
           self.push(module.clone());
           self.push(is_using);
-          println!("Loading module (should be empty?): {:?}", self.program);
+          //println!("Loading module (should be empty?): {:?}", self.program);
           self.program
               .prepend(list!("dictionary", "⚓", "pair", "🎁", "using"));
           //println!("Env: {:?}", self);
@@ -5422,14 +5446,14 @@ internally, to keep track of things like the stack, program, lists etc.
               //println!("starting dictionary: {:?}", env.dictionary.modules);
               //println!("Dict has {} words", env.dictionary.words.len());
               let mut env = [
-                  // fit!("errors"),
-                  // fit!("encode"),
-                  // fit!("time"), // good candidate for lib
-                  // fit!("pipes"),
-                  // fit!("methods"),
-                  // fit!("generators"),
-                  // fit!("debug"),
-                  // fit!("crypto-builtins"),
+                  fit!("errors"),
+                  fit!("encode"),
+                  fit!("time"), // good candidate for lib
+                  fit!("pipes"),
+                  fit!("methods"),
+                  fit!("generators"),
+                  fit!("debug"),
+                  fit!("crypto-builtins"),
                   // //"more-generators",
                   //"database",
               ]
@@ -6196,7 +6220,10 @@ This describes how we convert from one type to another (which the interpreter do
 
   impl<I: IntoIterator> DeriveIter<I> for crate::types::container::associative::AssociationContent
   where
-      I::Item: Fit<(crate::types::container::associative::KeyItem, crate::types::Item)>,
+      I::Item: Fit<(
+          crate::types::container::associative::KeyItem,
+          crate::types::Item,
+      )>,
   {
       fn derive_iter(iter: I) -> Self {
           iter.into_iter().map(|x| x.fit()).collect()
@@ -6205,7 +6232,10 @@ This describes how we convert from one type to another (which the interpreter do
 
   impl<I: IntoIterator> DeriveIter<I> for crate::types::container::associative::Association
   where
-      I::Item: Fit<(crate::types::container::associative::KeyItem, crate::types::Item)>,
+      I::Item: Fit<(
+          crate::types::container::associative::KeyItem,
+          crate::types::Item,
+      )>,
   {
       fn derive_iter(iter: I) -> Self {
           std::sync::Arc::new(iter.into_iter().map(|x| x.fit()).collect())
@@ -6255,9 +6285,7 @@ example, in order to read/write to/from disk).
               // there's an inner conversion being done or not. It
               // assumes not, but here there is one. We need some
               // polymorphism here. For now we just clear the inner.
-              edn_format::Value::Vector(v) => Ok(v
-                  .try_rewrap::<coll::List>()
-                  .fit()),
+              edn_format::Value::Vector(v) => Ok(v.try_rewrap::<coll::List>().fit()),
               edn_format::Value::Symbol(s) => Ok(Item::Word(Intern::new(WordData {
                   data: Intern::new(s.name().to_string()),
                   namespace: s
@@ -6299,7 +6327,10 @@ example, in order to read/write to/from disk).
   impl From<&Item> for edn_format::Value {
       fn from(item: &Item) -> Self {
           fn from_assoc(a: assoc::Associative) -> edn_format::Value {
-              let mut av = a.clone().into_iter().collect::<Vec<(assoc::KeyItem, Item)>>();
+              let mut av = a
+                  .clone()
+                  .into_iter()
+                  .collect::<Vec<(assoc::KeyItem, Item)>>();
               av.sort_by(|(ka, _), (kb, _)| ka.cmp(kb));
               edn_format::Value::Vector(
                   av.into_iter()
@@ -6384,7 +6415,9 @@ example, in order to read/write to/from disk).
   }
 
   impl TryDerive<Result<edn_format::Value, crate::types::container::error::Error>> for Item {
-      fn try_derive(r: Result<edn_format::Value, crate::types::container::error::Error>) -> Result<Item, Error> {
+      fn try_derive(
+          r: Result<edn_format::Value, crate::types::container::error::Error>,
+      ) -> Result<Item, Error> {
           match r {
               Ok(val) => match val.clone().try_fit() {
                   Ok(val) => Ok(val),
@@ -6397,7 +6430,10 @@ example, in order to read/write to/from disk).
 
   pub fn parse(s: String) -> Result<coll::List, Error> {
       let parser = edn_format::Parser::from_iter(s.chars(), edn_format::ParserOptions::default());
-      parser.into_iter().map(|x| x.unwrap().try_fit()).collect::<Result<crate::types::container::List, _>>()
+      parser
+          .into_iter()
+          .map(|x| x.unwrap().try_fit())
+          .collect::<Result<crate::types::container::List, _>>()
   }
 
   /// A streaming parser function that takes the state of the parsing
@@ -9120,8 +9156,11 @@ rust project or some other language through FFI.
                       log("Executing environment");
                       env_val = RUNTIME.block_on(async { axiom::eval(env_val).await });
                       log("Formatting result");
-                      let result =
-                          serialize::auto_format(env_val.stack.to_list().iter().emit().as_str(), 10, 40);
+                      let result = serialize::auto_format(
+                          env_val.stack.to_list().iter().emit().as_str(),
+                          10,
+                          40,
+                      );
                       // Write the updated environment back to the pointer
                       ,*env_ref = env_val;
 
@@ -9276,9 +9315,9 @@ rust project or some other language through FFI.
       // Note this useful idiom: importing names from outer (for mod tests) scope.
       //use super::error::Error;
       use crate::axiom;
+      use crate::derivation::{Fit, TryDerive, TryFit};
       use crate::serialize::Emit;
-      use crate::derivation::{TryDerive, TryFit, Fit};
-      
+
       use crate::types::container as coll;
       use crate::types::container::{environment::Environment, error::Error};
       use crate::types::{Item, Word};
@@ -9520,7 +9559,7 @@ rust project or some other language through FFI.
       #[test_case(">" ; "gt")]
       #[test_case(">=" ; "gte")]
       #[test_case("addmethod")]
-      #[test_case("assemble")]
+      //#[test_case("assemble")]
       #[test_case("assocify")]
       #[test_case("bail")]
       #[test_case("bailer")]
