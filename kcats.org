@@ -2997,8 +2997,9 @@ internally, to keep track of things like the stack, program, lists etc.
           self.0.push(frame);
       }
 
-      pub fn unwind_to_handle(&mut self, handle: &Item) -> (cont::List, bool) {
-          let mut unwound = cont::List::new();
+      pub fn unwind_to_handle(&mut self, handle: &Item) -> (Program, bool) {
+          println!("unwind_to_handle called!");
+          let mut unwound = Program::default();
           let mut found = false;
 
           while let Some(f) = self.0.last_mut() {
@@ -3010,29 +3011,45 @@ internally, to keep track of things like the stack, program, lists etc.
               match &*f.node {
                   ProgramNode::Seq(items) => {
                       let mut local_found = false;
+                      let start_idx = f.next_idx;
                       while f.next_idx < items.len() {
                           let item = &items[f.next_idx];
                           f.next_idx += 1;
                           if item == handle {
                               local_found = true;
                               break;
-                          } else { 
-                              unwound.push_back(item.clone());
                           }
                       }
                       if local_found {
                           found = true;
+                          let end_idx = f.next_idx - 1;
+                          let mut temp = items.clone();
+                          let unwound_items = temp.slice(0..end_idx);
+                          let unwound_frame = Frame {
+                              node: Arc::new(ProgramNode::Seq(unwound_items)),
+                              next_idx: start_idx,
+                          };
+                          unwound.0.push(unwound_frame);
                           break;
-                      } else { 
+                      } else {
+                          let mut unwound_frame = f.clone();
+                          unwound_frame.next_idx = start_idx;
+                          unwound.0.push(unwound_frame);
                           self.0.pop();
                       }
                   }
                   ProgramNode::Recur { .. } => {
+                      unwound.0.push(f.clone());
                       self.0.pop();
                   }
               }
           }
+          unwound.0.reverse();
           (unwound, found)
+      }
+
+      pub fn extend_program(&mut self, other: Program) {
+          self.0.extend(other.0);
       }
 
       pub fn extend(&mut self, snippet: cont::List) {
@@ -7202,6 +7219,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("ceiling", Box::leak(Box::new(f_stack1(ok1(ceiling))))),
           ("compare", Box::leak(Box::new(f_stack2(compare)))),
           ("📏", Box::leak(Box::new(f_stack1(ok1(count))))),
+          ("trace", Box::leak(Box::new(f_stack1(get_trace)))),
           ("dec", Box::leak(Box::new(f_stack1(ok1(dec))))),
           ("decache", Box::leak(Box::new(f_result(read_blob)))),
          // ("decide", Box::leak(Box::new(decide))),
@@ -7664,6 +7682,10 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           j.quoted = true;
           ,*i = Item::Word(Intern::new(j));
       }
+  }
+
+  pub fn get_trace(p: Program) -> Result<coll::List, Error> {
+      Ok(p.stacktrace())
   }
 
   pub fn dip(mut env: Environment) -> Sometime<'static, Environment> {
@@ -8258,14 +8280,14 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let err = match err {
           Item::Error(mut e) => {
               let data = e.data.mutate();
-              let mut unwound: coll::List = data
+              let mut unwound: Program = data
                   .remove(&fit!("unwound"))
                   .unwrap_or_default()
                   .try_fit()
-                  .unwrap_or_else(|_| list!());
+                  .unwrap_or_else(|_| Program::default());
 
               let (new_unwound, found_handle) = env.program.unwind_to_handle(handle);
-              unwound.extend(new_unwound);
+              unwound.extend_program(new_unwound);
 
               if found_handle {
                   // didn't unwind the whole program, handled error
@@ -9779,8 +9801,7 @@ rust project or some other language through FFI.
       #[test_case("verify")]
       fn test_crypto(word: &str) {
           test_lexicon(word, vec![fit!("crypto-builtins")])
-      }
-  }
+      }}
 #+end_src
 *** Top level execution
 We'll define the main module which reads input for the kcats
