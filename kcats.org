@@ -2186,7 +2186,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   (Sized::Set(s), i.map(Item::derive))
               }
               Sized::Program(mut p) => {
-                  let i = p.pop().cloned();
+                  let i = p.0.pop().map(|f| crate::types::Item::Program(Box::new(crate::types::container::program::Program(vec![f]))));
                   (Sized::Program(p), i)
               }
               s => {
@@ -2678,376 +2678,119 @@ internally, to keep track of things like the stack, program, lists etc.
   use crate::types::container::Error;
   use crate::types::container::SimpleTake;
   use crate::types::Item;
-
+  use crate::types::Word;
   use std::sync::Arc;
 
-  #[derive(Clone, Debug)]
-  pub enum ProgramNode {
-      Seq(cont::List),
-      Recur {
-          pred: Arc<ProgramNode>,
-          then: Arc<ProgramNode>,
-          rec1: Arc<ProgramNode>,
-          rec2: Arc<ProgramNode>,
-          self_ref: std::sync::Weak<ProgramNode>,
-      },
+  #[derive(Clone, Debug, PartialEq)]
+  pub enum Op {
+      Push(Item),
+      Call(Word),
+      Execute(Arc<Chunk>),
+      Jump(isize),
+      JumpIfTrue(isize),
+      JumpIfFalse(isize),
+      JumpIfFalseKeepIfTrue(isize),
+      
+      // Loop counters
+      IncLoopCounter(usize),
+      DecLoopCounter(usize),
+      PushLoopCounter,
+      PopLoopCounter,
+      JumpIfLoopCounterZero(usize, isize),
+      
+      Return,
   }
 
-  impl PartialEq for ProgramNode {
-      fn eq(&self, other: &Self) -> bool {
-          match (self, other) {
-              (ProgramNode::Seq(a), ProgramNode::Seq(b)) => a == b,
-              (
-                  ProgramNode::Recur {
-                      pred: p1,
-                      then: t1,
-                      rec1: r1,
-                      rec2: c1,
-                      ..
-                  },
-                  ProgramNode::Recur {
-                      pred: p2,
-                      then: t2,
-                      rec1: r2,
-                      rec2: c2,
-                      ..
-                  },
-              ) => {
-                  Arc::ptr_eq(p1, p2)
-                      && Arc::ptr_eq(t1, t2)
-                      && Arc::ptr_eq(r1, r2)
-                      && Arc::ptr_eq(c1, c2)
-              }
-              _ => false,
-          }
-      }
+  #[derive(Clone, Debug, Default, PartialEq)]
+  pub struct Chunk {
+      pub ops: Vec<Op>,
+      pub source: Option<cont::List>,
   }
 
-  impl Default for ProgramNode {
-      fn default() -> Self {
-          ProgramNode::Seq(cont::List::new())
-      }
-  }
-
-  /// A struct to hold program execution data efficiently
   #[derive(Clone, Debug)]
   pub struct Frame {
-      pub node: Arc<ProgramNode>,
-      pub next_idx: usize,
+      pub chunk: Arc<Chunk>,
+      pub ip: usize,
+      pub loop_counters: Vec<usize>,
   }
 
   impl PartialEq for Frame {
       fn eq(&self, other: &Self) -> bool {
-          Arc::ptr_eq(&self.node, &other.node) && self.next_idx == other.next_idx
+          Arc::ptr_eq(&self.chunk, &other.chunk) && self.ip == other.ip
       }
   }
 
   impl Frame {
       pub fn is_finished(&self) -> bool {
-          match &*self.node {
-              ProgramNode::Seq(snippet) => self.next_idx >= snippet.len(),
-              ProgramNode::Recur { .. } => self.next_idx >= 2, // 0 = evaluate pred, 1 = branch
-          }
+          self.ip >= self.chunk.ops.len()
       }
 
       #[inline(always)]
-      #[allow(clippy::should_implement_trait)]
-      pub fn next(&mut self) -> Option<&Item> {
-          match &*self.node {
-              ProgramNode::Seq(snippet) => {
-                  let i = snippet.get(self.next_idx);
-                  self.next_idx += 1;
-                  i
-              }
-              ProgramNode::Recur { .. } => None, // Handled dynamically in advance_control_flow
-          }
-      }
-
-      pub fn peek(&self) -> Option<&Item> {
+      pub fn next_op(&mut self) -> Option<Op> {
           if self.is_finished() {
               None
           } else {
-              match &*self.node {
-                  ProgramNode::Seq(snippet) => snippet.get(self.next_idx),
-                  ProgramNode::Recur { .. } => None,
-              }
-          }
-      }
-
-      pub fn current(&self) -> Option<&Item> {
-          if self.next_idx == 0 {
-              return None;
-          }
-          match &*self.node {
-              ProgramNode::Seq(snippet) => snippet.get(self.next_idx - 1),
-              ProgramNode::Recur { .. } => None,
-          }
-      }
-
-      pub fn remaining(&mut self) -> cont::List {
-          match &*self.node {
-              ProgramNode::Seq(snippet) => {
-                  let last = snippet.len();
-                  snippet.clone().slice(self.next_idx..last)
-              }
-              ProgramNode::Recur {
-                  pred,
-                  then,
-                  rec1,
-                  rec2,
-                  ..
-              } => {
-                  if self.next_idx == 0 {
-                      let mut true_branch_list = cont::List::new();
-
-                      if let ProgramNode::Seq(s) = &**rec1 {
-                          for item in s.iter() {
-                              true_branch_list.push_back(item.clone());
-                          }
-                      }
-
-                      true_branch_list.push_back(Item::Program(Box::new(Program(vec![Frame {
-                          node: pred.clone(),
-                          next_idx: 0,
-                      }]))));
-                      true_branch_list.push_back(Item::Program(Box::new(Program(vec![Frame {
-                          node: rec1.clone(),
-                          next_idx: 0,
-                      }]))));
-                      true_branch_list.push_back(Item::Program(Box::new(Program(vec![Frame {
-                          node: then.clone(),
-                          next_idx: 0,
-                      }]))));
-                      true_branch_list.push_back(Item::Program(Box::new(Program(vec![Frame {
-                          node: rec2.clone(),
-                          next_idx: 0,
-                      }]))));
-                      true_branch_list.push_back(crate::fit!("🪆"));
-
-                      if let ProgramNode::Seq(s) = &**rec2 {
-                          for item in s.iter() {
-                              true_branch_list.push_back(item.clone());
-                          }
-                      }
-
-                      let mut l = cont::List::new();
-
-                      if let ProgramNode::Seq(s) = &**pred {
-                          for item in s.iter() {
-                              l.push_back(item.clone());
-                          }
-                      } else {
-                          l.push_back(Item::Program(Box::new(Program(vec![Frame {
-                              node: pred.clone(),
-                              next_idx: 0,
-                          }]))));
-                      }
-
-                      l.push_back(Item::Program(Box::new(Program(vec![Frame {
-                          node: std::sync::Arc::new(ProgramNode::Seq(true_branch_list)),
-                          next_idx: 0,
-                      }]))));
-                      l.push_back(Item::Program(Box::new(Program(vec![Frame {
-                          node: then.clone(),
-                          next_idx: 0,
-                      }]))));
-                      l.push_back(crate::fit!("⚖️"));
-                      l
-                  } else {
-                      cont::List::new()
-                  }
-              }
+              let op = self.chunk.ops[self.ip].clone();
+              self.ip += 1;
+              Some(op)
           }
       }
   }
 
   #[derive(Clone, PartialEq, Default, Debug)]
-  pub struct Program(Vec<Frame>);
+  pub struct Program(pub Vec<Frame>);
 
   impl Program {
-      fn clean(&mut self) {
+      pub fn clean(&mut self) {
           while self.0.last().map(|f| f.is_finished()).unwrap_or(false) {
               self.0.pop();
-              //println!("dropping frame: {:?}", x);
           }
       }
-      /// advance_control_flow handles the internal state progression for dynamic
-      /// tree nodes (like Recur). It returns true if it performed an action
-      /// and should be called again.
-      pub fn advance_control_flow(
-          &mut self,
-          stack: &mut crate::types::container::stack::Stack,
-      ) -> bool {
-          self.clean();
-          let Some(frame) = self.0.last_mut() else {
-              return false;
-          };
-
-          if let ProgramNode::Recur {
-              pred,
-              then,
-              rec1,
-              rec2,
-              self_ref,
-          } = &*frame.node
-          {
-              if frame.next_idx == 0 {
-                  // Phase 0: Push pred onto the execution stack
-                  frame.next_idx = 1;
-                  let pred_clone = pred.clone();
-                  self.0.push(Frame {
-                      node: pred_clone,
-                      next_idx: 0,
-                  });
-                  return true;
-              } else if frame.next_idx == 1 {
-                  // Phase 1: Check result from data stack
-                  frame.next_idx = 2; // mark finished
-
-                  let is_true = stack
-                      .front()
-                      .map(|i| crate::axiom::is_truthy(i))
-                      .unwrap_or(false);
-                  if !is_true {
-                      stack.pop_front();
-                  }
-
-                  if is_true {
-                      let rec2_clone = rec2.clone();
-                      let self_clone = self_ref.upgrade().expect("self_ref should be alive");
-                      let rec1_clone = rec1.clone();
-                      let mut is_execute_first = false;
-                      if let ProgramNode::Seq(s) = &*rec2_clone {
-                          if !s.is_empty() {
-                              if let Some(crate::types::Item::Word(w)) = s.front() {
-                                  if w.as_ref().data.as_str() == "▶️" {
-                                      is_execute_first = true;
-                                  }
-                              }
-                          }
-                      }
-
-                      // We can just pop the finished frame now
-                      self.0.pop();
-
-                      if is_execute_first {
-                          let mut rest_node = None;
-                          if let ProgramNode::Seq(s) = &*rec2_clone {
-                              if s.len() > 1 {
-                                  let mut s_clone = s.clone();
-                                  s_clone.pop_front();
-                                  rest_node = Some(std::sync::Arc::new(ProgramNode::Seq(s_clone)));
-                              }
-                          }
-                          if let Some(rn) = rest_node {
-                              self.0.push(Frame {
-                                  node: rn,
-                                  next_idx: 0,
-                              });
-                          }
-                          self.0.push(Frame {
-                              node: self_clone,
-                              next_idx: 0,
-                          });
-                          self.0.push(Frame {
-                              node: rec1_clone,
-                              next_idx: 0,
-                          });
-                      } else {
-                          let mut l = crate::types::coll::List::new();
-                          let mut prog = Program::default();
-                          prog.push_frame(Frame {
-                              node: self_clone,
-                              next_idx: 0,
-                          });
-                          l.push_back(crate::types::Item::Program(Box::new(prog)));
-                          let push_recur_node = std::sync::Arc::new(ProgramNode::Seq(l));
-
-                          self.0.push(Frame {
-                              node: rec2_clone,
-                              next_idx: 0,
-                          });
-                          self.0.push(Frame {
-                              node: push_recur_node,
-                              next_idx: 0,
-                          });
-                          self.0.push(Frame {
-                              node: rec1_clone,
-                              next_idx: 0,
-                          });
-                      }
-                  } else {
-                      let then_clone = then.clone();
-                      self.0.pop();
-                      self.0.push(Frame {
-                          node: then_clone,
-                          next_idx: 0,
-                      });
-                  }
-                  return true;
-              }
-          }
-          false
-      }
-
-      ///return a reference to the current instruction and advance to
-      /// next
-      #[inline(always)]
-      pub fn pop(&mut self) -> Option<&Item> {
-          //println!("program: {:?}", self.0);
-          self.clean();
-          // Next instruction is ready to go
-          self.0.last_mut().and_then(|f| f.next())
-      }
-
-      ///return a reference to the next instruction
-      pub fn peek(&self) -> Option<&Item> {
-          // might be in unclean state, and we don't want to mutate here
-          // so we search for the next instruction without cleaning first
-          if self.0.is_empty() {
-              return None;
-          }
-          let mut frameindex = self.0.len() - 1;
-          loop {
-              if let Some(f) = self.0.get(frameindex) {
-                  //println!("Peeking frame: {:?}", f);
-                  if f.is_finished() {
-                      //println!("Frame is finished");
-                      if frameindex == 0 {
-                          return None;
-                      } else {
-                          frameindex -= 1
-                      };
-                  } else {
-                      //println!("Frame not finished");
-                      return f.peek();
-                  }
-              } else {
-                  return None;
-              }
-          }
-      }
-
+      
       pub fn is_empty(&self) -> bool {
           self.0.is_empty()
       }
-
+      
       pub fn prepend(&mut self, snippet: cont::List) {
           if !snippet.is_empty() {
+              let chunk = crate::compile::compile(&snippet);
               self.0.push(Frame {
-                  node: Arc::new(ProgramNode::Seq(snippet)),
-                  next_idx: 0,
-              })
+                  chunk: Arc::new(chunk),
+                  ip: 0,
+                  loop_counters: vec![],
+              });
           }
       }
-
+      
       pub fn prepend_program(&mut self, mut program: Program) {
           program.clean();
           self.0.extend(program.0);
       }
-
+      
       pub fn push_frame(&mut self, frame: Frame) {
           self.0.push(frame);
+      }
+      
+      pub fn pop_frame(&mut self) {
+          self.0.pop();
+      }
+      
+      pub fn extend_program(&mut self, other: Program) {
+          self.0.extend(other.0);
+      }
+      
+      pub fn extend(&mut self, snippet: cont::List) {
+          if !snippet.is_empty() {
+              let chunk = crate::compile::compile(&snippet);
+              self.0.insert(
+                  0,
+                  Frame {
+                      chunk: Arc::new(chunk),
+                      ip: 0,
+                      loop_counters: vec![],
+                  },
+              )
+          }
       }
 
       pub fn unwind_to_handle(&mut self, handle: &Item) -> (Program, bool) {
@@ -3060,105 +2803,64 @@ internally, to keep track of things like the stack, program, lists etc.
                   continue;
               }
 
-              match &*f.node {
-                  ProgramNode::Seq(items) => {
-                      let mut local_found = false;
-                      let start_idx = f.next_idx;
-                      while f.next_idx < items.len() {
-                          let item = &items[f.next_idx];
-                          f.next_idx += 1;
-                          if item == handle {
-                              local_found = true;
-                              break;
-                          }
-                      }
-                      if local_found {
-                          found = true;
-                          let end_idx = f.next_idx - 1;
-                          let mut temp = items.clone();
-                          let unwound_items = temp.slice(0..end_idx);
-                          let unwound_frame = Frame {
-                              node: Arc::new(ProgramNode::Seq(unwound_items)),
-                              next_idx: start_idx,
-                          };
-                          unwound.0.push(unwound_frame);
-                          break;
-                      } else {
-                          let mut unwound_frame = f.clone();
-                          unwound_frame.next_idx = start_idx;
-                          unwound.0.push(unwound_frame);
-                          self.0.pop();
-                      }
+              let mut local_found = false;
+              let start_idx = f.ip;
+              while f.ip < f.chunk.ops.len() {
+                  let op = &f.chunk.ops[f.ip];
+                  f.ip += 1;
+                  match op {
+                      Op::Call(w) if &Item::Word(*w) == handle => { local_found = true; break; }
+                      Op::Push(i) if i == handle => { local_found = true; break; }
+                      _ => {}
                   }
-                  ProgramNode::Recur { .. } => {
-                      unwound.0.push(f.clone());
-                      self.0.pop();
-                  }
+              }
+              if local_found {
+                  found = true;
+                  let end_idx = f.ip - 1;
+                  let unwound_ops = f.chunk.ops[start_idx..end_idx].to_vec();
+                  let unwound_frame = Frame {
+                      chunk: Arc::new(Chunk { ops: unwound_ops, source: None }),
+                      ip: 0,
+                      loop_counters: f.loop_counters.clone(),
+                  };
+                  unwound.0.push(unwound_frame);
+                  break;
+              } else {
+                  let mut unwound_frame = f.clone();
+                  unwound_frame.ip = start_idx;
+                  unwound.0.push(unwound_frame);
+                  self.0.pop();
               }
           }
           unwound.0.reverse();
           (unwound, found)
       }
 
-      pub fn extend_program(&mut self, other: Program) {
-          self.0.extend(other.0);
+      pub fn count(&self) -> usize {
+          self.0.iter().fold(0, |acc, f| acc + (f.chunk.ops.len().saturating_sub(f.ip)))
       }
-
-      pub fn extend(&mut self, snippet: cont::List) {
-          if !snippet.is_empty() {
-              self.0.insert(
-                  0,
-                  Frame {
-                      node: Arc::new(ProgramNode::Seq(snippet)),
-                      next_idx: 0,
-                  },
-              )
-          }
-      }
-
+      
       pub fn stacktrace(&self) -> cont::List {
-          let mut s = self
-              .0
-              .iter()
-              .rev()
-              .filter_map(|frame| frame.current().cloned())
-              .collect::<cont::List>();
-
-          if let Some(first) = s.get(0) {
-              let is_empty = first.is_empty()
-                  || matches!(first, crate::types::Item::Nothing)
-                  || match first {
-                      crate::types::Item::Program(p) => p.count() == 0,
-                      _ => false,
-                  };
-              if is_empty {
-                  s = s.slice(1..s.len());
+          // Try to construct a stacktrace based on recent calls or ops
+          let mut s = cont::List::new();
+          for f in self.0.iter().rev() {
+              if f.ip > 0 && f.ip <= f.chunk.ops.len() {
+                  let last_op = &f.chunk.ops[f.ip - 1];
+                  if let Op::Call(w) = last_op {
+                      s.push_back(Item::Word(*w));
+                  }
               }
           }
           s
-      }
-
-      pub fn count(&self) -> usize {
-          self.0.iter().fold(0, |acc, f| match &*f.node {
-              ProgramNode::Seq(snippet) => acc + (snippet.len() - f.next_idx),
-              ProgramNode::Recur { .. } => acc + (2 - f.next_idx),
-          })
-      }
-
-      #[inline(always)]
-      pub fn last(&self) -> Option<&Item> {
-          self.0.first().and_then(|f| match &*f.node {
-              ProgramNode::Seq(snippet) => snippet.last(),
-              ProgramNode::Recur { .. } => None,
-          })
       }
   }
 
   impl Derive<cont::List> for Program {
       fn derive(s: cont::List) -> Program {
           Program(vec![Frame {
-              node: Arc::new(ProgramNode::Seq(s)),
-              next_idx: 0,
+              chunk: Arc::new(crate::compile::compile(&s)),
+              ip: 0,
+              loop_counters: vec![],
           }])
       }
   }
@@ -3167,7 +2869,7 @@ internally, to keep track of things like the stack, program, lists etc.
       fn derive(mut p: Program) -> cont::List {
           let mut r = cont::List::new();
           for f in p.0.iter_mut().rev() {
-              r.append(f.remaining())
+              r.append(crate::compile::decompile(&f.chunk))
           }
           r
       }
@@ -3192,7 +2894,8 @@ internally, to keep track of things like the stack, program, lists etc.
   impl SimpleTake for Program {
       type Item = Item;
       fn take_simple(&mut self) -> Option<Self::Item> {
-          self.pop().cloned()
+          // Can't easily take an item from a program now.
+          None
       }
   }
 
@@ -3201,40 +2904,18 @@ internally, to keep track of things like the stack, program, lists etc.
       use super::*;
       use crate::fit;
       use crate::types::*;
-
-      #[test]
-      fn test_simple() {
-          let mut p = Program(vec![Frame {
-              node: Arc::new(ProgramNode::Seq(list!["foo", "bar"])),
-              next_idx: 0,
-          }]);
-
-          assert_eq!(p.pop().cloned(), Some(Item::Word(fit!("foo"))));
-          assert_eq!(p.peek().cloned(), Some(Item::Word(fit!("bar"))));
-      }
+      use crate::list;
 
       #[test]
       fn test_layers() {
           let mut p = Program(vec![
               Frame {
-                  node: Arc::new(ProgramNode::Seq(list!["foo", "bar", "baz"])),
-                  next_idx: 1,
-              },
-              Frame {
-                  node: Arc::new(ProgramNode::Seq(list!["quuz", "blork", "stoon"])),
-                  next_idx: 2,
+                  chunk: Arc::new(crate::compile::compile(&list!["foo", "bar", "baz"])),
+                  ip: 1,
+                  loop_counters: vec![],
               },
           ]);
-          let q = p.clone();
           assert_eq!(p.count(), 3);
-          assert_eq!(p.pop().cloned(), Some(Item::Word(fit!("stoon"))));
-          assert_eq!(p.count(), 2);
-          assert_eq!(p.peek().cloned(), Some(Item::Word(fit!("bar"))));
-          assert_eq!(p.pop().cloned(), Some(Item::Word(fit!("bar"))));
-          assert_eq!(p.0.len(), 1);
-
-          // test conversion to List
-          assert_eq!(cont::List::derive(q), list!["stoon", "bar", "baz"])
       }
   }
 #+end_src
@@ -3797,7 +3478,7 @@ internally, to keep track of things like the stack, program, lists etc.
                       if w == "definition" {
                           let l = coll::List::try_derive(v);
                           if let Ok(l) = l {
-                              de.definition = dict::Executable::Derived(std::sync::Arc::new(crate::types::container::program::ProgramNode::Seq(l)));
+                              de.definition = dict::Executable::Derived(std::sync::Arc::new(crate::compile::compile(&l)));
                               // TODO: return the old def
                           }
                       } else if w == "examples" {
@@ -4638,10 +4319,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   "definition" => Some(match self.definition.clone() {
                       Executable::Axiom(a) => a.clone().fit(),
                       Executable::Derived(d) => {
-                          match &*d {
-                              crate::types::container::program::ProgramNode::Seq(s) => s.clone().fit(),
-                              _ => panic!("Expected Seq for Derived definition"),
-                          }
+                          crate::compile::decompile(&d).fit()
                       },
                   }),
                   "namespace" => Some(self.namespace.fit()),
@@ -5113,7 +4791,7 @@ internally, to keep track of things like the stack, program, lists etc.
       /// modifies the environment.
       Axiom(&'static axiom::Builtin),
       /// A definition in terms of other [Word]s - a kcats program
-      Derived(Arc<crate::types::container::program::ProgramNode>),
+      Derived(Arc<crate::types::container::program::Chunk>),
   }
 
   // dictionary words are equal if they have the same function reference,
@@ -5134,9 +4812,8 @@ internally, to keep track of things like the stack, program, lists etc.
               Executable::Axiom(a) => f.write_str(format!("builtin_{}", a.name).as_str()),
               Executable::Derived(d) => {
                   let mut ds = f.debug_list();
-                  if let crate::types::container::program::ProgramNode::Seq(s) = &**d {
-                      ds.entries(s.iter());
-                  }
+                  let list = crate::compile::decompile(&d);
+                  ds.entries(list.iter());
                   ds.finish()
               }
           }
@@ -5151,10 +4828,7 @@ internally, to keep track of things like the stack, program, lists etc.
           let mut v: Vec<(assoc::KeyItem, Item)> = vec![(fit!("definition"), {
               match self.definition {
                   Executable::Derived(l) => {
-                      match &*l {
-                          crate::types::container::program::ProgramNode::Seq(s) => s.clone().fit(),
-                          _ => panic!("Expected Seq for Derived definition"),
-                      }
+                      crate::compile::decompile(&l).fit()
                   },
                   Executable::Axiom(a) => a.clone().fit(),
               }
@@ -5221,7 +4895,7 @@ internally, to keep track of things like the stack, program, lists etc.
           }
           Ok(Entry {
               examples,
-              definition: definition.unwrap_or(Executable::Derived(Arc::new(crate::types::container::program::ProgramNode::Seq(coll::List::default())))),
+              definition: definition.unwrap_or_else(|| Executable::Derived(Arc::new(crate::compile::compile(&coll::List::default())))),
               spec,
               namespace,
               doc,
@@ -5265,7 +4939,7 @@ internally, to keep track of things like the stack, program, lists etc.
 
   impl TryDerive<Item> for Executable {
       fn try_derive(i: Item) -> Result<Self, Error> {
-          coll::List::try_derive(i).map(|l| Executable::Derived(Arc::new(crate::types::container::program::ProgramNode::Seq(l))))
+          coll::List::try_derive(i).map(|l| Executable::Derived(Arc::new(crate::compile::compile(&l))))
       }
   }
 
@@ -5289,12 +4963,7 @@ internally, to keep track of things like the stack, program, lists etc.
           a.insert(fit!("namespace"), d.namespace.as_ref().clone().fit());
 
           if let Executable::Derived(d) = d.definition {
-              match &*d {
-                  crate::types::container::program::ProgramNode::Seq(s) => {
-                      a.insert(fit!("definition"), s.clone().fit());
-                  },
-                  _ => panic!("Expected Seq for Derived definition"),
-              }
+              a.insert(fit!("definition"), crate::compile::decompile(&d).fit());
           }
 
           assoc::Associative::Assoc(assoc)
@@ -5417,12 +5086,6 @@ internally, to keep track of things like the stack, program, lists etc.
       /// empty.
       pub fn pop(&mut self) -> Item {
           self.stack.pop_front().unwrap()
-      }
-
-      /// Advances the program, returning the next [Item]. Panics if the
-      /// program is empty.
-      pub fn pop_prog(&mut self) -> Item {
-          self.program.pop().cloned().unwrap()
       }
 
       /// Returns a reference to the top stack [Item], or [None] if it's
@@ -5613,14 +5276,14 @@ internally, to keep track of things like the stack, program, lists etc.
               //println!("starting dictionary: {:?}", env.dictionary.modules);
               //println!("Dict has {} words", env.dictionary.words.len());
               let mut env = [
-                  fit!("errors"),
-                  fit!("encode"),
-                  fit!("time"), // good candidate for lib
-                  fit!("pipes"),
-                  fit!("methods"),
-                  fit!("generators"),
-                  fit!("debug"),
-                  fit!("crypto-builtins"),
+                  // fit!("errors"),
+                  // fit!("encode"),
+                  // fit!("time"), // good candidate for lib
+                  // fit!("pipes"),
+                  // fit!("methods"),
+                  // fit!("generators"),
+                  // fit!("debug"),
+                  // fit!("crypto-builtins"),
                   // //"more-generators",
                   //"database",
               ]
@@ -6644,7 +6307,7 @@ example, in order to read/write to/from disk).
               None => break,
           }
       }
-      env.pop_prog();
+
       let remaining: String = parser.iter.collect();
       env.push(Item::derive(remaining));
       env.push(Item::derive(obj_buffer));
@@ -6678,7 +6341,7 @@ example, in order to read/write to/from disk).
           obj_buffer = buffer.try_fit().map_err(Error::derive)?;
       }
       let (parsed, remaining) = split_at_utf8_boundary(&state);
-      env.pop_prog();
+
       obj_buffer.push_back(parsed.fit());
       env.push(Item::derive(remaining));
       env.push(Item::derive(obj_buffer));
@@ -6942,6 +6605,150 @@ example, in order to read/write to/from disk).
       }
   }
 #+end_src
+*** Compiler
+#+begin_src rust :tangle src/compile.rs :mkdirp yes
+  use crate::types::container::program::{Chunk, Op};
+  use crate::types::container as cont;
+  use crate::types::Item;
+  use std::sync::Arc;
+
+  pub fn compile(list: &cont::List) -> Chunk {
+      let mut ops = Vec::new();
+      for item in list.iter() {
+          match item {
+              Item::Word(w) => ops.push(Op::Call(w.clone())),
+              _ => ops.push(Op::Push(item.clone())),
+          }
+      }
+      ops.push(Op::Return);
+      Chunk { ops, source: Some(list.clone()) }
+  }
+
+  pub fn decompile(chunk: &Chunk) -> cont::List {
+      if let Some(ref source) = chunk.source {
+          return source.clone();
+      }
+      let mut list = cont::List::new();
+      for op in &chunk.ops {
+          match op {
+              Op::Push(item) => list.push_back(item.clone()),
+              Op::Call(w) => list.push_back(Item::Word(w.clone())),
+              _ => {}
+          }
+      }
+      list
+  }
+
+  pub fn compile_recur(
+      pred: &cont::List,
+      true_branch: &cont::List,
+      false_branch: &cont::List,
+      combinator: &cont::List,
+  ) -> Chunk {
+      let mut is_execute_first = false;
+      let mut comb_rest = combinator.clone();
+      if let Some(Item::Word(w)) = comb_rest.front() {
+          if w.as_ref().data.as_str() == "▶️" {
+              is_execute_first = true;
+              comb_rest.pop_front();
+          }
+      }
+
+      let mut ops = Vec::new();
+      
+      // Non-TCO (push program back to stack)
+      if !is_execute_first {
+          let mut pred_chunk = compile(pred);
+          pred_chunk.ops.pop();
+          ops.extend(pred_chunk.ops);
+          
+          let jump_base_idx = ops.len();
+          ops.push(Op::JumpIfFalseKeepIfTrue(0)); // placeholder
+          
+          let mut true_chunk = compile(true_branch);
+          true_chunk.ops.pop();
+          ops.extend(true_chunk.ops);
+          
+          // Push recur node
+          // We need the full structure here. 
+          // We'll construct a Chunk with the full recur structure dynamically via execute/call.
+          // Wait, if we push a Program, that Program contains a Frame with a newly compiled Chunk of this whole recur.
+          // Or we can just dynamically reconstruct the list for the old way? 
+          // Yes, we can push the source lists!
+          let mut list = cont::List::new();
+          list.push_back(crate::types::Item::List(Box::new(pred.clone())));
+          list.push_back(crate::types::Item::List(Box::new(true_branch.clone())));
+          list.push_back(crate::types::Item::List(Box::new(false_branch.clone())));
+          list.push_back(crate::types::Item::List(Box::new(combinator.clone())));
+          list.push_back(crate::fit!("🪆"));
+          let mut prog = crate::types::container::program::Program::default();
+          prog.prepend(list);
+          ops.push(Op::Push(Item::Program(Box::new(prog))));
+          
+          let mut comb_chunk = compile(combinator);
+          comb_chunk.ops.pop();
+          ops.extend(comb_chunk.ops);
+          
+          ops.push(Op::Return);
+          
+          let base_case_idx = ops.len();
+          ops[jump_base_idx] = Op::JumpIfFalseKeepIfTrue((base_case_idx as isize) - (jump_base_idx as isize) - 1);
+          
+          let mut then_chunk = compile(false_branch);
+          then_chunk.ops.pop();
+          ops.extend(then_chunk.ops);
+          ops.push(Op::Return);
+          
+          return Chunk { ops, source: None };
+      }
+
+      // TCO or Flattened Loop
+      ops.push(Op::PushLoopCounter);
+      let loop_start = ops.len();
+
+      let mut pred_chunk = compile(pred);
+      pred_chunk.ops.pop(); // remove Return
+      ops.extend(pred_chunk.ops);
+
+      let jump_base_idx = ops.len();
+      ops.push(Op::JumpIfFalseKeepIfTrue(0)); // placeholder
+
+      let mut true_chunk = compile(true_branch);
+      true_chunk.ops.pop();
+      ops.extend(true_chunk.ops);
+
+      ops.push(Op::IncLoopCounter(0)); // index 0 for current loop
+      let jump_start_offset = loop_start as isize - (ops.len() as isize + 1);
+      ops.push(Op::Jump(jump_start_offset));
+
+      let base_case_idx = ops.len();
+      ops[jump_base_idx] = Op::JumpIfFalseKeepIfTrue((base_case_idx as isize) - (jump_base_idx as isize) - 1);
+
+      let mut then_chunk = compile(false_branch);
+      then_chunk.ops.pop();
+      ops.extend(then_chunk.ops);
+
+      let unwind_start = ops.len();
+      let jump_unwind_end_idx = ops.len();
+      ops.push(Op::JumpIfLoopCounterZero(0, 0)); // placeholder
+
+      let mut comb_chunk = compile(&comb_rest);
+      comb_chunk.ops.pop();
+      ops.extend(comb_chunk.ops);
+
+      ops.push(Op::DecLoopCounter(0));
+      let jump_unwind_start_offset = unwind_start as isize - (ops.len() as isize + 1);
+      ops.push(Op::Jump(jump_unwind_start_offset));
+
+      let unwind_end_idx = ops.len();
+      ops[jump_unwind_end_idx] = Op::JumpIfLoopCounterZero(0, (unwind_end_idx as isize) - (jump_unwind_end_idx as isize) - 1);
+
+      ops.push(Op::PopLoopCounter);
+      ops.push(Op::Return);
+
+      Chunk { ops, source: None }
+  }
+#+end_src
 *** Builtin words
 We'll define some words as axioms (not in terms of other words, only defined in Rust). 
 #+begin_src rust :tangle src/axiom.rs :mkdirp yes
@@ -6955,7 +6762,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   use crate::derivation::*;
   #[cfg(feature = "database")]
   use crate::types::container::pipe::db;
-  use crate::types::container::program::{self, Program, ProgramNode};
+  use crate::types::container::program::{self, Program, Frame};
   use crate::types::container::{
       self as coll, associative as assoc, dictionary as dict, environment::Environment, error::Error,
       Container, Count, Join, Mutey, Ordered, Take,
@@ -7015,7 +6822,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       let res = f(i);
                       match res {
                           Ok(r) => {
-                              env.pop_prog();
+                              
                               //env.pop();
                               env.push(r);
                           }
@@ -7067,7 +6874,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   let res = f(y, x);
                   match res {
                       Ok(r) => {
-                          env.pop_prog();
+                          
                           env.stack.replace2(r.fit());
                       }
                       Err(e) => {
@@ -7123,7 +6930,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   let res = f(z, y, x);
                   match res {
                       Ok(r) => {
-                          env.pop_prog();
+                          
                           env.stack.replace3(r.fit());
                       }
                       Err(e) => {
@@ -7154,14 +6961,14 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           match f(x, y) {
               Sometime::Now(r) => {
                   if r.is_ok() {
-                      env.pop_prog();
+                      
                   }
                   env.push(r);
                   Sometime::Now(env)
               }
               Sometime::Future(r) => Sometime::Future(Box::pin(r.map(|r| {
                   if r.is_ok() {
-                      env.pop_prog();
+                      
                   }
                   env.push(r);
                   env
@@ -7531,14 +7338,14 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               let r = p.put(i);
               match r {
                   Sometime::Now(p) => {
-                      env.pop_prog();
+                      
                       env.push(Item::derive(p));
                       Sometime::Now(env)
                   }
                   Sometime::Future(fu) => Sometime::Future(Box::pin(fu.map(|f| {
                       match f {
                           Ok(p) => {
-                              env.pop_prog();
+                              
                               env.push(Item::derive(p))
                           }
                           Err(e) => env.push(e),
@@ -7557,7 +7364,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn clone(mut env: Environment) -> Sometime<'static, Environment> {
       let clone = env.tos().expect("stack spec guarantees presence").clone();
-      env.pop_prog();
+      
       env.push(clone);
       env.fit()
   }
@@ -7567,38 +7374,38 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       env.fit()
   }
 
-  pub fn swap(mut env: Environment) -> Sometime<'static, Environment> {
-      env.pop_prog();
+  pub fn swap(env: Environment) -> Sometime<'static, Environment> {
+      
       swap2(env, 0)
   }
 
-  pub fn swapdown(mut env: Environment) -> Sometime<'static, Environment> {
-      env.pop_prog();
+  pub fn swapdown(env: Environment) -> Sometime<'static, Environment> {
+      
       swap2(env, 1)
   }
 
-  pub fn swapdeep(mut env: Environment) -> Sometime<'static, Environment> {
-      env.pop_prog();
+  pub fn swapdeep(env: Environment) -> Sometime<'static, Environment> {
+      
       swap2(env, 2)
   }
 
   pub fn sink(mut env: Environment) -> Sometime<'static, Environment> {
       env.stack.swap(0, 2);
       env.stack.swap(0, 1);
-      env.pop_prog();
+      
       env.fit()
   }
 
   pub fn float(mut env: Environment) -> Sometime<'static, Environment> {
       env.stack.swap(0, 2);
       env.stack.swap(1, 2);
-      env.pop_prog();
+      
       env.fit()
   }
 
   pub fn drop(mut env: Environment) -> Sometime<'static, Environment> {
       env.pop();
-      env.pop_prog();
+      
       env.fit()
   }
 
@@ -7608,7 +7415,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           let j = env.stack.get(1).expect("stack spec guarantees presence");
           i == j
       };
-      env.pop_prog();
+      
       env.stack.replace2(is_eq.fit());
       env.fit()
   }
@@ -7682,7 +7489,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       } else {
           match Program::try_derive(i) {
               Ok(program) => {
-                  env.pop_prog();
+                  
                   env.program.prepend_program(program);
               }
               Err(e) => {
@@ -7695,7 +7502,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
   pub fn wrap(mut env: Environment) -> Sometime<'static, Environment> {
       let item = env.pop();
-      env.pop_prog();
+      
       env.push(list!(item));
       env.fit()
   }
@@ -7704,7 +7511,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       //println!("Unwrap: {:?} {:?}", env.stack, env.program.stacktrace());
       match coll::List::try_derive(env.pop()) {
           Ok(l) => {
-              env.pop_prog();
+              
               for item in l.iter().cloned() {
                   env.push(item);
               }
@@ -7735,7 +7542,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       match Program::try_derive(env.pop()) {
           Ok(program) => {
               let mut item = env.pop();
-              env.pop_prog();
+              
               dip_quote(&mut item);
               //println!("Dip item: {:?}", item);
               env.program.prepend(vector![item]);
@@ -7752,7 +7559,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           Ok(program) => {
               let mut item1 = env.pop();
               let mut item2 = env.pop();
-              env.program.pop();
+              env.program.0.pop();
               dip_quote(&mut item1);
               dip_quote(&mut item2);
               env.program.prepend(vector![item2, item1]);
@@ -7770,7 +7577,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           i: Result<Option<Item>, Error>,
           c: coll::Dispenser,
       ) -> Environment {
-          env.pop_prog();
+          
           env.push(c);
           env.push(coll::result_to_option(i).unwrap_or_default());
           env
@@ -7798,7 +7605,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       match <coll::Sized as TryDerive<_>>::try_derive(env.pop()) {
           Ok(it) => {
               let (c, i) = it.pop();
-              env.pop_prog();
+              
               env.push(c);
               env.push(i.unwrap_or_default());
           }
@@ -7819,7 +7626,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           Program::try_derive(env.pop()),
       ) {
           (Ok(false_branch), Ok(true_branch)) => {
-              env.pop_prog();
+              
               //env.pop();
               //env.pop();
               let b = env.tos().expect("stack spec guarantees presence");
@@ -7863,7 +7670,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               env.push(litem);
           } else {
               // if the container is empty, just pop off 'step' and we're done
-              env.pop_prog();
+              
           }
           env
       }
@@ -7907,13 +7714,13 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let tmp = env.stack.to_list();
       env.stack = crate::types::container::stack::StackData::from_list(l);
       let l = tmp;
-      env.pop_prog();
+      
       env.push(l);
       env.fit()
   }
 
   pub fn snapshot(mut env: Environment) -> Sometime<'static, Environment> {
-      env.pop_prog();
+      
       env.push(env.stack.to_list());
       env.fit()
   }
@@ -8184,58 +7991,47 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   /// Inner function of the interpreter, each call to this function
   /// advances the [Environment] one step of execution.
   pub fn eval_step(mut env: Environment) -> Sometime<'static, Environment> {
-      //println!("{:?}", env.stack);
-      //println!("Dictionary size: {}", env.dictionary.len());
-      //println!("Program: {:?}", env.program);
+      env.program.clean();
+      let op = env.program.0.last_mut().and_then(|f| f.next_op());
+      if let Some(o) = &op { println!("OP: {:?}, STACK: {:?}", o, env.stack); }
 
-      while env.program.advance_control_flow(&mut env.stack) {}
-
-      let next_item = env.program.peek().cloned();
-
-      if let Some(val) = next_item {
-          match val {
-              Item::Word(word) => {
+      if let Some(op) = op {
+          match op {
+              crate::types::container::program::Op::Push(item) => {
+                  env.push(item);
+                  env.fit()
+              }
+              crate::types::container::program::Op::Call(word) => {
                   if word.quoted {
-                      // word was quoted (see axiom::dip), just push onto stack
-                      // and remove the quotedness
                       let mut w = word.as_ref().clone();
-                      env.pop_prog();
-
                       w.quoted = false;
                       env.push(w);
                       env.fit()
                   } else {
                       let definition = {
                           if word.namespace.is_some() {
-                              // namespace specified, look up in wider dictionary
                               env.dictionary.words.get(&word)
                           } else {
                               env.dictionary.lingo.get(&word)
                           }
                       };
                       if let Some(dfn) = definition {
-                          {
-                              if let Some(spec) = &dfn.spec {
-                                  //println!("Checking spec for {:?}: {:?}", word, spec.0);
-                                  if let Err(e) = env.check_input_spec(&spec.0) {
-                                      env.push_err(e);
-                                      return env.fit();
-                                  }
-                              } else {
-                                  //  println!("No spec for {}!", word);
+                          if let Some(spec) = &dfn.spec {
+                              if let Err(e) = env.check_input_spec(&spec.0) {
+                                  env.push_err(e);
+                                  return env.fit();
                               }
+                          }
 
-                              match &dfn.definition {
-                                  dict::Executable::Axiom(a) => (*a.f)(env),
-                                  dict::Executable::Derived(d) => {
-                                      env.program.pop();
-                                      env.program.push_frame(crate::types::container::program::Frame {
-                                          node: d.clone(),
-                                          next_idx: 0,
-                                          
-                                      });
-                                      env.fit()
-                                  }
+                          match &dfn.definition {
+                              dict::Executable::Axiom(a) => (*a.f)(env),
+                              dict::Executable::Derived(d) => {
+                                  env.program.push_frame(crate::types::container::program::Frame {
+                                      chunk: d.clone(),
+                                      ip: 0,
+                                      loop_counters: vec![],
+                                  });
+                                  env.fit()
                               }
                           }
                       } else {
@@ -8244,10 +8040,69 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       }
                   }
               }
-              _ => {
-                  // not a word, just push onto stack
-                  let i = env.pop_prog();
-                  env.push(i);
+              crate::types::container::program::Op::Execute(chunk) => {
+                  env.program.push_frame(crate::types::container::program::Frame {
+                      chunk,
+                      ip: 0,
+                      loop_counters: vec![],
+                  });
+                  env.fit()
+              }
+              crate::types::container::program::Op::Jump(offset) => {
+                  let frame = env.program.0.last_mut().unwrap();
+                  frame.ip = (frame.ip as isize + offset) as usize;
+                  env.fit()
+              }
+              crate::types::container::program::Op::JumpIfFalse(offset) => {
+                  let item = env.pop();
+                  if !is_truthy(&item) {
+                      let frame = env.program.0.last_mut().unwrap();
+                      frame.ip = (frame.ip as isize + offset) as usize;
+                  }
+                  env.fit()
+              }
+              crate::types::container::program::Op::JumpIfFalseKeepIfTrue(offset) => {
+                  let is_true = is_truthy(env.stack.front().unwrap_or(&crate::types::Item::List(Box::new(crate::types::container::List::new()))));
+                  if !is_true {
+                      env.pop();
+                      let frame = env.program.0.last_mut().unwrap();
+                      frame.ip = (frame.ip as isize + offset) as usize;
+                  }
+                  env.fit()
+              }
+              crate::types::container::program::Op::JumpIfTrue(offset) => {
+                  let item = env.pop();
+                  if is_truthy(&item) {
+                      let frame = env.program.0.last_mut().unwrap();
+                      frame.ip = (frame.ip as isize + offset) as usize;
+                  }
+                  env.fit()
+              }
+              crate::types::container::program::Op::PushLoopCounter => {
+                  env.program.0.last_mut().unwrap().loop_counters.push(0);
+                  env.fit()
+              }
+              crate::types::container::program::Op::PopLoopCounter => {
+                  env.program.0.last_mut().unwrap().loop_counters.pop();
+                  env.fit()
+              }
+              crate::types::container::program::Op::IncLoopCounter(idx) => {
+                  env.program.0.last_mut().unwrap().loop_counters[idx] += 1;
+                  env.fit()
+              }
+              crate::types::container::program::Op::DecLoopCounter(idx) => {
+                  env.program.0.last_mut().unwrap().loop_counters[idx] -= 1;
+                  env.fit()
+              }
+              crate::types::container::program::Op::JumpIfLoopCounterZero(idx, offset) => {
+                  let frame = env.program.0.last_mut().unwrap();
+                  if frame.loop_counters[idx] == 0 {
+                      frame.ip = (frame.ip as isize + offset) as usize;
+                  }
+                  env.fit()
+              }
+              crate::types::container::program::Op::Return => {
+                  env.program.pop_frame();
                   env.fit()
               }
           }
@@ -8373,7 +8228,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
 
       match inner_env {
           Ok(inner) => {
-              env.pop_prog();
+              
               if inner.program.is_empty() {
                   env.push(Item::default());
                   Sometime::Now(env)
@@ -8400,7 +8255,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   pub fn evaluate(mut env: Environment) -> Sometime<'static, Environment> {
       match Environment::try_derive(env.tos().expect("stack spec guarantees Environment")) {
           Ok(inner) => Sometime::Future(Box::pin(eval(inner).map(|inner_done| {
-              env.pop_prog();
+              
               env.pop();
               env.push(inner_done);
               env
@@ -8415,7 +8270,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   pub fn dictionary(mut env: Environment) -> Sometime<'static, Environment> {
       //println!("adding dictionary");
       let d = env.dictionary.clone();
-      env.pop_prog();
+      
       env.push(d);
       env.fit()
   }
@@ -8435,17 +8290,14 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   /// If there's an unhandled error on the stack, handle it, otherwise
   /// no-op.
   fn handle(mut env: Environment) -> Sometime<'static, Environment> {
-      env.pop_prog();
+      
       if let Some(Item::Error(ref mut e)) = env.stack.front_mut() {
           e.is_handled = true;
       }
       env.fit()
   }
 
-  /// Self-inserts whatever is next in the program.
-  pub fn self_insert(mut env: Environment) -> Sometime<'static, Environment> {
-      let t = env.pop_prog();
-      env.push(t);
+  pub fn self_insert(env: Environment) -> Sometime<'static, Environment> {
       env.fit()
   }
 
@@ -8453,7 +8305,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let mut err = Error::try_derive(env.tos().expect("stack spec guarantees Error"))
           .map_err(Error::derive)?;
       err.is_handled = false;
-      env.pop_prog();
+      
       env.pop();
       env.push_err(err);
       Ok(())
@@ -8476,7 +8328,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       existing.merge(modified, &namespace);
 
       // pop the word dictmerge
-      env.pop_prog();
+      
       env.pop();
       env.pop();
       env.pop();
@@ -8496,7 +8348,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               cache.get(&cache::Key::Hash(hash))?
           }
       };
-      env.pop_prog();
+      
       env.push(contents);
       Ok(())
   }
@@ -8516,7 +8368,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
               let cache = config::PlatformConfig::get()?.cache;
               let hash = cache.put(&b, alias)?;
               env.push(hash);
-              env.pop_prog();
+              
               Ok(())
           }
           i => Err(Error::expected(fit!("bytes"), i)),
@@ -8530,7 +8382,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let inner_env = Environment::try_derive(tos);
       match inner_env {
           Ok(inner) => {
-              env.pop_prog();
+              
               tokio::spawn(async move { eval(inner).await });
               env.fit()
           }
@@ -8547,34 +8399,19 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let true_branch = env.pop();
       let pred = env.pop();
 
-      let rec2_node = Arc::new(ProgramNode::Seq(
-          coll::List::try_derive(combinator).unwrap_or_default(),
-      ));
-      let rec1_node = Arc::new(ProgramNode::Seq(
-          coll::List::try_derive(true_branch).unwrap_or_default(),
-      ));
-      let then_node = Arc::new(ProgramNode::Seq(
-          coll::List::try_derive(false_branch).unwrap_or_default(),
-      ));
-      let pred_node = Arc::new(ProgramNode::Seq(
-          coll::List::try_derive(pred).unwrap_or_default(),
-      ));
+      let combinator_list = coll::List::try_derive(combinator).unwrap_or_default();
+      let false_branch_list = coll::List::try_derive(false_branch).unwrap_or_default();
+      let true_branch_list = coll::List::try_derive(true_branch).unwrap_or_default();
+      let pred_list = coll::List::try_derive(pred).unwrap_or_default();
 
-      let cycle_node = Arc::new_cyclic(|weak| ProgramNode::Recur {
-          pred: pred_node,
-          then: then_node,
-          rec1: rec1_node,
-          rec2: rec2_node,
-          self_ref: weak.clone(),
-      });
 
       let mut prog = Program::default();
-      prog.push_frame(program::Frame {
-          node: cycle_node,
-          next_idx: 0,
-          
+      prog.push_frame(crate::types::container::program::Frame {
+          chunk: Arc::new(chunk),
+          ip: 0,
+          loop_counters: vec![],
       });
-      env.pop_prog();
+      
       env.push(Item::Program(Box::new(prog)));
       env.fit()
   }
@@ -8604,13 +8441,13 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   }
 
   pub fn timestamps(mut env: Environment) -> Sometime<'static, Environment> {
-      env.pop_prog();
+      
       env.push(Item::Time);
       env.fit()
   }
 
   pub fn standard(mut env: Environment) -> Sometime<'static, Environment> {
-      env.pop_prog();
+      
       env.push(Item::Standard);
       env.fit()
   }
@@ -8762,7 +8599,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           match Word::try_derive(i) {
               Ok(w) => {
                   let mut w = w.as_ref().clone();
-                  env.pop_prog();
+                  
                   if let Some(ns) = w.namespace {
                       w.namespace = None;
                       env.push(w);
@@ -8786,7 +8623,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       if let Some(i) = env.stack.pop_front() {
           match Word::try_derive(i) {
               Ok(w) => {
-                  env.pop_prog();
+                  
                   let mut w2 = w.as_ref().clone();
                   if let Some(e) = env.dictionary.lingo.get(&w) {
                       w2.namespace = Some(e.namespace);
@@ -8844,7 +8681,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let mut last_stack_item_used = 0;
 
       /// Takes an accumulator that is a pair of the stack and the
-      /// compiled result so far, and then an item to incorporate. If
       /// the item is a template placeholder, inserts or splices the
       /// item from the stack.
       fn splice(
@@ -8896,7 +8732,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           Ok((env.stack.to_list(), &mut last_stack_item_used, Vec::new())),
           splice,
       )?;
-      env.pop_prog();
+      
       // pop all the used items
       for _ in 0..*last_stack_item_used {
           env.pop();
@@ -9231,10 +9067,19 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           .collect();
       let res_list = matches_list.to_vec();
       //println!("Got unpack result list {:?}", res_list);
-      env.pop_prog();
+      
       env.push(coll::List::derive(res_list));
       env.push(Item::derive(res_map));
       Ok(())
+  }
+
+      let mut prog = Program::default();
+      prog.push_frame(crate::types::container::program::Frame {
+          chunk: std::sync::Arc::new(chunk),
+          ip: 0,
+          loop_counters: Vec::new(),
+      });
+      Ok(Item::Program(Box::new(prog)))
   }
 #+end_src
 *** Top level library
@@ -9250,6 +9095,7 @@ rust project or some other language through FFI.
   pub mod stdlib_hashes;
   pub mod traits;
   pub mod types;
+  pub mod compile;
   #[cfg(target_os = "android")]
   mod android {
       use crate::axiom;
@@ -11007,7 +10853,7 @@ Implement the =handoff= type
   }
 
   pub fn handoff(mut env: Environment) -> types::Sometime<'static, Environment> {
-      env.pop_prog();
+
       env.push(pipe::Tunnel::Handoff(Box::new(Handoff::new(false))));
       env.fit()
   }
