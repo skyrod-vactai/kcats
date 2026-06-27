@@ -562,8 +562,8 @@ internally, to keep track of things like the stack, program, lists etc.
               Item::ServerSocket(s) => write!(f, "{:?}", s),
               Item::StaticFile(ff) => write!(f, "{:?}", ff),
               Item::Timer(t) => write!(f, "{:?}", t),
-              Item::Standard => write!(f, "{:?}", Item::Standard),
-              Item::Time => write!(f, "{:?}", Item::Time),
+              Item::Standard => write!(f, "Standard"),
+              Item::Time => write!(f, "Time"),
               Item::Word(w) => {
                   if w.quoted {
                       write!(f, "[{}]", Item::Word(*w).emit())
@@ -1704,7 +1704,7 @@ internally, to keep track of things like the stack, program, lists etc.
                   );
                   Sized::Set(a)
               }
-              (Sized::String(mut a), Sized::String(b)) => {
+  (Sized::String(mut a), Sized::String(b)) => {
                   a.push_str(&b);
                   Sized::String(a)
               }
@@ -1714,6 +1714,41 @@ internally, to keep track of things like the stack, program, lists etc.
               }
               (Sized::String(s), Sized::List(l)) => s.join(*l).unwrap(),
               (Sized::List(l), Sized::String(s)) => l.join(s).unwrap(),
+              (Sized::Program(mut a), Sized::Program(b)) => {
+                  a.clean();
+                  let mut b_prog = b.clone();
+                  b_prog.clean();
+                  if a.0.len() == 1 && b_prog.0.len() == 1 {
+                      let mut a_chunk = (*a.0[0].chunk).clone();
+                      let b_chunk = &b_prog.0[0].chunk;
+                      if let Some(crate::types::container::program::Op::Return) = a_chunk.ops.last() {
+                          a_chunk.ops.pop();
+                      }
+                      a_chunk.ops.extend(b_chunk.ops.iter().cloned());
+                      a_chunk.source = match (a_chunk.source, &b_chunk.source) {
+                          (Some(mut a_src), Some(b_src)) => {
+                              a_src.extend(b_src.iter().cloned());
+                              Some(a_src)
+                          }
+                          _ => None,
+                      };
+                      a.0[0].chunk = std::sync::Arc::new(a_chunk);
+                      Sized::Program(a)
+                  } else {
+                      let mut a_list = List::derive(a);
+                      a_list.extend(List::derive(b_prog).iter().cloned());
+                      Sized::List(Box::new(a_list))
+                  }
+              }
+              (Sized::Program(a), Sized::List(b)) => {
+                  let mut a_list = List::derive(a);
+                  a_list.extend(b.iter().cloned());
+                  Sized::List(Box::new(a_list))
+              }
+              (Sized::List(mut a), Sized::Program(b)) => {
+                  a.extend(List::derive(b).iter().cloned());
+                  Sized::List(a)
+              }
               (s, other) => Err(Error::expected(fit!("joinable"), list!(s, other)))?,
           })
       }
@@ -2686,6 +2721,7 @@ internally, to keep track of things like the stack, program, lists etc.
       Push(Item),
       Call(Word),
       Execute(Arc<Chunk>),
+      Dip(Arc<Chunk>),
       Jump(isize),
       JumpIfTrue(isize),
       JumpIfFalse(isize),
@@ -2902,13 +2938,12 @@ internally, to keep track of things like the stack, program, lists etc.
   #[cfg(test)]
   mod tests {
       use super::*;
-      use crate::fit;
-      use crate::types::*;
+
       use crate::list;
 
       #[test]
       fn test_layers() {
-          let mut p = Program(vec![
+          let p = Program(vec![
               Frame {
                   chunk: Arc::new(crate::compile::compile(&list!["foo", "bar", "baz"])),
                   ip: 1,
@@ -5276,22 +5311,22 @@ internally, to keep track of things like the stack, program, lists etc.
               //println!("starting dictionary: {:?}", env.dictionary.modules);
               //println!("Dict has {} words", env.dictionary.words.len());
               let mut env = [
-                  // fit!("errors"),
-                  // fit!("encode"),
-                  // fit!("time"), // good candidate for lib
-                  // fit!("pipes"),
-                  // fit!("methods"),
-                  // fit!("generators"),
-                  // fit!("debug"),
-                  // fit!("crypto-builtins"),
-                  // //"more-generators",
-                  //"database",
+                  fit!("errors"),
+                  fit!("encode"),
+                  fit!("time"), // good candidate for lib
+                  fit!("pipes"),
+                  fit!("methods"),
+                  fit!("generators"),
+                  fit!("debug"),
+                  fit!("crypto-builtins"),
+                  //fit!("more-generators"),
+                  //fit!("database"),
               ]
               .into_iter()
               .fold(env, |e, item| e.load_module(item, true));
 
               env = [
-                  // "collections", // actually we probably want collections in default dictionary? wait maybe not
+                  fit!("collections"), // actually we probably want collections in default dictionary? wait maybe not
               ]
               .into_iter()
               .fold(env, |e, item| e.load_module(item, false));
@@ -6610,13 +6645,86 @@ example, in order to read/write to/from disk).
   use crate::types::container::program::{Chunk, Op};
   use crate::types::container as cont;
   use crate::types::Item;
-  use std::sync::Arc;
+
 
   pub fn compile(list: &cont::List) -> Chunk {
       let mut ops = Vec::new();
       for item in list.iter() {
           match item {
-              Item::Word(w) => ops.push(Op::Call(w.clone())),
+              Item::Word(w) => {
+                  let w_str = w.data.as_str();
+                  if w_str == "▶️" {
+                      if let Some(Op::Push(Item::List(l))) = ops.last() {
+                          let l_clone = l.clone();
+                          ops.pop();
+                          let mut chunk = compile(&l_clone);
+                          chunk.ops.pop(); // remove Return
+                          ops.extend(chunk.ops);
+                          continue;
+                      }
+                  } else if w_str == "🪄" {
+                      if let Some(Op::Push(Item::List(l))) = ops.last() {
+                          let l_clone = l.clone();
+                          ops.pop();
+                          let chunk = compile(&l_clone);
+                          ops.push(Op::Dip(std::sync::Arc::new(chunk)));
+                          continue;
+                      }
+                  } else if w_str == "•🪄" {
+                      if let Some(Op::Push(Item::List(l))) = ops.last() {
+                          let l_clone = l.clone();
+                          ops.pop();
+                          let inner_chunk = compile(&l_clone);
+                          let dip_chunk = Chunk { ops: vec![Op::Dip(std::sync::Arc::new(inner_chunk)), Op::Return], source: None };
+                          ops.push(Op::Dip(std::sync::Arc::new(dip_chunk)));
+                          continue;
+                      }
+                  } else if w_str == "••🪄" {
+                      if let Some(Op::Push(Item::List(l))) = ops.last() {
+                          let l_clone = l.clone();
+                          ops.pop();
+                          let inner_chunk = compile(&l_clone);
+                          let dip_chunk1 = Chunk { ops: vec![Op::Dip(std::sync::Arc::new(inner_chunk)), Op::Return], source: None };
+                          let dip_chunk2 = Chunk { ops: vec![Op::Dip(std::sync::Arc::new(dip_chunk1)), Op::Return], source: None };
+                          ops.push(Op::Dip(std::sync::Arc::new(dip_chunk2)));
+                          continue;
+                      }
+                  } else if w_str == "↔️" {
+                      let len = ops.len();
+                      if len >= 2 {
+                          if let (Op::Push(Item::List(f)), Op::Push(Item::List(t))) = (&ops[len-1], &ops[len-2]) {
+                              let f_clone = f.clone();
+                              let t_clone = t.clone();
+                              ops.pop();
+                              ops.pop();
+                              
+                              let jump_base_idx = ops.len();
+                              ops.push(Op::JumpIfFalseKeepIfTrue(0)); // placeholder
+                              
+                              let mut true_chunk = compile(&t_clone);
+                              true_chunk.ops.pop();
+                              ops.extend(true_chunk.ops);
+                              
+                              let jump_start_idx = ops.len();
+                              ops.push(Op::Jump(0)); // placeholder
+                              
+                              let base_case_idx = ops.len();
+                              ops[jump_base_idx] = Op::JumpIfFalseKeepIfTrue((base_case_idx as isize) - (jump_base_idx as isize) - 1);
+                              
+                              let mut false_chunk = compile(&f_clone);
+                              false_chunk.ops.pop();
+                              ops.extend(false_chunk.ops);
+                              
+                              let end_idx = ops.len();
+                              ops[jump_start_idx] = Op::Jump((end_idx as isize) - (jump_start_idx as isize) - 1);
+                              
+                              continue;
+                          }
+                      }
+                  }
+                  
+                  ops.push(Op::Call(w.clone()));
+              }
               _ => ops.push(Op::Push(item.clone())),
           }
       }
@@ -6681,6 +6789,7 @@ example, in order to read/write to/from disk).
           list.push_back(crate::types::Item::List(Box::new(false_branch.clone())));
           list.push_back(crate::types::Item::List(Box::new(combinator.clone())));
           list.push_back(crate::fit!("🪆"));
+          list.push_back(crate::fit!("▶️"));
           let mut prog = crate::types::container::program::Program::default();
           prog.prepend(list);
           ops.push(Op::Push(Item::Program(Box::new(prog))));
@@ -6702,8 +6811,14 @@ example, in order to read/write to/from disk).
           return Chunk { ops, source: None };
       }
 
-      // TCO or Flattened Loop
-      ops.push(Op::PushLoopCounter);
+  // TCO or Flattened Loop
+      let mut comb_chunk = compile(&comb_rest);
+      comb_chunk.ops.pop(); // remove Return
+      let has_combinator = !comb_chunk.ops.is_empty();
+
+      if has_combinator {
+          ops.push(Op::PushLoopCounter);
+      }
       let loop_start = ops.len();
 
       let mut pred_chunk = compile(pred);
@@ -6717,7 +6832,9 @@ example, in order to read/write to/from disk).
       true_chunk.ops.pop();
       ops.extend(true_chunk.ops);
 
-      ops.push(Op::IncLoopCounter(0)); // index 0 for current loop
+      if has_combinator {
+          ops.push(Op::IncLoopCounter(0)); // index 0 for current loop
+      }
       let jump_start_offset = loop_start as isize - (ops.len() as isize + 1);
       ops.push(Op::Jump(jump_start_offset));
 
@@ -6728,22 +6845,22 @@ example, in order to read/write to/from disk).
       then_chunk.ops.pop();
       ops.extend(then_chunk.ops);
 
-      let unwind_start = ops.len();
-      let jump_unwind_end_idx = ops.len();
-      ops.push(Op::JumpIfLoopCounterZero(0, 0)); // placeholder
+      if has_combinator {
+          let unwind_start = ops.len();
+          let jump_unwind_end_idx = ops.len();
+          ops.push(Op::JumpIfLoopCounterZero(0, 0)); // placeholder
 
-      let mut comb_chunk = compile(&comb_rest);
-      comb_chunk.ops.pop();
-      ops.extend(comb_chunk.ops);
+          ops.extend(comb_chunk.ops);
 
-      ops.push(Op::DecLoopCounter(0));
-      let jump_unwind_start_offset = unwind_start as isize - (ops.len() as isize + 1);
-      ops.push(Op::Jump(jump_unwind_start_offset));
+          ops.push(Op::DecLoopCounter(0));
+          let jump_unwind_start_offset = unwind_start as isize - (ops.len() as isize + 1);
+          ops.push(Op::Jump(jump_unwind_start_offset));
 
-      let unwind_end_idx = ops.len();
-      ops[jump_unwind_end_idx] = Op::JumpIfLoopCounterZero(0, (unwind_end_idx as isize) - (jump_unwind_end_idx as isize) - 1);
+          let unwind_end_idx = ops.len();
+          ops[jump_unwind_end_idx] = Op::JumpIfLoopCounterZero(0, (unwind_end_idx as isize) - (jump_unwind_end_idx as isize) - 1);
 
-      ops.push(Op::PopLoopCounter);
+          ops.push(Op::PopLoopCounter);
+      }
       ops.push(Op::Return);
 
       Chunk { ops, source: None }
@@ -6762,7 +6879,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   use crate::derivation::*;
   #[cfg(feature = "database")]
   use crate::types::container::pipe::db;
-  use crate::types::container::program::{self, Program, Frame};
+  use crate::types::container::program::Program;
   use crate::types::container::{
       self as coll, associative as assoc, dictionary as dict, environment::Environment, error::Error,
       Container, Count, Join, Mutey, Ordered, Take,
@@ -7078,7 +7195,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
           ("difference", Box::leak(Box::new(f_stack2(difference)))),
           ("🪄", Box::leak(Box::new(dip))),
           ("dictionary", Box::leak(Box::new(dictionary))),
-          ("•🪄", Box::leak(Box::new(dipdown))),
+
           ("🗑️", Box::leak(Box::new(drop))),
           ("emit", Box::leak(Box::new(f_stack1(ok1(emit))))),
           ("empty", Box::leak(Box::new(f_stack1(empty)))),
@@ -7554,21 +7671,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       env.fit()
   }
 
-  pub fn dipdown(mut env: Environment) -> Sometime<'static, Environment> {
-      match Program::try_derive(env.pop()) {
-          Ok(program) => {
-              let mut item1 = env.pop();
-              let mut item2 = env.pop();
-              env.program.0.pop();
-              dip_quote(&mut item1);
-              dip_quote(&mut item2);
-              env.program.prepend(vector![item2, item1]);
-              env.program.prepend_program(program);
-          }
-          Err(e) => env.push_err(e),
-      }
-      env.fit()
-  }
+
 
   pub fn take(mut env: Environment) -> Sometime<'static, Environment> {
       // TODO: handle Nothing case
@@ -7993,8 +8096,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
   pub fn eval_step(mut env: Environment) -> Sometime<'static, Environment> {
       env.program.clean();
       let op = env.program.0.last_mut().and_then(|f| f.next_op());
-      if let Some(o) = &op { println!("OP: {:?}, STACK: {:?}", o, env.stack); }
-
       if let Some(op) = op {
           match op {
               crate::types::container::program::Op::Push(item) => {
@@ -8041,6 +8142,24 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                   }
               }
               crate::types::container::program::Op::Execute(chunk) => {
+                  env.program.push_frame(crate::types::container::program::Frame {
+                      chunk,
+                      ip: 0,
+                      loop_counters: vec![],
+                  });
+                  env.fit()
+              }
+              crate::types::container::program::Op::Dip(chunk) => {
+                  let item = env.pop();
+                  let push_chunk = Arc::new(crate::types::container::program::Chunk {
+                      ops: vec![crate::types::container::program::Op::Push(item), crate::types::container::program::Op::Return],
+                      source: None,
+                  });
+                  env.program.push_frame(crate::types::container::program::Frame {
+                      chunk: push_chunk,
+                      ip: 0,
+                      loop_counters: vec![],
+                  });
                   env.program.push_frame(crate::types::container::program::Frame {
                       chunk,
                       ip: 0,
@@ -8297,7 +8416,8 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       env.fit()
   }
 
-  pub fn self_insert(env: Environment) -> Sometime<'static, Environment> {
+  pub fn self_insert(mut env: Environment) -> Sometime<'static, Environment> {
+      env.push(true);
       env.fit()
   }
 
@@ -8404,6 +8524,7 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       let true_branch_list = coll::List::try_derive(true_branch).unwrap_or_default();
       let pred_list = coll::List::try_derive(pred).unwrap_or_default();
 
+      let chunk = crate::compile::compile_recur(&pred_list, &true_branch_list, &false_branch_list, &combinator_list);
 
       let mut prog = Program::default();
       prog.push_frame(crate::types::container::program::Frame {
@@ -9073,14 +9194,6 @@ We'll define some words as axioms (not in terms of other words, only defined in 
       Ok(())
   }
 
-      let mut prog = Program::default();
-      prog.push_frame(crate::types::container::program::Frame {
-          chunk: std::sync::Arc::new(chunk),
-          ip: 0,
-          loop_counters: Vec::new(),
-      });
-      Ok(Item::Program(Box::new(prog)))
-  }
 #+end_src
 *** Top level library
 Here is the top level for using kcats as a library, either in another
@@ -9327,7 +9440,7 @@ rust project or some other language through FFI.
       // Note this useful idiom: importing names from outer (for mod tests) scope.
       //use super::error::Error;
       use crate::axiom;
-      use crate::derivation::{Fit, TryDerive, TryFit};
+      use crate::derivation::{TryDerive, TryFit};
       use crate::serialize::Emit;
 
       use crate::types::container as coll;
