@@ -2735,6 +2735,7 @@ internally, to keep track of things like the stack, program, lists etc.
       JumpIfLoopCounterZero(usize, isize),
       
       Return,
+      Shuffle { pops: u8, pushes: Vec<u8> },
   }
 
   #[derive(Clone, Debug, Default, PartialEq)]
@@ -2970,6 +2971,33 @@ internally, to keep track of things like the stack, program, lists etc.
   pub type Stack = StackData;
 
   impl StackData {
+      
+      pub fn shuffle(&mut self, pops: u8, pushes: &[u8]) -> Result<(), crate::types::Error> {
+          if pops == 0 && pushes.is_empty() {
+              return Ok(());
+          }
+          let mut items = Vec::with_capacity(pops as usize);
+          for _ in 0..pops {
+              if let Some(item) = self.pop_front() {
+                  items.push(item);
+              } else {
+                  for i in (0..items.len()).rev() {
+                      self.push_front(items[i].clone());
+                  }
+                  return Err(Error::stack_underflow());
+              }
+          }
+          let mut final_push = Vec::with_capacity(pushes.len());
+          for &idx in pushes {
+              final_push.push(items[idx as usize].clone());
+          }
+          // Push elements from first to last, so the last element pushed becomes TOS
+          for item in final_push {
+              self.push_front(item);
+          }
+          Ok(())
+      }
+
       pub fn push_front(&mut self, item: Item) {
           if self.tos.is_none() {
               self.tos = Some(item);
@@ -5207,6 +5235,7 @@ internally, to keep track of things like the stack, program, lists etc.
               include_bytes!("../../kcats/stdlib/motion.kcats"),
               include_bytes!("../../kcats/stdlib/execute.kcats"),
               include_bytes!("../../kcats/stdlib/math.kcats"),
+              include_bytes!("../../kcats/stdlib/encode.kcats"),
               include_bytes!("../../kcats/stdlib/compare.kcats"),
               include_bytes!("../../kcats/stdlib/collections.kcats"),
               include_bytes!("../../kcats/stdlib/associations.kcats"),
@@ -5284,21 +5313,23 @@ internally, to keep track of things like the stack, program, lists etc.
           //println!("Loading module (should be empty?): {:?}", self.program);
           self.program
               .prepend(list!("dictionary", "⚓", "pair", "🎁", "using"));
-          //println!("Env: {:?}", self);
-          //println!("Dictionary: {:?}", self.dictionary);
           self = futures::executor::block_on(async move { axiom::eval(self).await });
-          //println!("Env: {:?}", self);
-          let mut dict: dict::Dictionary = self.pop().try_fit().unwrap();
+          let item = self.pop();
+          let mut dict: dict::Dictionary = match item.clone().try_fit() {
+              Ok(d) => d,
+              Err(_) => {
+                  panic!("Failed to fit Dictionary. Item was: {:?}", item);
+              }
+          };
           dict.resolve();
           self.dictionary = dict;
           //println!("loaded module {:?}: {:?}", module, self.dictionary);
+
           self
       }
   }
 
   impl Default for Environment {
-      /// Returns the default environment, which is the "standard"
-      /// environment. It loads some standard libraries and core
       /// functions. The environment is only built once and memoized.
       fn default() -> Self {
           static INST: Lazy<Environment> = Lazy::new(|| {
@@ -6655,19 +6686,147 @@ example, in order to read/write to/from disk).
   use crate::types::container::program::{Chunk, Op};
   use crate::types::container as cont;
   use crate::types::Item;
+  use crate::types::container::dictionary::Dictionary;
+  use crate::types::container::dictionary::Executable;
 
+  struct VirtualStack {
+      items: Vec<usize>,
+      pops: usize,
+  }
+
+  impl VirtualStack {
+      fn new() -> Self {
+          Self { items: Vec::new(), pops: 0 }
+      }
+
+      fn pop(&mut self) -> usize {
+          if let Some(i) = self.items.pop() {
+              i
+          } else {
+              let i = self.pops;
+              self.pops += 1;
+              i
+          }
+      }
+
+      fn push(&mut self, i: usize) {
+          self.items.push(i);
+      }
+      
+      fn apply_shuffle(&mut self, pops: usize, pushes: &[u8]) {
+          let mut popped = Vec::with_capacity(pops);
+          for _ in 0..pops {
+              popped.push(self.pop());
+          }
+          for &idx in pushes.iter().rev() {
+              self.push(popped[idx as usize]);
+          }
+      }
+
+      fn flush(&mut self, ops: &mut Vec<Op>) {
+          if self.pops == 0 && self.items.is_empty() {
+              return;
+          }
+          // Simplification pass
+          while !self.items.is_empty() && self.pops > 0 {
+              if self.items[0] == self.pops - 1 {
+                  let mut used_again = false;
+                  for i in 1..self.items.len() {
+                      if self.items[i] == self.pops - 1 {
+                          used_again = true;
+                          break;
+                      }
+                  }
+                  if used_again {
+                      break;
+                  }
+                  self.items.remove(0);
+                  self.pops -= 1;
+              } else {
+                  break;
+              }
+          }
+          if self.pops > 0 || !self.items.is_empty() {
+              let mut pushes = Vec::with_capacity(self.items.len());
+              for &item in &self.items {
+                  // item is the original depth (0 = tos).
+                  // it needs to fit into a u8.
+                  pushes.push(item as u8);
+              }
+              ops.push(Op::Shuffle {
+                  pops: self.pops as u8,
+                  pushes,
+              });
+          }
+          self.items.clear();
+          self.pops = 0;
+      }
+  }
 
   pub fn compile(list: &cont::List) -> Chunk {
+      compile_with_dict(list, None)
+  }
+
+  pub fn compile_with_dict(list: &cont::List, dict: Option<&Dictionary>) -> Chunk {
       let mut ops = Vec::new();
+      let mut vs = VirtualStack::new();
+
       for item in list.iter() {
           match item {
               Item::Word(w) => {
                   let w_str = w.data.as_str();
+                  
+                  // Stack twiddle primitives
+                  let mut handled_twiddle = false;
+                  match w_str {
+                      "🗑️" | "drop" => { vs.pop(); handled_twiddle = true; }
+                      "•🗑️" | "drop-down" => { vs.apply_shuffle(2, &[0]); handled_twiddle = true; }
+                      "••🗑️" | "drop-deep" => { vs.apply_shuffle(3, &[0, 1]); handled_twiddle = true; }
+                      "👥" | "dup" => { vs.apply_shuffle(1, &[0, 0]); handled_twiddle = true; }
+                      "•👥" | "dup-down" => { vs.apply_shuffle(2, &[0, 1, 1]); handled_twiddle = true; }
+                      "••👥" | "dup-deep" => { vs.apply_shuffle(3, &[0, 1, 2, 2]); handled_twiddle = true; }
+                      "🔀" | "swap" => { vs.apply_shuffle(2, &[1, 0]); handled_twiddle = true; }
+                      "•🔀" | "swap-down" => { vs.apply_shuffle(3, &[0, 2, 1]); handled_twiddle = true; }
+                      "••🔀" | "swap-deep" => { vs.apply_shuffle(4, &[0, 1, 3, 2]); handled_twiddle = true; }
+                      "⚓" | "sink" => { vs.apply_shuffle(3, &[1, 2, 0]); handled_twiddle = true; }
+                      "•⚓" | "sink-down" => { vs.apply_shuffle(4, &[0, 2, 3, 1]); handled_twiddle = true; }
+                      "••⚓" | "sink-deep" => { vs.apply_shuffle(5, &[0, 1, 3, 4, 2]); handled_twiddle = true; }
+                      "🛟" | "float" => { vs.apply_shuffle(3, &[2, 0, 1]); handled_twiddle = true; }
+                      "•🛟" | "float-down" => { vs.apply_shuffle(4, &[0, 3, 1, 2]); handled_twiddle = true; }
+                      "••🛟" | "float-deep" => { vs.apply_shuffle(5, &[0, 1, 4, 2, 3]); handled_twiddle = true; }
+                      _ => {}
+                  }
+                  
+                  if handled_twiddle {
+                      continue;
+                  }
+
+                  // Check for pure shuffle inlining if dict is available
+                  if let Some(d) = dict {
+                      if let Some(entry) = d.get_entry(w) {
+                          if let Executable::Derived(ref chunk) = entry.definition {
+                              if chunk.ops.len() == 2 {
+                                  if let (Op::Shuffle { pops, pushes }, Op::Return) = (&chunk.ops[0], &chunk.ops[1]) {
+                                      vs.apply_shuffle(*pops as usize, pushes);
+                                      continue;
+                                  }
+                              } else if chunk.ops.len() == 1 {
+                                  if let Op::Return = &chunk.ops[0] {
+                                      // empty chunk is a no-op
+                                      continue;
+                                  }
+                              }
+                          }
+                      }
+                  }
+
+                  vs.flush(&mut ops);
+                  
                   if w_str == "▶️" {
                       if let Some(Op::Push(Item::List(l))) = ops.last() {
                           let l_clone = l.clone();
                           ops.pop();
-                          let mut chunk = compile(&l_clone);
+                          let mut chunk = compile_with_dict(&l_clone, dict);
                           chunk.ops.pop(); // remove Return
                           ops.extend(chunk.ops);
                           continue;
@@ -6676,7 +6835,7 @@ example, in order to read/write to/from disk).
                       if let Some(Op::Push(Item::List(l))) = ops.last() {
                           let l_clone = l.clone();
                           ops.pop();
-                          let chunk = compile(&l_clone);
+                          let chunk = compile_with_dict(&l_clone, dict);
                           ops.push(Op::Dip(std::sync::Arc::new(chunk)));
                           continue;
                       }
@@ -6684,7 +6843,7 @@ example, in order to read/write to/from disk).
                       if let Some(Op::Push(Item::List(l))) = ops.last() {
                           let l_clone = l.clone();
                           ops.pop();
-                          let inner_chunk = compile(&l_clone);
+                          let inner_chunk = compile_with_dict(&l_clone, dict);
                           let dip_chunk = Chunk { ops: vec![Op::Dip(std::sync::Arc::new(inner_chunk)), Op::Return], source: None };
                           ops.push(Op::Dip(std::sync::Arc::new(dip_chunk)));
                           continue;
@@ -6693,7 +6852,7 @@ example, in order to read/write to/from disk).
                       if let Some(Op::Push(Item::List(l))) = ops.last() {
                           let l_clone = l.clone();
                           ops.pop();
-                          let inner_chunk = compile(&l_clone);
+                          let inner_chunk = compile_with_dict(&l_clone, dict);
                           let dip_chunk1 = Chunk { ops: vec![Op::Dip(std::sync::Arc::new(inner_chunk)), Op::Return], source: None };
                           let dip_chunk2 = Chunk { ops: vec![Op::Dip(std::sync::Arc::new(dip_chunk1)), Op::Return], source: None };
                           ops.push(Op::Dip(std::sync::Arc::new(dip_chunk2)));
@@ -6711,7 +6870,7 @@ example, in order to read/write to/from disk).
                               let jump_base_idx = ops.len();
                               ops.push(Op::JumpIfFalseKeepIfTrue(0)); // placeholder
                               
-                              let mut true_chunk = compile(&t_clone);
+                              let mut true_chunk = compile_with_dict(&t_clone, dict);
                               true_chunk.ops.pop();
                               ops.extend(true_chunk.ops);
                               
@@ -6721,7 +6880,7 @@ example, in order to read/write to/from disk).
                               let base_case_idx = ops.len();
                               ops[jump_base_idx] = Op::JumpIfFalseKeepIfTrue((base_case_idx as isize) - (jump_base_idx as isize) - 1);
                               
-                              let mut false_chunk = compile(&f_clone);
+                              let mut false_chunk = compile_with_dict(&f_clone, dict);
                               false_chunk.ops.pop();
                               ops.extend(false_chunk.ops);
                               
@@ -6735,9 +6894,13 @@ example, in order to read/write to/from disk).
                   
                   ops.push(Op::Call(w.clone()));
               }
-              _ => ops.push(Op::Push(item.clone())),
+              _ => {
+                  vs.flush(&mut ops);
+                  ops.push(Op::Push(item.clone()));
+              }
           }
       }
+      vs.flush(&mut ops);
       ops.push(Op::Return);
       Chunk { ops, source: Some(list.clone()) }
   }
@@ -6763,6 +6926,16 @@ example, in order to read/write to/from disk).
       false_branch: &cont::List,
       combinator: &cont::List,
   ) -> Chunk {
+      compile_recur_with_dict(pred, true_branch, false_branch, combinator, None)
+  }
+
+  pub fn compile_recur_with_dict(
+      pred: &cont::List,
+      true_branch: &cont::List,
+      false_branch: &cont::List,
+      combinator: &cont::List,
+      dict: Option<&Dictionary>
+  ) -> Chunk {
       let mut is_execute_first = false;
       let mut comb_rest = combinator.clone();
       if let Some(Item::Word(w)) = comb_rest.front() {
@@ -6776,23 +6949,17 @@ example, in order to read/write to/from disk).
       
       // Non-TCO (push program back to stack)
       if !is_execute_first {
-          let mut pred_chunk = compile(pred);
+          let mut pred_chunk = compile_with_dict(pred, dict);
           pred_chunk.ops.pop();
           ops.extend(pred_chunk.ops);
           
           let jump_base_idx = ops.len();
           ops.push(Op::JumpIfFalseKeepIfTrue(0)); // placeholder
           
-          let mut true_chunk = compile(true_branch);
+          let mut true_chunk = compile_with_dict(true_branch, dict);
           true_chunk.ops.pop();
           ops.extend(true_chunk.ops);
           
-          // Push recur node
-          // We need the full structure here. 
-          // We'll construct a Chunk with the full recur structure dynamically via execute/call.
-          // Wait, if we push a Program, that Program contains a Frame with a newly compiled Chunk of this whole recur.
-          // Or we can just dynamically reconstruct the list for the old way? 
-          // Yes, we can push the source lists!
           let mut list = cont::List::new();
           list.push_back(crate::types::Item::List(Box::new(pred.clone())));
           list.push_back(crate::types::Item::List(Box::new(true_branch.clone())));
@@ -6804,7 +6971,7 @@ example, in order to read/write to/from disk).
           prog.prepend(list);
           ops.push(Op::Push(Item::Program(Box::new(prog))));
           
-          let mut comb_chunk = compile(combinator);
+          let mut comb_chunk = compile_with_dict(combinator, dict);
           comb_chunk.ops.pop();
           ops.extend(comb_chunk.ops);
           
@@ -6813,7 +6980,7 @@ example, in order to read/write to/from disk).
           let base_case_idx = ops.len();
           ops[jump_base_idx] = Op::JumpIfFalseKeepIfTrue((base_case_idx as isize) - (jump_base_idx as isize) - 1);
           
-          let mut then_chunk = compile(false_branch);
+          let mut then_chunk = compile_with_dict(false_branch, dict);
           then_chunk.ops.pop();
           ops.extend(then_chunk.ops);
           ops.push(Op::Return);
@@ -6822,7 +6989,7 @@ example, in order to read/write to/from disk).
       }
 
   // TCO or Flattened Loop
-      let mut comb_chunk = compile(&comb_rest);
+      let mut comb_chunk = compile_with_dict(&comb_rest, dict);
       comb_chunk.ops.pop(); // remove Return
       let has_combinator = !comb_chunk.ops.is_empty();
 
@@ -6831,14 +6998,14 @@ example, in order to read/write to/from disk).
       }
       let loop_start = ops.len();
 
-      let mut pred_chunk = compile(pred);
+      let mut pred_chunk = compile_with_dict(pred, dict);
       pred_chunk.ops.pop(); // remove Return
       ops.extend(pred_chunk.ops);
 
       let jump_base_idx = ops.len();
       ops.push(Op::JumpIfFalseKeepIfTrue(0)); // placeholder
 
-      let mut true_chunk = compile(true_branch);
+      let mut true_chunk = compile_with_dict(true_branch, dict);
       true_chunk.ops.pop();
       ops.extend(true_chunk.ops);
 
@@ -6851,7 +7018,7 @@ example, in order to read/write to/from disk).
       let base_case_idx = ops.len();
       ops[jump_base_idx] = Op::JumpIfFalseKeepIfTrue((base_case_idx as isize) - (jump_base_idx as isize) - 1);
 
-      let mut then_chunk = compile(false_branch);
+      let mut then_chunk = compile_with_dict(false_branch, dict);
       then_chunk.ops.pop();
       ops.extend(then_chunk.ops);
 
@@ -6872,8 +7039,54 @@ example, in order to read/write to/from disk).
           ops.push(Op::PopLoopCounter);
       }
       ops.push(Op::Return);
-
       Chunk { ops, source: None }
+  }
+
+
+  #[cfg(test)]
+  mod tests {
+      use super::*;
+      use crate::types::container::program::{Chunk, Op};
+      use crate::types::Item;
+      use crate::types::container::List;
+      use internment::Intern;
+      use crate::types::WordData;
+
+      fn check_compile(word: &str, expected_pops: u8, expected_pushes: &[u8]) {
+          let mut list = List::new();
+          list.push_back(Item::Word(Intern::new(WordData {
+              data: Intern::new(word.to_string()),
+              quoted: false,
+              namespace: None,
+          })));
+          let chunk = compile(&list);
+          if expected_pops == 0 && expected_pushes.is_empty() {
+              assert_eq!(chunk.ops.len(), 1, "Expected no shuffle for {}", word);
+              assert!(matches!(chunk.ops[0], Op::Return));
+              return;
+          }
+          assert_eq!(chunk.ops.len(), 2, "Expected 2 ops for {}", word);
+          if let Op::Shuffle { pops, pushes } = &chunk.ops[0] {
+              assert_eq!(*pops, expected_pops, "pops mismatch for {}", word);
+              assert_eq!(pushes.as_slice(), expected_pushes, "pushes mismatch for {}", word);
+          } else {
+              panic!("Expected Shuffle for {}, got {:?}", word, chunk.ops[0]);
+          }
+      }
+
+      #[test]
+      fn test_shuffles() {
+          check_compile("drop", 1, &[]);
+          check_compile("swap", 2, &[0, 1]);
+          check_compile("dup", 1, &[0, 0]);
+          check_compile("sink", 3, &[0, 2, 1]);
+
+          check_compile("swap-down", 3, &[1, 2, 0]);
+          check_compile("sink-down", 4, &[1, 3, 2, 0]);
+          
+          check_compile("float", 3, &[1, 0, 2]);
+          check_compile("float-down", 4, &[2, 1, 3, 0]);
+      }
   }
 #+end_src
 *** Builtin words
@@ -8151,7 +8364,15 @@ We'll define some words as axioms (not in terms of other words, only defined in 
                       }
                   }
               }
+
+              crate::types::container::program::Op::Shuffle { pops, pushes } => {
+                  if let Err(e) = env.stack.shuffle(pops, &pushes) {
+                      env.push(e);
+                  }
+                  env.fit()
+              }
               crate::types::container::program::Op::Execute(chunk) => {
+
                   env.program.push_frame(crate::types::container::program::Frame {
                       chunk,
                       ip: 0,
@@ -9812,7 +10033,9 @@ rust project or some other language through FFI.
       #[test_case("verify")]
       fn test_crypto(word: &str) {
           test_lexicon(word, vec![fit!("crypto-builtins")])
-      }}
+
+  }
+  }
 #+end_src
 *** Top level execution
 We'll define the main module which reads input for the kcats
