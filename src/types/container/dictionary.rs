@@ -499,7 +499,7 @@ impl Dict for Words {
         for (bw, bd) in BUILTIN_FUNCTIONS.iter() {
             let ns = core_nss
                 .get(bw.data.as_str())
-                .unwrap_or_else(|| panic!("Missing namespace for builtin: {}", bw.data.as_str()));
+                .unwrap_or_else(|| panic!("Missing namespace for builtin: '{}', core_nss len: {}, contains 'and': {}", bw.data.as_str(), core_nss.len(), core_nss.contains_key("and")));
             let entry = Entry {
                 definition: bd.clone(),
                 examples: None,

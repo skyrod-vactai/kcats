@@ -78,6 +78,28 @@ impl VirtualStack {
     }
 }
 
+fn chunk_to_shuffle(chunk: &Chunk) -> Option<(u8, Vec<u8>)> {
+    let mut shuffle = None;
+    for op in &chunk.ops {
+        match op {
+            Op::Shuffle { pops, pushes } => {
+                if shuffle.is_none() {
+                    let mut tos_to_deepest = Vec::with_capacity(pushes.len());
+                    for &idx in pushes.iter().rev() {
+                        tos_to_deepest.push(idx);
+                    }
+                    shuffle = Some((*pops, tos_to_deepest));
+                } else {
+                    return None;
+                }
+            }
+            Op::Return => break,
+            _ => return None,
+        }
+    }
+    Some(shuffle.unwrap_or_else(|| (0, Vec::new())))
+}
+
 pub fn compile(list: &cont::List) -> Chunk {
     compile_with_dict(list, None)
 }
@@ -120,21 +142,13 @@ pub fn compile_with_dict(list: &cont::List, dict: Option<&Dictionary>) -> Chunk 
                 if let Some(d) = dict {
                     if let Some(entry) = d.get_entry(w) {
                         if let Executable::Derived(ref chunk) = entry.definition {
-                            if chunk.ops.len() == 2 {
-                                if let (Op::Shuffle { pops, pushes }, Op::Return) = (&chunk.ops[0], &chunk.ops[1]) {
-                                    vs.apply_shuffle(*pops as usize, pushes);
-                                    continue;
-                                }
-                            } else if chunk.ops.len() == 1 {
-                                if let Op::Return = &chunk.ops[0] {
-                                    // empty chunk is a no-op
-                                    continue;
-                                }
+                            if let Some((pops, pushes)) = chunk_to_shuffle(chunk) {
+                                vs.apply_shuffle(pops as usize, &pushes);
+                                continue;
                             }
                         }
                     }
                 }
-
                 vs.flush(&mut ops);
                 
                 if w_str == "▶️" {
@@ -151,6 +165,14 @@ pub fn compile_with_dict(list: &cont::List, dict: Option<&Dictionary>) -> Chunk 
                         let l_clone = l.clone();
                         ops.pop();
                         let chunk = compile_with_dict(&l_clone, dict);
+                        if let Some((pops, pushes)) = chunk_to_shuffle(&chunk) {
+                            let mut new_pushes = vec![0];
+                            for &idx in &pushes {
+                                new_pushes.push(idx + 1);
+                            }
+                            vs.apply_shuffle(pops as usize + 1, &new_pushes);
+                            continue;
+                        }
                         ops.push(Op::Dip(std::sync::Arc::new(chunk)));
                         continue;
                     }
@@ -159,6 +181,14 @@ pub fn compile_with_dict(list: &cont::List, dict: Option<&Dictionary>) -> Chunk 
                         let l_clone = l.clone();
                         ops.pop();
                         let inner_chunk = compile_with_dict(&l_clone, dict);
+                        if let Some((pops, pushes)) = chunk_to_shuffle(&inner_chunk) {
+                            let mut new_pushes = vec![0, 1];
+                            for &idx in &pushes {
+                                new_pushes.push(idx + 2);
+                            }
+                            vs.apply_shuffle(pops as usize + 2, &new_pushes);
+                            continue;
+                        }
                         let dip_chunk = Chunk { ops: vec![Op::Dip(std::sync::Arc::new(inner_chunk)), Op::Return], source: None };
                         ops.push(Op::Dip(std::sync::Arc::new(dip_chunk)));
                         continue;
@@ -168,6 +198,14 @@ pub fn compile_with_dict(list: &cont::List, dict: Option<&Dictionary>) -> Chunk 
                         let l_clone = l.clone();
                         ops.pop();
                         let inner_chunk = compile_with_dict(&l_clone, dict);
+                        if let Some((pops, pushes)) = chunk_to_shuffle(&inner_chunk) {
+                            let mut new_pushes = vec![0, 1, 2];
+                            for &idx in &pushes {
+                                new_pushes.push(idx + 3);
+                            }
+                            vs.apply_shuffle(pops as usize + 3, &new_pushes);
+                            continue;
+                        }
                         let dip_chunk1 = Chunk { ops: vec![Op::Dip(std::sync::Arc::new(inner_chunk)), Op::Return], source: None };
                         let dip_chunk2 = Chunk { ops: vec![Op::Dip(std::sync::Arc::new(dip_chunk1)), Op::Return], source: None };
                         ops.push(Op::Dip(std::sync::Arc::new(dip_chunk2)));
