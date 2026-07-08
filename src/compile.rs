@@ -107,25 +107,33 @@ impl VirtualStack {
 /// This allows us to transparently inline complex composite twiddles (like derived `swapdown` words) 
 /// or optimize the inner blocks of `dip` combinators into flat bytecode.
 fn chunk_to_shuffle(chunk: &Chunk) -> Option<(u8, Vec<u8>)> {
-    let mut shuffle = None;
+    let mut temp_vs = VirtualStack::new();
     for op in &chunk.ops {
         match op {
             Op::Shuffle { pops, pushes } => {
-                if shuffle.is_none() {
-                    let mut tos_to_deepest = Vec::with_capacity(pushes.len());
-                    for &idx in pushes.iter().rev() {
-                        tos_to_deepest.push(idx);
-                    }
-                    shuffle = Some((*pops, tos_to_deepest));
-                } else {
-                    return None;
+                let mut rev_pushes = Vec::with_capacity(pushes.len());
+                for &idx in pushes.iter().rev() {
+                    rev_pushes.push(idx);
                 }
+                temp_vs.apply_shuffle(*pops as usize, &rev_pushes);
             }
             Op::Return => break,
             _ => return None,
         }
     }
-    Some(shuffle.unwrap_or_else(|| (0, Vec::new())))
+    let mut dummy_ops = Vec::new();
+    temp_vs.flush(&mut dummy_ops);
+    if dummy_ops.is_empty() {
+        Some((0, Vec::new()))
+    } else if let Op::Shuffle { pops, pushes } = &dummy_ops[0] {
+        let mut tos_to_deepest = Vec::with_capacity(pushes.len());
+        for &idx in pushes.iter().rev() {
+            tos_to_deepest.push(idx);
+        }
+        Some((*pops, tos_to_deepest))
+    } else {
+        None
+    }
 }
 
 /// Main entry point for compiling a `List` of items into executable bytecode (`Chunk`).

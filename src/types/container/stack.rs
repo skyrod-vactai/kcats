@@ -1,12 +1,13 @@
 use crate::types::container::List;
 use crate::types::Item;
+use std::collections::VecDeque;
 
 #[derive(Clone, PartialEq, Default, Debug)]
 pub struct StackData {
     pub tos: Option<Item>,
     pub nos: Option<Item>,
     pub nnd: Option<Item>,
-    pub rest: List,
+    pub rest: VecDeque<Item>,
 }
 
 pub type Stack = StackData;
@@ -86,7 +87,7 @@ impl StackData {
     }
 
     pub fn to_list(&self) -> List {
-        let mut list = self.rest.clone();
+        let mut list: List = self.rest.iter().cloned().collect();
         if let Some(nnd) = &self.nnd {
             list.push_front(nnd.clone());
         }
@@ -130,7 +131,7 @@ impl StackData {
             tos,
             nos,
             nnd,
-            rest: list,
+            rest: list.into_iter().collect(),
         }
     }
 }

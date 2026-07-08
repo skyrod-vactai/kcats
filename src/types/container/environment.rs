@@ -414,6 +414,41 @@ impl TryDerive<Item> for Environment {
     }
 }
 
+impl TryDerive<(Item, dict::Dictionary)> for Environment {
+    fn try_derive((i, d): (Item, dict::Dictionary)) -> Result<Self, Error> {
+        let s = coll::Sized::try_derive(i)?;
+
+        match s {
+            coll::Sized::Env(e) => Ok(*e),
+            coll::Sized::List(l) => {
+                let mut env = Environment {
+                    dictionary: d,
+                    ..Environment::default()
+                };
+                let chunk = crate::compile::compile_with_dict(&l, Some(&env.dictionary));
+                env.program.push_frame(crate::types::container::program::Frame {
+                    chunk: std::sync::Arc::new(chunk),
+                    ip: 0,
+                    loop_counters: vec![],
+                });
+                Ok(env)
+            }
+            coll::Sized::Program(p) => {
+                let mut env = Environment {
+                    dictionary: d,
+                    ..Environment::default()
+                };
+                env.program = p;
+                Ok(env)
+            }
+            l => {
+                let env: Environment = l.into_iter().try_fit()?;
+                Ok(env)
+            }
+        }
+    }
+}
+
 impl Derive<Environment> for Item {
     fn derive(env: Environment) -> Item {
         assoc::Associative::Env(Box::new(env)).fit()

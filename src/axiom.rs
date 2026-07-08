@@ -318,6 +318,7 @@ lazy_static! {
         ("trace", Box::leak(Box::new(f_stack1(get_trace)))),
         ("dec", Box::leak(Box::new(f_stack1(ok1(dec))))),
         ("decache", Box::leak(Box::new(f_result(read_blob)))),
+        ("disassemble", Box::leak(Box::new(disassemble))),
        // ("decide", Box::leak(Box::new(decide))),
         ("decodejson", Box::leak(Box::new(f_stack1(decode_json)))),
         ("dictmerge", Box::leak(Box::new(f_result(dictmerge)))),
@@ -1480,7 +1481,7 @@ pub async fn eval(mut env: Environment) -> Environment {
 
 pub fn eval_step_outer(mut env: Environment) -> Sometime<'static, Environment> {
     let tos = env.pop();
-    let inner_env = Environment::try_derive(tos);
+    let inner_env = Environment::try_derive((tos, env.dictionary.clone()));
 
     match inner_env {
         Ok(inner) => {
@@ -1509,7 +1510,7 @@ pub fn eval_step_outer(mut env: Environment) -> Sometime<'static, Environment> {
 }
 
 pub fn evaluate(mut env: Environment) -> Sometime<'static, Environment> {
-    match Environment::try_derive(env.tos().expect("stack spec guarantees Environment")) {
+    match Environment::try_derive((env.tos().expect("stack spec guarantees Environment").clone(), env.dictionary.clone())) {
         Ok(inner) => Sometime::Future(Box::pin(eval(inner).map(|inner_done| {
             
             env.pop();
@@ -1610,6 +1611,30 @@ pub fn read_blob(env: &mut Environment) -> Result<(), Error> {
     Ok(())
 }
 
+pub fn disassemble(mut env: Environment) -> Sometime<'static, Environment> {
+    let item = env.pop();
+    let string_repr = match item {
+        Item::List(l) => {
+            let chunk = crate::compile::compile_with_dict(&l, Some(&env.dictionary));
+            format!("{:?}", chunk.ops)
+        }
+        Item::Word(w) => {
+            let dfn = env.dictionary.get_entry(&w);
+            if let Some(entry) = dfn {
+                match entry.definition {
+                    dict::Executable::Axiom(_) => format!("Axiom(<native code>)"),
+                    dict::Executable::Derived(chunk) => format!("{:?}", chunk.ops),
+                }
+            } else {
+                format!("Undefined word")
+            }
+        }
+        _ => format!("Cannot disassemble {:?}", item),
+    };
+    env.push(Item::String(Box::new(string_repr)));
+    env.fit()
+}
+
 /// Writes a given binary object to the cache. Supports [Bytes], and
 /// certain kinds of pipes. The top of stack should be the alias to
 /// store the contents under, which should be either a [Word] or
@@ -1661,7 +1686,7 @@ pub fn f_recur(mut env: Environment) -> Sometime<'static, Environment> {
     let true_branch_list = coll::List::try_derive(true_branch).unwrap_or_default();
     let pred_list = coll::List::try_derive(pred).unwrap_or_default();
 
-    let chunk = crate::compile::compile_recur(&pred_list, &true_branch_list, &false_branch_list, &combinator_list);
+    let chunk = crate::compile::compile_recur_with_dict(&pred_list, &true_branch_list, &false_branch_list, &combinator_list, Some(&env.dictionary));
 
     let mut prog = Program::default();
     prog.push_frame(crate::types::container::program::Frame {
