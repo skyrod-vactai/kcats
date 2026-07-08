@@ -4,16 +4,27 @@ use crate::types::Item;
 use crate::types::container::dictionary::Dictionary;
 use crate::types::container::dictionary::Executable;
 
+/// `VirtualStack` simulates stack manipulations at compile-time to collapse
+/// adjacent stack twiddles (like `swap`, `dup`, `drop`) into a single `Op::Shuffle` instruction.
+/// 
+/// It maintains a virtual state of the stack relative to the actual runtime stack at the start of a basic block.
+/// The `items` vector represents the current stack ordering natively: `items[0]` is the Top-of-Stack (ToS),
+/// `items[1]` is Next-on-Stack (NoS), and so on down to the deepest tracked element.
 struct VirtualStack {
     items: Vec<usize>,
     pops: usize,
 }
 
 impl VirtualStack {
+    /// Creates a fresh, empty VirtualStack state.
     fn new() -> Self {
         Self { items: Vec::new(), pops: 0 }
     }
 
+    /// Pops the Top-of-Stack from the virtual state.
+    /// If the virtual stack is currently empty, it means we are popping a value
+    /// that existed on the runtime stack *before* this block of twiddles started.
+    /// We represent this original depth using `self.pops`.
     fn pop(&mut self) -> usize {
         if self.items.is_empty() {
             let i = self.pops;
@@ -24,10 +35,16 @@ impl VirtualStack {
         }
     }
 
+    /// Pushes an item onto the Top-of-Stack of the virtual state.
+    /// Since index 0 is the ToS, we insert the item at the front of the vector.
     fn push(&mut self, item: usize) {
         self.items.insert(0, item);
     }
     
+    /// Applies a compile-time shuffle to the virtual stack state.
+    /// 
+    /// `pushes` is expected to be an array of indices referencing the items just popped,
+    /// ordered from Top-of-Stack to Deepest. For example, a `swap` operation takes `&[1, 0]`.
     fn apply_shuffle(&mut self, pops: usize, pushes: &[u8]) {
         let mut popped = Vec::with_capacity(pops);
         for _ in 0..pops {
@@ -37,11 +54,17 @@ impl VirtualStack {
             self.push(popped[idx as usize]);
         }
     }
+    /// Flushes the current virtual state, emitting an optimized `Op::Shuffle` instruction
+    /// into the bytecode output `ops` if any stack mutations actually occurred.
     fn flush(&mut self, ops: &mut Vec<Op>) {
         if self.pops == 0 && self.items.is_empty() {
             return;
         }
-        // Simplification pass
+        // Simplification pass: We trim redundant items from the bottom of the virtual stack.
+        // If the deepest pushed item (which lives at the end of the `items` vector) maps directly
+        // to the deepest popped original item (`self.pops - 1`), and it is not duplicated anywhere else,
+        // we can safely trim it out. This prevents emitting `Op::Shuffle` instructions that just
+        // pop and push the exact same item back where it started.
         while !self.items.is_empty() && self.pops > 0 {
             if *self.items.last().unwrap() == self.pops - 1 {
                 let mut used_again = false;
@@ -62,6 +85,9 @@ impl VirtualStack {
         }
         if self.pops > 0 || !self.items.is_empty() {
             let mut pushes = Vec::with_capacity(self.items.len());
+            // Note: `Op::Shuffle` executes at runtime by popping values and then reading the `pushes`
+            // array. It expects the array to be ordered from DEEPEST-to-TOS. Since our internal `items`
+            // is naturally ordered TOS-to-DEEPEST, we must explicitly reverse it here at the boundary.
             for &item in self.items.iter().rev() {
                 // item is the original depth (0 = tos).
                 // it needs to fit into a u8.
@@ -77,6 +103,9 @@ impl VirtualStack {
     }
 }
 
+/// A helper function to identify if a given `Chunk` consists exclusively of a single pure stack shuffle.
+/// This allows us to transparently inline complex composite twiddles (like derived `swapdown` words) 
+/// or optimize the inner blocks of `dip` combinators into flat bytecode.
 fn chunk_to_shuffle(chunk: &Chunk) -> Option<(u8, Vec<u8>)> {
     let mut shuffle = None;
     for op in &chunk.ops {
@@ -99,10 +128,14 @@ fn chunk_to_shuffle(chunk: &Chunk) -> Option<(u8, Vec<u8>)> {
     Some(shuffle.unwrap_or_else(|| (0, Vec::new())))
 }
 
+/// Main entry point for compiling a `List` of items into executable bytecode (`Chunk`).
 pub fn compile(list: &cont::List) -> Chunk {
     compile_with_dict(list, None)
 }
 
+/// Compiles a list, optionally using a local dictionary to perform aggressive compile-time inlining.
+/// This handles iterating through the AST, matching builtin words, applying peephole stack optimizations,
+/// and generating combinator branches (like `evaluate`, `dip`, `↔️`).
 pub fn compile_with_dict(list: &cont::List, dict: Option<&Dictionary>) -> Chunk {
     let mut ops = Vec::new();
     let mut vs = VirtualStack::new();
@@ -159,6 +192,9 @@ pub fn compile_with_dict(list: &cont::List, dict: Option<&Dictionary>) -> Chunk 
                         ops.extend(chunk.ops);
                         continue;
                     }
+                // `🪄` (dip) combinator: Pops a block, pops the TOS, runs the block, restores the TOS.
+                // If the inner block is purely stack shuffles, we can map it to a single inline shuffle 
+                // by shifting all internal indices up by 1 and maintaining TOS (index 0) identically.
                 } else if w_str == "🪄" {
                     if let Some(Op::Push(Item::List(l))) = ops.last() {
                         let l_clone = l.clone();
@@ -175,6 +211,7 @@ pub fn compile_with_dict(list: &cont::List, dict: Option<&Dictionary>) -> Chunk 
                         ops.push(Op::Dip(std::sync::Arc::new(chunk)));
                         continue;
                     }
+                // `•🪄` (dipdown) combinator: Pops a block, hides TOS & NOS, runs block, restores them.
                 } else if w_str == "•🪄" {
                     if let Some(Op::Push(Item::List(l))) = ops.last() {
                         let l_clone = l.clone();
@@ -192,6 +229,7 @@ pub fn compile_with_dict(list: &cont::List, dict: Option<&Dictionary>) -> Chunk 
                         ops.push(Op::Dip(std::sync::Arc::new(dip_chunk)));
                         continue;
                     }
+                // `••🪄` (dipdeep) combinator: Hides the top 3 elements before running the block.
                 } else if w_str == "••🪄" {
                     if let Some(Op::Push(Item::List(l))) = ops.last() {
                         let l_clone = l.clone();
@@ -210,6 +248,8 @@ pub fn compile_with_dict(list: &cont::List, dict: Option<&Dictionary>) -> Chunk 
                         ops.push(Op::Dip(std::sync::Arc::new(dip_chunk2)));
                         continue;
                     }
+                // `↔️` (branch) combinator: Pops a boolean condition and two blocks. Executes one based on the condition.
+                // We compile this to `JumpIfFalseKeepIfTrue` and `Jump` instructions for native performance.
                 } else if w_str == "↔️" {
                     let len = ops.len();
                     if len >= 2 {
