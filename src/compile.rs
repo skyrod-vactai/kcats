@@ -15,17 +15,17 @@ impl VirtualStack {
     }
 
     fn pop(&mut self) -> usize {
-        if let Some(i) = self.items.pop() {
-            i
-        } else {
+        if self.items.is_empty() {
             let i = self.pops;
             self.pops += 1;
             i
+        } else {
+            self.items.remove(0)
         }
     }
 
-    fn push(&mut self, i: usize) {
-        self.items.push(i);
+    fn push(&mut self, item: usize) {
+        self.items.insert(0, item);
     }
     
     fn apply_shuffle(&mut self, pops: usize, pushes: &[u8]) {
@@ -37,16 +37,15 @@ impl VirtualStack {
             self.push(popped[idx as usize]);
         }
     }
-
     fn flush(&mut self, ops: &mut Vec<Op>) {
         if self.pops == 0 && self.items.is_empty() {
             return;
         }
         // Simplification pass
         while !self.items.is_empty() && self.pops > 0 {
-            if self.items[0] == self.pops - 1 {
+            if *self.items.last().unwrap() == self.pops - 1 {
                 let mut used_again = false;
-                for i in 1..self.items.len() {
+                for i in 0..self.items.len() - 1 {
                     if self.items[i] == self.pops - 1 {
                         used_again = true;
                         break;
@@ -55,7 +54,7 @@ impl VirtualStack {
                 if used_again {
                     break;
                 }
-                self.items.remove(0);
+                self.items.pop();
                 self.pops -= 1;
             } else {
                 break;
@@ -63,7 +62,7 @@ impl VirtualStack {
         }
         if self.pops > 0 || !self.items.is_empty() {
             let mut pushes = Vec::with_capacity(self.items.len());
-            for &item in &self.items {
+            for &item in self.items.iter().rev() {
                 // item is the original depth (0 = tos).
                 // it needs to fit into a u8.
                 pushes.push(item as u8);
