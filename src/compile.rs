@@ -444,25 +444,27 @@ mod tests {
     use internment::Intern;
     use crate::types::WordData;
 
-    fn check_compile(word: &str, expected_pops: u8, expected_pushes: &[u8]) {
+    fn check_compile(words: &str, expected_pops: u8, expected_pushes: &[u8]) {
         let mut list = List::new();
-        list.push_back(Item::Word(Intern::new(WordData {
-            data: Intern::new(word.to_string()),
-            quoted: false,
-            namespace: None,
-        })));
+        for word in words.split_whitespace() {
+            list.push_back(Item::Word(Intern::new(WordData {
+                data: Intern::new(word.to_string()),
+                quoted: false,
+                namespace: None,
+            })));
+        }
         let chunk = compile(&list);
         if expected_pops == 0 && expected_pushes.is_empty() {
-            assert_eq!(chunk.ops.len(), 1, "Expected no shuffle for {}", word);
+            assert_eq!(chunk.ops.len(), 1, "Expected no shuffle for {}", words);
             assert!(matches!(chunk.ops[0], Op::Return));
             return;
         }
-        assert_eq!(chunk.ops.len(), 2, "Expected 2 ops for {}", word);
+        assert_eq!(chunk.ops.len(), 2, "Expected 2 ops for {}", words);
         if let Op::Shuffle { pops, pushes } = &chunk.ops[0] {
-            assert_eq!(*pops, expected_pops, "pops mismatch for {}", word);
-            assert_eq!(pushes.as_slice(), expected_pushes, "pushes mismatch for {}", word);
+            assert_eq!(*pops, expected_pops, "pops mismatch for {}", words);
+            assert_eq!(pushes.as_slice(), expected_pushes, "pushes mismatch for {}", words);
         } else {
-            panic!("Expected Shuffle for {}, got {:?}", word, chunk.ops[0]);
+            panic!("Expected Shuffle for {}, got {:?}", words, chunk.ops[0]);
         }
     }
 
@@ -476,7 +478,13 @@ mod tests {
         check_compile("swap-down", 3, &[1, 2, 0]);
         check_compile("sink-down", 4, &[1, 3, 2, 0]);
         
-        check_compile("float", 3, &[1, 0, 2]);
+        check_compile("float", 3, &[1, 0, 2]); // Original DEEPEST-to-TOS for float: [1, 0, 2]
         check_compile("float-down", 4, &[2, 1, 3, 0]);
+
+        // Composites
+        check_compile("swap drop", 2, &[0]);
+        check_compile("dup drop", 0, &[]);
+        check_compile("dup swap-down drop", 2, &[0, 1]); // Equivalent to swap
+        check_compile("dup float drop", 2, &[0, 0]); // Mathematically verified to be dup
     }
 }
