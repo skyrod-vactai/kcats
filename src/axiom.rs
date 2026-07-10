@@ -51,7 +51,7 @@ where
 /// A higher order function that executes a simpler function `f`,
 /// where `f` takes a stack item and returns a [Result] of another
 /// stack item.
-fn f_stack1<F, Arg1, Output, Err>(f: F) -> impl Fn(Environment) -> Sometime<'static, Environment>
+fn f_stack1<F, Arg1, Output, Err>(f: F) -> impl Fn(&mut Environment) -> StepResult
 where
     F: Fn(Arg1) -> Result<Output, Err> + 'static,
     Arg1: TryDerive<Item> + Fit<Item> + Clone,
@@ -60,7 +60,7 @@ where
     //for<'a> <SpecInput as TryDerive<&'a Item>>::Error: Fit<Error>,
     Output: Fit<Item>,
 {
-    move |mut env: Environment| {
+    move |env: &mut Environment| {
         let x = env.stack.pop_front().ok_or_else(Error::stack_underflow);
         match x {
             Ok(i) => match <Arg1>::try_derive(i) {
@@ -85,7 +85,7 @@ where
                 env.push_err(e);
             }
         }
-        env.fit()
+        StepResult::Done
     }
 }
 
@@ -94,7 +94,7 @@ where
 /// stack item.
 fn f_stack2<F, Output, SpecInputY, SpecInputX, E>(
     f: F,
-) -> impl Fn(Environment) -> Sometime<'static, Environment>
+) -> impl Fn(&mut Environment) -> StepResult
 where
     F: Fn(SpecInputY, SpecInputX) -> Result<Output, E> + 'static,
     SpecInputX: for<'a> TryDerive<&'a Item> + Fit<Item> + Clone,
@@ -104,7 +104,7 @@ where
     E: Fit<Error>,
     Output: Fit<Item>,
 {
-    move |mut env: Environment| {
+    move |env: &mut Environment| {
         let x = env
             .tos()
             .ok_or_else(Error::stack_underflow)
@@ -135,7 +135,7 @@ where
                 env.push_err(e);
             }
         }
-        env.fit()
+        StepResult::Done
     }
 }
 
@@ -144,7 +144,7 @@ where
 /// stack item.
 fn f_stack3<F, Output, SpecInputZ, SpecInputY, SpecInputX, E>(
     f: F,
-) -> impl Fn(Environment) -> Sometime<'static, Environment>
+) -> impl Fn(&mut Environment) -> StepResult
 where
     F: Fn(SpecInputZ, SpecInputY, SpecInputX) -> Result<Output, E> + 'static,
     SpecInputX: for<'a> TryDerive<&'a Item> + Fit<Item> + Clone,
@@ -156,7 +156,7 @@ where
     E: Fit<Error>,
     Output: Fit<Item>,
 {
-    move |mut env: Environment| {
+    move |env: &mut Environment| {
         let x = env
             .tos()
             .ok_or_else(Error::stack_underflow)
@@ -194,14 +194,14 @@ where
                 env.push_err(e);
             }
         }
-        env.fit()
+        StepResult::Done
     }
 }
 
 fn f_stack2_async(
     f: fn(Item, Item) -> Sometime<'static, ItemResult>,
-) -> impl Fn(Environment) -> Sometime<'static, Environment> {
-    move |mut env: Environment| {
+) -> impl Fn(&mut Environment) -> StepResult {
+    move |env: &mut Environment| {
         let x = env.pop();
         let y = env.pop();
         match f(x, y) {
@@ -210,15 +210,18 @@ fn f_stack2_async(
                     
                 }
                 env.push(r);
-                Sometime::Now(env)
+                StepResult::Done
             }
-            Sometime::Future(r) => Sometime::Future(Box::pin(r.map(|r| {
+            Sometime::Future(r) => {
+                let mut env_owned = std::mem::replace(env, Environment::empty());
+                StepResult::Async(Box::pin(r.map(move |r| {
                 if r.is_ok() {
                     
                 }
-                env.push(r);
-                env
-            }))),
+                env_owned.push(r);
+                env_owned
+            })))
+            }
         }
     }
 }
@@ -228,17 +231,17 @@ fn f_stack2_async(
 /// append that error to the env. The function `f` should return
 /// either unit or an Error. If it returns an [Error] it will be
 /// pushed onto the stack.
-fn f_result<F>(f: F) -> impl Fn(Environment) -> Sometime<'static, Environment>
+fn f_result<F>(f: F) -> impl Fn(&mut Environment) -> StepResult
 where
     F: Fn(&mut Environment) -> Result<(), Error>,
 {
-    move |mut env: Environment| {
-        let r = f(&mut env);
+    move |env: &mut Environment| {
+        let r = f(env);
         match r {
-            Ok(_) => env.fit(),
+            Ok(_) => StepResult::Done,
             Err(e) => {
                 env.push_err(e);
-                env.fit()
+                StepResult::Done
             }
         }
     }
@@ -578,7 +581,7 @@ pub fn join(i: coll::Sized, j: coll::Sized) -> Result<coll::Sized, Error> {
     i.join(j)
 }
 
-pub fn put(mut env: Environment) -> Sometime<'static, Environment> {
+pub fn put(env: &mut Environment) -> StepResult {
     let i = env.pop();
     match coll::Receptacle::try_derive(env.pop()) {
         Ok(p) => {
@@ -587,76 +590,79 @@ pub fn put(mut env: Environment) -> Sometime<'static, Environment> {
                 Sometime::Now(p) => {
                     
                     env.push(Item::derive(p));
-                    Sometime::Now(env)
+                    StepResult::Done
                 }
-                Sometime::Future(fu) => Sometime::Future(Box::pin(fu.map(|f| {
+                Sometime::Future(fu) => {
+                let mut env_owned = std::mem::replace(env, Environment::empty());
+                StepResult::Async(Box::pin(fu.map(move |f| {
                     match f {
                         Ok(p) => {
                             
-                            env.push(Item::derive(p))
+                            env_owned.push(Item::derive(p))
                         }
-                        Err(e) => env.push(e),
+                        Err(e) => env_owned.push(e),
                     };
-                    env
-                }))),
+                                    env_owned
+            })))
+            }
             }
         }
 
         Err(e) => {
             env.push_err(e);
-            env.fit()
+            StepResult::Done
         }
     }
 }
 
-pub fn clone(mut env: Environment) -> Sometime<'static, Environment> {
+pub fn clone(env: &mut Environment) -> StepResult {
     let clone = env.tos().expect("stack spec guarantees presence").clone();
     
     env.push(clone);
-    env.fit()
+    StepResult::Done
 }
 
-fn swap2(mut env: Environment, offset: usize) -> Sometime<'static, Environment> {
+fn swap2(env: &mut Environment, offset: usize) -> StepResult {
     env.stack.swap(offset, offset + 1);
-    env.fit()
+    StepResult::Done
 }
 
-pub fn swap(env: Environment) -> Sometime<'static, Environment> {
+pub fn swap(env: &mut Environment) -> StepResult {
     
     swap2(env, 0)
 }
 
-pub fn swapdown(env: Environment) -> Sometime<'static, Environment> {
+pub fn swapdown(env: &mut Environment) -> StepResult {
     
     swap2(env, 1)
 }
 
-pub fn swapdeep(env: Environment) -> Sometime<'static, Environment> {
+pub fn swapdeep(env: &mut Environment) -> StepResult {
     
     swap2(env, 2)
 }
 
-pub fn sink(mut env: Environment) -> Sometime<'static, Environment> {
+pub fn sink(env: &mut Environment) -> StepResult {
     env.stack.swap(0, 2);
     env.stack.swap(0, 1);
     
-    env.fit()
+    StepResult::Done
 }
 
-pub fn float(mut env: Environment) -> Sometime<'static, Environment> {
+pub fn float(env: &mut Environment) -> StepResult {
     env.stack.swap(0, 2);
     env.stack.swap(1, 2);
     
-    env.fit()
+    StepResult::Done
 }
 
-pub fn drop(mut env: Environment) -> Sometime<'static, Environment> {
+pub fn drop(env: &mut Environment) -> StepResult {
     env.pop();
     
-    env.fit()
+    StepResult::Done
 }
 
-pub fn eq(mut env: Environment) -> Sometime<'static, Environment> {
+pub fn eq(env: &mut Environment) -> StepResult {
     let is_eq = {
         let i = env.stack.get(0).expect("stack spec guarantees presence");
         let j = env.stack.get(1).expect("stack spec guarantees presence");
@@ -664,7 +670,7 @@ pub fn eq(mut env: Environment) -> Sometime<'static, Environment> {
     };
     
     env.stack.replace2(is_eq.fit());
-    env.fit()
+    StepResult::Done
 }
 
 pub fn count(i: coll::Sized) -> Int {
@@ -729,10 +735,10 @@ pub fn last(c: coll::Sized) -> Item {
 
 impl Identity for Sometime<'static, Environment> {}
 
-pub fn execute(mut env: Environment) -> Sometime<'static, Environment> {
+pub fn execute(env: &mut Environment) -> StepResult {
     let i = env.pop();
     if let Item::Builtin(b) = i {
-        (*b.f)(env).fit()
+        (*b.f)(env)
     } else {
         match Program::try_derive(i) {
             Ok(program) => {
@@ -743,18 +749,18 @@ pub fn execute(mut env: Environment) -> Sometime<'static, Environment> {
                 env.push(e);
             }
         }
-        env.fit()
+        StepResult::Done
     }
 }
 
-pub fn wrap(mut env: Environment) -> Sometime<'static, Environment> {
+pub fn wrap(env: &mut Environment) -> StepResult {
     let item = env.pop();
     
     env.push(list!(item));
-    env.fit()
+    StepResult::Done
 }
 
-pub fn unwrap(mut env: Environment) -> Sometime<'static, Environment> {
+pub fn unwrap(env: &mut Environment) -> StepResult {
     //println!("Unwrap: {:?} {:?}", env.stack, env.program.stacktrace());
     match coll::List::try_derive(env.pop()) {
         Ok(l) => {
@@ -767,7 +773,7 @@ pub fn unwrap(mut env: Environment) -> Sometime<'static, Environment> {
             env.push(e);
         }
     };
-    env.fit()
+    StepResult::Done
 }
 
 /// If it's a word, don't bother wrapping and
@@ -785,7 +791,7 @@ pub fn get_trace(p: Program) -> Result<coll::List, Error> {
     Ok(p.stacktrace())
 }
 
-pub fn dip(mut env: Environment) -> Sometime<'static, Environment> {
+pub fn dip(env: &mut Environment) -> StepResult {
     match Program::try_derive(env.pop()) {
         Ok(program) => {
             let mut item = env.pop();
@@ -798,43 +804,44 @@ pub fn dip(mut env: Environment) -> Sometime<'static, Environment> {
         }
         Err(e) => env.push_err(e),
     }
-    env.fit()
+    StepResult::Done
 }
 
 
 
-pub fn take(mut env: Environment) -> Sometime<'static, Environment> {
+pub fn take(env: &mut Environment) -> StepResult {
     // TODO: handle Nothing case
-    fn finish(
-        mut env: Environment,
+    fn finish(env: &mut Environment,
         i: Result<Option<Item>, Error>,
         c: coll::Dispenser,
-    ) -> Environment {
-        
+    ) {
         env.push(c);
         env.push(coll::result_to_option(i).unwrap_or_default());
-        env
     }
     match coll::Dispenser::try_derive(env.pop()) {
         Ok(d) => match d.take() {
             Sometime::Now(r) => {
                 let (i, c) = r;
-                finish(env, i, c).fit()
+                { finish(env, i, c); StepResult::Done }; StepResult::Done
             }
-            Sometime::Future(r) => Sometime::Future(Box::pin(async move {
-                let (i, c) = r.await;
-                finish(env, i, c)
-            })),
+            Sometime::Future(r) => {
+                let mut env_owned = std::mem::replace(env, Environment::empty());
+                StepResult::Async(Box::pin(async move {
+                    let (i, c) = r.await;
+                    finish(&mut env_owned, i, c);
+                    env_owned
+                }))
+            },
         },
         Err(e) => {
             //println!("Not a dispenser! {:?}", env.tos().unwrap());
             env.push_err(e);
-            env.fit()
+            StepResult::Done
         }
     }
 }
 
-pub fn pop(mut env: Environment) -> Sometime<'static, Environment> {
+pub fn pop(env: &mut Environment) -> StepResult {
     match <coll::Sized as TryDerive<_>>::try_derive(env.pop()) {
         Ok(it) => {
             let (c, i) = it.pop();
@@ -846,14 +853,14 @@ pub fn pop(mut env: Environment) -> Sometime<'static, Environment> {
             env.push_err(e);
         }
     }
-    env.fit()
+    StepResult::Done
 }
 
 pub fn is_truthy(i: &Item) -> bool {
     !i.is_empty()
 }
 
-pub fn branch(mut env: Environment) -> Sometime<'static, Environment> {
+pub fn branch(env: &mut Environment) -> StepResult {
     match (
         Program::try_derive(env.pop()),
         Program::try_derive(env.pop()),
@@ -875,24 +882,23 @@ pub fn branch(mut env: Environment) -> Sometime<'static, Environment> {
         }
         (Err(e), i) => {
             env.push(i);
-            env.push_err(e)
+            env.push_err(e);
         }
         (i, Err(e)) => {
             env.push(e.actual().expect("error actual guarantees presence"));
             env.push(i);
-            env.push(e)
+            env.push(e);
         }
     }
-    env.fit()
+    StepResult::Done
 }
 
-pub fn step(mut env: Environment) -> Sometime<'static, Environment> {
-    fn finish(
-        mut env: Environment,
+pub fn step(env: &mut Environment) -> StepResult {
+    fn finish(env: &mut Environment,
         r: Result<Option<Item>, Error>,
         dispenser: coll::Dispenser,
         p: coll::List,
-    ) -> Environment {
+    ) {
         if let Some(litem) = coll::result_to_option(r) {
             // prepare the next iteration. First we execute p, then we
             // push the remaining dispenser and a new copy of p. Do
@@ -905,17 +911,20 @@ pub fn step(mut env: Environment) -> Sometime<'static, Environment> {
             // if the container is empty, just pop off 'step' and we're done
             
         }
-        env
     }
     let p = coll::List::try_derive(env.pop()).expect("stack spec guarantees List");
     let dispenser =
         coll::Dispenser::try_derive(env.pop()).expect("stack spec guarantees Dispenser");
     match dispenser.take() {
-        Sometime::Now((r, dispenser)) => finish(env, r, dispenser, p).fit(),
-        Sometime::Future(f) => Sometime::Future(Box::pin(async move {
-            let (r, dispenser) = f.await;
-            finish(env, r, dispenser, p)
-        })),
+        Sometime::Now((r, dispenser)) => { finish(env, r, dispenser, p); StepResult::Done },
+        Sometime::Future(f) => {
+            let mut env_owned = std::mem::replace(env, Environment::empty());
+            StepResult::Async(Box::pin(async move {
+                let (r, dispenser) = f.await;
+                finish(&mut env_owned, r, dispenser, p);
+                env_owned
+            }))
+        },
     }
 }
 
@@ -942,20 +951,20 @@ pub fn range(from: Int, to: Int, stepby: Int) -> coll::List {
 //(fn [{[l & others] 'stack :as env}]
 //            (assoc env 'stack (apply list (vec others) l)))
 
-pub fn evert(mut env: Environment) -> Sometime<'static, Environment> {
+pub fn evert(env: &mut Environment) -> StepResult {
     let l = coll::List::try_derive(env.pop()).expect("stack spec guarantees List");
     let tmp = env.stack.to_list();
     env.stack = crate::types::container::stack::StackData::from_list(l);
     let l = tmp;
     
     env.push(l);
-    env.fit()
+    StepResult::Done
 }
 
-pub fn snapshot(mut env: Environment) -> Sometime<'static, Environment> {
+pub fn snapshot(env: &mut Environment) -> StepResult {
     
     env.push(env.stack.to_list());
-    env.fit()
+    StepResult::Done
 }
 
 fn assoc_in(i: Option<Item>, ks: &[assoc::KeyItem], v: Item) -> Result<Item, Error> {
@@ -1223,21 +1232,21 @@ pub fn autoformat(i: Item) -> Result<String, Error> {
 
 /// Inner function of the interpreter, each call to this function
 /// advances the [Environment] one step of execution.
-pub fn eval_step(mut env: Environment) -> Sometime<'static, Environment> {
+pub fn eval_step(env: &mut Environment) -> StepResult {
     env.program.clean();
     let op = env.program.0.last_mut().and_then(|f| f.next_op());
     if let Some(op) = op {
         match op {
             crate::types::container::program::Op::Push(item) => {
                 env.push(item);
-                env.fit()
+                StepResult::Done
             }
             crate::types::container::program::Op::Call(word) => {
                 if word.quoted {
                     let mut w = word.as_ref().clone();
                     w.quoted = false;
                     env.push(w);
-                    env.fit()
+                    StepResult::Done
                 } else {
                     let definition = {
                         if word.namespace.is_some() {
@@ -1250,7 +1259,7 @@ pub fn eval_step(mut env: Environment) -> Sometime<'static, Environment> {
                         if let Some(spec) = &dfn.spec {
                             if let Err(e) = env.check_input_spec(&spec.0) {
                                 env.push_err(e);
-                                return env.fit();
+                                return StepResult::Done;
                             }
                         }
 
@@ -1262,12 +1271,12 @@ pub fn eval_step(mut env: Environment) -> Sometime<'static, Environment> {
                                     ip: 0,
                                     loop_counters: vec![],
                                 });
-                                env.fit()
+                                StepResult::Done
                             }
                         }
                     } else {
                         env.push_err(Error::undefined(word.clone().fit()));
-                        env.fit()
+                        StepResult::Done
                     }
                 }
             }
@@ -1276,7 +1285,7 @@ pub fn eval_step(mut env: Environment) -> Sometime<'static, Environment> {
                 if let Err(e) = env.stack.shuffle(pops, &pushes) {
                     env.push(e);
                 }
-                env.fit()
+                StepResult::Done
             }
             crate::types::container::program::Op::Execute(chunk) => {
 
@@ -1285,7 +1294,7 @@ pub fn eval_step(mut env: Environment) -> Sometime<'static, Environment> {
                     ip: 0,
                     loop_counters: vec![],
                 });
-                env.fit()
+                StepResult::Done
             }
             crate::types::container::program::Op::Dip(chunk) => {
                 let item = env.pop();
@@ -1303,12 +1312,12 @@ pub fn eval_step(mut env: Environment) -> Sometime<'static, Environment> {
                     ip: 0,
                     loop_counters: vec![],
                 });
-                env.fit()
+                StepResult::Done
             }
             crate::types::container::program::Op::Jump(offset) => {
                 let frame = env.program.0.last_mut().unwrap();
                 frame.ip = (frame.ip as isize + offset) as usize;
-                env.fit()
+                StepResult::Done
             }
             crate::types::container::program::Op::JumpIfFalse(offset) => {
                 let item = env.pop();
@@ -1316,7 +1325,7 @@ pub fn eval_step(mut env: Environment) -> Sometime<'static, Environment> {
                     let frame = env.program.0.last_mut().unwrap();
                     frame.ip = (frame.ip as isize + offset) as usize;
                 }
-                env.fit()
+                StepResult::Done
             }
             crate::types::container::program::Op::JumpIfFalseKeepIfTrue(offset) => {
                 let is_true = is_truthy(env.stack.front().unwrap_or(&crate::types::Item::List(Box::new(crate::types::container::List::new()))));
@@ -1325,7 +1334,7 @@ pub fn eval_step(mut env: Environment) -> Sometime<'static, Environment> {
                     let frame = env.program.0.last_mut().unwrap();
                     frame.ip = (frame.ip as isize + offset) as usize;
                 }
-                env.fit()
+                StepResult::Done
             }
             crate::types::container::program::Op::JumpIfTrue(offset) => {
                 let item = env.pop();
@@ -1333,38 +1342,38 @@ pub fn eval_step(mut env: Environment) -> Sometime<'static, Environment> {
                     let frame = env.program.0.last_mut().unwrap();
                     frame.ip = (frame.ip as isize + offset) as usize;
                 }
-                env.fit()
+                StepResult::Done
             }
             crate::types::container::program::Op::PushLoopCounter => {
                 env.program.0.last_mut().unwrap().loop_counters.push(0);
-                env.fit()
+                StepResult::Done
             }
             crate::types::container::program::Op::PopLoopCounter => {
                 env.program.0.last_mut().unwrap().loop_counters.pop();
-                env.fit()
+                StepResult::Done
             }
             crate::types::container::program::Op::IncLoopCounter(idx) => {
                 env.program.0.last_mut().unwrap().loop_counters[idx] += 1;
-                env.fit()
+                StepResult::Done
             }
             crate::types::container::program::Op::DecLoopCounter(idx) => {
                 env.program.0.last_mut().unwrap().loop_counters[idx] -= 1;
-                env.fit()
+                StepResult::Done
             }
             crate::types::container::program::Op::JumpIfLoopCounterZero(idx, offset) => {
                 let frame = env.program.0.last_mut().unwrap();
                 if frame.loop_counters[idx] == 0 {
                     frame.ip = (frame.ip as isize + offset) as usize;
                 }
-                env.fit()
+                StepResult::Done
             }
             crate::types::container::program::Op::Return => {
                 env.program.pop_frame();
-                env.fit()
+                StepResult::Done
             }
         }
     } else {
-        env.fit()
+        StepResult::Done
     }
 }
 
@@ -1468,9 +1477,9 @@ pub async fn eval(mut env: Environment) -> Environment {
             };
         }
         if !env.program.is_empty() {
-            env = match eval_step(env) {
-                Sometime::Now(env) => env,
-                Sometime::Future(fenv) => fenv.await,
+            env = match eval_step(&mut env) {
+                StepResult::Done => env,
+                StepResult::Async(fenv) => fenv.await,
             };
         } else {
             break;
@@ -1479,7 +1488,7 @@ pub async fn eval(mut env: Environment) -> Environment {
     env
 }
 
-pub fn eval_step_outer(mut env: Environment) -> Sometime<'static, Environment> {
+pub fn eval_step_outer(env: &mut Environment) -> StepResult {
     let tos = env.pop();
     let inner_env = Environment::try_derive((tos, env.dictionary.clone()));
 
@@ -1488,48 +1497,55 @@ pub fn eval_step_outer(mut env: Environment) -> Sometime<'static, Environment> {
             
             if inner.program.is_empty() {
                 env.push(Item::default());
-                Sometime::Now(env)
+                StepResult::Done
             } else {
-                match eval_step(inner) {
-                    Sometime::Now(inner) => {
-                        env.push(inner);
-                        Sometime::Now(env)
+                let mut inner_mut = inner;
+                match eval_step(&mut inner_mut) {
+                    StepResult::Done => {
+                        env.push(inner_mut);
+                        StepResult::Done
                     }
-                    Sometime::Future(finner) => Sometime::Future(Box::pin(finner.map(|e| {
-                        env.push(e);
-                        env
-                    }))),
+                    StepResult::Async(finner) => {
+                    let mut env_owned = std::mem::replace(env, Environment::empty());
+                    StepResult::Async(Box::pin(finner.map(move |e| {
+                        env_owned.push(e);
+                        env_owned
+                    })))
+                },
                 }
             }
         }
         Err(e) => {
             env.push(e);
-            env.fit()
+            StepResult::Done
         }
     }
 }
 
-pub fn evaluate(mut env: Environment) -> Sometime<'static, Environment> {
+pub fn evaluate(env: &mut Environment) -> StepResult {
     match Environment::try_derive((env.tos().expect("stack spec guarantees Environment").clone(), env.dictionary.clone())) {
-        Ok(inner) => Sometime::Future(Box::pin(eval(inner).map(|inner_done| {
+        Ok(inner) => {
+                let mut env_owned = std::mem::replace(env, Environment::empty());
+                StepResult::Async(Box::pin(eval(inner).map(move |inner_done| {
             
-            env.pop();
-            env.push(inner_done);
-            env
-        }))),
+            env_owned.pop();
+                env_owned.push(inner_done);
+                env_owned
+            })))
+            }
         Err(e) => {
             env.push(e);
-            env.fit()
+            StepResult::Done
         }
     }
 }
 
-pub fn dictionary(mut env: Environment) -> Sometime<'static, Environment> {
+pub fn dictionary(env: &mut Environment) -> StepResult {
     //println!("adding dictionary");
     let d = env.dictionary.clone();
     
     env.push(d);
-    env.fit()
+    StepResult::Done
 }
 
 pub fn lingo(dict: dict::Dictionary) -> dict::Words {
@@ -1546,17 +1562,17 @@ fn abs(i: Number) -> Number {
 
 /// If there's an unhandled error on the stack, handle it, otherwise
 /// no-op.
-fn handle(mut env: Environment) -> Sometime<'static, Environment> {
+fn handle(env: &mut Environment) -> StepResult {
     
     if let Some(Item::Error(ref mut e)) = env.stack.front_mut() {
         e.is_handled = true;
     }
-    env.fit()
+    StepResult::Done
 }
 
-pub fn self_insert(mut env: Environment) -> Sometime<'static, Environment> {
+pub fn self_insert(env: &mut Environment) -> StepResult {
     env.push(true);
-    env.fit()
+    StepResult::Done
 }
 
 pub fn fail(env: &mut Environment) -> Result<(), Error> {
@@ -1611,7 +1627,7 @@ pub fn read_blob(env: &mut Environment) -> Result<(), Error> {
     Ok(())
 }
 
-pub fn disassemble(mut env: Environment) -> Sometime<'static, Environment> {
+pub fn disassemble(env: &mut Environment) -> StepResult {
     let item = env.pop();
     let string_repr = match item {
         Item::List(l) => {
@@ -1632,7 +1648,7 @@ pub fn disassemble(mut env: Environment) -> Sometime<'static, Environment> {
         _ => format!("Cannot disassemble {:?}", item),
     };
     env.push(Item::String(Box::new(string_repr)));
-    env.fit()
+    StepResult::Done
 }
 
 /// Writes a given binary object to the cache. Supports [Bytes], and
@@ -1659,23 +1675,23 @@ pub fn write_blob(env: &mut Environment) -> Result<(), Error> {
 
 /// Takes an inner environment from the top of the stack, and spawns a
 /// tokio task to evaluate that environment.
-pub fn animate(mut env: Environment) -> Sometime<'static, Environment> {
+pub fn animate(env: &mut Environment) -> StepResult {
     let tos = env.pop();
     let inner_env = Environment::try_derive(tos);
     match inner_env {
         Ok(inner) => {
             
             tokio::spawn(async move { eval(inner).await });
-            env.fit()
+            StepResult::Done
         }
         Err(e) => {
             env.push(e);
-            env.fit()
+            StepResult::Done
         }
     }
 }
 
-pub fn f_recur(mut env: Environment) -> Sometime<'static, Environment> {
+pub fn f_recur(env: &mut Environment) -> StepResult {
     let combinator = env.pop();
     let false_branch = env.pop();
     let true_branch = env.pop();
@@ -1696,7 +1712,7 @@ pub fn f_recur(mut env: Environment) -> Sometime<'static, Environment> {
     });
     
     env.push(Item::Program(Box::new(prog)));
-    env.fit()
+    StepResult::Done
 }
 
 fn xor_(i: Bytes, j: Bytes) -> Bytes {
@@ -1723,16 +1739,16 @@ pub fn inspect(i: Item) -> String {
     format!("{:?}", i)
 }
 
-pub fn timestamps(mut env: Environment) -> Sometime<'static, Environment> {
+pub fn timestamps(env: &mut Environment) -> StepResult {
     
     env.push(Item::Time);
-    env.fit()
+    StepResult::Done
 }
 
-pub fn standard(mut env: Environment) -> Sometime<'static, Environment> {
+pub fn standard(env: &mut Environment) -> StepResult {
     
     env.push(Item::Standard);
-    env.fit()
+    StepResult::Done
 }
 
 pub fn intersection(i: Item, j: Item) -> ItemResult {
@@ -1877,7 +1893,7 @@ fn namespace(word: Word, ns: Bytes) -> Word {
     word.fit()
 }
 
-fn unnamespace(mut env: Environment) -> Sometime<'static, Environment> {
+fn unnamespace(env: &mut Environment) -> StepResult {
     if let Some(i) = env.stack.pop_front() {
         match Word::try_derive(i) {
             Ok(w) => {
@@ -1899,10 +1915,10 @@ fn unnamespace(mut env: Environment) -> Sometime<'static, Environment> {
     } else {
         env.push(Error::stack_underflow())
     }
-    env.fit()
+    StepResult::Done
 }
 
-fn resolve(mut env: Environment) -> Sometime<'static, Environment> {
+fn resolve(env: &mut Environment) -> StepResult {
     if let Some(i) = env.stack.pop_front() {
         match Word::try_derive(i) {
             Ok(w) => {
@@ -1921,7 +1937,7 @@ fn resolve(mut env: Environment) -> Sometime<'static, Environment> {
         env.push(Error::stack_underflow())
     }
 
-    env.fit()
+    StepResult::Done
 }
 
 fn is_finished(env: Environment) -> bool {

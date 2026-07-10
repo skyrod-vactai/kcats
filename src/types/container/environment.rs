@@ -25,6 +25,18 @@ pub struct Environment {
 }
 
 impl Environment {
+    pub fn empty() -> Self {
+        Environment {
+            dictionary: dict::Dictionary {
+                words: Default::default(),
+                modules: Default::default(),
+                lingo: dict::Words::fresh(),
+            },
+            stack: Default::default(),
+            program: Default::default()
+        }
+    }
+
     /// Push the [Item] onto the top of the stack.
     pub fn push<T: Fit<Item>>(&mut self, i: T) {
         self.stack.push_front(i.fit());

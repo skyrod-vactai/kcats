@@ -167,10 +167,10 @@ impl crate::serialize::Display for Handoff<Item> {
     }
 }
 
-pub fn handoff(mut env: Environment) -> types::Sometime<'static, Environment> {
+pub fn handoff(env: &mut Environment) -> types::StepResult {
 
     env.push(pipe::Tunnel::Handoff(Box::new(Handoff::new(false))));
-    env.fit()
+    types::StepResult::Done
 }
 
 impl From<flume::RecvError> for error::Error {

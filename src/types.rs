@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::future::{self, IntoFuture};
 use std::hash::Hash;
 use std::marker::Sync;
-use std::pin::Pin;
+
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -409,7 +409,17 @@ impl<'a, T> IntoFuture for Sometime<'a, T> {
 
 /// A type for a function that advances the execution of a kcats
 /// [env::Environment] by one step.
-pub type StepFn = dyn Fn(env::Environment) -> Sometime<'static, env::Environment> + Sync + Send;
+
+
+
+
+use std::pin::Pin;
+pub enum StepResult {
+    Done,
+    Async(Pin<Box<dyn std::future::Future<Output = env::Environment> + Send + 'static>>),
+}
+
+pub type StepFn = dyn Fn(&mut env::Environment) -> StepResult + Sync + Send;
 
 impl PartialEq for Item {
     fn eq(&self, other: &Self) -> bool {
