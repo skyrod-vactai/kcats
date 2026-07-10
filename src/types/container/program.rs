@@ -39,6 +39,7 @@ pub struct Frame {
     pub chunk: Arc<Chunk>,
     pub ip: usize,
     pub loop_counters: Vec<usize>,
+    pub restore_items: Vec<crate::types::Item>,
 }
 
 impl PartialEq for Frame {
@@ -68,10 +69,16 @@ impl Frame {
 pub struct Program(pub Vec<Frame>);
 
 impl Program {
-    pub fn clean(&mut self) {
+    pub fn clean(&mut self) -> Vec<crate::types::Item> {
+        let mut restored = Vec::new();
         while self.0.last().map(|f| f.is_finished()).unwrap_or(false) {
-            self.0.pop();
+            if let Some(frame) = self.0.pop() {
+                for item in frame.restore_items.into_iter().rev() {
+                    restored.push(item);
+                }
+            }
         }
+        restored
     }
     
     pub fn is_empty(&self) -> bool {
@@ -85,6 +92,7 @@ impl Program {
                 chunk: Arc::new(chunk),
                 ip: 0,
                 loop_counters: vec![],
+                restore_items: vec![],
             });
         }
     }
@@ -98,8 +106,8 @@ impl Program {
         self.0.push(frame);
     }
     
-    pub fn pop_frame(&mut self) {
-        self.0.pop();
+    pub fn pop_frame(&mut self) -> Option<Frame> {
+        self.0.pop()
     }
     
     pub fn extend_program(&mut self, other: Program) {
@@ -115,6 +123,7 @@ impl Program {
                     chunk: Arc::new(chunk),
                     ip: 0,
                     loop_counters: vec![],
+                    restore_items: vec![],
                 },
             )
         }
@@ -149,6 +158,7 @@ impl Program {
                     chunk: Arc::new(Chunk { ops: unwound_ops, source: None }),
                     ip: 0,
                     loop_counters: f.loop_counters.clone(),
+                    restore_items: vec![],
                 };
                 unwound.0.push(unwound_frame);
                 break;
@@ -188,6 +198,7 @@ impl Derive<cont::List> for Program {
             chunk: Arc::new(crate::compile::compile(&s)),
             ip: 0,
             loop_counters: vec![],
+            restore_items: vec![],
         }])
     }
 }
@@ -239,6 +250,7 @@ mod tests {
                 chunk: Arc::new(crate::compile::compile(&list!["foo", "bar", "baz"])),
                 ip: 1,
                 loop_counters: vec![],
+                restore_items: vec![],
             },
         ]);
         assert_eq!(p.count(), 3);

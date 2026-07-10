@@ -442,6 +442,7 @@ impl TryDerive<(Item, dict::Dictionary)> for Environment {
                     chunk: std::sync::Arc::new(chunk),
                     ip: 0,
                     loop_counters: vec![],
+                    restore_items: vec![],
                 });
                 Ok(env)
             }

@@ -1233,7 +1233,10 @@ pub fn autoformat(i: Item) -> Result<String, Error> {
 /// Inner function of the interpreter, each call to this function
 /// advances the [Environment] one step of execution.
 pub fn eval_step(env: &mut Environment) -> StepResult {
-    env.program.clean();
+    let restored = env.program.clean();
+    for item in restored {
+        env.push(item);
+    }
     let op = env.program.0.last_mut().and_then(|f| f.next_op());
     if let Some(op) = op {
         match op {
@@ -1270,6 +1273,7 @@ pub fn eval_step(env: &mut Environment) -> StepResult {
                                     chunk: d.clone(),
                                     ip: 0,
                                     loop_counters: vec![],
+                                    restore_items: vec![],
                                 });
                                 StepResult::Done
                             }
@@ -1293,24 +1297,17 @@ pub fn eval_step(env: &mut Environment) -> StepResult {
                     chunk,
                     ip: 0,
                     loop_counters: vec![],
+                    restore_items: vec![],
                 });
                 StepResult::Done
             }
             crate::types::container::program::Op::Dip(chunk) => {
                 let item = env.pop();
-                let push_chunk = Arc::new(crate::types::container::program::Chunk {
-                    ops: vec![crate::types::container::program::Op::Push(item), crate::types::container::program::Op::Return],
-                    source: None,
-                });
-                env.program.push_frame(crate::types::container::program::Frame {
-                    chunk: push_chunk,
-                    ip: 0,
-                    loop_counters: vec![],
-                });
                 env.program.push_frame(crate::types::container::program::Frame {
                     chunk,
                     ip: 0,
                     loop_counters: vec![],
+                    restore_items: vec![item],
                 });
                 StepResult::Done
             }
@@ -1368,7 +1365,11 @@ pub fn eval_step(env: &mut Environment) -> StepResult {
                 StepResult::Done
             }
             crate::types::container::program::Op::Return => {
-                env.program.pop_frame();
+                if let Some(frame) = env.program.pop_frame() {
+                    for item in frame.restore_items.into_iter().rev() {
+                        env.push(item);
+                    }
+                }
                 StepResult::Done
             }
         }
@@ -1709,6 +1710,7 @@ pub fn f_recur(env: &mut Environment) -> StepResult {
         chunk: Arc::new(chunk),
         ip: 0,
         loop_counters: vec![],
+        restore_items: vec![],
     });
     
     env.push(Item::Program(Box::new(prog)));
