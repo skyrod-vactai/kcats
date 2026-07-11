@@ -12,6 +12,7 @@ pub enum Op {
     Call(Word),
     Execute(Arc<Chunk>),
     Dip(Arc<Chunk>),
+    Shield(Arc<Chunk>),
     Jump(isize),
     JumpIfTrue(isize),
     JumpIfFalse(isize),
@@ -40,6 +41,7 @@ pub struct Frame {
     pub ip: usize,
     pub loop_counters: Vec<usize>,
     pub restore_items: Vec<crate::types::Item>,
+    pub restore_stack: Option<crate::types::container::stack::StackData>,
 }
 
 impl PartialEq for Frame {
@@ -69,16 +71,22 @@ impl Frame {
 pub struct Program(pub Vec<Frame>);
 
 impl Program {
-    pub fn clean(&mut self) -> Vec<crate::types::Item> {
+    pub fn clean(&mut self) -> (Vec<crate::types::Item>, Option<crate::types::container::stack::StackData>) {
         let mut restored = Vec::new();
+        let mut restored_stack = None;
         while self.0.last().map(|f| f.is_finished()).unwrap_or(false) {
             if let Some(frame) = self.0.pop() {
-                for item in frame.restore_items.into_iter().rev() {
-                    restored.push(item);
+                if frame.restore_stack.is_some() {
+                    restored_stack = frame.restore_stack;
+                    restored.clear();
+                } else {
+                    for item in frame.restore_items.into_iter().rev() {
+                        restored.push(item);
+                    }
                 }
             }
         }
-        restored
+        (restored, restored_stack)
     }
     
     pub fn is_empty(&self) -> bool {
@@ -93,6 +101,7 @@ impl Program {
                 ip: 0,
                 loop_counters: vec![],
                 restore_items: vec![],
+                restore_stack: None,
             });
         }
     }
@@ -124,6 +133,7 @@ impl Program {
                     ip: 0,
                     loop_counters: vec![],
                     restore_items: vec![],
+                    restore_stack: None,
                 },
             )
         }
@@ -159,6 +169,7 @@ impl Program {
                     ip: 0,
                     loop_counters: f.loop_counters.clone(),
                     restore_items: vec![],
+                    restore_stack: None,
                 };
                 unwound.0.push(unwound_frame);
                 break;
@@ -199,6 +210,7 @@ impl Derive<cont::List> for Program {
             ip: 0,
             loop_counters: vec![],
             restore_items: vec![],
+            restore_stack: None,
         }])
     }
 }
@@ -251,6 +263,7 @@ mod tests {
                 ip: 1,
                 loop_counters: vec![],
                 restore_items: vec![],
+                restore_stack: None,
             },
         ]);
         assert_eq!(p.count(), 3);

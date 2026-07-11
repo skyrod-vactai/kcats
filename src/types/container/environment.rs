@@ -443,6 +443,7 @@ impl TryDerive<(Item, dict::Dictionary)> for Environment {
                     ip: 0,
                     loop_counters: vec![],
                     restore_items: vec![],
+                    restore_stack: None,
                 });
                 Ok(env)
             }

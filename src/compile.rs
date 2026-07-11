@@ -256,6 +256,23 @@ pub fn compile_with_dict(list: &cont::List, dict: Option<&Dictionary>) -> Chunk 
                         ops.push(Op::Dip(std::sync::Arc::new(dip_chunk2)));
                         continue;
                     }
+                } else if w_str == "▶️" || w_str == "evaluate" {
+                    let len = ops.len();
+                    if len >= 2 {
+                        if let (Op::Call(w_prev), Op::Push(crate::types::Item::List(l))) = (&ops[len-1], &ops[len-2]) {
+                            if w_prev.data.as_str() == "🛡️" || w_prev.data.as_str() == "shield" {
+                                let l_clone = l.clone();
+                                ops.pop();
+                                ops.pop();
+                                let mut inner_chunk = compile_with_dict(&l_clone, dict);
+                                inner_chunk.ops.pop(); // remove implicit return
+                                ops.push(Op::Shield(std::sync::Arc::new(inner_chunk)));
+                                continue;
+                            }
+                        }
+                    }
+                    ops.push(Op::Call(w.clone()));
+                    continue;
                 // `↔️` (branch) combinator: Pops a boolean condition and two blocks. Executes one based on the condition.
                 // We compile this to `JumpIfFalseKeepIfTrue` and `Jump` instructions for native performance.
                 } else if w_str == "↔️" {

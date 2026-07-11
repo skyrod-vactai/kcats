@@ -1233,7 +1233,12 @@ pub fn autoformat(i: Item) -> Result<String, Error> {
 /// Inner function of the interpreter, each call to this function
 /// advances the [Environment] one step of execution.
 pub fn eval_step(env: &mut Environment) -> StepResult {
-    let restored = env.program.clean();
+    let (restored, restored_stack) = env.program.clean();
+    if let Some(stack) = restored_stack {
+        let top = env.stack.pop_front().unwrap_or(crate::types::Item::Nothing);
+        env.stack = stack;
+        env.push(top);
+    }
     for item in restored {
         env.push(item);
     }
@@ -1274,6 +1279,7 @@ pub fn eval_step(env: &mut Environment) -> StepResult {
                                     ip: 0,
                                     loop_counters: vec![],
                                     restore_items: vec![],
+                                    restore_stack: None,
                                 });
                                 StepResult::Done
                             }
@@ -1298,6 +1304,7 @@ pub fn eval_step(env: &mut Environment) -> StepResult {
                     ip: 0,
                     loop_counters: vec![],
                     restore_items: vec![],
+                    restore_stack: None,
                 });
                 StepResult::Done
             }
@@ -1308,6 +1315,18 @@ pub fn eval_step(env: &mut Environment) -> StepResult {
                     ip: 0,
                     loop_counters: vec![],
                     restore_items: vec![item],
+                    restore_stack: None,
+                });
+                StepResult::Done
+            }
+            crate::types::container::program::Op::Shield(chunk) => {
+                let saved_stack = env.stack.clone();
+                env.program.push_frame(crate::types::container::program::Frame {
+                    chunk,
+                    ip: 0,
+                    loop_counters: vec![],
+                    restore_items: vec![],
+                    restore_stack: Some(saved_stack),
                 });
                 StepResult::Done
             }
@@ -1366,8 +1385,14 @@ pub fn eval_step(env: &mut Environment) -> StepResult {
             }
             crate::types::container::program::Op::Return => {
                 if let Some(frame) = env.program.pop_frame() {
-                    for item in frame.restore_items.into_iter().rev() {
-                        env.push(item);
+                    if let Some(stack) = frame.restore_stack {
+                        let top = env.stack.pop_front().unwrap_or(crate::types::Item::Nothing);
+                        env.stack = stack;
+                        env.push(top);
+                    } else {
+                        for item in frame.restore_items.into_iter().rev() {
+                            env.push(item);
+                        }
                     }
                 }
                 StepResult::Done
@@ -1711,6 +1736,7 @@ pub fn f_recur(env: &mut Environment) -> StepResult {
         ip: 0,
         loop_counters: vec![],
         restore_items: vec![],
+        restore_stack: None,
     });
     
     env.push(Item::Program(Box::new(prog)));
