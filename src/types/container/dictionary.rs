@@ -204,6 +204,7 @@ pub type Words = coll::Arc<HashMap<Word, Entry>>;
 #[derive(Clone, PartialEq)]
 #[derive(Default)]
 pub struct Dictionary {
+
     pub words: Words,
     pub lingo: Words,
     pub modules: Vec<Namespace>,
@@ -225,6 +226,11 @@ impl fmt::Debug for Dictionary {
 }
 
 impl Dictionary {
+    pub fn empty() -> &'static Self {
+        static EMPTY: std::sync::OnceLock<Dictionary> = std::sync::OnceLock::new();
+        EMPTY.get_or_init(|| Dictionary::default())
+    }
+
     /// Treats the [Dictionary] as an associative structure,
     /// returning one of its fields, or [None].
     pub fn get(&self, key: &assoc::KeyItem) -> Option<Item> {

@@ -95,7 +95,7 @@ impl Program {
     
     pub fn prepend(&mut self, snippet: cont::List) {
         if !snippet.is_empty() {
-            let chunk = crate::compile::compile_with_dict(&snippet, &crate::types::container::dictionary::Dictionary::default());
+            let chunk = crate::compile::compile_with_dict(&snippet, &crate::types::container::dictionary::Dictionary::empty());
             self.0.push(Frame {
                 chunk: Arc::new(chunk),
                 ip: 0,
@@ -125,7 +125,7 @@ impl Program {
     
     pub fn extend(&mut self, snippet: cont::List) {
         if !snippet.is_empty() {
-            let chunk = crate::compile::compile_with_dict(&snippet, &crate::types::container::dictionary::Dictionary::default());
+            let chunk = crate::compile::compile_with_dict(&snippet, &crate::types::container::dictionary::Dictionary::empty());
             self.0.insert(
                 0,
                 Frame {
@@ -206,7 +206,7 @@ impl Program {
 impl Derive<cont::List> for Program {
     fn derive(s: cont::List) -> Program {
         Program(vec![Frame {
-            chunk: Arc::new(crate::compile::compile_with_dict(&s, &crate::types::container::dictionary::Dictionary::default())),
+            chunk: Arc::new(crate::compile::compile_with_dict(&s, &crate::types::container::dictionary::Dictionary::empty())),
             ip: 0,
             loop_counters: vec![],
             restore_items: vec![],
@@ -259,7 +259,7 @@ mod tests {
     fn test_layers() {
         let p = Program(vec![
             Frame {
-                chunk: Arc::new(crate::compile::compile_with_dict(&list!["foo", "bar", "baz"], &crate::types::container::dictionary::Dictionary::default())),
+                chunk: Arc::new(crate::compile::compile_with_dict(&list!["foo", "bar", "baz"], &crate::types::container::dictionary::Dictionary::empty())),
                 ip: 1,
                 loop_counters: vec![],
                 restore_items: vec![],

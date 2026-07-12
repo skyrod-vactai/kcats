@@ -547,7 +547,7 @@ mod tests {
                 namespace: None,
             })));
         }
-        let chunk = compile_with_dict(&list, &crate::types::container::dictionary::Dictionary::default());
+        let chunk = compile_with_dict(&list, &crate::types::container::dictionary::Dictionary::empty());
         if expected_pops == 0 && expected_pushes.is_empty() {
             assert_eq!(chunk.ops.len(), 1, "Expected no shuffle for {}", words);
             assert!(matches!(chunk.ops[0], Op::Return));
