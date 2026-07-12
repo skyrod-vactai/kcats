@@ -68,7 +68,6 @@ where
                     let res = f(i);
                     match res {
                         Ok(r) => {
-                            
                             //env.pop();
                             env.push(r);
                         }
@@ -92,9 +91,7 @@ where
 /// A higher order function that executes a simpler function `f`,
 /// where `f` takes two stack items and returns a [Result] of another
 /// stack item.
-fn f_stack2<F, Output, SpecInputY, SpecInputX, E>(
-    f: F,
-) -> impl Fn(&mut Environment) -> StepResult
+fn f_stack2<F, Output, SpecInputY, SpecInputX, E>(f: F) -> impl Fn(&mut Environment) -> StepResult
 where
     F: Fn(SpecInputY, SpecInputX) -> Result<Output, E> + 'static,
     SpecInputX: for<'a> TryDerive<&'a Item> + Fit<Item> + Clone,
@@ -120,7 +117,6 @@ where
                 let res = f(y, x);
                 match res {
                     Ok(r) => {
-                        
                         env.stack.replace2(r.fit());
                     }
                     Err(e) => {
@@ -176,7 +172,6 @@ where
                 let res = f(z, y, x);
                 match res {
                     Ok(r) => {
-                        
                         env.stack.replace3(r.fit());
                     }
                     Err(e) => {
@@ -206,21 +201,17 @@ fn f_stack2_async(
         let y = env.pop();
         match f(x, y) {
             Sometime::Now(r) => {
-                if r.is_ok() {
-                    
-                }
+                if r.is_ok() {}
                 env.push(r);
                 StepResult::Done
             }
             Sometime::Future(r) => {
                 let mut env_owned = std::mem::replace(env, Environment::empty());
                 StepResult::Async(Box::pin(r.map(move |r| {
-                if r.is_ok() {
-                    
-                }
-                env_owned.push(r);
-                env_owned
-            })))
+                    if r.is_ok() {}
+                    env_owned.push(r);
+                    env_owned
+                })))
             }
         }
     }
@@ -588,23 +579,19 @@ pub fn put(env: &mut Environment) -> StepResult {
             let r = p.put(i);
             match r {
                 Sometime::Now(p) => {
-                    
                     env.push(Item::derive(p));
                     StepResult::Done
                 }
                 Sometime::Future(fu) => {
-                let mut env_owned = std::mem::replace(env, Environment::empty());
-                StepResult::Async(Box::pin(fu.map(move |f| {
-                    match f {
-                        Ok(p) => {
-                            
-                            env_owned.push(Item::derive(p))
-                        }
-                        Err(e) => env_owned.push(e),
-                    };
-                                    env_owned
-            })))
-            }
+                    let mut env_owned = std::mem::replace(env, Environment::empty());
+                    StepResult::Async(Box::pin(fu.map(move |f| {
+                        match f {
+                            Ok(p) => env_owned.push(Item::derive(p)),
+                            Err(e) => env_owned.push(e),
+                        };
+                        env_owned
+                    })))
+                }
             }
         }
 
@@ -617,7 +604,7 @@ pub fn put(env: &mut Environment) -> StepResult {
 
 pub fn clone(env: &mut Environment) -> StepResult {
     let clone = env.tos().expect("stack spec guarantees presence").clone();
-    
+
     env.push(clone);
     StepResult::Done
 }
@@ -628,37 +615,34 @@ fn swap2(env: &mut Environment, offset: usize) -> StepResult {
 }
 
 pub fn swap(env: &mut Environment) -> StepResult {
-    
     swap2(env, 0)
 }
 
 pub fn swapdown(env: &mut Environment) -> StepResult {
-    
     swap2(env, 1)
 }
 
 pub fn swapdeep(env: &mut Environment) -> StepResult {
-    
     swap2(env, 2)
 }
 
 pub fn sink(env: &mut Environment) -> StepResult {
     env.stack.swap(0, 2);
     env.stack.swap(0, 1);
-    
+
     StepResult::Done
 }
 
 pub fn float(env: &mut Environment) -> StepResult {
     env.stack.swap(0, 2);
     env.stack.swap(1, 2);
-    
+
     StepResult::Done
 }
 
 pub fn drop(env: &mut Environment) -> StepResult {
     env.pop();
-    
+
     StepResult::Done
 }
 
@@ -668,7 +652,7 @@ pub fn eq(env: &mut Environment) -> StepResult {
         let j = env.stack.get(1).expect("stack spec guarantees presence");
         i == j
     };
-    
+
     env.stack.replace2(is_eq.fit());
     StepResult::Done
 }
@@ -742,7 +726,6 @@ pub fn execute(env: &mut Environment) -> StepResult {
     } else {
         match Program::try_derive(i) {
             Ok(program) => {
-                
                 env.program.prepend_program(program);
             }
             Err(e) => {
@@ -755,7 +738,7 @@ pub fn execute(env: &mut Environment) -> StepResult {
 
 pub fn wrap(env: &mut Environment) -> StepResult {
     let item = env.pop();
-    
+
     env.push(list!(item));
     StepResult::Done
 }
@@ -764,7 +747,6 @@ pub fn unwrap(env: &mut Environment) -> StepResult {
     //println!("Unwrap: {:?} {:?}", env.stack, env.program.stacktrace());
     match coll::List::try_derive(env.pop()) {
         Ok(l) => {
-            
             for item in l.iter().cloned() {
                 env.push(item);
             }
@@ -795,7 +777,7 @@ pub fn dip(env: &mut Environment) -> StepResult {
     match Program::try_derive(env.pop()) {
         Ok(program) => {
             let mut item = env.pop();
-            
+
             dip_quote(&mut item);
             //println!("Dip item: {:?}", item);
             env.program.prepend(vector![item]);
@@ -807,14 +789,9 @@ pub fn dip(env: &mut Environment) -> StepResult {
     StepResult::Done
 }
 
-
-
 pub fn take(env: &mut Environment) -> StepResult {
     // TODO: handle Nothing case
-    fn finish(env: &mut Environment,
-        i: Result<Option<Item>, Error>,
-        c: coll::Dispenser,
-    ) {
+    fn finish(env: &mut Environment, i: Result<Option<Item>, Error>, c: coll::Dispenser) {
         env.push(c);
         env.push(coll::result_to_option(i).unwrap_or_default());
     }
@@ -822,7 +799,11 @@ pub fn take(env: &mut Environment) -> StepResult {
         Ok(d) => match d.take() {
             Sometime::Now(r) => {
                 let (i, c) = r;
-                { finish(env, i, c); StepResult::Done }; StepResult::Done
+                {
+                    finish(env, i, c);
+                    StepResult::Done
+                };
+                StepResult::Done
             }
             Sometime::Future(r) => {
                 let mut env_owned = std::mem::replace(env, Environment::empty());
@@ -831,7 +812,7 @@ pub fn take(env: &mut Environment) -> StepResult {
                     finish(&mut env_owned, i, c);
                     env_owned
                 }))
-            },
+            }
         },
         Err(e) => {
             //println!("Not a dispenser! {:?}", env.tos().unwrap());
@@ -845,7 +826,7 @@ pub fn pop(env: &mut Environment) -> StepResult {
     match <coll::Sized as TryDerive<_>>::try_derive(env.pop()) {
         Ok(it) => {
             let (c, i) = it.pop();
-            
+
             env.push(c);
             env.push(i.unwrap_or_default());
         }
@@ -866,7 +847,6 @@ pub fn branch(env: &mut Environment) -> StepResult {
         Program::try_derive(env.pop()),
     ) {
         (Ok(false_branch), Ok(true_branch)) => {
-            
             //env.pop();
             //env.pop();
             let b = env.tos().expect("stack spec guarantees presence");
@@ -894,7 +874,8 @@ pub fn branch(env: &mut Environment) -> StepResult {
 }
 
 pub fn step(env: &mut Environment) -> StepResult {
-    fn finish(env: &mut Environment,
+    fn finish(
+        env: &mut Environment,
         r: Result<Option<Item>, Error>,
         dispenser: coll::Dispenser,
         p: coll::List,
@@ -909,14 +890,16 @@ pub fn step(env: &mut Environment) -> StepResult {
             env.push(litem);
         } else {
             // if the container is empty, just pop off 'step' and we're done
-            
         }
     }
     let p = coll::List::try_derive(env.pop()).expect("stack spec guarantees List");
     let dispenser =
         coll::Dispenser::try_derive(env.pop()).expect("stack spec guarantees Dispenser");
     match dispenser.take() {
-        Sometime::Now((r, dispenser)) => { finish(env, r, dispenser, p); StepResult::Done },
+        Sometime::Now((r, dispenser)) => {
+            finish(env, r, dispenser, p);
+            StepResult::Done
+        }
         Sometime::Future(f) => {
             let mut env_owned = std::mem::replace(env, Environment::empty());
             StepResult::Async(Box::pin(async move {
@@ -924,7 +907,7 @@ pub fn step(env: &mut Environment) -> StepResult {
                 finish(&mut env_owned, r, dispenser, p);
                 env_owned
             }))
-        },
+        }
     }
 }
 
@@ -956,13 +939,12 @@ pub fn evert(env: &mut Environment) -> StepResult {
     let tmp = env.stack.to_list();
     env.stack = crate::types::container::stack::StackData::from_list(l);
     let l = tmp;
-    
+
     env.push(l);
     StepResult::Done
 }
 
 pub fn snapshot(env: &mut Environment) -> StepResult {
-    
     env.push(env.stack.to_list());
     StepResult::Done
 }
@@ -1274,13 +1256,14 @@ pub fn eval_step(env: &mut Environment) -> StepResult {
                         match &dfn.definition {
                             dict::Executable::Axiom(a) => (*a.f)(env),
                             dict::Executable::Derived(d) => {
-                                env.program.push_frame(crate::types::container::program::Frame {
-                                    chunk: d.clone(),
-                                    ip: 0,
-                                    loop_counters: vec![],
-                                    restore_items: vec![],
-                                    restore_stack: None,
-                                });
+                                env.program
+                                    .push_frame(crate::types::container::program::Frame {
+                                        chunk: d.clone(),
+                                        ip: 0,
+                                        loop_counters: vec![],
+                                        restore_items: vec![],
+                                        restore_stack: None,
+                                    });
                                 StepResult::Done
                             }
                         }
@@ -1298,36 +1281,38 @@ pub fn eval_step(env: &mut Environment) -> StepResult {
                 StepResult::Done
             }
             crate::types::container::program::Op::Execute(chunk) => {
-
-                env.program.push_frame(crate::types::container::program::Frame {
-                    chunk,
-                    ip: 0,
-                    loop_counters: vec![],
-                    restore_items: vec![],
-                    restore_stack: None,
-                });
+                env.program
+                    .push_frame(crate::types::container::program::Frame {
+                        chunk,
+                        ip: 0,
+                        loop_counters: vec![],
+                        restore_items: vec![],
+                        restore_stack: None,
+                    });
                 StepResult::Done
             }
             crate::types::container::program::Op::Dip(chunk) => {
                 let item = env.pop();
-                env.program.push_frame(crate::types::container::program::Frame {
-                    chunk,
-                    ip: 0,
-                    loop_counters: vec![],
-                    restore_items: vec![item],
-                    restore_stack: None,
-                });
+                env.program
+                    .push_frame(crate::types::container::program::Frame {
+                        chunk,
+                        ip: 0,
+                        loop_counters: vec![],
+                        restore_items: vec![item],
+                        restore_stack: None,
+                    });
                 StepResult::Done
             }
             crate::types::container::program::Op::Shield(chunk) => {
                 let saved_stack = env.stack.clone();
-                env.program.push_frame(crate::types::container::program::Frame {
-                    chunk,
-                    ip: 0,
-                    loop_counters: vec![],
-                    restore_items: vec![],
-                    restore_stack: Some(saved_stack),
-                });
+                env.program
+                    .push_frame(crate::types::container::program::Frame {
+                        chunk,
+                        ip: 0,
+                        loop_counters: vec![],
+                        restore_items: vec![],
+                        restore_stack: Some(saved_stack),
+                    });
                 StepResult::Done
             }
             crate::types::container::program::Op::Jump(offset) => {
@@ -1344,7 +1329,9 @@ pub fn eval_step(env: &mut Environment) -> StepResult {
                 StepResult::Done
             }
             crate::types::container::program::Op::JumpIfFalseKeepIfTrue(offset) => {
-                let is_true = is_truthy(env.stack.front().unwrap_or(&crate::types::Item::List(Box::new(crate::types::container::List::new()))));
+                let is_true = is_truthy(env.stack.front().unwrap_or(&crate::types::Item::List(
+                    Box::new(crate::types::container::List::new()),
+                )));
                 if !is_true {
                     env.pop();
                     let frame = env.program.0.last_mut().unwrap();
@@ -1520,7 +1507,6 @@ pub fn eval_step_outer(env: &mut Environment) -> StepResult {
 
     match inner_env {
         Ok(inner) => {
-            
             if inner.program.is_empty() {
                 env.push(Item::default());
                 StepResult::Done
@@ -1532,12 +1518,12 @@ pub fn eval_step_outer(env: &mut Environment) -> StepResult {
                         StepResult::Done
                     }
                     StepResult::Async(finner) => {
-                    let mut env_owned = std::mem::replace(env, Environment::empty());
-                    StepResult::Async(Box::pin(finner.map(move |e| {
-                        env_owned.push(e);
-                        env_owned
-                    })))
-                },
+                        let mut env_owned = std::mem::replace(env, Environment::empty());
+                        StepResult::Async(Box::pin(finner.map(move |e| {
+                            env_owned.push(e);
+                            env_owned
+                        })))
+                    }
                 }
             }
         }
@@ -1549,16 +1535,20 @@ pub fn eval_step_outer(env: &mut Environment) -> StepResult {
 }
 
 pub fn evaluate(env: &mut Environment) -> StepResult {
-    match Environment::try_derive((env.tos().expect("stack spec guarantees Environment").clone(), env.dictionary.clone())) {
+    match Environment::try_derive((
+        env.tos()
+            .expect("stack spec guarantees Environment")
+            .clone(),
+        env.dictionary.clone(),
+    )) {
         Ok(inner) => {
-                let mut env_owned = std::mem::replace(env, Environment::empty());
-                StepResult::Async(Box::pin(eval(inner).map(move |inner_done| {
-            
-            env_owned.pop();
+            let mut env_owned = std::mem::replace(env, Environment::empty());
+            StepResult::Async(Box::pin(eval(inner).map(move |inner_done| {
+                env_owned.pop();
                 env_owned.push(inner_done);
                 env_owned
             })))
-            }
+        }
         Err(e) => {
             env.push(e);
             StepResult::Done
@@ -1569,7 +1559,7 @@ pub fn evaluate(env: &mut Environment) -> StepResult {
 pub fn dictionary(env: &mut Environment) -> StepResult {
     //println!("adding dictionary");
     let d = env.dictionary.clone();
-    
+
     env.push(d);
     StepResult::Done
 }
@@ -1589,7 +1579,6 @@ fn abs(i: Number) -> Number {
 /// If there's an unhandled error on the stack, handle it, otherwise
 /// no-op.
 fn handle(env: &mut Environment) -> StepResult {
-    
     if let Some(Item::Error(ref mut e)) = env.stack.front_mut() {
         e.is_handled = true;
     }
@@ -1605,7 +1594,7 @@ pub fn fail(env: &mut Environment) -> Result<(), Error> {
     let mut err = Error::try_derive(env.tos().expect("stack spec guarantees Error"))
         .map_err(Error::derive)?;
     err.is_handled = false;
-    
+
     env.pop();
     env.push_err(err);
     Ok(())
@@ -1614,7 +1603,6 @@ pub fn fail(env: &mut Environment) -> Result<(), Error> {
 /// Takes a dictionary diff, merges it into an existing dictionary,
 /// with all the changes marked with the given namespace.
 pub fn dictmerge(env: &mut Environment) -> Result<(), Error> {
-    //println!("dictmerge: {:?}", env);
     let modified =
         dict::Dictionary::try_derive(env.tos().expect("stack spec guarantees Dictionary"))
             .map_err(Error::derive)?;
@@ -1628,7 +1616,7 @@ pub fn dictmerge(env: &mut Environment) -> Result<(), Error> {
     existing.merge(modified, &namespace);
 
     // pop the word dictmerge
-    
+
     env.pop();
     env.pop();
     env.pop();
@@ -1648,7 +1636,7 @@ pub fn read_blob(env: &mut Environment) -> Result<(), Error> {
             cache.get(&cache::Key::Hash(hash))?
         }
     };
-    
+
     env.push(contents);
     Ok(())
 }
@@ -1657,7 +1645,7 @@ pub fn disassemble(env: &mut Environment) -> StepResult {
     let item = env.pop();
     let string_repr = match item {
         Item::List(l) => {
-            let chunk = crate::compile::compile_with_dict(&l, Some(&env.dictionary));
+            let chunk = crate::compile::compile_with_dict(&l, &env.dictionary);
             format!("{:?}", chunk.ops)
         }
         Item::Word(w) => {
@@ -1692,7 +1680,7 @@ pub fn write_blob(env: &mut Environment) -> Result<(), Error> {
             let cache = config::PlatformConfig::get()?.cache;
             let hash = cache.put(&b, alias)?;
             env.push(hash);
-            
+
             Ok(())
         }
         i => Err(Error::expected(fit!("bytes"), i)),
@@ -1706,7 +1694,6 @@ pub fn animate(env: &mut Environment) -> StepResult {
     let inner_env = Environment::try_derive(tos);
     match inner_env {
         Ok(inner) => {
-            
             tokio::spawn(async move { eval(inner).await });
             StepResult::Done
         }
@@ -1728,7 +1715,13 @@ pub fn f_recur(env: &mut Environment) -> StepResult {
     let true_branch_list = coll::List::try_derive(true_branch).unwrap_or_default();
     let pred_list = coll::List::try_derive(pred).unwrap_or_default();
 
-    let chunk = crate::compile::compile_recur_with_dict(&pred_list, &true_branch_list, &false_branch_list, &combinator_list, Some(&env.dictionary));
+    let chunk = crate::compile::compile_recur_with_dict(
+        &pred_list,
+        &true_branch_list,
+        &false_branch_list,
+        &combinator_list,
+        &env.dictionary,
+    );
 
     let mut prog = Program::default();
     prog.push_frame(crate::types::container::program::Frame {
@@ -1738,7 +1731,7 @@ pub fn f_recur(env: &mut Environment) -> StepResult {
         restore_items: vec![],
         restore_stack: None,
     });
-    
+
     env.push(Item::Program(Box::new(prog)));
     StepResult::Done
 }
@@ -1768,13 +1761,11 @@ pub fn inspect(i: Item) -> String {
 }
 
 pub fn timestamps(env: &mut Environment) -> StepResult {
-    
     env.push(Item::Time);
     StepResult::Done
 }
 
 pub fn standard(env: &mut Environment) -> StepResult {
-    
     env.push(Item::Standard);
     StepResult::Done
 }
@@ -1926,7 +1917,7 @@ fn unnamespace(env: &mut Environment) -> StepResult {
         match Word::try_derive(i) {
             Ok(w) => {
                 let mut w = w.as_ref().clone();
-                
+
                 if let Some(ns) = w.namespace {
                     w.namespace = None;
                     env.push(w);
@@ -1950,7 +1941,6 @@ fn resolve(env: &mut Environment) -> StepResult {
     if let Some(i) = env.stack.pop_front() {
         match Word::try_derive(i) {
             Ok(w) => {
-                
                 let mut w2 = w.as_ref().clone();
                 if let Some(e) = env.dictionary.lingo.get(&w) {
                     w2.namespace = Some(e.namespace);
@@ -2059,7 +2049,7 @@ fn pack(env: &mut Environment) -> Result<(), Error> {
         Ok((env.stack.to_list(), &mut last_stack_item_used, Vec::new())),
         splice,
     )?;
-    
+
     // pop all the used items
     for _ in 0..*last_stack_item_used {
         env.pop();
@@ -2394,7 +2384,7 @@ fn unpack(env: &mut Environment) -> Result<(), Error> {
         .collect();
     let res_list = matches_list.to_vec();
     //println!("Got unpack result list {:?}", res_list);
-    
+
     env.push(coll::List::derive(res_list));
     env.push(Item::derive(res_map));
     Ok(())

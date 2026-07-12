@@ -140,14 +140,11 @@ fn chunk_to_shuffle(chunk: &Chunk) -> Option<(u8, Vec<u8>)> {
 }
 
 /// Main entry point for compiling a `List` of items into executable bytecode (`Chunk`).
-pub fn compile(list: &cont::List) -> Chunk {
-    compile_with_dict(list, None)
-}
 
 /// Compiles a list, optionally using a local dictionary to perform aggressive compile-time inlining.
 /// This handles iterating through the AST, matching builtin words, applying peephole stack optimizations,
 /// and generating combinator branches (like `evaluate`, `dip`, `↔️`).
-pub fn compile_with_dict(list: &cont::List, dict: Option<&Dictionary>) -> Chunk {
+pub fn compile_with_dict(list: &cont::List, dict: &Dictionary) -> Chunk {
     let mut ops = Vec::new();
     let mut vs = VirtualStack::new();
 
@@ -156,70 +153,80 @@ pub fn compile_with_dict(list: &cont::List, dict: Option<&Dictionary>) -> Chunk 
             Item::Word(w) => {
                 let w_str = w.data.as_str();
 
+                let is_overridden = {
+                    if let Some(entry) = dict.get_entry(w) {
+                        matches!(entry.definition, Executable::Derived(_))
+                    } else {
+                        false
+                    }
+                };
+
                 // Stack twiddle primitives
                 let mut handled_twiddle = false;
-                match w_str {
-                    "🗑️" | "drop" => {
-                        vs.pop();
-                        handled_twiddle = true;
+                if !is_overridden {
+                    match w_str {
+                        "🗑️" | "drop" => {
+                            vs.pop();
+                            handled_twiddle = true;
+                        }
+                        "•🗑️" | "drop-down" => {
+                            vs.apply_shuffle(2, &[0]);
+                            handled_twiddle = true;
+                        }
+                        "••🗑️" | "drop-deep" => {
+                            vs.apply_shuffle(3, &[0, 1]);
+                            handled_twiddle = true;
+                        }
+                        "👥" | "dup" => {
+                            vs.apply_shuffle(1, &[0, 0]);
+                            handled_twiddle = true;
+                        }
+                        "•👥" | "dup-down" => {
+                            vs.apply_shuffle(2, &[0, 1, 1]);
+                            handled_twiddle = true;
+                        }
+                        "••👥" | "dup-deep" => {
+                            vs.apply_shuffle(3, &[0, 1, 2, 2]);
+                            handled_twiddle = true;
+                        }
+                        "🔀" | "swap" => {
+                            vs.apply_shuffle(2, &[1, 0]);
+                            handled_twiddle = true;
+                        }
+                        "•🔀" | "swap-down" => {
+                            vs.apply_shuffle(3, &[0, 2, 1]);
+                            handled_twiddle = true;
+                        }
+                        "••🔀" | "swap-deep" => {
+                            vs.apply_shuffle(4, &[0, 1, 3, 2]);
+                            handled_twiddle = true;
+                        }
+                        "⚓" | "sink" => {
+                            vs.apply_shuffle(3, &[1, 2, 0]);
+                            handled_twiddle = true;
+                        }
+                        "•⚓" | "sink-down" => {
+                            vs.apply_shuffle(4, &[0, 2, 3, 1]);
+                            handled_twiddle = true;
+                        }
+                        "••⚓" | "sink-deep" => {
+                            vs.apply_shuffle(5, &[0, 1, 3, 4, 2]);
+                            handled_twiddle = true;
+                        }
+                        "🛟" | "float" => {
+                            vs.apply_shuffle(3, &[2, 0, 1]);
+                            handled_twiddle = true;
+                        }
+                        "•🛟" | "float-down" => {
+                            vs.apply_shuffle(4, &[0, 3, 1, 2]);
+                            handled_twiddle = true;
+                        }
+                        "••🛟" | "float-deep" => {
+                            vs.apply_shuffle(5, &[0, 1, 4, 2, 3]);
+                            handled_twiddle = true;
+                        }
+                        _ => {}
                     }
-                    "•🗑️" | "drop-down" => {
-                        vs.apply_shuffle(2, &[0]);
-                        handled_twiddle = true;
-                    }
-                    "••🗑️" | "drop-deep" => {
-                        vs.apply_shuffle(3, &[0, 1]);
-                        handled_twiddle = true;
-                    }
-                    "👥" | "dup" => {
-                        vs.apply_shuffle(1, &[0, 0]);
-                        handled_twiddle = true;
-                    }
-                    "•👥" | "dup-down" => {
-                        vs.apply_shuffle(2, &[0, 1, 1]);
-                        handled_twiddle = true;
-                    }
-                    "••👥" | "dup-deep" => {
-                        vs.apply_shuffle(3, &[0, 1, 2, 2]);
-                        handled_twiddle = true;
-                    }
-                    "🔀" | "swap" => {
-                        vs.apply_shuffle(2, &[1, 0]);
-                        handled_twiddle = true;
-                    }
-                    "•🔀" | "swap-down" => {
-                        vs.apply_shuffle(3, &[0, 2, 1]);
-                        handled_twiddle = true;
-                    }
-                    "••🔀" | "swap-deep" => {
-                        vs.apply_shuffle(4, &[0, 1, 3, 2]);
-                        handled_twiddle = true;
-                    }
-                    "⚓" | "sink" => {
-                        vs.apply_shuffle(3, &[1, 2, 0]);
-                        handled_twiddle = true;
-                    }
-                    "•⚓" | "sink-down" => {
-                        vs.apply_shuffle(4, &[0, 2, 3, 1]);
-                        handled_twiddle = true;
-                    }
-                    "••⚓" | "sink-deep" => {
-                        vs.apply_shuffle(5, &[0, 1, 3, 4, 2]);
-                        handled_twiddle = true;
-                    }
-                    "🛟" | "float" => {
-                        vs.apply_shuffle(3, &[2, 0, 1]);
-                        handled_twiddle = true;
-                    }
-                    "•🛟" | "float-down" => {
-                        vs.apply_shuffle(4, &[0, 3, 1, 2]);
-                        handled_twiddle = true;
-                    }
-                    "••🛟" | "float-deep" => {
-                        vs.apply_shuffle(5, &[0, 1, 4, 2, 3]);
-                        handled_twiddle = true;
-                    }
-                    _ => {}
                 }
 
                 if handled_twiddle {
@@ -227,13 +234,12 @@ pub fn compile_with_dict(list: &cont::List, dict: Option<&Dictionary>) -> Chunk 
                 }
 
                 // Check for pure shuffle inlining if dict is available
-                if let Some(d) = dict {
-                    if let Some(entry) = d.get_entry(w) {
-                        if let Executable::Derived(ref chunk) = entry.definition {
-                            if let Some((pops, pushes)) = chunk_to_shuffle(chunk) {
-                                vs.apply_shuffle(pops as usize, &pushes);
-                                continue;
-                            }
+
+                if let Some(entry) = dict.get_entry(w) {
+                    if let Executable::Derived(ref chunk) = entry.definition {
+                        if let Some((pops, pushes)) = chunk_to_shuffle(chunk) {
+                            vs.apply_shuffle(pops as usize, &pushes);
+                            continue;
                         }
                     }
                 }
@@ -405,21 +411,12 @@ pub fn decompile(chunk: &Chunk) -> cont::List {
     list
 }
 
-pub fn compile_recur(
-    pred: &cont::List,
-    true_branch: &cont::List,
-    false_branch: &cont::List,
-    combinator: &cont::List,
-) -> Chunk {
-    compile_recur_with_dict(pred, true_branch, false_branch, combinator, None)
-}
-
 pub fn compile_recur_with_dict(
     pred: &cont::List,
     true_branch: &cont::List,
     false_branch: &cont::List,
     combinator: &cont::List,
-    dict: Option<&Dictionary>,
+    dict: &Dictionary,
 ) -> Chunk {
     let mut is_execute_first = false;
     let mut comb_rest = combinator.clone();
@@ -550,7 +547,7 @@ mod tests {
                 namespace: None,
             })));
         }
-        let chunk = compile(&list);
+        let chunk = compile_with_dict(&list, &crate::types::container::dictionary::Dictionary::default());
         if expected_pops == 0 && expected_pushes.is_empty() {
             assert_eq!(chunk.ops.len(), 1, "Expected no shuffle for {}", words);
             assert!(matches!(chunk.ops[0], Op::Return));

@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::compile::{compile, VirtualStack};
+    use crate::compile::{compile_with_dict, VirtualStack};
     use crate::types::container::program::{Chunk, Op};
     use crate::types::Item;
     use crate::types::container::List;
@@ -8,7 +8,7 @@ mod tests {
     fn check_compile(word: &str, expected_pops: u8, expected_pushes: &[u8]) {
         let mut list = List::new();
         list.push_back(Item::Word(crate::types::Intern::new(word.to_string())));
-        let chunk = compile(&list);
+        let chunk = compile_with_dict(&list, &crate::types::container::dictionary::Dictionary::default());
         if expected_pops == 0 && expected_pushes.is_empty() {
             assert_eq!(chunk.ops.len(), 1, "Expected no shuffle for {}", word);
             assert!(matches!(chunk.ops[0], Op::Return));

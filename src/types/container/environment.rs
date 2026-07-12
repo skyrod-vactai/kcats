@@ -239,15 +239,15 @@ impl Default for Environment {
             //println!("starting dictionary: {:?}", env.dictionary.modules);
             //println!("Dict has {} words", env.dictionary.words.len());
             let mut env = [
-                // fit!("errors"),
-                //fit!("collections"),
-                // fit!("encode"),
-                // fit!("time"), // good candidate for lib
-                // fit!("pipes"),
-                // fit!("methods"),
-                // fit!("generators"),
-                // fit!("debug"),
-                // fit!("crypto-builtins"),
+                fit!("errors"),
+                fit!("collections"),
+                fit!("encode"),
+                fit!("time"), // good candidate for lib
+                fit!("pipes"),
+                fit!("methods"),
+                fit!("generators"),
+                fit!("debug"),
+                fit!("crypto-builtins"),
                 //fit!("more-generators"),
                 //fit!("database"),
             ]
@@ -433,7 +433,7 @@ impl TryDerive<(Item, dict::Dictionary)> for Environment {
                     dictionary: d,
                     ..Environment::default()
                 };
-                let chunk = crate::compile::compile_with_dict(&l, Some(&env.dictionary));
+                let chunk = crate::compile::compile_with_dict(&l, &env.dictionary);
                 env.program
                     .push_frame(crate::types::container::program::Frame {
                         chunk: std::sync::Arc::new(chunk),

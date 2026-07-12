@@ -377,7 +377,7 @@ impl Associative {
                     if w == "definition" {
                         let l = coll::List::try_derive(v);
                         if let Ok(l) = l {
-                            de.definition = dict::Executable::Derived(std::sync::Arc::new(crate::compile::compile(&l)));
+                            de.definition = dict::Executable::Derived(std::sync::Arc::new(crate::compile::compile_with_dict(&l, &crate::types::container::dictionary::Dictionary::default())));
                             // TODO: return the old def
                         }
                     } else if w == "examples" {

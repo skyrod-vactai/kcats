@@ -2,7 +2,7 @@ use crate::types::container::List;
 use crate::types::Item;
 use std::collections::VecDeque;
 
-#[derive(Clone, PartialEq, Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct StackData {
     pub cache: VecDeque<Item>,
     pub base: List,
@@ -24,14 +24,11 @@ impl StackData {
                 for i in (0..items.len()).rev() {
                     self.push_front(items[i].clone());
                 }
-                return Err(crate::types::Error::expected(
-                    crate::types::fit!("enough items on stack to shuffle"),
-                    crate::types::Item::Nothing,
-                ));
+                return Err(crate::types::Error::stack_underflow());
             }
         }
-        for item in items.into_iter().rev() {
-            self.push_front(item);
+        for &idx in pushes {
+            self.push_front(items[idx as usize].clone());
         }
 
         Ok(())
@@ -191,5 +188,19 @@ impl crate::derivation::Derive<StackData> for List {
 impl crate::derivation::Derive<StackData> for Item {
     fn derive(value: StackData) -> Self {
         Item::List(Box::new(value.to_list()))
+    }
+}
+
+impl PartialEq for StackData {
+    fn eq(&self, other: &Self) -> bool {
+        if self.len() != other.len() {
+            return false;
+        }
+        for i in 0..self.len() {
+            if self.get(i) != other.get(i) {
+                return false;
+            }
+        }
+        true
     }
 }

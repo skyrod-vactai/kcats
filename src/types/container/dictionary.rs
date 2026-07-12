@@ -202,6 +202,7 @@ pub type Words = coll::Arc<HashMap<Word, Entry>>;
 /// definition of the same word to use (based on which module it comes
 /// from). The lingo field is a cache of which words are selected.
 #[derive(Clone, PartialEq)]
+#[derive(Default)]
 pub struct Dictionary {
     pub words: Words,
     pub lingo: Words,
@@ -271,7 +272,36 @@ impl Dictionary {
     /// modules from this dictionary. Saves computation at runtime
     /// because resolution is already done.
     pub fn resolve(&mut self) {
+        // Re-compilation optimization pass:
+        // During bootstrap (or dynamic parsing), code is initially compiled against
+        // `Dictionary::default()`. This guarantees the code is 100% valid and runnable,
+        // preventing uncompiled execution bugs, but misses out on inlining custom
+        // shuffles because the dictionary was incomplete at parsing time.
+        // Because `resolve()` is called after loading core words as an atomic unit,
+        // we can re-compile all derived words using the now fully-loaded dictionary
+        // to cleanly apply all inlining optimizations, regardless of definition order.
+        let mut to_recompile = Vec::new();
+        for (w, entry) in self.words.iter() {
+            if let Executable::Derived(chunk) = &entry.definition {
+                if let Some(source) = &chunk.source {
+                    to_recompile.push((w.clone(), source.clone()));
+                }
+            }
+        }
+        let mut recompiled = Vec::new();
+        for (w, source) in to_recompile {
+            let chunk = crate::compile::compile_with_dict(&source, self);
+            recompiled.push((w, Executable::Derived(std::sync::Arc::new(chunk))));
+        }
+        let words = self.words.mutate();
+        for (w, def) in recompiled {
+            if let Some(entry) = words.get_mut(&w) {
+                entry.definition = def;
+            }
+        }
+
         fn group_by_namespace(words: &Words) -> HashMap<Namespace, Vec<(types::Word, Entry)>> {
+
             let mut grouped: HashMap<Namespace, Vec<(types::Word, Entry)>> = HashMap::new();
 
             for (k, v) in words.iter() {
@@ -384,7 +414,14 @@ fn merge_entries(orig: &mut Entry, new: Entry) {
     // builtin, now that we've read the lexicon. The definition is the
     // builtin and we want to keep that.
     match (orig.definition.clone(), new.definition) {
-        (Executable::Axiom(_), _) => {} // don't overwrite
+        (Executable::Axiom(_), Executable::Derived(d)) if d.ops.is_empty() || (d.ops.len() == 1 && matches!(d.ops[0], crate::types::container::program::Op::Return)) => {
+            // println!("merge_entries: kept axiom {}", a.name);
+        } // keep axiom, this is a dummy from .kcats
+        (Executable::Axiom(_a), Executable::Derived(d)) => {
+            // println!("merge_entries: overwrote axiom {} with derived", a.name);
+            orig.definition = Executable::Derived(d); // user override
+        }
+        (Executable::Axiom(_), Executable::Axiom(_)) => {} // don't overwrite axiom with axiom
         (_, Executable::Derived(d)) => {
             orig.definition = Executable::Derived(d); // both derived? overwrite
         }
@@ -725,7 +762,7 @@ impl TryDerive<Box<dyn Iterator<Item = Item>>> for Entry {
         }
         Ok(Entry {
             examples,
-            definition: definition.unwrap_or_else(|| Executable::Derived(Arc::new(crate::compile::compile(&coll::List::default())))),
+            definition: definition.unwrap_or_else(|| Executable::Derived(Arc::new(crate::compile::compile_with_dict(&coll::List::default(), &crate::types::container::dictionary::Dictionary::default())))),
             spec,
             namespace,
             doc,
@@ -769,7 +806,7 @@ impl TryDerive<Box<dyn Iterator<Item = Item>>> for Dictionary {
 
 impl TryDerive<Item> for Executable {
     fn try_derive(i: Item) -> Result<Self, Error> {
-        coll::List::try_derive(i).map(|l| Executable::Derived(Arc::new(crate::compile::compile(&l))))
+        coll::List::try_derive(i).map(|l| Executable::Derived(Arc::new(crate::compile::compile_with_dict(&l, &crate::types::container::dictionary::Dictionary::default()))))
     }
 }
 
