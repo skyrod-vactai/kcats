@@ -1,12 +1,12 @@
-use crate::types::container::program::{Chunk, Op};
 use crate::types::container as cont;
-use crate::types::Item;
 use crate::types::container::dictionary::Dictionary;
 use crate::types::container::dictionary::Executable;
+use crate::types::container::program::{Chunk, Op};
+use crate::types::Item;
 
 /// `VirtualStack` simulates stack manipulations at compile-time to collapse
 /// adjacent stack twiddles (like `swap`, `dup`, `drop`) into a single `Op::Shuffle` instruction.
-/// 
+///
 /// It maintains a virtual state of the stack relative to the actual runtime stack at the start of a basic block.
 /// The `items` vector represents the current stack ordering natively: `items[0]` is the Top-of-Stack (ToS),
 /// `items[1]` is Next-on-Stack (NoS), and so on down to the deepest tracked element.
@@ -18,7 +18,10 @@ struct VirtualStack {
 impl VirtualStack {
     /// Creates a fresh, empty VirtualStack state.
     fn new() -> Self {
-        Self { items: Vec::new(), pops: 0 }
+        Self {
+            items: Vec::new(),
+            pops: 0,
+        }
     }
 
     /// Pops the Top-of-Stack from the virtual state.
@@ -40,9 +43,9 @@ impl VirtualStack {
     fn push(&mut self, item: usize) {
         self.items.insert(0, item);
     }
-    
+
     /// Applies a compile-time shuffle to the virtual stack state.
-    /// 
+    ///
     /// `pushes` is expected to be an array of indices referencing the items just popped,
     /// ordered from Top-of-Stack to Deepest. For example, a `swap` operation takes `&[1, 0]`.
     fn apply_shuffle(&mut self, pops: usize, pushes: &[u8]) {
@@ -104,7 +107,7 @@ impl VirtualStack {
 }
 
 /// A helper function to identify if a given `Chunk` consists exclusively of a single pure stack shuffle.
-/// This allows us to transparently inline complex composite twiddles (like derived `swapdown` words) 
+/// This allows us to transparently inline complex composite twiddles (like derived `swapdown` words)
 /// or optimize the inner blocks of `dip` combinators into flat bytecode.
 fn chunk_to_shuffle(chunk: &Chunk) -> Option<(u8, Vec<u8>)> {
     let mut temp_vs = VirtualStack::new();
@@ -152,28 +155,73 @@ pub fn compile_with_dict(list: &cont::List, dict: Option<&Dictionary>) -> Chunk 
         match item {
             Item::Word(w) => {
                 let w_str = w.data.as_str();
-                
+
                 // Stack twiddle primitives
                 let mut handled_twiddle = false;
                 match w_str {
-                    "🗑️" | "drop" => { vs.pop(); handled_twiddle = true; }
-                    "•🗑️" | "drop-down" => { vs.apply_shuffle(2, &[0]); handled_twiddle = true; }
-                    "••🗑️" | "drop-deep" => { vs.apply_shuffle(3, &[0, 1]); handled_twiddle = true; }
-                    "👥" | "dup" => { vs.apply_shuffle(1, &[0, 0]); handled_twiddle = true; }
-                    "•👥" | "dup-down" => { vs.apply_shuffle(2, &[0, 1, 1]); handled_twiddle = true; }
-                    "••👥" | "dup-deep" => { vs.apply_shuffle(3, &[0, 1, 2, 2]); handled_twiddle = true; }
-                    "🔀" | "swap" => { vs.apply_shuffle(2, &[1, 0]); handled_twiddle = true; }
-                    "•🔀" | "swap-down" => { vs.apply_shuffle(3, &[0, 2, 1]); handled_twiddle = true; }
-                    "••🔀" | "swap-deep" => { vs.apply_shuffle(4, &[0, 1, 3, 2]); handled_twiddle = true; }
-                    "⚓" | "sink" => { vs.apply_shuffle(3, &[1, 2, 0]); handled_twiddle = true; }
-                    "•⚓" | "sink-down" => { vs.apply_shuffle(4, &[0, 2, 3, 1]); handled_twiddle = true; }
-                    "••⚓" | "sink-deep" => { vs.apply_shuffle(5, &[0, 1, 3, 4, 2]); handled_twiddle = true; }
-                    "🛟" | "float" => { vs.apply_shuffle(3, &[2, 0, 1]); handled_twiddle = true; }
-                    "•🛟" | "float-down" => { vs.apply_shuffle(4, &[0, 3, 1, 2]); handled_twiddle = true; }
-                    "••🛟" | "float-deep" => { vs.apply_shuffle(5, &[0, 1, 4, 2, 3]); handled_twiddle = true; }
+                    "🗑️" | "drop" => {
+                        vs.pop();
+                        handled_twiddle = true;
+                    }
+                    "•🗑️" | "drop-down" => {
+                        vs.apply_shuffle(2, &[0]);
+                        handled_twiddle = true;
+                    }
+                    "••🗑️" | "drop-deep" => {
+                        vs.apply_shuffle(3, &[0, 1]);
+                        handled_twiddle = true;
+                    }
+                    "👥" | "dup" => {
+                        vs.apply_shuffle(1, &[0, 0]);
+                        handled_twiddle = true;
+                    }
+                    "•👥" | "dup-down" => {
+                        vs.apply_shuffle(2, &[0, 1, 1]);
+                        handled_twiddle = true;
+                    }
+                    "••👥" | "dup-deep" => {
+                        vs.apply_shuffle(3, &[0, 1, 2, 2]);
+                        handled_twiddle = true;
+                    }
+                    "🔀" | "swap" => {
+                        vs.apply_shuffle(2, &[1, 0]);
+                        handled_twiddle = true;
+                    }
+                    "•🔀" | "swap-down" => {
+                        vs.apply_shuffle(3, &[0, 2, 1]);
+                        handled_twiddle = true;
+                    }
+                    "••🔀" | "swap-deep" => {
+                        vs.apply_shuffle(4, &[0, 1, 3, 2]);
+                        handled_twiddle = true;
+                    }
+                    "⚓" | "sink" => {
+                        vs.apply_shuffle(3, &[1, 2, 0]);
+                        handled_twiddle = true;
+                    }
+                    "•⚓" | "sink-down" => {
+                        vs.apply_shuffle(4, &[0, 2, 3, 1]);
+                        handled_twiddle = true;
+                    }
+                    "••⚓" | "sink-deep" => {
+                        vs.apply_shuffle(5, &[0, 1, 3, 4, 2]);
+                        handled_twiddle = true;
+                    }
+                    "🛟" | "float" => {
+                        vs.apply_shuffle(3, &[2, 0, 1]);
+                        handled_twiddle = true;
+                    }
+                    "•🛟" | "float-down" => {
+                        vs.apply_shuffle(4, &[0, 3, 1, 2]);
+                        handled_twiddle = true;
+                    }
+                    "••🛟" | "float-deep" => {
+                        vs.apply_shuffle(5, &[0, 1, 4, 2, 3]);
+                        handled_twiddle = true;
+                    }
                     _ => {}
                 }
-                
+
                 if handled_twiddle {
                     continue;
                 }
@@ -190,7 +238,7 @@ pub fn compile_with_dict(list: &cont::List, dict: Option<&Dictionary>) -> Chunk 
                     }
                 }
                 vs.flush(&mut ops);
-                
+
                 if w_str == "▶️" {
                     if let Some(Op::Push(Item::List(l))) = ops.last() {
                         let l_clone = l.clone();
@@ -201,7 +249,7 @@ pub fn compile_with_dict(list: &cont::List, dict: Option<&Dictionary>) -> Chunk 
                         continue;
                     }
                 // `🪄` (dip) combinator: Pops a block, pops the TOS, runs the block, restores the TOS.
-                // If the inner block is purely stack shuffles, we can map it to a single inline shuffle 
+                // If the inner block is purely stack shuffles, we can map it to a single inline shuffle
                 // by shifting all internal indices up by 1 and maintaining TOS (index 0) identically.
                 } else if w_str == "🪄" {
                     if let Some(Op::Push(Item::List(l))) = ops.last() {
@@ -233,7 +281,10 @@ pub fn compile_with_dict(list: &cont::List, dict: Option<&Dictionary>) -> Chunk 
                             vs.apply_shuffle(pops as usize + 2, &new_pushes);
                             continue;
                         }
-                        let dip_chunk = Chunk { ops: vec![Op::Dip(std::sync::Arc::new(inner_chunk)), Op::Return], source: None };
+                        let dip_chunk = Chunk {
+                            ops: vec![Op::Dip(std::sync::Arc::new(inner_chunk)), Op::Return],
+                            source: None,
+                        };
                         ops.push(Op::Dip(std::sync::Arc::new(dip_chunk)));
                         continue;
                     }
@@ -251,16 +302,25 @@ pub fn compile_with_dict(list: &cont::List, dict: Option<&Dictionary>) -> Chunk 
                             vs.apply_shuffle(pops as usize + 3, &new_pushes);
                             continue;
                         }
-                        let dip_chunk1 = Chunk { ops: vec![Op::Dip(std::sync::Arc::new(inner_chunk)), Op::Return], source: None };
-                        let dip_chunk2 = Chunk { ops: vec![Op::Dip(std::sync::Arc::new(dip_chunk1)), Op::Return], source: None };
+                        let dip_chunk1 = Chunk {
+                            ops: vec![Op::Dip(std::sync::Arc::new(inner_chunk)), Op::Return],
+                            source: None,
+                        };
+                        let dip_chunk2 = Chunk {
+                            ops: vec![Op::Dip(std::sync::Arc::new(dip_chunk1)), Op::Return],
+                            source: None,
+                        };
                         ops.push(Op::Dip(std::sync::Arc::new(dip_chunk2)));
                         continue;
                     }
                 } else if w_str == "▶️" || w_str == "evaluate" {
                     let len = ops.len();
                     if len >= 2 {
-                        if let (Op::Call(w_prev), Op::Push(crate::types::Item::List(l))) = (&ops[len-1], &ops[len-2]) {
-                            if w_prev.data.as_str() == "🛡️" || w_prev.data.as_str() == "shield" {
+                        if let (Op::Call(w_prev), Op::Push(crate::types::Item::List(l))) =
+                            (&ops[len - 1], &ops[len - 2])
+                        {
+                            if w_prev.data.as_str() == "🛡️" || w_prev.data.as_str() == "shield"
+                            {
                                 let l_clone = l.clone();
                                 ops.pop();
                                 ops.pop();
@@ -278,37 +338,42 @@ pub fn compile_with_dict(list: &cont::List, dict: Option<&Dictionary>) -> Chunk 
                 } else if w_str == "↔️" {
                     let len = ops.len();
                     if len >= 2 {
-                        if let (Op::Push(Item::List(f)), Op::Push(Item::List(t))) = (&ops[len-1], &ops[len-2]) {
+                        if let (Op::Push(Item::List(f)), Op::Push(Item::List(t))) =
+                            (&ops[len - 1], &ops[len - 2])
+                        {
                             let f_clone = f.clone();
                             let t_clone = t.clone();
                             ops.pop();
                             ops.pop();
-                            
+
                             let jump_base_idx = ops.len();
                             ops.push(Op::JumpIfFalseKeepIfTrue(0)); // placeholder
-                            
+
                             let mut true_chunk = compile_with_dict(&t_clone, dict);
                             true_chunk.ops.pop();
                             ops.extend(true_chunk.ops);
-                            
+
                             let jump_start_idx = ops.len();
                             ops.push(Op::Jump(0)); // placeholder
-                            
+
                             let base_case_idx = ops.len();
-                            ops[jump_base_idx] = Op::JumpIfFalseKeepIfTrue((base_case_idx as isize) - (jump_base_idx as isize) - 1);
-                            
+                            ops[jump_base_idx] = Op::JumpIfFalseKeepIfTrue(
+                                (base_case_idx as isize) - (jump_base_idx as isize) - 1,
+                            );
+
                             let mut false_chunk = compile_with_dict(&f_clone, dict);
                             false_chunk.ops.pop();
                             ops.extend(false_chunk.ops);
-                            
+
                             let end_idx = ops.len();
-                            ops[jump_start_idx] = Op::Jump((end_idx as isize) - (jump_start_idx as isize) - 1);
-                            
+                            ops[jump_start_idx] =
+                                Op::Jump((end_idx as isize) - (jump_start_idx as isize) - 1);
+
                             continue;
                         }
                     }
                 }
-                
+
                 ops.push(Op::Call(w.clone()));
             }
             _ => {
@@ -319,7 +384,10 @@ pub fn compile_with_dict(list: &cont::List, dict: Option<&Dictionary>) -> Chunk 
     }
     vs.flush(&mut ops);
     ops.push(Op::Return);
-    Chunk { ops, source: Some(list.clone()) }
+    Chunk {
+        ops,
+        source: Some(list.clone()),
+    }
 }
 
 pub fn decompile(chunk: &Chunk) -> cont::List {
@@ -351,7 +419,7 @@ pub fn compile_recur_with_dict(
     true_branch: &cont::List,
     false_branch: &cont::List,
     combinator: &cont::List,
-    dict: Option<&Dictionary>
+    dict: Option<&Dictionary>,
 ) -> Chunk {
     let mut is_execute_first = false;
     let mut comb_rest = combinator.clone();
@@ -363,20 +431,20 @@ pub fn compile_recur_with_dict(
     }
 
     let mut ops = Vec::new();
-    
+
     // Non-TCO (push program back to stack)
     if !is_execute_first {
         let mut pred_chunk = compile_with_dict(pred, dict);
         pred_chunk.ops.pop();
         ops.extend(pred_chunk.ops);
-        
+
         let jump_base_idx = ops.len();
         ops.push(Op::JumpIfFalseKeepIfTrue(0)); // placeholder
-        
+
         let mut true_chunk = compile_with_dict(true_branch, dict);
         true_chunk.ops.pop();
         ops.extend(true_chunk.ops);
-        
+
         let mut list = cont::List::new();
         list.push_back(crate::types::Item::List(Box::new(pred.clone())));
         list.push_back(crate::types::Item::List(Box::new(true_branch.clone())));
@@ -387,25 +455,26 @@ pub fn compile_recur_with_dict(
         let mut prog = crate::types::container::program::Program::default();
         prog.prepend(list);
         ops.push(Op::Push(Item::Program(Box::new(prog))));
-        
+
         let mut comb_chunk = compile_with_dict(combinator, dict);
         comb_chunk.ops.pop();
         ops.extend(comb_chunk.ops);
-        
+
         ops.push(Op::Return);
-        
+
         let base_case_idx = ops.len();
-        ops[jump_base_idx] = Op::JumpIfFalseKeepIfTrue((base_case_idx as isize) - (jump_base_idx as isize) - 1);
-        
+        ops[jump_base_idx] =
+            Op::JumpIfFalseKeepIfTrue((base_case_idx as isize) - (jump_base_idx as isize) - 1);
+
         let mut then_chunk = compile_with_dict(false_branch, dict);
         then_chunk.ops.pop();
         ops.extend(then_chunk.ops);
         ops.push(Op::Return);
-        
+
         return Chunk { ops, source: None };
     }
 
-// TCO or Flattened Loop
+    // TCO or Flattened Loop
     let mut comb_chunk = compile_with_dict(&comb_rest, dict);
     comb_chunk.ops.pop(); // remove Return
     let has_combinator = !comb_chunk.ops.is_empty();
@@ -433,7 +502,8 @@ pub fn compile_recur_with_dict(
     ops.push(Op::Jump(jump_start_offset));
 
     let base_case_idx = ops.len();
-    ops[jump_base_idx] = Op::JumpIfFalseKeepIfTrue((base_case_idx as isize) - (jump_base_idx as isize) - 1);
+    ops[jump_base_idx] =
+        Op::JumpIfFalseKeepIfTrue((base_case_idx as isize) - (jump_base_idx as isize) - 1);
 
     let mut then_chunk = compile_with_dict(false_branch, dict);
     then_chunk.ops.pop();
@@ -451,7 +521,10 @@ pub fn compile_recur_with_dict(
         ops.push(Op::Jump(jump_unwind_start_offset));
 
         let unwind_end_idx = ops.len();
-        ops[jump_unwind_end_idx] = Op::JumpIfLoopCounterZero(0, (unwind_end_idx as isize) - (jump_unwind_end_idx as isize) - 1);
+        ops[jump_unwind_end_idx] = Op::JumpIfLoopCounterZero(
+            0,
+            (unwind_end_idx as isize) - (jump_unwind_end_idx as isize) - 1,
+        );
 
         ops.push(Op::PopLoopCounter);
     }
@@ -459,15 +532,14 @@ pub fn compile_recur_with_dict(
     Chunk { ops, source: None }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::container::program::{Chunk, Op};
-    use crate::types::Item;
+    use crate::types::container::program::Op;
     use crate::types::container::List;
-    use internment::Intern;
+    use crate::types::Item;
     use crate::types::WordData;
+    use internment::Intern;
 
     fn check_compile(words: &str, expected_pops: u8, expected_pushes: &[u8]) {
         let mut list = List::new();
@@ -487,7 +559,12 @@ mod tests {
         assert_eq!(chunk.ops.len(), 2, "Expected 2 ops for {}", words);
         if let Op::Shuffle { pops, pushes } = &chunk.ops[0] {
             assert_eq!(*pops, expected_pops, "pops mismatch for {}", words);
-            assert_eq!(pushes.as_slice(), expected_pushes, "pushes mismatch for {}", words);
+            assert_eq!(
+                pushes.as_slice(),
+                expected_pushes,
+                "pushes mismatch for {}",
+                words
+            );
         } else {
             panic!("Expected Shuffle for {}, got {:?}", words, chunk.ops[0]);
         }
@@ -502,7 +579,7 @@ mod tests {
 
         check_compile("swap-down", 3, &[1, 2, 0]);
         check_compile("sink-down", 4, &[1, 3, 2, 0]);
-        
+
         check_compile("float", 3, &[1, 0, 2]); // Original DEEPEST-to-TOS for float: [1, 0, 2]
         check_compile("float-down", 4, &[2, 1, 3, 0]);
 

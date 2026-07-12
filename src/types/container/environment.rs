@@ -33,7 +33,7 @@ impl Environment {
                 lingo: dict::Words::fresh(),
             },
             stack: Default::default(),
-            program: Default::default()
+            program: Default::default(),
         }
     }
 
@@ -239,25 +239,21 @@ impl Default for Environment {
             //println!("starting dictionary: {:?}", env.dictionary.modules);
             //println!("Dict has {} words", env.dictionary.words.len());
             let mut env = [
-                fit!("errors"),
-                fit!("encode"),
-                fit!("time"), // good candidate for lib
-                fit!("pipes"),
-                fit!("methods"),
-                fit!("generators"),
-                fit!("debug"),
-                fit!("crypto-builtins"),
+                // fit!("errors"),
+                //fit!("collections"),
+                // fit!("encode"),
+                // fit!("time"), // good candidate for lib
+                // fit!("pipes"),
+                // fit!("methods"),
+                // fit!("generators"),
+                // fit!("debug"),
+                // fit!("crypto-builtins"),
                 //fit!("more-generators"),
                 //fit!("database"),
             ]
             .into_iter()
             .fold(env, |e, item| e.load_module(item, true));
 
-            env = [
-                fit!("collections"), // actually we probably want collections in default dictionary? wait maybe not
-            ]
-            .into_iter()
-            .fold(env, |e, item| e.load_module(item, false));
             // need to do this again because we loaded some builtins
             // above, need to add the rust definitions back that got
             // overwritten.
@@ -438,13 +434,14 @@ impl TryDerive<(Item, dict::Dictionary)> for Environment {
                     ..Environment::default()
                 };
                 let chunk = crate::compile::compile_with_dict(&l, Some(&env.dictionary));
-                env.program.push_frame(crate::types::container::program::Frame {
-                    chunk: std::sync::Arc::new(chunk),
-                    ip: 0,
-                    loop_counters: vec![],
-                    restore_items: vec![],
-                    restore_stack: None,
-                });
+                env.program
+                    .push_frame(crate::types::container::program::Frame {
+                        chunk: std::sync::Arc::new(chunk),
+                        ip: 0,
+                        loop_counters: vec![],
+                        restore_items: vec![],
+                        restore_stack: None,
+                    });
                 Ok(env)
             }
             coll::Sized::Program(p) => {
