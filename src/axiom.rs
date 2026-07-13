@@ -1215,14 +1215,18 @@ pub fn autoformat(i: Item) -> Result<String, Error> {
 /// Inner function of the interpreter, each call to this function
 /// advances the [Environment] one step of execution.
 pub fn eval_step(env: &mut Environment) -> StepResult {
-    let (restored, restored_stack) = env.program.clean();
-    if let Some(stack) = restored_stack {
-        let top = env.stack.pop_front().unwrap_or(crate::types::Item::Nothing);
-        env.stack = stack;
-        env.push(top);
-    }
-    for item in restored {
-        env.push(item);
+    while env.program.0.last().map_or(false, |f| f.is_finished()) {
+        if let Some(frame) = env.program.0.pop() {
+            if let Some(stack) = frame.restore_stack {
+                let top = env.stack.pop_front().unwrap_or(crate::types::Item::Nothing);
+                env.stack = stack;
+                env.push(top);
+            } else {
+                for item in frame.restore_items.into_iter().rev() {
+                    env.push(item);
+                }
+            }
+        }
     }
     let op = env.program.0.last_mut().and_then(|f| f.next_op());
     if let Some(op) = op {
@@ -1490,10 +1494,9 @@ pub async fn eval(mut env: Environment) -> Environment {
             };
         }
         if !env.program.is_empty() {
-            env = match eval_step(&mut env) {
-                StepResult::Done => env,
-                StepResult::Async(fenv) => fenv.await,
-            };
+            if let StepResult::Async(fenv) = eval_step(&mut env) {
+                env = fenv.await;
+            }
         } else {
             break;
         }
